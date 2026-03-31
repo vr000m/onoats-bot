@@ -485,17 +485,40 @@ async def run_koda(*, interactive: bool = False) -> None:
             return
         _shutdown_done = True
 
-        logger.info("Shutdown: flushing in-memory transcript buffer to .active/")
-        await transcript_buffer.flush_to_disk()
-
         logger.info("Shutdown: stopping silence detector monitoring")
         await silence_detector.stop_monitoring()
 
-        # Wait for any in-flight post-processing tasks to finish enqueueing
-        # their index work before stopping the writer
+        # Wait for any in-flight post-processing tasks to complete
         if _inflight_tasks:
             logger.info(f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)")
             await asyncio.gather(*_inflight_tasks, return_exceptions=True)
+
+        # Flush the current buffer and process it before exiting.
+        # The .active/ session file is only deleted after full success.
+        logger.info("Shutdown: flushing and processing current transcript buffer")
+        buffer_contents, session_path = await transcript_buffer.flush()
+        if buffer_contents:
+            utterance_count = sum(1 for e in buffer_contents if e.get("type") == "utterance")
+            logger.info(
+                f"Shutdown: processing {len(buffer_contents)} buffered entries "
+                f"({utterance_count} utterances) before exit"
+            )
+            try:
+                await run_post_processing(
+                    buffer_contents=buffer_contents,
+                    segmenter=segmenter,
+                    classifier=classifier,
+                    memory_writer=memory_writer,
+                    session_path=session_path,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Shutdown: post-processing failed ({exc}). "
+                    "Session file preserved in .active/ for crash recovery."
+                )
+        else:
+            # No buffered content — still flush any unpersisted entries to disk
+            await transcript_buffer.flush_to_disk()
 
         logger.info("Shutdown: draining memory writer queue")
         await memory_writer.stop()
