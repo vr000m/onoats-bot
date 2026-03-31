@@ -1,0 +1,466 @@
+"""Audio device selection and validation for local transport.
+
+Provides interactive device picker with last-used memory, env var
+overrides, and device validation.
+
+Koda is a silent listener — it only needs a mic (input) device in
+normal operation. Output devices are only required in interactive
+mode (Phase 2, when Koda responds with voice).
+
+Usage — silent listener mode (input only)::
+
+    from bot.config.audio_devices import select_input_device
+
+    mic = select_input_device(input_device_env=os.getenv("INPUT_DEVICE"))
+
+Usage — interactive mode (input + output)::
+
+    from bot.config.audio_devices import select_audio_devices
+
+    mic, speaker = select_audio_devices(
+        input_device_env=os.getenv("INPUT_DEVICE"),
+        output_device_env=os.getenv("OUTPUT_DEVICE"),
+    )
+"""
+
+import sys
+from pathlib import Path
+
+from loguru import logger
+
+LAST_DEVICE_FILE = Path(__file__).parents[2] / ".last_audio_devices"
+
+# Pipeline sample rate — 16kHz for Silero VAD compatibility.
+# Silero VAD requires 8kHz or 16kHz. All tested devices support 16kHz.
+PIPELINE_SAMPLE_RATE = 16000
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_audio_device(device_index, label, need_input=False):
+    """Check that a device index exists, has the right channel type,
+    and supports PIPELINE_SAMPLE_RATE.
+
+    Returns the validated index, or None if the device is unsuitable.
+    """
+    if device_index is None or device_index < 0:
+        return None
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    try:
+        if device_index >= pa.get_device_count():
+            logger.warning(f"{label}={device_index} not found, using system default")
+            return None
+        info = pa.get_device_info_by_index(device_index)
+        channels = info["maxInputChannels"] if need_input else info["maxOutputChannels"]
+        if channels == 0:
+            logger.warning(
+                f"{label}={device_index} ({info['name']}) has no "
+                f"{'input' if need_input else 'output'} channels, using system default"
+            )
+            return None
+        # Verify the device supports PIPELINE_SAMPLE_RATE
+        try:
+            if need_input:
+                pa.is_format_supported(
+                    PIPELINE_SAMPLE_RATE, input_device=device_index,
+                    input_channels=1, input_format=pyaudio.paInt16,
+                )
+            else:
+                pa.is_format_supported(
+                    PIPELINE_SAMPLE_RATE, output_device=device_index,
+                    output_channels=1, output_format=pyaudio.paInt16,
+                )
+        except ValueError:
+            logger.warning(
+                f"{label}={device_index} ({info['name']}) does not support "
+                f"{PIPELINE_SAMPLE_RATE}Hz, using system default"
+            )
+            return None
+        return device_index
+    finally:
+        pa.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Silent listener mode — input only
+# ---------------------------------------------------------------------------
+
+def select_input_device(input_device_env=None):
+    """Select an audio input (mic) device. No output device required.
+
+    Use this in silent listener mode (Phase 1). Koda only needs a mic.
+
+    Args:
+        input_device_env: INPUT_DEVICE env var value (int or None).
+
+    Returns:
+        Input device index (int), or None for system default.
+    """
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    try:
+        # Check env var override
+        env_in = validate_audio_device(input_device_env, "INPUT_DEVICE", need_input=True)
+        if env_in is not None:
+            in_info = pa.get_device_info_by_index(env_in)
+            logger.info(f"Audio input:  [{env_in}] {in_info['name']} (from env)")
+            return env_in
+
+        # Build input device list
+        inputs = []
+        for i in range(pa.get_device_count()):
+            d = pa.get_device_info_by_index(i)
+            if d["maxInputChannels"] > 0:
+                inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+
+        # Load last-used input device
+        last_in = _load_last_input()
+        last_in = validate_audio_device(last_in, "last_input", need_input=True)
+
+        # Interactive or non-interactive selection
+        if sys.stdin.isatty():
+            picked_in = _pick_input_device(inputs, last_in)
+        else:
+            picked_in = last_in
+
+        input_dev = picked_in
+
+        # Fall back to system default
+        if input_dev is None:
+            input_dev = int(pa.get_default_input_device_info()["index"])
+
+        # Validate default supports PIPELINE_SAMPLE_RATE
+        try:
+            pa.is_format_supported(
+                PIPELINE_SAMPLE_RATE, input_device=input_dev,
+                input_channels=1, input_format=pyaudio.paInt16,
+            )
+        except ValueError:
+            dev_name = pa.get_device_info_by_index(input_dev)["name"]
+            raise RuntimeError(
+                f"Audio input device [{input_dev}] {dev_name} does not support "
+                f"{PIPELINE_SAMPLE_RATE}Hz. Set INPUT_DEVICE to a compatible device, "
+                f"or change PIPELINE_SAMPLE_RATE."
+            )
+
+        in_info = pa.get_device_info_by_index(input_dev)
+        logger.info(f"Audio input:  [{input_dev}] {in_info['name']}")
+
+        # Save for next time (input only)
+        _save_last_input(input_dev)
+
+        return input_dev
+    finally:
+        pa.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Interactive mode — input + output (Phase 2)
+# ---------------------------------------------------------------------------
+
+def select_audio_devices(input_device_env=None, output_device_env=None):
+    """Select audio input and output devices interactively.
+
+    Use this in interactive mode (Phase 2) when Koda responds with voice.
+
+    Args:
+        input_device_env:  INPUT_DEVICE env var value (int or None).
+        output_device_env: OUTPUT_DEVICE env var value (int or None).
+
+    Returns:
+        Tuple of (input_device_index, output_device_index). Either may be
+        None for system default.
+    """
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    try:
+        # Check env var overrides
+        env_in = validate_audio_device(input_device_env, "INPUT_DEVICE", need_input=True)
+        env_out = validate_audio_device(output_device_env, "OUTPUT_DEVICE", need_input=False)
+
+        # If both env vars are set, skip interactive selection entirely
+        if env_in is not None and env_out is not None:
+            in_info = pa.get_device_info_by_index(env_in)
+            out_info = pa.get_device_info_by_index(env_out)
+            logger.info(f"Audio input:  [{env_in}] {in_info['name']}")
+            logger.info(f"Audio output: [{env_out}] {out_info['name']}")
+            return env_in, env_out
+
+        # Build device lists
+        inputs = []
+        outputs = []
+        for i in range(pa.get_device_count()):
+            d = pa.get_device_info_by_index(i)
+            if d["maxInputChannels"] > 0:
+                inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+            if d["maxOutputChannels"] > 0:
+                outputs.append((i, d["name"], int(d["defaultSampleRate"])))
+
+        # Load last-used devices
+        last_in, last_out = _load_last_devices()
+        last_in = validate_audio_device(last_in, "last_input", need_input=True)
+        last_out = validate_audio_device(last_out, "last_output", need_input=False)
+
+        # Use env overrides where available, pick the rest interactively
+        if sys.stdin.isatty():
+            picked_in, picked_out = _pick_devices(
+                inputs, outputs,
+                env_in if env_in is not None else last_in,
+                env_out if env_out is not None else last_out,
+                skip_input=env_in is not None,
+                skip_output=env_out is not None,
+            )
+        else:
+            picked_in = last_in
+            picked_out = last_out
+
+        input_dev = env_in if env_in is not None else picked_in
+        output_dev = env_out if env_out is not None else picked_out
+
+        # Fall back to system defaults
+        if input_dev is None:
+            input_dev = int(pa.get_default_input_device_info()["index"])
+        if output_dev is None:
+            output_dev = int(pa.get_default_output_device_info()["index"])
+
+        # Validate both defaults support PIPELINE_SAMPLE_RATE
+        for dev_idx, direction, label in [
+            (input_dev, True, "default input"),
+            (output_dev, False, "default output"),
+        ]:
+            try:
+                if direction:
+                    pa.is_format_supported(
+                        PIPELINE_SAMPLE_RATE, input_device=dev_idx,
+                        input_channels=1, input_format=pyaudio.paInt16,
+                    )
+                else:
+                    pa.is_format_supported(
+                        PIPELINE_SAMPLE_RATE, output_device=dev_idx,
+                        output_channels=1, output_format=pyaudio.paInt16,
+                    )
+            except ValueError:
+                dev_name = pa.get_device_info_by_index(dev_idx)["name"]
+                raise RuntimeError(
+                    f"Audio {label} device [{dev_idx}] {dev_name} does not support "
+                    f"{PIPELINE_SAMPLE_RATE}Hz. Set INPUT_DEVICE/OUTPUT_DEVICE to a "
+                    f"compatible device, or change PIPELINE_SAMPLE_RATE."
+                )
+
+        in_info = pa.get_device_info_by_index(input_dev)
+        out_info = pa.get_device_info_by_index(output_dev)
+        logger.info(f"Audio input:  [{input_dev}] {in_info['name']}")
+        logger.info(f"Audio output: [{output_dev}] {out_info['name']}")
+
+        # Save for next time
+        _save_last_devices(input_dev, output_dev)
+
+        return input_dev, output_dev
+    finally:
+        pa.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Device tag (for filenames)
+# ---------------------------------------------------------------------------
+
+def get_device_tag(input_dev, output_dev=None):
+    """Build a short device tag for recording filenames.
+
+    In silent listener mode, output_dev is omitted.
+
+    Examples:
+        get_device_tag(3) → "in3-jabra"
+        get_device_tag(3, 2) → "in3-jabra_out2-jabra"
+    """
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    try:
+        def _short_name(idx):
+            if idx is None:
+                return "default"
+            name = pa.get_device_info_by_index(idx)["name"]
+            return name.split()[0].lower()
+
+        in_label = input_dev if input_dev is not None else "D"
+        tag = f"in{in_label}-{_short_name(input_dev)}"
+        if output_dev is not None:
+            out_label = output_dev
+            tag += f"_out{out_label}-{_short_name(output_dev)}"
+        return tag
+    finally:
+        pa.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def _load_last_input():
+    """Read the last-used input device index from disk (input-only format)."""
+    if not LAST_DEVICE_FILE.exists():
+        return None
+    try:
+        parts = LAST_DEVICE_FILE.read_text().strip().split("\n")
+        # Support both single-line (input-only) and two-line (input+output) formats
+        if len(parts) >= 1 and parts[0].strip():
+            return int(parts[0])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _save_last_input(input_dev):
+    """Write the last-used input device index to disk."""
+    try:
+        # Preserve existing output device line if present
+        existing_out = None
+        if LAST_DEVICE_FILE.exists():
+            try:
+                parts = LAST_DEVICE_FILE.read_text().strip().split("\n")
+                if len(parts) == 2 and parts[1].strip():
+                    existing_out = parts[1].strip()
+            except (ValueError, IndexError):
+                pass
+        if existing_out is not None:
+            LAST_DEVICE_FILE.write_text(f"{input_dev}\n{existing_out}\n")
+        else:
+            LAST_DEVICE_FILE.write_text(f"{input_dev}\n")
+    except OSError:
+        pass
+
+
+def _load_last_devices():
+    """Read the last-used input and output device indices from disk."""
+    if not LAST_DEVICE_FILE.exists():
+        return None, None
+    try:
+        parts = LAST_DEVICE_FILE.read_text().strip().split("\n")
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+        if len(parts) == 1 and parts[0].strip():
+            return int(parts[0]), None
+    except (ValueError, IndexError):
+        pass
+    return None, None
+
+
+def _save_last_devices(input_dev, output_dev):
+    """Write the last-used input and output device indices to disk."""
+    try:
+        LAST_DEVICE_FILE.write_text(f"{input_dev}\n{output_dev}\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Interactive pickers
+# ---------------------------------------------------------------------------
+
+def _pick_input_device(inputs, last_in):
+    """Interactive input-only device picker."""
+    last_in_name = (
+        next((n for i, n, _ in inputs if i == last_in), None)
+        if last_in is not None else None
+    )
+
+    print("\n--- Mic Device Selection ---")
+    if last_in_name:
+        print(f"Last used: IN=[{last_in}] {last_in_name}")
+        print("Press Enter to reuse, or pick a new device.\n")
+
+    print("Input devices:")
+    for idx, name, rate in inputs:
+        marker = " *" if idx == last_in else ""
+        print(f"  [{idx}] {name}{marker}")
+
+    try:
+        default_label = f" [{last_in}]" if last_in is not None else ""
+        choice = input(f"Select input device{default_label}: ").strip()
+        if choice:
+            input_dev = int(choice)
+            if not any(d[0] == input_dev for d in inputs):
+                print(f"  Invalid device {input_dev}, using last/default")
+                input_dev = last_in
+        else:
+            input_dev = last_in
+    except (ValueError, EOFError, KeyboardInterrupt):
+        input_dev = last_in
+
+    print()
+    return input_dev
+
+
+def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_output=False):
+    """Interactive device picker showing both input and output."""
+    last_in_name = (
+        next((n for i, n, _ in inputs if i == last_in), None)
+        if last_in is not None else None
+    )
+    last_out_name = (
+        next((n for i, n, _ in outputs if i == last_out), None)
+        if last_out is not None else None
+    )
+
+    print("\n--- Audio Device Selection ---")
+    if last_in_name and last_out_name and not skip_input and not skip_output:
+        print(f"Last used: IN=[{last_in}] {last_in_name}, OUT=[{last_out}] {last_out_name}")
+        print("Press Enter to reuse, or pick new devices.\n")
+
+    # Input device
+    if skip_input:
+        input_dev = last_in
+        in_name = (
+            next((n for i, n, _ in inputs if i == last_in), "?")
+            if last_in is not None else "?"
+        )
+        print(f"Input device: [{last_in}] {in_name} (from env)")
+    else:
+        print("Input devices:")
+        for idx, name, rate in inputs:
+            marker = " *" if idx == last_in else ""
+            print(f"  [{idx}] {name}{marker}")
+        try:
+            default_label = f" [{last_in}]" if last_in is not None else ""
+            choice = input(f"Select input device{default_label}: ").strip()
+            if choice:
+                input_dev = int(choice)
+                if not any(d[0] == input_dev for d in inputs):
+                    print(f"  Invalid device {input_dev}, using last/default")
+                    input_dev = last_in
+            else:
+                input_dev = last_in
+        except (ValueError, EOFError, KeyboardInterrupt):
+            input_dev = last_in
+
+    # Output device
+    if skip_output:
+        output_dev = last_out
+        out_name = (
+            next((n for i, n, _ in outputs if i == last_out), "?")
+            if last_out is not None else "?"
+        )
+        print(f"Output device: [{last_out}] {out_name} (from env)")
+    else:
+        print("\nOutput devices:")
+        for idx, name, rate in outputs:
+            marker = " *" if idx == last_out else ""
+            print(f"  [{idx}] {name}{marker}")
+        try:
+            default_label = f" [{last_out}]" if last_out is not None else ""
+            choice = input(f"Select output device{default_label}: ").strip()
+            if choice:
+                output_dev = int(choice)
+                if not any(d[0] == output_dev for d in outputs):
+                    print(f"  Invalid device {output_dev}, using last/default")
+                    output_dev = last_out
+            else:
+                output_dev = last_out
+        except (ValueError, EOFError, KeyboardInterrupt):
+            output_dev = last_out
+
+    print()
+    return input_dev, output_dev
