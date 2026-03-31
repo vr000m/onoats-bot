@@ -9,8 +9,8 @@ Modes:
 
 Run::
 
-    uv run python bot.py                 # silent listener
-    uv run python bot.py --interactive   # voice responses enabled (Phase 2 stub)
+    ./koda bot                           # silent listener
+    ./koda bot --interactive             # voice responses enabled (Phase 2 stub)
 
 Config (.env or environment):
     STT_SERVICE          - STT backend: "whisper" (default, local MLX) or "deepgram"
@@ -388,19 +388,10 @@ async def run_koda(*, interactive: bool = False) -> None:
     llm_client = create_llm_client()  # provider from LLM_PROVIDER env var (default: gemini)
     segmenter = Segmenter(llm_client)
 
-    # Classifier is not yet implemented; import guarded so bot.py runs now
-    # and post-processing will light up once services/classifier.py is created.
-    classifier = None
-    try:
-        from shared.classifier import Classifier  # type: ignore[import]
+    from shared.classifier import Classifier
 
-        classifier = Classifier(llm_client)
-        logger.info("Classifier: loaded")
-    except ImportError:
-        logger.warning(
-            "services/classifier.py not found — post-processing will be skipped. "
-            "Implement the Classifier class to enable full pipeline."
-        )
+    classifier = Classifier(llm_client)
+    logger.info("Classifier: loaded")
 
     memory_writer = MemoryWriter(data_dir=data_dir)
     await memory_writer.start()
