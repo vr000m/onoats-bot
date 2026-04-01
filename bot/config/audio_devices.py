@@ -39,6 +39,7 @@ PIPELINE_SAMPLE_RATE = 16000
 # Validation
 # ---------------------------------------------------------------------------
 
+
 def validate_audio_device(device_index, label, need_input=False):
     """Check that a device index exists, has the right channel type,
     and supports PIPELINE_SAMPLE_RATE.
@@ -48,6 +49,7 @@ def validate_audio_device(device_index, label, need_input=False):
     if device_index is None or device_index < 0:
         return None
     import pyaudio
+
     pa = pyaudio.PyAudio()
     try:
         if device_index >= pa.get_device_count():
@@ -65,13 +67,17 @@ def validate_audio_device(device_index, label, need_input=False):
         try:
             if need_input:
                 pa.is_format_supported(
-                    PIPELINE_SAMPLE_RATE, input_device=device_index,
-                    input_channels=1, input_format=pyaudio.paInt16,
+                    PIPELINE_SAMPLE_RATE,
+                    input_device=device_index,
+                    input_channels=1,
+                    input_format=pyaudio.paInt16,
                 )
             else:
                 pa.is_format_supported(
-                    PIPELINE_SAMPLE_RATE, output_device=device_index,
-                    output_channels=1, output_format=pyaudio.paInt16,
+                    PIPELINE_SAMPLE_RATE,
+                    output_device=device_index,
+                    output_channels=1,
+                    output_format=pyaudio.paInt16,
                 )
         except ValueError:
             logger.warning(
@@ -88,6 +94,7 @@ def validate_audio_device(device_index, label, need_input=False):
 # Silent listener mode — input only
 # ---------------------------------------------------------------------------
 
+
 def select_input_device(input_device_env=None):
     """Select an audio input (mic) device. No output device required.
 
@@ -100,6 +107,7 @@ def select_input_device(input_device_env=None):
         Input device index (int), or None for system default.
     """
     import pyaudio
+
     pa = pyaudio.PyAudio()
     try:
         # Check env var override
@@ -135,8 +143,10 @@ def select_input_device(input_device_env=None):
         # Validate default supports PIPELINE_SAMPLE_RATE
         try:
             pa.is_format_supported(
-                PIPELINE_SAMPLE_RATE, input_device=input_dev,
-                input_channels=1, input_format=pyaudio.paInt16,
+                PIPELINE_SAMPLE_RATE,
+                input_device=input_dev,
+                input_channels=1,
+                input_format=pyaudio.paInt16,
             )
         except ValueError:
             dev_name = pa.get_device_info_by_index(input_dev)["name"]
@@ -161,6 +171,7 @@ def select_input_device(input_device_env=None):
 # Interactive mode — input + output (Phase 2)
 # ---------------------------------------------------------------------------
 
+
 def select_audio_devices(input_device_env=None, output_device_env=None):
     """Select audio input and output devices interactively.
 
@@ -175,6 +186,7 @@ def select_audio_devices(input_device_env=None, output_device_env=None):
         None for system default.
     """
     import pyaudio
+
     pa = pyaudio.PyAudio()
     try:
         # Check env var overrides
@@ -207,7 +219,8 @@ def select_audio_devices(input_device_env=None, output_device_env=None):
         # Use env overrides where available, pick the rest interactively
         if sys.stdin.isatty():
             picked_in, picked_out = _pick_devices(
-                inputs, outputs,
+                inputs,
+                outputs,
                 env_in if env_in is not None else last_in,
                 env_out if env_out is not None else last_out,
                 skip_input=env_in is not None,
@@ -234,13 +247,17 @@ def select_audio_devices(input_device_env=None, output_device_env=None):
             try:
                 if direction:
                     pa.is_format_supported(
-                        PIPELINE_SAMPLE_RATE, input_device=dev_idx,
-                        input_channels=1, input_format=pyaudio.paInt16,
+                        PIPELINE_SAMPLE_RATE,
+                        input_device=dev_idx,
+                        input_channels=1,
+                        input_format=pyaudio.paInt16,
                     )
                 else:
                     pa.is_format_supported(
-                        PIPELINE_SAMPLE_RATE, output_device=dev_idx,
-                        output_channels=1, output_format=pyaudio.paInt16,
+                        PIPELINE_SAMPLE_RATE,
+                        output_device=dev_idx,
+                        output_channels=1,
+                        output_format=pyaudio.paInt16,
                     )
             except ValueError:
                 dev_name = pa.get_device_info_by_index(dev_idx)["name"]
@@ -267,6 +284,7 @@ def select_audio_devices(input_device_env=None, output_device_env=None):
 # Device tag (for filenames)
 # ---------------------------------------------------------------------------
 
+
 def get_device_tag(input_dev, output_dev=None):
     """Build a short device tag for recording filenames.
 
@@ -277,8 +295,10 @@ def get_device_tag(input_dev, output_dev=None):
         get_device_tag(3, 2) → "in3-jabra_out2-jabra"
     """
     import pyaudio
+
     pa = pyaudio.PyAudio()
     try:
+
         def _short_name(idx):
             if idx is None:
                 return "default"
@@ -298,6 +318,7 @@ def get_device_tag(input_dev, output_dev=None):
 # ---------------------------------------------------------------------------
 # Persistence helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_last_input():
     """Read the last-used input device index from disk (input-only format)."""
@@ -360,11 +381,11 @@ def _save_last_devices(input_dev, output_dev):
 # Interactive pickers
 # ---------------------------------------------------------------------------
 
+
 def _pick_input_device(inputs, last_in):
     """Interactive input-only device picker."""
     last_in_name = (
-        next((n for i, n, _ in inputs if i == last_in), None)
-        if last_in is not None else None
+        next((n for i, n, _ in inputs if i == last_in), None) if last_in is not None else None
     )
 
     print("\n--- Mic Device Selection ---")
@@ -397,12 +418,10 @@ def _pick_input_device(inputs, last_in):
 def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_output=False):
     """Interactive device picker showing both input and output."""
     last_in_name = (
-        next((n for i, n, _ in inputs if i == last_in), None)
-        if last_in is not None else None
+        next((n for i, n, _ in inputs if i == last_in), None) if last_in is not None else None
     )
     last_out_name = (
-        next((n for i, n, _ in outputs if i == last_out), None)
-        if last_out is not None else None
+        next((n for i, n, _ in outputs if i == last_out), None) if last_out is not None else None
     )
 
     print("\n--- Audio Device Selection ---")
@@ -414,8 +433,7 @@ def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_
     if skip_input:
         input_dev = last_in
         in_name = (
-            next((n for i, n, _ in inputs if i == last_in), "?")
-            if last_in is not None else "?"
+            next((n for i, n, _ in inputs if i == last_in), "?") if last_in is not None else "?"
         )
         print(f"Input device: [{last_in}] {in_name} (from env)")
     else:
@@ -440,8 +458,7 @@ def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_
     if skip_output:
         output_dev = last_out
         out_name = (
-            next((n for i, n, _ in outputs if i == last_out), "?")
-            if last_out is not None else "?"
+            next((n for i, n, _ in outputs if i == last_out), "?") if last_out is not None else "?"
         )
         print(f"Output device: [{last_out}] {out_name} (from env)")
     else:

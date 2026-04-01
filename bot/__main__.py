@@ -128,9 +128,7 @@ def _create_stt_service():
         mlx_key = _MLX_MODEL_MAP.get(STT_MODEL or "large-v3-turbo", "LARGE_V3_TURBO").upper()
         mlx_model = getattr(MLXModel, mlx_key, None)
         if mlx_model is None:
-            logger.warning(
-                f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo"
-            )
+            logger.warning(f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo")
             mlx_model = MLXModel.LARGE_V3_TURBO
         logger.info(f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon)")
         return WhisperSTTServiceMLX(
@@ -155,7 +153,7 @@ async def run_post_processing(
     buffer_contents: list[dict],
     segmenter,
     classifier,
-    memory_writer,
+    transcript_store,
     session_path: Optional[Path],
 ) -> None:
     """Process a flushed transcript buffer through segment → classify → write.
@@ -167,7 +165,7 @@ async def run_post_processing(
         buffer_contents:  List of buffer entry dicts from TranscriptBuffer.flush().
         segmenter:        Segmenter instance (may be None if not yet implemented).
         classifier:       Classifier instance (may be None if not yet implemented).
-        memory_writer:    MemoryWriter instance for cold storage writes.
+        transcript_store: TranscriptStore instance for cold storage writes + SQLite overlay.
         session_path:     Path to the .active/ JSONL file to delete on success.
     """
     if not buffer_contents:
@@ -176,8 +174,7 @@ async def run_post_processing(
 
     utterance_count = sum(1 for e in buffer_contents if e.get("type") == "utterance")
     logger.info(
-        f"Post-processing: {len(buffer_contents)} buffer entries "
-        f"({utterance_count} utterances)"
+        f"Post-processing: {len(buffer_contents)} buffer entries ({utterance_count} utterances)"
     )
 
     if segmenter is None or classifier is None:
@@ -200,36 +197,21 @@ async def run_post_processing(
             _cleanup_session(session_path)
             return
 
-        # Step 2: Classify and write each segment, collecting index futures
-        index_futures: list[asyncio.Future[None]] = []
+        # Step 2: Classify and write each segment
         for i, seg_entries in enumerate(segments, 1):
             try:
                 classified = await classifier.classify(seg_entries)
-                path = await memory_writer.write_transcript(classified)
-                future = await memory_writer.update_index(classified, path)
-                index_futures.append(future)
+                transcript_id, path = await transcript_store.ingest_segment(classified)
                 logger.info(
                     f"Post-processing: segment {i}/{len(segments)} written — "
-                    f"{classified.category} / {path.name}"
+                    f"{classified.category} / {path.name} / {transcript_id}"
                 )
             except Exception as exc:
-                logger.error(
-                    f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}"
-                )
+                logger.error(f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}")
                 # Don't delete session file on partial failure — crash recovery will retry
                 return
 
-        # Step 3: Wait for THIS batch's index writes to be durable before cleanup
-        try:
-            await memory_writer.await_index_writes(index_futures)
-        except RuntimeError as exc:
-            logger.error(
-                f"Post-processing: index writes failed ({exc}). "
-                "Leaving session file for crash recovery."
-            )
-            return
-
-        # Step 4: Clean up working storage on full success
+        # Step 3: Clean up working storage on full success
         _cleanup_session(session_path)
 
     except Exception as exc:
@@ -251,7 +233,7 @@ def _cleanup_session(session_path: Optional[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_crash_recovery(segmenter, classifier, memory_writer, data_dir: Path) -> None:
+async def run_crash_recovery(segmenter, classifier, transcript_store, data_dir: Path) -> None:
     """Check for orphaned .active/ session files and process them.
 
     Called once at startup, before the main pipeline begins. If the previous
@@ -278,9 +260,7 @@ async def run_crash_recovery(segmenter, classifier, memory_writer, data_dir: Pat
                 )
                 continue
             if not entries:
-                logger.warning(
-                    f"Crash recovery: {session_path.name} is empty, deleting"
-                )
+                logger.warning(f"Crash recovery: {session_path.name} is empty, deleting")
                 _cleanup_session(session_path)
                 continue
 
@@ -288,7 +268,7 @@ async def run_crash_recovery(segmenter, classifier, memory_writer, data_dir: Pat
                 buffer_contents=entries,
                 segmenter=segmenter,
                 classifier=classifier,
-                memory_writer=memory_writer,
+                transcript_store=transcript_store,
                 session_path=session_path,
             )
         except Exception as exc:
@@ -338,13 +318,15 @@ def _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_de
     """
     from pipecat.pipeline.pipeline import Pipeline
 
-    return Pipeline([
-        transport.input(),    # Mic audio in (raw audio frames)
-        vad_processor,        # Silero VAD → emits VAD start/stop speaking frames
-        stt,                  # Whisper MLX or Deepgram STT → TranscriptionFrames
-        transcript_buffer,    # Accumulate TranscriptionFrames + mark silence gaps
-        silence_detector,     # Watch VAD frames; fire callback on prolonged inactivity
-    ])
+    return Pipeline(
+        [
+            transport.input(),  # Mic audio in (raw audio frames)
+            vad_processor,  # Silero VAD → emits VAD start/stop speaking frames
+            stt,  # Whisper MLX or Deepgram STT → TranscriptionFrames
+            transcript_buffer,  # Accumulate TranscriptionFrames + mark silence gaps
+            silence_detector,  # Watch VAD frames; fire callback on prolonged inactivity
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +351,9 @@ async def run_koda(*, interactive: bool = False) -> None:
     from bot.processors.silence_detector import SilenceDetector
     from bot.processors.transcript_buffer import TranscriptBuffer
     from shared.llm_client import create_llm_client
-    from shared.memory_writer import MemoryWriter
+    from shared.migrate import rebuild_index
     from shared.segmenter import Segmenter
+    from shared.store import TranscriptStore
 
     # ----------------------------------------------------------------
     # Step 1: Load config
@@ -393,13 +376,14 @@ async def run_koda(*, interactive: bool = False) -> None:
     classifier = Classifier(llm_client)
     logger.info("Classifier: loaded")
 
-    memory_writer = MemoryWriter(data_dir=data_dir)
-    await memory_writer.start()
+    transcript_store = TranscriptStore(data_dir=data_dir)
+    await transcript_store.init_db()
+    await rebuild_index(data_dir=data_dir, db_path=transcript_store.db_path, full_rebuild=False)
 
     # ----------------------------------------------------------------
     # Step 4: Crash recovery — process any orphaned .active/ files
     # ----------------------------------------------------------------
-    await run_crash_recovery(segmenter, classifier, memory_writer, data_dir)
+    await run_crash_recovery(segmenter, classifier, transcript_store, data_dir)
 
     # ----------------------------------------------------------------
     # Step 5: Build pipecat pipeline components
@@ -420,7 +404,7 @@ async def run_koda(*, interactive: bool = False) -> None:
                 buffer_contents=buffer_contents,
                 segmenter=segmenter,
                 classifier=classifier,
-                memory_writer=memory_writer,
+                transcript_store=transcript_store,
                 session_path=session_path,
             ),
             name="post_processing",
@@ -490,7 +474,9 @@ async def run_koda(*, interactive: bool = False) -> None:
 
         # Wait for any in-flight post-processing tasks to complete
         if _inflight_tasks:
-            logger.info(f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)")
+            logger.info(
+                f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)"
+            )
             await asyncio.gather(*_inflight_tasks, return_exceptions=True)
 
         # Flush the current buffer and process it before exiting.
@@ -508,7 +494,7 @@ async def run_koda(*, interactive: bool = False) -> None:
                     buffer_contents=buffer_contents,
                     segmenter=segmenter,
                     classifier=classifier,
-                    memory_writer=memory_writer,
+                    transcript_store=transcript_store,
                     session_path=session_path,
                 )
             except Exception as exc:
@@ -520,8 +506,8 @@ async def run_koda(*, interactive: bool = False) -> None:
             # No buffered content — still flush any unpersisted entries to disk
             await transcript_buffer.flush_to_disk()
 
-        logger.info("Shutdown: draining memory writer queue")
-        await memory_writer.stop()
+        logger.info("Shutdown: closing transcript store")
+        await transcript_store.close()
 
         logger.info("Shutdown: complete")
 

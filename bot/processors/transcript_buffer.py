@@ -102,7 +102,11 @@ class TranscriptBuffer(FrameProcessor):
     ):
         super().__init__(**kwargs)
 
-        self._threshold = segment_hint_threshold if segment_hint_threshold is not None else _segment_hint_threshold()
+        self._threshold = (
+            segment_hint_threshold
+            if segment_hint_threshold is not None
+            else _segment_hint_threshold()
+        )
         self._data_dir = Path(data_dir) if data_dir is not None else _data_dir()
 
         # In-memory buffer of JSONL entry dicts
@@ -160,7 +164,8 @@ class TranscriptBuffer(FrameProcessor):
         async with self._write_lock:
             # Materialize any entries that never made it to disk
             unpersisted = [
-                (i, entry) for i, entry in enumerate(self._buffer)
+                (i, entry)
+                for i, entry in enumerate(self._buffer)
                 if i not in self._persisted_indices
             ]
             for i, entry in unpersisted:
@@ -189,7 +194,8 @@ class TranscriptBuffer(FrameProcessor):
         """
         async with self._write_lock:
             unpersisted = [
-                (i, entry) for i, entry in enumerate(self._buffer)
+                (i, entry)
+                for i, entry in enumerate(self._buffer)
                 if i not in self._persisted_indices
             ]
             if unpersisted:
@@ -270,9 +276,7 @@ class TranscriptBuffer(FrameProcessor):
 
         # Verify session path resolves within .active/
         if not self._session_file.resolve().parent == active_dir.resolve():
-            raise RuntimeError(
-                f"Session file {self._session_file} escapes .active/ directory"
-            )
+            raise RuntimeError(f"Session file {self._session_file} escapes .active/ directory")
         logger.info(f"TranscriptBuffer: session file created at {self._session_file}")
         return self._session_file
 
