@@ -128,9 +128,7 @@ def _create_stt_service():
         mlx_key = _MLX_MODEL_MAP.get(STT_MODEL or "large-v3-turbo", "LARGE_V3_TURBO").upper()
         mlx_model = getattr(MLXModel, mlx_key, None)
         if mlx_model is None:
-            logger.warning(
-                f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo"
-            )
+            logger.warning(f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo")
             mlx_model = MLXModel.LARGE_V3_TURBO
         logger.info(f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon)")
         return WhisperSTTServiceMLX(
@@ -176,8 +174,7 @@ async def run_post_processing(
 
     utterance_count = sum(1 for e in buffer_contents if e.get("type") == "utterance")
     logger.info(
-        f"Post-processing: {len(buffer_contents)} buffer entries "
-        f"({utterance_count} utterances)"
+        f"Post-processing: {len(buffer_contents)} buffer entries ({utterance_count} utterances)"
     )
 
     if segmenter is None or classifier is None:
@@ -210,9 +207,7 @@ async def run_post_processing(
                     f"{classified.category} / {path.name} / {transcript_id}"
                 )
             except Exception as exc:
-                logger.error(
-                    f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}"
-                )
+                logger.error(f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}")
                 # Don't delete session file on partial failure — crash recovery will retry
                 return
 
@@ -265,9 +260,7 @@ async def run_crash_recovery(segmenter, classifier, transcript_store, data_dir: 
                 )
                 continue
             if not entries:
-                logger.warning(
-                    f"Crash recovery: {session_path.name} is empty, deleting"
-                )
+                logger.warning(f"Crash recovery: {session_path.name} is empty, deleting")
                 _cleanup_session(session_path)
                 continue
 
@@ -325,13 +318,15 @@ def _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_de
     """
     from pipecat.pipeline.pipeline import Pipeline
 
-    return Pipeline([
-        transport.input(),    # Mic audio in (raw audio frames)
-        vad_processor,        # Silero VAD → emits VAD start/stop speaking frames
-        stt,                  # Whisper MLX or Deepgram STT → TranscriptionFrames
-        transcript_buffer,    # Accumulate TranscriptionFrames + mark silence gaps
-        silence_detector,     # Watch VAD frames; fire callback on prolonged inactivity
-    ])
+    return Pipeline(
+        [
+            transport.input(),  # Mic audio in (raw audio frames)
+            vad_processor,  # Silero VAD → emits VAD start/stop speaking frames
+            stt,  # Whisper MLX or Deepgram STT → TranscriptionFrames
+            transcript_buffer,  # Accumulate TranscriptionFrames + mark silence gaps
+            silence_detector,  # Watch VAD frames; fire callback on prolonged inactivity
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +474,9 @@ async def run_koda(*, interactive: bool = False) -> None:
 
         # Wait for any in-flight post-processing tasks to complete
         if _inflight_tasks:
-            logger.info(f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)")
+            logger.info(
+                f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)"
+            )
             await asyncio.gather(*_inflight_tasks, return_exceptions=True)
 
         # Flush the current buffer and process it before exiting.

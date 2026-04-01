@@ -93,8 +93,7 @@ class SilenceDetector(FrameProcessor):
         self._monitor_task: Optional[asyncio.Task] = None
 
         logger.debug(
-            f"SilenceDetector initialized "
-            f"(timeout={self._timeout}s, poll={self._poll_interval}s)"
+            f"SilenceDetector initialized (timeout={self._timeout}s, poll={self._poll_interval}s)"
         )
 
     # ------------------------------------------------------------------
