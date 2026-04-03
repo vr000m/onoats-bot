@@ -368,12 +368,13 @@ async def run_koda(*, interactive: bool = False) -> None:
     # ----------------------------------------------------------------
     # Step 3: Create post-processing services
     # ----------------------------------------------------------------
-    llm_client = create_llm_client()  # provider from LLM_PROVIDER env var (default: gemini)
-    segmenter = Segmenter(llm_client)
+    # Per-task provider routing: each service can use a different LLM provider
+    # via LLM_PROVIDER_SEGMENT, LLM_PROVIDER_CLASSIFY env vars (falls back to LLM_PROVIDER)
+    segmenter = Segmenter(create_llm_client(task="segment"))
 
     from shared.classifier import Classifier
 
-    classifier = Classifier(llm_client)
+    classifier = Classifier(create_llm_client(task="classify"))
     logger.info("Classifier: loaded")
 
     transcript_store = TranscriptStore(data_dir=data_dir)
