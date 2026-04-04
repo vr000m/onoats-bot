@@ -171,8 +171,9 @@ async def run_post_processing(
     classifier,
     transcript_store,
     session_path: Optional[Path],
+    transcript_cleaner=None,
 ) -> None:
-    """Process a flushed transcript buffer through dictionary → segment → classify → write.
+    """Process a flushed transcript buffer through dictionary → segment → cleanup → classify → write.
 
     Called from the silence timeout callback. Runs as a plain asyncio task,
     outside the pipecat pipeline.
@@ -183,6 +184,7 @@ async def run_post_processing(
         classifier:       Classifier instance (may be None if not yet implemented).
         transcript_store: TranscriptStore instance for cold storage writes + SQLite overlay.
         session_path:     Path to the .active/ JSONL file to delete on success.
+        transcript_cleaner: Optional TranscriptCleaner for LLM-assisted cleanup.
     """
     if not buffer_contents:
         logger.debug("Post-processing: empty buffer — nothing to process")
@@ -224,12 +226,13 @@ async def run_post_processing(
             _cleanup_session(session_path)
             return
 
-        # Step 3: Classify and write each segment
+        # Step 3: Per-segment cleanup → classify → write
         for i, seg_entries in enumerate(segments, 1):
             try:
                 classified = await classifier.classify(
                     seg_entries,
                     dictionary_hash=dictionary_hash,
+                    transcript_cleaner=transcript_cleaner,
                 )
                 transcript_id, path = await transcript_store.ingest_segment(classified)
                 logger.info(
@@ -270,7 +273,12 @@ def _cleanup_session(session_path: Optional[Path]) -> None:
 
 
 async def run_crash_recovery(
-    dictionary, segmenter, classifier, transcript_store, data_dir: Path
+    dictionary,
+    segmenter,
+    classifier,
+    transcript_store,
+    data_dir: Path,
+    transcript_cleaner=None,
 ) -> None:
     """Check for orphaned .active/ session files and process them.
 
@@ -309,6 +317,7 @@ async def run_crash_recovery(
                 classifier=classifier,
                 transcript_store=transcript_store,
                 session_path=session_path,
+                transcript_cleaner=transcript_cleaner,
             )
         except Exception as exc:
             logger.error(
@@ -414,9 +423,20 @@ async def run_koda(*, interactive: bool = False) -> None:
     segmenter = Segmenter(create_llm_client(task="segment"))
 
     from shared.classifier import Classifier
+    from shared.transcript_cleaner import TranscriptCleaner
 
     classifier = Classifier(create_llm_client(task="classify"))
     logger.info("Classifier: loaded")
+
+    # LLM-assisted transcript cleanup (optional — graceful skip if LLM unavailable)
+    # Uses LLM_PROVIDER_CLEANUP env var for provider routing (default: same as LLM_PROVIDER)
+    try:
+        cleanup_llm = create_llm_client(task="cleanup")
+        transcript_cleaner = TranscriptCleaner(cleanup_llm)
+        logger.info("TranscriptCleaner: loaded")
+    except Exception as exc:
+        logger.warning(f"TranscriptCleaner: not available ({exc}), cleanup will be skipped")
+        transcript_cleaner = None
 
     transcript_store = TranscriptStore(data_dir=data_dir)
     await transcript_store.init_db()
@@ -425,7 +445,14 @@ async def run_koda(*, interactive: bool = False) -> None:
     # ----------------------------------------------------------------
     # Step 4: Crash recovery — process any orphaned .active/ files
     # ----------------------------------------------------------------
-    await run_crash_recovery(dictionary, segmenter, classifier, transcript_store, data_dir)
+    await run_crash_recovery(
+        dictionary,
+        segmenter,
+        classifier,
+        transcript_store,
+        data_dir,
+        transcript_cleaner=transcript_cleaner,
+    )
 
     # ----------------------------------------------------------------
     # Step 5: Build pipecat pipeline components
@@ -449,6 +476,7 @@ async def run_koda(*, interactive: bool = False) -> None:
                 classifier=classifier,
                 transcript_store=transcript_store,
                 session_path=session_path,
+                transcript_cleaner=transcript_cleaner,
             ),
             name="post_processing",
         )
