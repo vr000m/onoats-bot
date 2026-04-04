@@ -166,12 +166,13 @@ async def _run_collation(transcript_id: str, store) -> None:
 
 async def run_post_processing(
     buffer_contents: list[dict],
+    dictionary,
     segmenter,
     classifier,
     transcript_store,
     session_path: Optional[Path],
 ) -> None:
-    """Process a flushed transcript buffer through segment → classify → write.
+    """Process a flushed transcript buffer through dictionary → segment → classify → write.
 
     Called from the silence timeout callback. Runs as a plain asyncio task,
     outside the pipecat pipeline.
@@ -203,7 +204,18 @@ async def run_post_processing(
         return
 
     try:
-        # Step 1: Segment the buffer at conversation boundaries
+        # Step 1: Apply deterministic dictionary substitutions before segmentation
+        dictionary_hash = ""
+        if dictionary is not None:
+            for entry in buffer_contents:
+                if entry.get("type") != "utterance":
+                    continue
+                text = entry.get("text")
+                if isinstance(text, str) and text:
+                    entry["text"] = dictionary.apply(text)
+            dictionary_hash = dictionary.content_hash()
+
+        # Step 2: Segment the buffer at conversation boundaries
         segments = await segmenter.segment(buffer_contents)
         logger.info(f"Post-processing: segmented into {len(segments)} conversation(s)")
 
@@ -212,10 +224,13 @@ async def run_post_processing(
             _cleanup_session(session_path)
             return
 
-        # Step 2: Classify and write each segment
+        # Step 3: Classify and write each segment
         for i, seg_entries in enumerate(segments, 1):
             try:
-                classified = await classifier.classify(seg_entries)
+                classified = await classifier.classify(
+                    seg_entries,
+                    dictionary_hash=dictionary_hash,
+                )
                 transcript_id, path = await transcript_store.ingest_segment(classified)
                 logger.info(
                     f"Post-processing: segment {i}/{len(segments)} written — "
@@ -232,7 +247,7 @@ async def run_post_processing(
                 # Don't delete session file on partial failure — crash recovery will retry
                 return
 
-        # Step 3: Clean up working storage on full success
+        # Step 4: Clean up working storage on full success
         _cleanup_session(session_path)
 
     except Exception as exc:
@@ -254,7 +269,9 @@ def _cleanup_session(session_path: Optional[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_crash_recovery(segmenter, classifier, transcript_store, data_dir: Path) -> None:
+async def run_crash_recovery(
+    dictionary, segmenter, classifier, transcript_store, data_dir: Path
+) -> None:
     """Check for orphaned .active/ session files and process them.
 
     Called once at startup, before the main pipeline begins. If the previous
@@ -287,6 +304,7 @@ async def run_crash_recovery(segmenter, classifier, transcript_store, data_dir: 
 
             await run_post_processing(
                 buffer_contents=entries,
+                dictionary=dictionary,
                 segmenter=segmenter,
                 classifier=classifier,
                 transcript_store=transcript_store,
@@ -371,6 +389,7 @@ async def run_koda(*, interactive: bool = False) -> None:
     from bot.config.audio_devices import select_input_device
     from bot.processors.silence_detector import SilenceDetector
     from bot.processors.transcript_buffer import TranscriptBuffer
+    from shared.dictionary import Dictionary
     from shared.llm_client import create_llm_client
     from shared.migrate import rebuild_index
     from shared.segmenter import Segmenter
@@ -391,6 +410,7 @@ async def run_koda(*, interactive: bool = False) -> None:
     # ----------------------------------------------------------------
     # Per-task provider routing: each service can use a different LLM provider
     # via LLM_PROVIDER_SEGMENT, LLM_PROVIDER_CLASSIFY env vars (falls back to LLM_PROVIDER)
+    dictionary = Dictionary(data_dir=data_dir, auto_create=True)
     segmenter = Segmenter(create_llm_client(task="segment"))
 
     from shared.classifier import Classifier
@@ -405,7 +425,7 @@ async def run_koda(*, interactive: bool = False) -> None:
     # ----------------------------------------------------------------
     # Step 4: Crash recovery — process any orphaned .active/ files
     # ----------------------------------------------------------------
-    await run_crash_recovery(segmenter, classifier, transcript_store, data_dir)
+    await run_crash_recovery(dictionary, segmenter, classifier, transcript_store, data_dir)
 
     # ----------------------------------------------------------------
     # Step 5: Build pipecat pipeline components
@@ -424,6 +444,7 @@ async def run_koda(*, interactive: bool = False) -> None:
         t = asyncio.create_task(
             run_post_processing(
                 buffer_contents=buffer_contents,
+                dictionary=dictionary,
                 segmenter=segmenter,
                 classifier=classifier,
                 transcript_store=transcript_store,
@@ -514,6 +535,7 @@ async def run_koda(*, interactive: bool = False) -> None:
             try:
                 await run_post_processing(
                     buffer_contents=buffer_contents,
+                    dictionary=dictionary,
                     segmenter=segmenter,
                     classifier=classifier,
                     transcript_store=transcript_store,
