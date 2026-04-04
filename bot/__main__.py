@@ -149,6 +149,21 @@ def _create_stt_service():
 # ---------------------------------------------------------------------------
 
 
+async def _run_collation(transcript_id: str, store) -> None:
+    """Fire-and-forget: collate topics related to a newly classified ideas transcript."""
+    try:
+        from shared.collation_service import CollationService
+        from shared.llm_client import create_llm_client
+
+        llm = create_llm_client(task="collate")
+        service = CollationService(store, llm)
+        paths = await service.collate_for_transcript(transcript_id)
+        if paths:
+            logger.info(f"Collation: updated {len(paths)} topic(s) for {transcript_id}")
+    except Exception as exc:
+        logger.warning(f"Collation failed for {transcript_id}: {exc}")
+
+
 async def run_post_processing(
     buffer_contents: list[dict],
     segmenter,
@@ -206,6 +221,12 @@ async def run_post_processing(
                     f"Post-processing: segment {i}/{len(segments)} written — "
                     f"{classified.category} / {path.name} / {transcript_id}"
                 )
+                # Trigger collation for ideas (fire-and-forget)
+                if classified.category == "ideas":
+                    asyncio.create_task(
+                        _run_collation(transcript_id, transcript_store),
+                        name=f"collation_{transcript_id}",
+                    )
             except Exception as exc:
                 logger.error(f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}")
                 # Don't delete session file on partial failure — crash recovery will retry
