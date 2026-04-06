@@ -407,7 +407,7 @@ async def run_koda(*, interactive: bool = False) -> None:
     # ----------------------------------------------------------------
     # Step 1: Load config
     # ----------------------------------------------------------------
-    data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data"))
+    data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data")).expanduser()
 
     # ----------------------------------------------------------------
     # Step 2: Select audio device (input only — silent listener)
