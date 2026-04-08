@@ -155,8 +155,8 @@ _topic_pipeline_tasks: set[asyncio.Task] = set()
 async def _run_topic_pipeline(transcript_id: str, store) -> None:
     """Fire-and-forget: match tags → extract passages → refresh collations.
 
-    Falls back to legacy collate_for_transcript for ideas transcripts when
-    no directory topics are matched (preserves flat-file topic auto-refresh).
+    Also runs legacy collate_for_transcript for ideas transcripts to keep
+    flat-file topics up to date even when directory topics also matched.
     """
     try:
         from shared.llm_client import create_llm_client
@@ -166,9 +166,9 @@ async def _run_topic_pipeline(transcript_id: str, store) -> None:
         matched = await process_transcript(transcript_id, store, llm)
         if matched:
             logger.info(f"Topic pipeline: processed {len(matched)} topic(s) for {transcript_id}")
-            return
 
-        # No directory topic matches — fall back to legacy collation for ideas
+        # Also run legacy collation for ideas — don't skip even if directory
+        # topics matched, otherwise flat-file topics stop getting refreshed
         summary = await store.get_transcript_summary(transcript_id)
         if summary and summary.category == "ideas":
             from shared.collation_service import CollationService
