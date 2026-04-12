@@ -423,20 +423,27 @@ def _remove_pid_file(pid_path: Path) -> None:
 
 def _install_signal_handlers(
     shutdown_event: asyncio.Event,
+    force_exit_event: asyncio.Event,
     flush_callback,
     silence_detector,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """Install signal handlers.
 
-    - SIGINT (Ctrl+C): graceful shutdown
+    - SIGINT (Ctrl+C once): graceful shutdown (flush + drain tasks)
+    - SIGINT (Ctrl+C again during shutdown): force exit (cancel pending tasks)
     - SIGTERM: graceful shutdown
     - SIGUSR1: flush current transcript, keep listening (used by ``./koda flush``)
     """
 
     def _handle_shutdown(sig):
-        logger.info(f"Received signal {sig.name} — initiating graceful shutdown")
-        loop.call_soon_threadsafe(shutdown_event.set)
+        if shutdown_event.is_set():
+            # Already shutting down — second Ctrl+C means force exit
+            logger.warning("Received second Ctrl+C — forcing exit (cancelling pending tasks)")
+            loop.call_soon_threadsafe(force_exit_event.set)
+        else:
+            logger.info(f"Received signal {sig.name} — initiating graceful shutdown")
+            loop.call_soon_threadsafe(shutdown_event.set)
 
     def _handle_flush(sig):
         logger.info(f"Received {sig.name} — manual flush requested")
@@ -706,60 +713,73 @@ async def run_koda(*, interactive: bool = False) -> None:
     # ----------------------------------------------------------------
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
-    _install_signal_handlers(shutdown_event, _flush_and_process, silence_detector, loop)
+    force_exit_event = asyncio.Event()
+    _install_signal_handlers(
+        shutdown_event, force_exit_event, _flush_and_process, silence_detector, loop
+    )
 
     _shutdown_done = False
+
+    async def _wait_or_force(coro_or_future, label: str) -> None:
+        """Await a coroutine/future, but cancel it immediately if force_exit_event fires."""
+        wait_task = asyncio.ensure_future(coro_or_future)
+        force_task = asyncio.create_task(force_exit_event.wait(), name="force_exit_wait")
+        done, _ = await asyncio.wait({wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED)
+        if force_task in done:
+            logger.warning(f"Shutdown: force-cancelling {label}")
+            wait_task.cancel()
+            try:
+                await wait_task
+            except asyncio.CancelledError:
+                pass
+        else:
+            force_task.cancel()
+
+    async def _drain_tasks(tasks: set[asyncio.Task], label: str) -> None:
+        """Wait for a set of tasks, interruptible by force exit."""
+        if not tasks:
+            return
+        logger.info(f"Shutdown: waiting for {len(tasks)} {label}")
+        await _wait_or_force(asyncio.gather(*tasks, return_exceptions=True), label)
 
     async def _on_shutdown() -> None:
         """Flush in-memory buffer to disk and drain the memory writer queue.
         Guarded to run exactly once regardless of how many exit paths trigger it.
+        A second Ctrl+C during shutdown sets force_exit_event, which cancels
+        any pending waits immediately.
         """
         nonlocal _shutdown_done
         if _shutdown_done:
             return
         _shutdown_done = True
 
-        logger.info("Shutdown: stopping silence detector monitoring")
+        logger.info("Shutdown: graceful shutdown started. Press Ctrl+C again to force exit.")
         await silence_detector.stop_monitoring()
 
         # Wait for crash recovery to finish if still running
         if _crash_recovery_task and not _crash_recovery_task.done():
             logger.info("Shutdown: waiting for crash recovery to finish")
-            await _crash_recovery_task
+            await _wait_or_force(_crash_recovery_task, "crash recovery")
 
-        # Wait for any in-flight post-processing tasks to complete
-        if _inflight_tasks:
-            logger.info(
-                f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)"
-            )
-            await asyncio.gather(*_inflight_tasks, return_exceptions=True)
+        if force_exit_event.is_set():
+            logger.warning("Shutdown: force exit — skipping task drain")
+        else:
+            await _drain_tasks(_inflight_tasks, "in-flight post-processing task(s)")
+            await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
 
-        # Wait for any in-flight topic pipeline tasks to complete
-        if _topic_pipeline_tasks:
-            logger.info(
-                f"Shutdown: waiting for {len(_topic_pipeline_tasks)} topic pipeline task(s)"
-            )
-            await asyncio.gather(*_topic_pipeline_tasks, return_exceptions=True)
+        if not force_exit_event.is_set():
+            # Flush the current buffer and process it before exiting.
+            try:
+                await _flush_and_process("Shutdown")
+            except Exception as exc:
+                logger.error(
+                    f"Shutdown: post-processing failed ({exc}). "
+                    "Session file preserved in .active/ for crash recovery."
+                )
 
-        # Flush the current buffer and process it before exiting.
-        # The .active/ session file is only deleted after full success.
-        try:
-            await _flush_and_process("Shutdown")
-        except Exception as exc:
-            logger.error(
-                f"Shutdown: post-processing failed ({exc}). "
-                "Session file preserved in .active/ for crash recovery."
-            )
-
-        # Wait for the shutdown flush task and any topic pipeline tasks it spawned
-        if _inflight_tasks:
-            logger.info(f"Shutdown: waiting for {len(_inflight_tasks)} post-processing task(s)")
-            await asyncio.gather(*_inflight_tasks, return_exceptions=True)
-        if _topic_pipeline_tasks:
-            logger.info(
-                f"Shutdown: waiting for {len(_topic_pipeline_tasks)} topic pipeline task(s)"
-            )
-            await asyncio.gather(*_topic_pipeline_tasks, return_exceptions=True)
+            # Wait for the shutdown flush task and any topic pipeline tasks it spawned
+            await _drain_tasks(_inflight_tasks, "post-processing task(s)")
+            await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()
@@ -800,7 +820,10 @@ async def run_koda(*, interactive: bool = False) -> None:
     # Step 11: Run the pipeline — cleanup runs on ALL exit paths
     # ----------------------------------------------------------------
     runner = PipelineRunner(handle_sigint=False)  # We handle SIGINT ourselves
-    logger.info(f"{BOT_NAME} is listening. Ctrl+T = flush transcript. Ctrl+C = quit.")
+    logger.info(
+        f"{BOT_NAME} is listening. "
+        "Ctrl+T = flush transcript. Ctrl+C = quit. Ctrl+C twice = force quit."
+    )
     try:
         await runner.run(task)
     finally:
