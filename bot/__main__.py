@@ -789,8 +789,10 @@ async def run_koda(*, interactive: bool = False) -> None:
     # Monitor the shutdown event in the background and cancel the pipeline task
     async def _shutdown_watcher() -> None:
         await shutdown_event.wait()
-        await _on_shutdown()
+        # Stop the STT pipeline first — no point capturing audio during shutdown
+        logger.info("Shutdown: stopping pipeline (STT/VAD)")
         await task.cancel()
+        await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")
 
