@@ -36,10 +36,13 @@ import os
 import platform
 import signal
 import sys
-import termios
 import threading
-import tty
 from pathlib import Path
+
+# termios/tty are Unix-only — guard for Windows compatibility
+if sys.platform != "win32":
+    import termios
+    import tty
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -594,7 +597,7 @@ async def run_koda(*, interactive: bool = False) -> None:
     # Step 4: Crash recovery — process any orphaned .active/ files
     # (runs in background so the pipeline starts immediately)
     # ----------------------------------------------------------------
-    _crash_recovery_task: asyncio.Task | None = asyncio.create_task(
+    _crash_recovery_task = asyncio.create_task(
         run_crash_recovery(
             dictionary,
             segmenter,
@@ -615,16 +618,24 @@ async def run_koda(*, interactive: bool = False) -> None:
 
     # Track in-flight post-processing tasks so shutdown can await them
     _inflight_tasks: set[asyncio.Task] = set()
+    _flush_lock = asyncio.Lock()
 
     async def _flush_and_process(reason: str) -> None:
         """Flush the transcript buffer and kick off post-processing.
 
-        Shared by silence timeout, SIGUSR1 manual flush, and shutdown.
+        Shared by silence timeout, SIGUSR1 manual flush, Ctrl+T, and shutdown.
+        Serialized via _flush_lock to prevent concurrent flushes from racing.
         """
+        async with _flush_lock:
+            await _flush_and_process_locked(reason)
+
+    async def _flush_and_process_locked(reason: str) -> None:
         logger.info(f"{reason} — flushing transcript buffer for post-processing")
         buffer_contents, session_path = await transcript_buffer.flush()
         if not buffer_contents:
             logger.info("Flush: buffer was empty, nothing to process")
+            # Still persist any unpersisted in-memory entries to disk
+            await transcript_buffer.flush_to_disk()
             return
         t = asyncio.create_task(
             run_post_processing(
@@ -685,7 +696,13 @@ async def run_koda(*, interactive: bool = False) -> None:
     await silence_detector.start_monitoring()
 
     # ----------------------------------------------------------------
-    # Step 8: Graceful shutdown wiring
+    # Step 8: Write PID file for ./koda flush discovery
+    # (before signal handlers so ./koda flush works as soon as SIGUSR1 is wired)
+    # ----------------------------------------------------------------
+    pid_path = _write_pid_file(data_dir)
+
+    # ----------------------------------------------------------------
+    # Step 9: Graceful shutdown wiring
     # ----------------------------------------------------------------
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -775,17 +792,12 @@ async def run_koda(*, interactive: bool = False) -> None:
         )
 
     # ----------------------------------------------------------------
-    # Step 10: Write PID file for ./koda flush discovery
-    # ----------------------------------------------------------------
-    pid_path = _write_pid_file(data_dir)
-
-    # ----------------------------------------------------------------
-    # Step 11: Start Ctrl+T keypress reader (cbreak mode)
+    # Step 10: Start Ctrl+T keypress reader (cbreak mode)
     # ----------------------------------------------------------------
     _old_terminal_settings = _start_keypress_reader(_flush_and_process, silence_detector, loop)
 
     # ----------------------------------------------------------------
-    # Step 12: Run the pipeline — cleanup runs on ALL exit paths
+    # Step 11: Run the pipeline — cleanup runs on ALL exit paths
     # ----------------------------------------------------------------
     runner = PipelineRunner(handle_sigint=False)  # We handle SIGINT ourselves
     logger.info(f"{BOT_NAME} is listening. Ctrl+T = flush transcript. Ctrl+C = quit.")
