@@ -378,10 +378,16 @@ async def run_crash_recovery(
 
 
 PID_FILENAME = "koda.pid"
+# Marker written to PID file to verify the process is actually Koda
+_PID_MARKER = "koda-bot"
 
 
 def _write_pid_file(data_dir: Path) -> Path:
-    """Write the current process PID to .active/koda.pid.
+    """Write the current process PID and identity marker to .active/koda.pid.
+
+    Format: ``PID\\nkoda-bot`` (two lines). The marker is verified by
+    ``./koda flush`` and ``_read_pid_file`` to prevent signaling an unrelated
+    process after PID reuse.
 
     If a stale PID file exists (process no longer running), it is overwritten
     with a warning log.
@@ -391,23 +397,42 @@ def _write_pid_file(data_dir: Path) -> Path:
     pid_path = active_dir / PID_FILENAME
 
     # Check for stale PID file
-    if pid_path.exists():
+    existing = _read_pid_file(pid_path)
+    if existing is not None:
         try:
-            old_pid = int(pid_path.read_text().strip())
-            os.kill(old_pid, 0)  # Check if process is alive
+            os.kill(existing, 0)  # Check if process is alive
             logger.warning(
-                f"PID file exists and process {old_pid} is still running. "
+                f"PID file exists and process {existing} is still running. "
                 "Overwriting — another bot instance may be active."
             )
-        except (ValueError, ProcessLookupError):
+        except ProcessLookupError:
             logger.info("Removing stale PID file (process gone)")
         except PermissionError:
             # Process exists but we can't signal it (different user)
             logger.warning("PID file exists, process may be running as different user")
 
-    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    pid_path.write_text(f"{os.getpid()}\n{_PID_MARKER}\n", encoding="utf-8")
     logger.debug(f"PID file written: {pid_path} (PID {os.getpid()})")
     return pid_path
+
+
+def _read_pid_file(pid_path: Path) -> int | None:
+    """Read and validate a PID file. Returns the PID if valid, None otherwise.
+
+    Validates that the file contains two lines: a numeric PID and the
+    ``koda-bot`` marker. Returns None if the file is missing, malformed,
+    or lacks the marker (could be from an older version or corrupted).
+    """
+    if not pid_path.exists():
+        return None
+    try:
+        lines = pid_path.read_text(encoding="utf-8").strip().splitlines()
+        if len(lines) < 2 or lines[1].strip() != _PID_MARKER:
+            logger.warning(f"PID file {pid_path} missing identity marker — ignoring")
+            return None
+        return int(lines[0].strip())
+    except (ValueError, OSError):
+        return None
 
 
 def _remove_pid_file(pid_path: Path) -> None:
@@ -792,9 +817,11 @@ async def run_koda(*, interactive: bool = False) -> None:
     # Monitor the shutdown event in the background and cancel the pipeline task
     async def _shutdown_watcher() -> None:
         await shutdown_event.wait()
-        # Stop the STT pipeline first — no point capturing audio during shutdown
+        # Stop the STT pipeline first — no point capturing audio during shutdown.
+        # Race against force_exit_event so a second Ctrl+C can interrupt a stuck
+        # pipeline teardown (e.g. hung transport/STT cleanup).
         logger.info("Shutdown: stopping pipeline (STT/VAD)")
-        await task.cancel()
+        await _wait_or_force(task.cancel(), "pipeline cancel")
         await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")
