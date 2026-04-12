@@ -467,6 +467,9 @@ def _start_keypress_reader(flush_callback, silence_detector, loop) -> list | Non
     Returns the original terminal settings (for restore on shutdown),
     or None if stdin is not a TTY.
     """
+    if sys.platform == "win32":
+        logger.debug("Keypress reader: not supported on Windows")
+        return None
     if not sys.stdin.isatty():
         logger.debug("Keypress reader: stdin is not a TTY, skipping cbreak setup")
         return None
@@ -498,7 +501,7 @@ def _start_keypress_reader(flush_callback, silence_detector, loop) -> list | Non
 
 def _restore_terminal(old_settings: list | None) -> None:
     """Restore terminal settings from cbreak mode."""
-    if old_settings is None:
+    if old_settings is None or sys.platform == "win32":
         return
     try:
         fd = sys.stdin.fileno()
@@ -634,9 +637,9 @@ async def run_koda(*, interactive: bool = False) -> None:
         Serialized via _flush_lock to prevent concurrent flushes from racing.
         """
         async with _flush_lock:
-            await _flush_and_process_locked(reason)
+            await _flush_impl(reason)
 
-    async def _flush_and_process_locked(reason: str) -> None:
+    async def _flush_impl(reason: str) -> None:
         logger.info(f"{reason} — flushing transcript buffer for post-processing")
         buffer_contents, session_path = await transcript_buffer.flush()
         if not buffer_contents:
