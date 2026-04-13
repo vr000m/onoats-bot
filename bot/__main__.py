@@ -382,12 +382,42 @@ PID_FILENAME = "koda.pid"
 _PID_MARKER = "koda-bot"
 
 
-def _write_pid_file(data_dir: Path) -> Path:
-    """Write the current process PID and identity marker to .active/koda.pid.
+def _own_ps_cmdline() -> str:
+    """Return the `ps -p <self> -o command=` string for the current process.
 
-    Format: ``PID\\nkoda-bot`` (two lines). The marker is verified by
-    ``./koda flush`` and ``_read_pid_file`` to prevent signaling an unrelated
-    process after PID reuse.
+    Used as an identity fingerprint in the PID file so that `./koda flush`
+    can verify the live process at that PID has the same command line we
+    recorded at startup, not an unrelated program that inherited the PID
+    after reuse. Returns an empty string if `ps` is unavailable (Windows,
+    restricted environment).
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["ps", "-p", str(os.getpid()), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+def _write_pid_file(data_dir: Path) -> Path:
+    """Write the current process PID, identity marker, and cmdline fingerprint.
+
+    Format: three lines — ``PID``, ``koda-bot`` marker, and the process's
+    own ``ps -p <pid> -o command=`` output captured at startup. The marker
+    and cmdline are verified by ``./koda flush`` and ``_read_pid_file`` to
+    prevent signaling an unrelated process after PID reuse. Without the
+    cmdline check, a crashed Koda leaves a PID file whose PID can be
+    reassigned by the kernel to an unrelated program; `kill -0` and the
+    marker alone would both still pass.
 
     If a stale PID file exists (process no longer running), it is overwritten
     with a warning log.
@@ -411,17 +441,25 @@ def _write_pid_file(data_dir: Path) -> Path:
             # Process exists but we can't signal it (different user)
             logger.warning("PID file exists, process may be running as different user")
 
-    pid_path.write_text(f"{os.getpid()}\n{_PID_MARKER}\n", encoding="utf-8")
-    logger.debug(f"PID file written: {pid_path} (PID {os.getpid()})")
+    cmdline = _own_ps_cmdline()
+    pid_path.write_text(
+        f"{os.getpid()}\n{_PID_MARKER}\n{cmdline}\n",
+        encoding="utf-8",
+    )
+    logger.debug(f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})")
     return pid_path
 
 
 def _read_pid_file(pid_path: Path) -> int | None:
     """Read and validate a PID file. Returns the PID if valid, None otherwise.
 
-    Validates that the file contains two lines: a numeric PID and the
-    ``koda-bot`` marker. Returns None if the file is missing, malformed,
-    or lacks the marker (could be from an older version or corrupted).
+    Validates that the file contains at least two lines (PID + ``koda-bot``
+    marker). A third line with the process cmdline fingerprint is optional
+    at read time — we do not re-invoke ``ps`` here because this helper is
+    called during our own startup to detect stale predecessors, not from a
+    separate tool. ``./koda flush`` does perform the cmdline match.
+
+    Returns None if the file is missing, malformed, or lacks the marker.
     """
     if not pid_path.exists():
         return None
@@ -731,13 +769,11 @@ async def run_koda(*, interactive: bool = False) -> None:
     await silence_detector.start_monitoring()
 
     # ----------------------------------------------------------------
-    # Step 8: Write PID file for ./koda flush discovery
-    # (before signal handlers so ./koda flush works as soon as SIGUSR1 is wired)
-    # ----------------------------------------------------------------
-    pid_path = _write_pid_file(data_dir)
-
-    # ----------------------------------------------------------------
-    # Step 9: Graceful shutdown wiring
+    # Step 8: Graceful shutdown wiring + signal handlers
+    # (must be installed BEFORE the PID file is published, otherwise a
+    # `./koda flush` during the startup window will send SIGUSR1 to a
+    # process that still has the default disposition for that signal —
+    # terminating the fresh bot instead of flushing.)
     # ----------------------------------------------------------------
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -745,6 +781,13 @@ async def run_koda(*, interactive: bool = False) -> None:
     _install_signal_handlers(
         shutdown_event, force_exit_event, _flush_and_process, silence_detector, loop
     )
+
+    # ----------------------------------------------------------------
+    # Step 9: Write PID file for ./koda flush discovery
+    # (after signal handlers so SIGUSR1 is already wired by the time
+    # the PID file is visible.)
+    # ----------------------------------------------------------------
+    pid_path = _write_pid_file(data_dir)
 
     _shutdown_done = False
 
