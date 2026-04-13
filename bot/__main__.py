@@ -36,7 +36,13 @@ import os
 import platform
 import signal
 import sys
+import threading
 from pathlib import Path
+
+# termios/tty are Unix-only — guard for Windows compatibility
+if sys.platform != "win32":
+    import termios
+    import tty
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -305,7 +311,12 @@ async def run_crash_recovery(
     run crashed before post-processing completed, the session JSONL files
     are left in .active/. We process them now.
     """
-    from shared.memory_writer import list_orphaned_sessions, read_session_file
+    from shared.memory_writer import (
+        claim_session_file,
+        list_orphaned_sessions,
+        read_session_file,
+        unclaim_session_file,
+    )
 
     orphans = list_orphaned_sessions(data_dir)
     if not orphans:
@@ -315,18 +326,24 @@ async def run_crash_recovery(
     logger.info(f"Crash recovery: found {len(orphans)} orphaned session file(s)")
 
     for session_path in orphans:
-        logger.info(f"Crash recovery: processing {session_path.name}")
+        # Atomically claim the file so a concurrent bot instance won't process it
+        claimed_path = claim_session_file(session_path)
+        if claimed_path is None:
+            continue
+
+        logger.info(f"Crash recovery: processing {claimed_path.name}")
         try:
-            entries = read_session_file(session_path)
+            entries = read_session_file(claimed_path)
             if entries is None:
                 logger.error(
-                    f"Crash recovery: could not read {session_path.name} — "
-                    "leaving file for manual inspection"
+                    f"Crash recovery: could not read {claimed_path.name} — "
+                    "renaming back for next retry"
                 )
+                unclaim_session_file(claimed_path)
                 continue
             if not entries:
-                logger.warning(f"Crash recovery: {session_path.name} is empty, deleting")
-                _cleanup_session(session_path)
+                logger.warning(f"Crash recovery: {claimed_path.name} is empty, deleting")
+                _cleanup_session(claimed_path)
                 continue
 
             await run_post_processing(
@@ -335,14 +352,24 @@ async def run_crash_recovery(
                 segmenter=segmenter,
                 classifier=classifier,
                 transcript_store=transcript_store,
-                session_path=session_path,
+                session_path=claimed_path,
                 transcript_cleaner=transcript_cleaner,
             )
+            # run_post_processing only deletes the session file on full success.
+            # If it returned without deleting (partial failure), unclaim so next
+            # startup retries.
+            if claimed_path.exists():
+                logger.warning(
+                    f"Crash recovery: {claimed_path.name} still on disk after "
+                    "post-processing — renaming back for next retry"
+                )
+                unclaim_session_file(claimed_path)
         except Exception as exc:
             logger.error(
-                f"Crash recovery: failed to process {session_path.name}: {exc}. "
-                "File left on disk for manual inspection."
+                f"Crash recovery: failed to process {claimed_path.name}: {exc}. "
+                "Renaming back for next retry."
             )
+            unclaim_session_file(claimed_path)
 
 
 # ---------------------------------------------------------------------------
@@ -350,23 +377,201 @@ async def run_crash_recovery(
 # ---------------------------------------------------------------------------
 
 
+PID_FILENAME = "koda.pid"
+# Marker written to PID file to verify the process is actually Koda
+_PID_MARKER = "koda-bot"
+
+
+def _own_ps_cmdline() -> str:
+    """Return the `ps -p <self> -o command=` string for the current process.
+
+    Used as an identity fingerprint in the PID file so that `./koda flush`
+    can verify the live process at that PID has the same command line we
+    recorded at startup, not an unrelated program that inherited the PID
+    after reuse. Returns an empty string if `ps` is unavailable (Windows,
+    restricted environment).
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["ps", "-p", str(os.getpid()), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+def _write_pid_file(data_dir: Path) -> Path:
+    """Write the current process PID, identity marker, and cmdline fingerprint.
+
+    Format: three lines — ``PID``, ``koda-bot`` marker, and the process's
+    own ``ps -p <pid> -o command=`` output captured at startup. The marker
+    and cmdline are verified by ``./koda flush`` and ``_read_pid_file`` to
+    prevent signaling an unrelated process after PID reuse. Without the
+    cmdline check, a crashed Koda leaves a PID file whose PID can be
+    reassigned by the kernel to an unrelated program; `kill -0` and the
+    marker alone would both still pass.
+
+    If a stale PID file exists (process no longer running), it is overwritten
+    with a warning log.
+    """
+    active_dir = data_dir / ".active"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    pid_path = active_dir / PID_FILENAME
+
+    # Check for stale PID file
+    existing = _read_pid_file(pid_path)
+    if existing is not None:
+        try:
+            os.kill(existing, 0)  # Check if process is alive
+            logger.warning(
+                f"PID file exists and process {existing} is still running. "
+                "Overwriting — another bot instance may be active."
+            )
+        except ProcessLookupError:
+            logger.info("Removing stale PID file (process gone)")
+        except PermissionError:
+            # Process exists but we can't signal it (different user)
+            logger.warning("PID file exists, process may be running as different user")
+
+    cmdline = _own_ps_cmdline()
+    pid_path.write_text(
+        f"{os.getpid()}\n{_PID_MARKER}\n{cmdline}\n",
+        encoding="utf-8",
+    )
+    logger.debug(f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})")
+    return pid_path
+
+
+def _read_pid_file(pid_path: Path) -> int | None:
+    """Read and validate a PID file. Returns the PID if valid, None otherwise.
+
+    Validates that the file contains at least two lines (PID + ``koda-bot``
+    marker). A third line with the process cmdline fingerprint is optional
+    at read time — we do not re-invoke ``ps`` here because this helper is
+    called during our own startup to detect stale predecessors, not from a
+    separate tool. ``./koda flush`` does perform the cmdline match.
+
+    Returns None if the file is missing, malformed, or lacks the marker.
+    """
+    if not pid_path.exists():
+        return None
+    try:
+        lines = pid_path.read_text(encoding="utf-8").strip().splitlines()
+        if len(lines) < 2 or lines[1].strip() != _PID_MARKER:
+            logger.warning(f"PID file {pid_path} missing identity marker — ignoring")
+            return None
+        return int(lines[0].strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _remove_pid_file(pid_path: Path) -> None:
+    """Remove the PID file on shutdown."""
+    try:
+        pid_path.unlink()
+        logger.debug(f"PID file removed: {pid_path}")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning(f"Could not remove PID file {pid_path}: {exc}")
+
+
 def _install_signal_handlers(
     shutdown_event: asyncio.Event,
+    force_exit_event: asyncio.Event,
+    flush_callback,
+    silence_detector,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
-    """Install SIGINT / SIGTERM handlers that trigger a clean shutdown."""
+    """Install signal handlers.
 
-    def _handle_signal(sig):
-        logger.info(f"Received signal {sig.name} — initiating graceful shutdown")
-        loop.call_soon_threadsafe(shutdown_event.set)
+    - SIGINT (Ctrl+C once): graceful shutdown (flush + drain tasks)
+    - SIGINT (Ctrl+C again during shutdown): force exit (cancel pending tasks)
+    - SIGTERM: graceful shutdown
+    - SIGUSR1: flush current transcript, keep listening (used by ``./koda flush``)
+    """
+
+    def _handle_shutdown(sig):
+        if shutdown_event.is_set():
+            # Already shutting down — second Ctrl+C means force exit
+            logger.warning("Received second Ctrl+C — forcing exit (cancelling pending tasks)")
+            loop.call_soon_threadsafe(force_exit_event.set)
+        else:
+            logger.info(f"Received signal {sig.name} — initiating graceful shutdown")
+            loop.call_soon_threadsafe(shutdown_event.set)
+
+    def _handle_flush(sig):
+        logger.info(f"Received {sig.name} — manual flush requested")
+        silence_detector.reset_timer()
+        asyncio.ensure_future(flush_callback("Manual flush (SIGUSR1)"))
 
     # Windows does not support add_signal_handler on the event loop
     if sys.platform != "win32":
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, _handle_signal, sig)
+            loop.add_signal_handler(sig, _handle_shutdown, sig)
+        loop.add_signal_handler(signal.SIGUSR1, _handle_flush, signal.SIGUSR1)
     else:
         # Fallback: KeyboardInterrupt will propagate naturally on Windows
         logger.debug("Signal handlers: using default (Windows platform)")
+
+
+def _start_keypress_reader(flush_callback, silence_detector, loop) -> list | None:
+    """Start a background thread that reads stdin keypresses in cbreak mode.
+
+    Maps Ctrl+T (0x14) to flush the current transcript.
+    Returns the original terminal settings (for restore on shutdown),
+    or None if stdin is not a TTY.
+    """
+    if sys.platform == "win32":
+        logger.debug("Keypress reader: not supported on Windows")
+        return None
+    if not sys.stdin.isatty():
+        logger.debug("Keypress reader: stdin is not a TTY, skipping cbreak setup")
+        return None
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    logger.debug("Keypress reader: terminal set to cbreak mode")
+
+    def _reader():
+        try:
+            while True:
+                ch = sys.stdin.read(1)
+                if not ch:
+                    break  # EOF
+                if ch == "\x14":  # Ctrl+T
+                    silence_detector.reset_timer()
+                    loop.call_soon_threadsafe(
+                        asyncio.ensure_future,
+                        flush_callback("Manual flush (Ctrl+T)"),
+                    )
+        except (OSError, ValueError):
+            pass  # stdin closed during shutdown
+
+    thread = threading.Thread(target=_reader, daemon=True, name="keypress_reader")
+    thread.start()
+    return old_settings
+
+
+def _restore_terminal(old_settings: list | None) -> None:
+    """Restore terminal settings from cbreak mode."""
+    if old_settings is None or sys.platform == "win32":
+        return
+    try:
+        fd = sys.stdin.fileno()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        logger.debug("Keypress reader: terminal settings restored")
+    except (OSError, ValueError):
+        pass  # stdin already closed
 
 
 # ---------------------------------------------------------------------------
@@ -463,14 +668,18 @@ async def run_koda(*, interactive: bool = False) -> None:
 
     # ----------------------------------------------------------------
     # Step 4: Crash recovery — process any orphaned .active/ files
+    # (runs in background so the pipeline starts immediately)
     # ----------------------------------------------------------------
-    await run_crash_recovery(
-        dictionary,
-        segmenter,
-        classifier,
-        transcript_store,
-        data_dir,
-        transcript_cleaner=transcript_cleaner,
+    _crash_recovery_task = asyncio.create_task(
+        run_crash_recovery(
+            dictionary,
+            segmenter,
+            classifier,
+            transcript_store,
+            data_dir,
+            transcript_cleaner=transcript_cleaner,
+        ),
+        name="crash_recovery",
     )
 
     # ----------------------------------------------------------------
@@ -482,11 +691,25 @@ async def run_koda(*, interactive: bool = False) -> None:
 
     # Track in-flight post-processing tasks so shutdown can await them
     _inflight_tasks: set[asyncio.Task] = set()
+    _flush_lock = asyncio.Lock()
 
-    # Silence timeout callback — triggered by SilenceDetector after N minutes of inactivity
-    async def on_silence_timeout() -> None:
-        logger.info("Silence timeout fired — flushing transcript buffer for post-processing")
+    async def _flush_and_process(reason: str) -> None:
+        """Flush the transcript buffer and kick off post-processing.
+
+        Shared by silence timeout, SIGUSR1 manual flush, Ctrl+T, and shutdown.
+        Serialized via _flush_lock to prevent concurrent flushes from racing.
+        """
+        async with _flush_lock:
+            await _flush_impl(reason)
+
+    async def _flush_impl(reason: str) -> None:
+        logger.info(f"{reason} — flushing transcript buffer for post-processing")
         buffer_contents, session_path = await transcript_buffer.flush()
+        if not buffer_contents:
+            logger.info("Flush: buffer was empty, nothing to process")
+            # Still persist any unpersisted in-memory entries to disk
+            await transcript_buffer.flush_to_disk()
+            return
         t = asyncio.create_task(
             run_post_processing(
                 buffer_contents=buffer_contents,
@@ -501,6 +724,10 @@ async def run_koda(*, interactive: bool = False) -> None:
         )
         _inflight_tasks.add(t)
         t.add_done_callback(_inflight_tasks.discard)
+
+    # Silence timeout callback — triggered by SilenceDetector after N minutes of inactivity
+    async def on_silence_timeout() -> None:
+        await _flush_and_process("Silence timeout fired")
 
     silence_timeout_sec = float(os.getenv("SILENCE_TIMEOUT_SEC", "300"))
     silence_detector = SilenceDetector(
@@ -542,67 +769,88 @@ async def run_koda(*, interactive: bool = False) -> None:
     await silence_detector.start_monitoring()
 
     # ----------------------------------------------------------------
-    # Step 8: Graceful shutdown wiring
+    # Step 8: Graceful shutdown wiring + signal handlers
+    # (must be installed BEFORE the PID file is published, otherwise a
+    # `./koda flush` during the startup window will send SIGUSR1 to a
+    # process that still has the default disposition for that signal —
+    # terminating the fresh bot instead of flushing.)
     # ----------------------------------------------------------------
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
-    _install_signal_handlers(shutdown_event, loop)
+    force_exit_event = asyncio.Event()
+    _install_signal_handlers(
+        shutdown_event, force_exit_event, _flush_and_process, silence_detector, loop
+    )
+
+    # ----------------------------------------------------------------
+    # Step 9: Write PID file for ./koda flush discovery
+    # (after signal handlers so SIGUSR1 is already wired by the time
+    # the PID file is visible.)
+    # ----------------------------------------------------------------
+    pid_path = _write_pid_file(data_dir)
 
     _shutdown_done = False
+
+    async def _wait_or_force(coro_or_future, label: str) -> None:
+        """Await a coroutine/future, but cancel it immediately if force_exit_event fires."""
+        wait_task = asyncio.ensure_future(coro_or_future)
+        force_task = asyncio.create_task(force_exit_event.wait(), name="force_exit_wait")
+        done, _ = await asyncio.wait({wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED)
+        if force_task in done:
+            logger.warning(f"Shutdown: force-cancelling {label}")
+            wait_task.cancel()
+            try:
+                await wait_task
+            except asyncio.CancelledError:
+                pass
+        else:
+            force_task.cancel()
+
+    async def _drain_tasks(tasks: set[asyncio.Task], label: str) -> None:
+        """Wait for a set of tasks, interruptible by force exit."""
+        if not tasks:
+            return
+        logger.info(f"Shutdown: waiting for {len(tasks)} {label}")
+        await _wait_or_force(asyncio.gather(*tasks, return_exceptions=True), label)
 
     async def _on_shutdown() -> None:
         """Flush in-memory buffer to disk and drain the memory writer queue.
         Guarded to run exactly once regardless of how many exit paths trigger it.
+        A second Ctrl+C during shutdown sets force_exit_event, which cancels
+        any pending waits immediately.
         """
         nonlocal _shutdown_done
         if _shutdown_done:
             return
         _shutdown_done = True
 
-        logger.info("Shutdown: stopping silence detector monitoring")
+        logger.info("Shutdown: graceful shutdown started. Press Ctrl+C again to force exit.")
         await silence_detector.stop_monitoring()
 
-        # Wait for any in-flight post-processing tasks to complete
-        if _inflight_tasks:
-            logger.info(
-                f"Shutdown: waiting for {len(_inflight_tasks)} in-flight post-processing task(s)"
-            )
-            await asyncio.gather(*_inflight_tasks, return_exceptions=True)
+        # Wait for crash recovery to finish if still running
+        if _crash_recovery_task and not _crash_recovery_task.done():
+            logger.info("Shutdown: waiting for crash recovery to finish")
+            await _wait_or_force(_crash_recovery_task, "crash recovery")
 
-        # Wait for any in-flight topic pipeline tasks to complete
-        if _topic_pipeline_tasks:
-            logger.info(
-                f"Shutdown: waiting for {len(_topic_pipeline_tasks)} topic pipeline task(s)"
-            )
-            await asyncio.gather(*_topic_pipeline_tasks, return_exceptions=True)
+        if force_exit_event.is_set():
+            logger.warning("Shutdown: force exit — skipping task drain")
+        else:
+            await _drain_tasks(_inflight_tasks, "in-flight post-processing task(s)")
+            await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
 
-        # Flush the current buffer and process it before exiting.
-        # The .active/ session file is only deleted after full success.
-        logger.info("Shutdown: flushing and processing current transcript buffer")
-        buffer_contents, session_path = await transcript_buffer.flush()
-        if buffer_contents:
-            utterance_count = sum(1 for e in buffer_contents if e.get("type") == "utterance")
-            logger.info(
-                f"Shutdown: processing {len(buffer_contents)} buffered entries "
-                f"({utterance_count} utterances) before exit"
-            )
+        if not force_exit_event.is_set():
+            # Flush the current buffer and process it before exiting.
             try:
-                await run_post_processing(
-                    buffer_contents=buffer_contents,
-                    dictionary=dictionary,
-                    segmenter=segmenter,
-                    classifier=classifier,
-                    transcript_store=transcript_store,
-                    session_path=session_path,
-                )
+                await _flush_and_process("Shutdown")
             except Exception as exc:
                 logger.error(
                     f"Shutdown: post-processing failed ({exc}). "
                     "Session file preserved in .active/ for crash recovery."
                 )
-        else:
-            # No buffered content — still flush any unpersisted entries to disk
-            await transcript_buffer.flush_to_disk()
+
+            # Wait for the shutdown flush task and any topic pipeline tasks it spawned
+            await _drain_tasks(_inflight_tasks, "post-processing task(s)")
+            await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()
@@ -612,8 +860,12 @@ async def run_koda(*, interactive: bool = False) -> None:
     # Monitor the shutdown event in the background and cancel the pipeline task
     async def _shutdown_watcher() -> None:
         await shutdown_event.wait()
+        # Stop the STT pipeline first — no point capturing audio during shutdown.
+        # Race against force_exit_event so a second Ctrl+C can interrupt a stuck
+        # pipeline teardown (e.g. hung transport/STT cleanup).
+        logger.info("Shutdown: stopping pipeline (STT/VAD)")
+        await _wait_or_force(task.cancel(), "pipeline cancel")
         await _on_shutdown()
-        await task.cancel()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")
 
@@ -635,14 +887,24 @@ async def run_koda(*, interactive: bool = False) -> None:
         )
 
     # ----------------------------------------------------------------
-    # Step 10: Run the pipeline — cleanup runs on ALL exit paths
+    # Step 10: Start Ctrl+T keypress reader (cbreak mode)
+    # ----------------------------------------------------------------
+    _old_terminal_settings = _start_keypress_reader(_flush_and_process, silence_detector, loop)
+
+    # ----------------------------------------------------------------
+    # Step 11: Run the pipeline — cleanup runs on ALL exit paths
     # ----------------------------------------------------------------
     runner = PipelineRunner(handle_sigint=False)  # We handle SIGINT ourselves
-    logger.info(f"{BOT_NAME} is listening. Press Ctrl+C to stop.")
+    logger.info(
+        f"{BOT_NAME} is listening. "
+        "Ctrl+T = flush transcript. Ctrl+C = quit. Ctrl+C twice = force quit."
+    )
     try:
         await runner.run(task)
     finally:
         await _on_shutdown()
+        _restore_terminal(_old_terminal_settings)
+        _remove_pid_file(pid_path)
 
 
 # ---------------------------------------------------------------------------

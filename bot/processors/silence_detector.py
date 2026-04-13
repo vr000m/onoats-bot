@@ -161,6 +161,16 @@ class SilenceDetector(FrameProcessor):
         self._fired = False
         logger.debug("SilenceDetector: speech stopped, timer armed")
 
+    def reset_timer(self) -> None:
+        """Reset the inactivity timer without firing the callback.
+
+        Used after a manual flush (e.g. SIGUSR1) so the silence timeout
+        restarts from scratch for the new transcript.
+        """
+        self._last_vad_activity = None
+        self._fired = False
+        logger.info("SilenceDetector: timer reset")
+
     # ------------------------------------------------------------------
     # Background monitoring loop
     # ------------------------------------------------------------------
