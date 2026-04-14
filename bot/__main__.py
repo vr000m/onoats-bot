@@ -257,7 +257,7 @@ async def run_post_processing(
                     dictionary_hash=dictionary_hash,
                     transcript_cleaner=transcript_cleaner,
                 )
-                transcript_id, path = await transcript_store.ingest_segment(classified)
+                transcript_id, path, _was_new = await transcript_store.ingest_segment(classified)
                 logger.info(
                     f"Post-processing: segment {i}/{len(segments)} written — "
                     f"{classified.category} / {path.name} / {transcript_id}"
