@@ -195,6 +195,7 @@ async def run_post_processing(
     transcript_store,
     session_path: Optional[Path],
     transcript_cleaner=None,
+    locked_category: str | None = None,
 ) -> None:
     """Process a flushed transcript buffer through dictionary → segment → cleanup → classify → write.
 
@@ -208,6 +209,7 @@ async def run_post_processing(
         transcript_store: TranscriptStore instance for cold storage writes + SQLite overlay.
         session_path:     Path to the .active/ JSONL file to delete on success.
         transcript_cleaner: Optional TranscriptCleaner for LLM-assisted cleanup.
+        locked_category:  If set, force all segments to this category.
     """
     if not buffer_contents:
         logger.debug("Post-processing: empty buffer — nothing to process")
@@ -256,6 +258,7 @@ async def run_post_processing(
                     seg_entries,
                     dictionary_hash=dictionary_hash,
                     transcript_cleaner=transcript_cleaner,
+                    locked_category=locked_category,
                 )
                 transcript_id, path, _was_new = await transcript_store.ingest_segment(classified)
                 logger.info(
@@ -606,12 +609,15 @@ def _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_de
 # ---------------------------------------------------------------------------
 
 
-async def run_koda(*, interactive: bool = False) -> None:
+async def run_koda(*, interactive: bool = False, locked_category: str | None = None) -> None:
     """Build and run the full Koda listener pipeline.
 
     Args:
         interactive: If True, voice response mode is enabled (Phase 2 stub —
                      flag is accepted but full interactive mode is not yet wired).
+        locked_category: If set, force all classified segments to this category.
+                         The classifier still extracts summary/tags/action_items
+                         but the category is overridden.
     """
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
@@ -719,6 +725,7 @@ async def run_koda(*, interactive: bool = False) -> None:
                 transcript_store=transcript_store,
                 session_path=session_path,
                 transcript_cleaner=transcript_cleaner,
+                locked_category=locked_category,
             ),
             name="post_processing",
         )
@@ -875,6 +882,8 @@ async def run_koda(*, interactive: bool = False) -> None:
     mode = "interactive (Phase 2 stub)" if interactive else "silent listener"
     logger.info(f"--- {BOT_NAME} starting ---")
     logger.info(f"  Mode:      {mode}")
+    if locked_category:
+        logger.info(f"  Category:  {locked_category} (locked via --category)")
     logger.info(f"  Data dir:  {data_dir}")
     logger.info(f"  STT:       {STT_SERVICE} / model={STT_MODEL or 'default'}")
     logger.info(f"  LLM:       {os.getenv('LLM_PROVIDER', 'gemini')}")
@@ -927,9 +936,32 @@ def _parse_args() -> argparse.Namespace:
             "(Phase 2 — flag accepted, full interactive mode not yet implemented)"
         ),
     )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Lock all segments to this category (e.g., seminars, work, advisory). "
+            "Useful when you know the context upfront — attending a talk, a specific "
+            "meeting type, etc. The classifier still runs to extract summary/tags/actions "
+            "but the category is forced."
+        ),
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    asyncio.run(run_koda(interactive=args.interactive))
+    if args.category:
+        from shared.models import VALID_CATEGORIES
+
+        cat = args.category.lower().strip()
+        if cat not in VALID_CATEGORIES or cat == "uncategorized":
+            print(
+                f"Error: --category must be one of: "
+                f"{', '.join(sorted(VALID_CATEGORIES - {'uncategorized'}))}"
+            )
+            sys.exit(1)
+        args.category = cat
+    asyncio.run(run_koda(interactive=args.interactive, locked_category=args.category))
