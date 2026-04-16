@@ -307,12 +307,16 @@ async def run_crash_recovery(
     transcript_store,
     data_dir: Path,
     transcript_cleaner=None,
+    locked_category: str | None = None,
 ) -> None:
     """Check for orphaned .active/ session files and process them.
 
     Called once at startup, before the main pipeline begins. If the previous
     run crashed before post-processing completed, the session JSONL files
     are left in .active/. We process them now.
+
+    If ``locked_category`` is set (from ``--category``), recovered sessions
+    use the same category lock as the current run.
     """
     from shared.memory_writer import (
         claim_session_file,
@@ -357,6 +361,7 @@ async def run_crash_recovery(
                 transcript_store=transcript_store,
                 session_path=claimed_path,
                 transcript_cleaner=transcript_cleaner,
+                locked_category=locked_category,
             )
             # run_post_processing only deletes the session file on full success.
             # If it returned without deleting (partial failure), unclaim so next
@@ -684,6 +689,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
             transcript_store,
             data_dir,
             transcript_cleaner=transcript_cleaner,
+            locked_category=locked_category,
         ),
         name="crash_recovery",
     )
