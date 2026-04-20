@@ -52,12 +52,25 @@ def _segment_hint_threshold() -> float:
 # ---------------------------------------------------------------------------
 
 
-def _utterance_entry(text: str) -> dict:
-    return {
+def _utterance_entry(
+    text: str,
+    *,
+    source: str | None = None,
+    source_order: int | None = None,
+    branch_sequence: int | None = None,
+) -> dict:
+    entry = {
         "time": datetime.now(timezone.utc).isoformat(),
         "type": "utterance",
         "text": text,
     }
+    if source:
+        entry["source"] = source
+    if isinstance(source_order, int):
+        entry["source_order"] = source_order
+    if isinstance(branch_sequence, int):
+        entry["branch_sequence"] = branch_sequence
+    return entry
 
 
 def _silence_gap_entry(duration_seconds: float) -> dict:
@@ -81,6 +94,7 @@ class TranscriptBuffer(FrameProcessor):
     Session JSONL layout (one entry per line)::
 
         {"time": "ISO8601", "type": "utterance", "text": "..."}
+        {"time": "ISO8601", "type": "utterance", "text": "...", "source": "me"}
         {"time": "ISO8601", "type": "silence_gap", "duration_seconds": N}
 
     The session file is created on first write and lives in
@@ -98,6 +112,9 @@ class TranscriptBuffer(FrameProcessor):
         self,
         segment_hint_threshold: Optional[float] = None,
         data_dir: Optional[Path] = None,
+        *,
+        track_vad_gaps: bool = True,
+        use_frame_source: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -108,6 +125,8 @@ class TranscriptBuffer(FrameProcessor):
             else _segment_hint_threshold()
         )
         self._data_dir = Path(data_dir) if data_dir is not None else _data_dir()
+        self._track_vad_gaps = track_vad_gaps
+        self._use_frame_source = use_frame_source
 
         # In-memory buffer of JSONL entry dicts
         self._buffer: list[dict] = []
@@ -139,9 +158,9 @@ class TranscriptBuffer(FrameProcessor):
 
         if isinstance(frame, TranscriptionFrame):
             await self._handle_transcription(frame)
-        elif isinstance(frame, VADUserStartedSpeakingFrame):
+        elif self._track_vad_gaps and isinstance(frame, VADUserStartedSpeakingFrame):
             await self._handle_vad_started(frame)
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+        elif self._track_vad_gaps and isinstance(frame, VADUserStoppedSpeakingFrame):
             await self._handle_vad_stopped(frame)
 
         await self.push_frame(frame, direction)
@@ -216,8 +235,26 @@ class TranscriptBuffer(FrameProcessor):
         if not text:
             return
 
+        source = None
+        source_order = None
+        branch_sequence = None
+        if self._use_frame_source:
+            raw_source = getattr(frame, "user_id", None)
+            source = str(raw_source).strip().lower() if raw_source else None
+            raw_source_order = getattr(frame, "koda_source_order", None)
+            if isinstance(raw_source_order, int):
+                source_order = raw_source_order
+            raw_branch_sequence = getattr(frame, "koda_branch_sequence", None)
+            if isinstance(raw_branch_sequence, int):
+                branch_sequence = raw_branch_sequence
+
         async with self._write_lock:
-            entry = _utterance_entry(text)
+            entry = _utterance_entry(
+                text,
+                source=source,
+                source_order=source_order,
+                branch_sequence=branch_sequence,
+            )
             self._buffer.append(entry)
             idx = len(self._buffer) - 1
             if await self._write_entry(entry):
