@@ -1,4 +1,4 @@
-"""Experimental dual-input Koda listener.
+"""Dual-input Koda listener.
 
 Runs separate microphone and loopback capture branches, keeps them isolated
 through VAD and STT, tags final transcription frames as `me` / `them`, and
@@ -6,6 +6,8 @@ merges only after STT into the shared post-processing path.
 
 Run::
 
+    ./koda bot
+    ./koda bot --live-terminal
     ./koda bot-dual
     ./koda bot-dual --live-terminal
 
@@ -14,8 +16,8 @@ Config:
     SYSTEM_INPUT_DEVICE  - Loopback input device index or stable name
 
 Notes:
-    - INPUT_DEVICE is ignored by this experimental entrypoint.
-    - The legacy `./koda bot` path remains unchanged.
+    - INPUT_DEVICE is ignored by the dual-input listener.
+    - The legacy mic-only path remains available as `./koda bot-single`.
 """
 
 from __future__ import annotations
@@ -32,11 +34,13 @@ from bot.__main__ import (
     BOT_NAME,
     STT_MODEL,
     STT_SERVICE,
+    _remove_pid_file,
     _create_stt_service,
     _install_signal_handlers,
     _restore_terminal,
     _start_keypress_reader,
     _topic_pipeline_tasks,
+    _write_pid_file,
     run_crash_recovery,
     run_post_processing,
 )
@@ -130,7 +134,9 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data")).expanduser()
 
     if os.getenv("INPUT_DEVICE", "").strip():
-        logger.info("bot-dual ignores INPUT_DEVICE; use MIC_INPUT_DEVICE and SYSTEM_INPUT_DEVICE")
+        logger.info(
+            "Dual-input bot ignores INPUT_DEVICE; use MIC_INPUT_DEVICE and SYSTEM_INPUT_DEVICE"
+        )
 
     mic_input = os.getenv("MIC_INPUT_DEVICE", "").strip() or None
     system_input = os.getenv("SYSTEM_INPUT_DEVICE", "").strip() or None
@@ -263,6 +269,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         silence_detector,
         loop,
     )
+    pid_path = _write_pid_file(data_dir)
 
     shutdown_done = False
 
@@ -332,7 +339,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher_dual")
 
-    logger.info(f"--- {BOT_NAME} dual-input experiment starting ---")
+    logger.info(f"--- {BOT_NAME} dual-input starting ---")
     if locked_category:
         logger.info(f"  Category:         {locked_category} (locked via --category)")
     logger.info(f"  Data dir:         {data_dir}")
@@ -355,13 +362,23 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     finally:
         await _on_shutdown()
         _restore_terminal(old_terminal_settings)
+        _remove_pid_file(pid_path)
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Koda experimental dual-input listener",
+        description="Koda dual-input listener",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        help=(
+            "Accepted for CLI compatibility with the legacy single-input bot. "
+            "The dual-input listener still runs in silent mode."
+        ),
     )
     parser.add_argument(
         "--category",
@@ -384,6 +401,11 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.interactive:
+        logger.warning(
+            "Interactive mode is not implemented for the dual-input listener. "
+            "Running in silent mode."
+        )
     if args.category:
         from shared.models import VALID_CATEGORIES
 
