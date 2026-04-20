@@ -42,43 +42,57 @@ from bot.__main__ import (
 )
 
 
-def _build_dual_pipeline(mic_transport, system_transport, mic_vad, system_vad, mic_stt, system_stt):
+def _build_dual_pipeline(
+    mic_transport,
+    system_transport,
+    mic_vad,
+    system_vad,
+    mic_stt,
+    system_stt,
+    transcript_buffer,
+    silence_detector,
+    *,
+    live_terminal: bool = False,
+):
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
 
+    from bot.processors.live_terminal import LiveTerminalRenderer
     from bot.processors.source_tagger import SourceTagger
 
-    return Pipeline(
-        [
-            ParallelPipeline(
-                [
-                    mic_transport.input(),
-                    mic_vad,
-                    mic_stt,
-                    SourceTagger(source="me", source_order=0),
-                ],
-                [
-                    system_transport.input(),
-                    system_vad,
-                    system_stt,
-                    SourceTagger(source="them", source_order=1),
-                ],
-            )
-        ]
-    )
+    processors = [
+        ParallelPipeline(
+            [
+                mic_transport.input(),
+                mic_vad,
+                mic_stt,
+                SourceTagger(source="me", source_order=0),
+            ],
+            [
+                system_transport.input(),
+                system_vad,
+                system_stt,
+                SourceTagger(source="them", source_order=1),
+            ],
+        ),
+        transcript_buffer,
+    ]
+    if live_terminal:
+        processors.append(LiveTerminalRenderer())
+    processors.append(silence_detector)
+
+    return Pipeline(processors)
 
 
 async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | None = None) -> None:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
-    from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
     from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
     from bot.config.audio_devices import select_dual_input_devices
     from bot.processors.dual_silence_detector import DualSilenceDetector
-    from bot.processors.live_terminal import LiveTerminalRenderer
     from bot.processors.transcript_buffer import TranscriptBuffer
     from shared.dictionary import Dictionary
     from shared.llm_client import create_llm_client
@@ -199,14 +213,10 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         system_vad,
         mic_stt,
         system_stt,
+        transcript_buffer,
+        silence_detector,
+        live_terminal=live_terminal,
     )
-
-    processors = list(pipeline.processors)
-    processors.append(transcript_buffer)
-    if live_terminal:
-        processors.append(LiveTerminalRenderer())
-    processors.append(silence_detector)
-    pipeline = Pipeline(processors)
 
     task = PipelineTask(
         pipeline,
