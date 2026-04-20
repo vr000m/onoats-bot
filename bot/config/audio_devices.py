@@ -186,11 +186,7 @@ def select_input_device(input_device_env=None):
             return env_in
 
         # Build input device list
-        inputs = []
-        for i in range(pa.get_device_count()):
-            d = pa.get_device_info_by_index(i)
-            if d["maxInputChannels"] > 0:
-                inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+        inputs = _enumerate_input_devices(pa)
 
         # Load last-used input device
         last_in = _load_last_input()
@@ -253,11 +249,7 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
             _log_dual_inputs(pa, env_mic, env_system, env_label="from env")
             return env_mic, env_system
 
-        inputs = []
-        for i in range(pa.get_device_count()):
-            d = pa.get_device_info_by_index(i)
-            if d["maxInputChannels"] > 0:
-                inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+        inputs = _enumerate_input_devices(pa)
 
         last_mic_name, last_system_name = _load_last_dual_inputs()
         last_mic = validate_audio_device(last_mic_name, "last_mic_input", need_input=True)
@@ -304,6 +296,16 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
         return mic_dev, system_dev
     finally:
         pa.terminate()
+
+
+def _enumerate_input_devices(pa) -> list[tuple[int, str, int]]:
+    """Return ``[(index, name, default_sample_rate), ...]`` for every input device."""
+    inputs: list[tuple[int, str, int]] = []
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if d["maxInputChannels"] > 0:
+            inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+    return inputs
 
 
 # ---------------------------------------------------------------------------

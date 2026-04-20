@@ -239,7 +239,10 @@ class TranscriptBuffer(FrameProcessor):
         source_order = None
         branch_sequence = None
         if self._use_frame_source:
-            raw_source = getattr(frame, "user_id", None)
+            # Prefer the namespaced ``koda_source`` attribute written by
+            # SourceTagger; fall back to Pipecat's standard ``user_id`` field
+            # so STT services that diarize natively still flow through.
+            raw_source = getattr(frame, "koda_source", None) or getattr(frame, "user_id", None)
             source = str(raw_source).strip().lower() if raw_source else None
             raw_source_order = getattr(frame, "koda_source_order", None)
             if isinstance(raw_source_order, int):
