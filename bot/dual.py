@@ -42,6 +42,33 @@ from bot.__main__ import (
 )
 
 
+async def _shutdown_stt_service(stt_service, label: str) -> None:
+    """Best-effort drain for STT services used by the dual-input path.
+
+    The dual pipeline instantiates two Whisper services in one process. When
+    shutdown is abrupt, MLX can still have GPU work in flight. Explicitly
+    stopping and cleaning up each service gives Pipecat a chance to tear down
+    those resources before interpreter exit.
+    """
+
+    from pipecat.frames.frames import EndFrame
+
+    stop = getattr(stt_service, "stop", None)
+    cleanup = getattr(stt_service, "cleanup", None)
+
+    if stop is not None:
+        try:
+            await stop(EndFrame())
+        except Exception as exc:
+            logger.warning(f"Shutdown: failed to stop {label} STT service cleanly: {exc}")
+
+    if cleanup is not None:
+        try:
+            await cleanup()
+        except Exception as exc:
+            logger.warning(f"Shutdown: failed to clean up {label} STT service: {exc}")
+
+
 def _build_dual_pipeline(
     mic_transport,
     system_transport,
@@ -288,6 +315,10 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
                 )
             await _drain_tasks(inflight_tasks, "post-processing task(s)")
             await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
+
+        logger.info("Shutdown: draining dual STT services")
+        await _shutdown_stt_service(mic_stt, "mic")
+        await _shutdown_stt_service(system_stt, "system")
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()
