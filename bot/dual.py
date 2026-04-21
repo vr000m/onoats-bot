@@ -179,7 +179,12 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         name="dual_crash_recovery",
     )
 
-    transcript_buffer = TranscriptBuffer(track_vad_gaps=False, use_frame_source=True)
+    # Source-aware gap tracking: TranscriptBuffer only advances its
+    # ``last_vad_stop`` when every branch is idle, so cross-branch
+    # overlapping speech won't produce spurious silence_gap entries.
+    # Enabling this restores Segmenter's ability to split short sessions
+    # (segmenter fast-skips no-gap buffers with <=10 utterances).
+    transcript_buffer = TranscriptBuffer(track_vad_gaps=True, use_frame_source=True)
     inflight_tasks: set[asyncio.Task] = set()
     flush_lock = asyncio.Lock()
 

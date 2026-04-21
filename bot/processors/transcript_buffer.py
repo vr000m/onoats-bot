@@ -58,9 +58,14 @@ def _utterance_entry(
     source: str | None = None,
     source_order: int | None = None,
     branch_sequence: int | None = None,
+    timestamp: str | None = None,
 ) -> dict:
+    # Prefer the STT-supplied timestamp (ISO8601) when available; branches
+    # can finalize at different speeds, so wall-clock arrival time would
+    # chronologically invert interleaved utterances before segmentation.
+    ts = timestamp if timestamp else datetime.now(timezone.utc).isoformat()
     entry = {
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": ts,
         "type": "utterance",
         "text": text,
     }
@@ -131,8 +136,16 @@ class TranscriptBuffer(FrameProcessor):
         # In-memory buffer of JSONL entry dicts
         self._buffer: list[dict] = []
 
-        # Wall-clock time of last VADUserStoppedSpeakingFrame (or None)
+        # Wall-clock time of last VADUserStoppedSpeakingFrame (or None).
+        # In source-aware mode, updated only when *all* known branches
+        # have gone idle — otherwise a brief pause on one branch while
+        # the other is mid-utterance would be mis-recorded as a gap.
         self._last_vad_stop: Optional[float] = None  # asyncio.get_event_loop().time()
+
+        # Source-aware cross-branch tracking (dual-input only). Keeps the
+        # set of branches currently speaking so ``_last_vad_stop`` only
+        # advances when every known branch is idle.
+        self._speaking_sources: set[str] = set()
 
         # Path of the current session JSONL file (created lazily on first write)
         self._session_file: Optional[Path] = None
@@ -202,6 +215,7 @@ class TranscriptBuffer(FrameProcessor):
             self._last_vad_stop = None
             self._session_file = None
             self._persisted_indices = set()
+            self._speaking_sources = set()
         logger.info(f"TranscriptBuffer flushed ({len(contents)} entries)")
         return contents, session_path
 
@@ -251,12 +265,16 @@ class TranscriptBuffer(FrameProcessor):
             if isinstance(raw_branch_sequence, int):
                 branch_sequence = raw_branch_sequence
 
+        frame_timestamp = getattr(frame, "timestamp", None)
+        frame_timestamp = str(frame_timestamp) if frame_timestamp else None
+
         async with self._write_lock:
             entry = _utterance_entry(
                 text,
                 source=source,
                 source_order=source_order,
                 branch_sequence=branch_sequence,
+                timestamp=frame_timestamp,
             )
             self._buffer.append(entry)
             idx = len(self._buffer) - 1
@@ -267,23 +285,50 @@ class TranscriptBuffer(FrameProcessor):
     async def _handle_vad_started(self, frame: VADUserStartedSpeakingFrame) -> None:
         """On speech start, measure the actual silence gap since last stop."""
         now = asyncio.get_running_loop().time()
+        source = self._frame_source(frame)
 
-        if self._last_vad_stop is not None:
-            silence_duration = now - self._last_vad_stop
-            if silence_duration >= self._threshold:
-                async with self._write_lock:
-                    entry = _silence_gap_entry(silence_duration)
-                    self._buffer.append(entry)
-                    idx = len(self._buffer) - 1
-                    if await self._write_entry(entry):
-                        self._persisted_indices.add(idx)
-                logger.info(
-                    f"TranscriptBuffer: silence_gap recorded ({silence_duration:.1f}s >= {self._threshold}s threshold)"
-                )
+        # Source-aware path (dual-input): only measure gap when no branch
+        # is currently speaking. Otherwise this branch's start overlaps
+        # with another that's still mid-utterance — no silence at all.
+        if source is not None:
+            all_idle = not self._speaking_sources
+            self._speaking_sources.add(source)
+            if not all_idle or self._last_vad_stop is None:
+                return
+        elif self._last_vad_stop is None:
+            return
+
+        silence_duration = now - self._last_vad_stop
+        if silence_duration >= self._threshold:
+            async with self._write_lock:
+                entry = _silence_gap_entry(silence_duration)
+                self._buffer.append(entry)
+                idx = len(self._buffer) - 1
+                if await self._write_entry(entry):
+                    self._persisted_indices.add(idx)
+            logger.info(
+                f"TranscriptBuffer: silence_gap recorded ({silence_duration:.1f}s >= {self._threshold}s threshold)"
+            )
 
     async def _handle_vad_stopped(self, frame: VADUserStoppedSpeakingFrame) -> None:
         """On speech stop, record the timestamp for silence gap measurement."""
-        self._last_vad_stop = asyncio.get_running_loop().time()
+        now = asyncio.get_running_loop().time()
+        source = self._frame_source(frame)
+
+        if source is not None:
+            self._speaking_sources.discard(source)
+            if self._speaking_sources:
+                return
+
+        self._last_vad_stop = now
+
+    def _frame_source(self, frame: Frame) -> str | None:
+        if not self._use_frame_source:
+            return None
+        raw = getattr(frame, "source", None) or getattr(frame, "koda_source", None)
+        if not raw:
+            return None
+        return str(raw).strip().lower() or None
 
     # ------------------------------------------------------------------
     # Disk I/O

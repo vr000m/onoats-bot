@@ -15,10 +15,13 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 _SILENCE_TIMEOUT_DEFAULT = 300.0
 _POLL_INTERVAL = 10.0
-# If a VADStarted arrives without a matching VADStopped (STT crash, transport
-# drop), treat the branch as idle after this many seconds of silence on that
-# branch. Guards against wedging the flush coordinator open indefinitely.
-_SPEAKING_STALENESS_SECS = 30.0
+# Minimum floor for the "speaking staleness" heuristic. A branch that emits
+# VADStarted without a matching VADStopped (STT crash, transport drop) is
+# cleared after this many seconds of silence — but never below this floor,
+# and never smaller than the configured silence timeout, so active speakers
+# aren't flushed mid-utterance.
+_SPEAKING_STALENESS_FLOOR = 60.0
+_SPEAKING_STALENESS_MULTIPLIER = 1.5
 
 
 class DualSilenceDetector(FrameProcessor):
@@ -34,6 +37,12 @@ class DualSilenceDetector(FrameProcessor):
         super().__init__(**kwargs)
         self._on_silence_timeout = on_silence_timeout
         self._timeout = silence_timeout if silence_timeout is not None else _SILENCE_TIMEOUT_DEFAULT
+        # Staleness must be >= the silence timeout, otherwise we'd clear an
+        # actively speaking branch before the idle threshold is even reached.
+        self._speaking_staleness = max(
+            _SPEAKING_STALENESS_FLOOR,
+            self._timeout * _SPEAKING_STALENESS_MULTIPLIER,
+        )
         self._poll_interval = poll_interval
         self._last_vad_activity: dict[str, float] = {}
         self._speaking: dict[str, bool] = {}
@@ -106,8 +115,10 @@ class DualSilenceDetector(FrameProcessor):
 
         A branch that emitted VADStarted without a matching VADStopped (STT
         crash, transport drop) would otherwise wedge the coordinator open
-        forever; after ``_SPEAKING_STALENESS_SECS`` with no new VAD activity,
-        treat it as idle.
+        forever; after ``self._speaking_staleness`` seconds with no new VAD
+        activity, treat it as idle. The threshold scales with the configured
+        silence timeout so long monologues and low-timeout configs don't
+        flush active speech mid-utterance.
         """
         if not self._speaking_since:
             return any(self._speaking.values())
@@ -116,7 +127,7 @@ class DualSilenceDetector(FrameProcessor):
             if not self._speaking.get(source, False):
                 continue
             last_activity = self._last_vad_activity.get(source, started_at)
-            if now - max(started_at, last_activity) > _SPEAKING_STALENESS_SECS:
+            if now - max(started_at, last_activity) > self._speaking_staleness:
                 logger.warning(
                     f"DualSilenceDetector: clearing stale speaking state for "
                     f"source={source!r} (no VAD stop for "
