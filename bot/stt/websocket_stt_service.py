@@ -12,16 +12,17 @@ Lifecycle wire mapping (matches docs/dev_plans/20260420-design-whisper-websocket
   ``turn_detection=null``, await ``session.updated``
 - ``run_stt(audio)``       -> ``send_audio`` + ``commit``, wait for
   ``conversation.item.input_audio_transcription.completed``
-- ``process_frame(EndFrame)``    -> graceful ``session.close`` + socket close
-- ``process_frame(CancelFrame)`` -> best-effort ``session.cancel``, then close
+- ``stop(EndFrame)``       -> graceful ``session.close`` + socket close
+- ``cancel(CancelFrame)``  -> best-effort ``session.cancel``, then close;
+  also resolves any in-flight ``_pending`` so ``run_stt`` unwinds promptly
 - ``cleanup()``            -> fallback teardown; takes the cancel path if
   Pipecat is already cancelling so we don't wait out ``session.closed`` on
   a server that's still mid-decode.
 
-``stop(EndFrame)`` / ``cancel(CancelFrame)`` are intentionally NOT
-overridden — neither exists on the ``SegmentedSTTService`` /
-``FrameProcessor`` hierarchy, so the pipeline would never invoke them.
-Frame-driven teardown must happen inside ``process_frame``.
+Both frame-flow (via the pipeline) and direct calls (``bot/dual.py``'s
+shutdown helper calls ``stop(EndFrame)`` directly) are covered because
+the close helpers are idempotent — ``_graceful_close`` / ``_cancel_and_close``
+early-return once ``self._client is None``.
 
 The MLX V1 backend is commit-oriented, so we emit a single finalised
 ``TranscriptionFrame`` per segment. ``InterimTranscriptionFrame`` is a
@@ -42,7 +43,6 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
@@ -128,15 +128,21 @@ class WebSocketSTTService(SegmentedSTTService):
             )
         await self._ensure_connected()
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        # Route EndFrame / CancelFrame through here because SegmentedSTTService
-        # / FrameProcessor have no ``stop(EndFrame)`` or ``cancel(CancelFrame)``
-        # hook — overriding those would silently never run.
-        if isinstance(frame, EndFrame):
-            await self._graceful_close()
-        elif isinstance(frame, CancelFrame):
-            await self._cancel_and_close()
-        await super().process_frame(frame, direction)
+    async def stop(self, frame: EndFrame) -> None:
+        # Pipecat invokes this via the pipeline AND ``bot/dual.py`` calls it
+        # directly during shutdown, bypassing the pipeline. Either way we
+        # must close the websocket session cleanly here — waiting until
+        # cleanup() leaves the socket open for the whole drain window.
+        await self._graceful_close()
+        await super().stop(frame)
+
+    async def cancel(self, frame: CancelFrame) -> None:
+        # Direct cancel() during an in-flight run_stt would otherwise leave
+        # ``_pending`` unresolved until the 90 s decode timeout. The hard
+        # cancel path cancels the pending future and tears the socket down
+        # immediately so run_stt unwinds promptly.
+        await self._cancel_and_close()
+        await super().cancel(frame)
 
     async def cleanup(self) -> None:
         # Called by the pipeline on task teardown. If the pipeline is
