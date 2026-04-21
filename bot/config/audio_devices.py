@@ -29,6 +29,7 @@ from pathlib import Path
 from loguru import logger
 
 LAST_DEVICE_FILE = Path(__file__).parents[2] / ".last_audio_devices"
+LAST_DUAL_DEVICE_FILE = Path(__file__).parents[2] / ".last_dual_audio_devices"
 
 # Pipeline sample rate — 16kHz for Silero VAD compatibility.
 # Silero VAD requires 8kHz or 16kHz. All tested devices support 16kHz.
@@ -40,48 +41,115 @@ PIPELINE_SAMPLE_RATE = 16000
 # ---------------------------------------------------------------------------
 
 
-def validate_audio_device(device_index, label, need_input=False):
-    """Check that a device index exists, has the right channel type,
-    and supports PIPELINE_SAMPLE_RATE.
+def _coerce_device_query(device_query):
+    """Normalize a device query into ``int`` index, ``str`` name, or ``None``."""
+    if device_query is None:
+        return None
+    if isinstance(device_query, int):
+        return device_query if device_query >= 0 else None
+    raw = str(device_query).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return raw
+    return value if value >= 0 else None
 
-    Returns the validated index, or None if the device is unsuitable.
+
+def _device_supports_sample_rate(pa, device_index, *, need_input: bool) -> bool:
+    import pyaudio
+
+    try:
+        if need_input:
+            pa.is_format_supported(
+                PIPELINE_SAMPLE_RATE,
+                input_device=device_index,
+                input_channels=1,
+                input_format=pyaudio.paInt16,
+            )
+        else:
+            pa.is_format_supported(
+                PIPELINE_SAMPLE_RATE,
+                output_device=device_index,
+                output_channels=1,
+                output_format=pyaudio.paInt16,
+            )
+    except ValueError:
+        return False
+    return True
+
+
+def _find_device_by_name(pa, query: str, *, need_input: bool) -> int | None:
+    query_norm = query.casefold()
+    exact_matches: list[int] = []
+    partial_matches: list[int] = []
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        channels = info["maxInputChannels"] if need_input else info["maxOutputChannels"]
+        if channels == 0:
+            continue
+        if not _device_supports_sample_rate(pa, i, need_input=need_input):
+            continue
+        name = str(info["name"])
+        name_norm = name.casefold()
+        if name_norm == query_norm:
+            exact_matches.append(i)
+        elif query_norm in name_norm:
+            partial_matches.append(i)
+
+    matches = exact_matches or partial_matches
+    if not matches:
+        return None
+    if len(matches) > 1:
+        names = ", ".join(str(pa.get_device_info_by_index(idx)["name"]) for idx in matches[:5])
+        logger.warning(
+            f"Device query '{query}' matched multiple devices for "
+            f"{'input' if need_input else 'output'} selection: {names}. Using [{matches[0]}]."
+        )
+    return matches[0]
+
+
+def validate_audio_device(device_query, label, need_input=False):
+    """Resolve a device query and verify it supports the pipeline sample rate.
+
+    ``device_query`` may be:
+    - an integer device index
+    - a numeric string device index
+    - a case-insensitive exact or substring device name
     """
-    if device_index is None or device_index < 0:
+    query = _coerce_device_query(device_query)
+    if query is None:
         return None
     import pyaudio
 
     pa = pyaudio.PyAudio()
     try:
-        if device_index >= pa.get_device_count():
-            logger.warning(f"{label}={device_index} not found, using system default")
-            return None
+        if isinstance(query, int):
+            device_index = query
+            if device_index >= pa.get_device_count():
+                logger.warning(f"{label}={device_index} not found, using system default")
+                return None
+        else:
+            device_index = _find_device_by_name(pa, query, need_input=need_input)
+            if device_index is None:
+                logger.warning(
+                    f"{label}={query!r} not found at {PIPELINE_SAMPLE_RATE}Hz, using system default"
+                )
+                return None
+
         info = pa.get_device_info_by_index(device_index)
         channels = info["maxInputChannels"] if need_input else info["maxOutputChannels"]
         if channels == 0:
             logger.warning(
-                f"{label}={device_index} ({info['name']}) has no "
+                f"{label}={device_query!r} ({info['name']}) has no "
                 f"{'input' if need_input else 'output'} channels, using system default"
             )
             return None
-        # Verify the device supports PIPELINE_SAMPLE_RATE
-        try:
-            if need_input:
-                pa.is_format_supported(
-                    PIPELINE_SAMPLE_RATE,
-                    input_device=device_index,
-                    input_channels=1,
-                    input_format=pyaudio.paInt16,
-                )
-            else:
-                pa.is_format_supported(
-                    PIPELINE_SAMPLE_RATE,
-                    output_device=device_index,
-                    output_channels=1,
-                    output_format=pyaudio.paInt16,
-                )
-        except ValueError:
+
+        if not _device_supports_sample_rate(pa, device_index, need_input=need_input):
             logger.warning(
-                f"{label}={device_index} ({info['name']}) does not support "
+                f"{label}={device_query!r} ({info['name']}) does not support "
                 f"{PIPELINE_SAMPLE_RATE}Hz, using system default"
             )
             return None
@@ -118,11 +186,7 @@ def select_input_device(input_device_env=None):
             return env_in
 
         # Build input device list
-        inputs = []
-        for i in range(pa.get_device_count()):
-            d = pa.get_device_info_by_index(i)
-            if d["maxInputChannels"] > 0:
-                inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+        inputs = _enumerate_input_devices(pa)
 
         # Load last-used input device
         last_in = _load_last_input()
@@ -165,6 +229,83 @@ def select_input_device(input_device_env=None):
         return input_dev
     finally:
         pa.terminate()
+
+
+def select_dual_input_devices(mic_input_env=None, system_input_env=None):
+    """Select separate microphone and system-loopback input devices.
+
+    ``mic_input_env`` and ``system_input_env`` may be indices or stable device
+    names. The dual-input picker persists the last-used device names so the
+    selection remains stable across host-side PortAudio reindexing.
+    """
+    import pyaudio
+
+    pa = pyaudio.PyAudio()
+    try:
+        env_mic = validate_audio_device(mic_input_env, "MIC_INPUT_DEVICE", need_input=True)
+        env_system = validate_audio_device(system_input_env, "SYSTEM_INPUT_DEVICE", need_input=True)
+        if env_mic is not None and env_system is not None:
+            _ensure_distinct_dual_inputs(env_mic, env_system, pa)
+            _log_dual_inputs(pa, env_mic, env_system, env_label="from env")
+            return env_mic, env_system
+
+        inputs = _enumerate_input_devices(pa)
+
+        last_mic_name, last_system_name = _load_last_dual_inputs()
+        last_mic = validate_audio_device(last_mic_name, "last_mic_input", need_input=True)
+        last_system = validate_audio_device(last_system_name, "last_system_input", need_input=True)
+
+        if sys.stdin.isatty():
+            picked_mic, picked_system = _pick_dual_input_devices(
+                inputs,
+                env_mic if env_mic is not None else last_mic,
+                env_system if env_system is not None else last_system,
+                skip_mic=env_mic is not None,
+                skip_system=env_system is not None,
+            )
+        else:
+            picked_mic = env_mic if env_mic is not None else last_mic
+            picked_system = env_system if env_system is not None else last_system
+
+        mic_dev = env_mic if env_mic is not None else picked_mic
+        system_dev = env_system if env_system is not None else picked_system
+
+        if mic_dev is None:
+            mic_dev = int(pa.get_default_input_device_info()["index"])
+        if system_dev is None:
+            raise RuntimeError(
+                "No system loopback input selected. Set SYSTEM_INPUT_DEVICE or run "
+                "`./koda bot-dual` in an interactive terminal to choose one."
+            )
+
+        for dev_idx, label in [
+            (mic_dev, "microphone"),
+            (system_dev, "system"),
+        ]:
+            if not _device_supports_sample_rate(pa, dev_idx, need_input=True):
+                dev_name = pa.get_device_info_by_index(dev_idx)["name"]
+                raise RuntimeError(
+                    f"Audio {label} device [{dev_idx}] {dev_name} does not support "
+                    f"{PIPELINE_SAMPLE_RATE}Hz. Set MIC_INPUT_DEVICE/SYSTEM_INPUT_DEVICE "
+                    f"to compatible devices."
+                )
+
+        _ensure_distinct_dual_inputs(mic_dev, system_dev, pa)
+        _log_dual_inputs(pa, mic_dev, system_dev)
+        _save_last_dual_inputs(pa, mic_dev, system_dev)
+        return mic_dev, system_dev
+    finally:
+        pa.terminate()
+
+
+def _enumerate_input_devices(pa) -> list[tuple[int, str, int]]:
+    """Return ``[(index, name, default_sample_rate), ...]`` for every input device."""
+    inputs: list[tuple[int, str, int]] = []
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if d["maxInputChannels"] > 0:
+            inputs.append((i, d["name"], int(d["defaultSampleRate"])))
+    return inputs
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +518,31 @@ def _save_last_devices(input_dev, output_dev):
         pass
 
 
+def _load_last_dual_inputs():
+    """Read last-used dual-input device names from disk."""
+    if not LAST_DUAL_DEVICE_FILE.exists():
+        return None, None
+    try:
+        parts = LAST_DUAL_DEVICE_FILE.read_text().strip().split("\n")
+        if len(parts) >= 2:
+            mic = parts[0].strip() or None
+            system = parts[1].strip() or None
+            return mic, system
+    except OSError:
+        pass
+    return None, None
+
+
+def _save_last_dual_inputs(pa, mic_dev, system_dev):
+    """Persist dual-input device names so selection survives index drift."""
+    try:
+        mic_name = str(pa.get_device_info_by_index(mic_dev)["name"]).strip()
+        system_name = str(pa.get_device_info_by_index(system_dev)["name"]).strip()
+        LAST_DUAL_DEVICE_FILE.write_text(f"{mic_name}\n{system_name}\n")
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Interactive pickers
 # ---------------------------------------------------------------------------
@@ -481,3 +647,72 @@ def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_
 
     print()
     return input_dev, output_dev
+
+
+def _pick_dual_input_devices(
+    inputs,
+    last_mic,
+    last_system,
+    *,
+    skip_mic: bool = False,
+    skip_system: bool = False,
+):
+    """Interactive picker for separate mic and loopback input devices."""
+
+    def _pick(label, default_idx, *, skip: bool = False):
+        if skip:
+            name = next((n for i, n, _ in inputs if i == default_idx), "?")
+            print(f"{label}: [{default_idx}] {name} (from env)")
+            return default_idx
+
+        print(f"{label} input devices:")
+        for idx, name, _rate in inputs:
+            marker = " *" if idx == default_idx else ""
+            print(f"  [{idx}] {name}{marker}")
+        try:
+            default_label = f" [{default_idx}]" if default_idx is not None else ""
+            choice = input(f"Select {label.lower()} input device{default_label}: ").strip()
+            if choice:
+                picked = int(choice)
+                if not any(d[0] == picked for d in inputs):
+                    print(f"  Invalid device {picked}, using last/default")
+                    return default_idx
+                return picked
+            return default_idx
+        except (ValueError, EOFError, KeyboardInterrupt):
+            return default_idx
+
+    print("\n--- Dual Input Device Selection ---")
+    if last_mic is not None:
+        mic_name = next((n for i, n, _ in inputs if i == last_mic), None)
+        if mic_name:
+            print(f"Last microphone: [{last_mic}] {mic_name}")
+    if last_system is not None:
+        system_name = next((n for i, n, _ in inputs if i == last_system), None)
+        if system_name:
+            print(f"Last system:     [{last_system}] {system_name}")
+    if last_mic is not None or last_system is not None:
+        print("Press Enter to reuse a highlighted device.\n")
+
+    mic_dev = _pick("Microphone", last_mic, skip=skip_mic)
+    print()
+    system_dev = _pick("System", last_system, skip=skip_system)
+    print()
+    return mic_dev, system_dev
+
+
+def _ensure_distinct_dual_inputs(mic_dev: int, system_dev: int, pa) -> None:
+    if mic_dev == system_dev:
+        name = pa.get_device_info_by_index(mic_dev)["name"]
+        raise RuntimeError(
+            "MIC_INPUT_DEVICE and SYSTEM_INPUT_DEVICE resolved to the same input "
+            f"device [{mic_dev}] {name}. Choose separate devices for bot-dual."
+        )
+
+
+def _log_dual_inputs(pa, mic_dev: int, system_dev: int, env_label: str | None = None) -> None:
+    mic_info = pa.get_device_info_by_index(mic_dev)
+    system_info = pa.get_device_info_by_index(system_dev)
+    suffix = f" ({env_label})" if env_label else ""
+    logger.info(f"Mic input:    [{mic_dev}] {mic_info['name']}{suffix}")
+    logger.info(f"System input: [{system_dev}] {system_info['name']}{suffix}")
