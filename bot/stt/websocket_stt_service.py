@@ -169,16 +169,55 @@ class WebSocketSTTService(SegmentedSTTService):
     async def _ensure_connected(self) -> None:
         if self._connected and self._client is not None:
             return
-        client = TranscriptionClient(**self._connect_kwargs)
-        await client.connect()
-        await client.update_session(turn_detection=None, language=self._language)
-        self._client = client
-        self._connected = True
-        self._reader_task = asyncio.create_task(
-            self._read_events(client), name=f"{self.name}:ws_reader"
-        )
+
+        # Close any stale client/reader from a prior (crashed) session so we
+        # don't leak the websocket or race a dying reader with the new one.
+        await self._discard_stale()
+
+        # One quick retry covers the common race where launchd is mid-restart.
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                client = TranscriptionClient(**self._connect_kwargs)
+                await client.connect()
+                await client.update_session(turn_detection=None, language=self._language)
+                self._client = client
+                self._connected = True
+                self._reader_task = asyncio.create_task(
+                    self._read_events(client), name=f"{self.name}:ws_reader"
+                )
+                if attempt > 0:
+                    logger.info("WebSocketSTTService: reconnected on retry")
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    logger.warning(
+                        f"WebSocketSTTService: connect attempt 1 failed ({exc}), retrying"
+                    )
+                    await asyncio.sleep(0.25)
+        assert last_exc is not None
+        raise last_exc
+
+    async def _discard_stale(self) -> None:
+        """Drop a dead client + reader without blocking on a broken socket."""
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reader_task = None
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+        self._client = None
+        self._connected = False
 
     async def _read_events(self, client: TranscriptionClient) -> None:
+        saw_session_closed = False
         try:
             async for ev in client.events():
                 etype = ev.get("type")
@@ -192,6 +231,7 @@ class WebSocketSTTService(SegmentedSTTService):
                     else:
                         logger.warning(f"WebSocketSTTService: server error: {ev}")
                 elif etype == P.EVT_SESSION_CLOSED:
+                    saw_session_closed = True
                     break
                 # Other events (delta, committed, session.updated, status)
                 # are ignored; MLX V1 is commit-oriented.
@@ -203,6 +243,13 @@ class WebSocketSTTService(SegmentedSTTService):
                 self._pending.set_exception(exc)
         finally:
             self._connected = False
+            # If the socket closed (crash or network drop) while a decode was
+            # in flight, fail fast instead of letting run_stt hit its 90 s
+            # timeout. Clean session.closed -> graceful, leave it alone.
+            if not saw_session_closed and self._pending is not None and not self._pending.done():
+                self._pending.set_exception(
+                    ConnectionError("stt_server connection lost mid-decode")
+                )
 
     async def _graceful_close(self) -> None:
         if self._client is None:
