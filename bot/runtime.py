@@ -17,6 +17,7 @@ import asyncio
 import os
 import platform
 import signal
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -113,6 +114,51 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     }
 
 
+def _preflight_stt_ws(kwargs: dict, target: str) -> None:
+    """Fail fast if the stt_server endpoint is not reachable at startup.
+
+    Without this, a missing server manifests as a 30–60 s cascade of
+    VAD-driven connect warnings with no transcription, which is easy to
+    miss in a long log stream. A single clear error up front pointing at
+    ``./koda stt start`` is a lot easier to act on than 20 WARN lines.
+
+    Runtime reconnect during a live session is still handled by
+    ``WebSocketSTTService._ensure_connected`` — this check only runs once
+    before the pipeline starts.
+    """
+    sock_path = kwargs.get("socket_path")
+    host = kwargs.get("host")
+    port = kwargs.get("port")
+
+    hint = (
+        "Start it with: ./koda stt start   (or: scripts/install_stt_agent.sh "
+        "install — only needed once)\n"
+        "Verify with:  ./koda stt status"
+    )
+
+    try:
+        if sock_path:
+            expanded = os.path.expanduser(sock_path)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            try:
+                s.connect(expanded)
+            finally:
+                s.close()
+        elif host and port:
+            with socket.create_connection((host, int(port)), timeout=0.5):
+                pass
+        else:
+            # ws://… URI — skip TCP probe; websockets.asyncio.connect handles
+            # reconnects for us and URIs may encode paths/schemes we don't
+            # want to re-parse here.
+            return
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
+        logger.error(f"STT: stt_server not reachable at {target} ({exc})")
+        logger.error(hint)
+        raise SystemExit(1)
+
+
 def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -132,6 +178,7 @@ def _create_stt_service():
         kwargs = _resolve_stt_ws_target(os.environ)
         target = kwargs["uri"] or kwargs["socket_path"] or f"{kwargs['host']}:{kwargs['port']}"
         logger.info(f"STT: websocket (server={target})")
+        _preflight_stt_ws(kwargs, target)
         return WebSocketSTTService(language="en", **kwargs)
 
     if STT_SERVICE == "deepgram":
