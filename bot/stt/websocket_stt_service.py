@@ -187,6 +187,7 @@ class WebSocketSTTService(SegmentedSTTService):
         await self._discard_stale()
 
         # One quick retry covers the common race where launchd is mid-restart.
+        endpoint = self._endpoint_label()
         last_exc: Exception | None = None
         for attempt in range(2):
             try:
@@ -199,17 +200,30 @@ class WebSocketSTTService(SegmentedSTTService):
                     self._read_events(client), name=f"{self.name}:ws_reader"
                 )
                 if attempt > 0:
-                    logger.info("WebSocketSTTService: reconnected on retry")
+                    logger.info(f"{self.name}: reconnected to {endpoint}")
+                else:
+                    logger.info(f"{self.name}: connected to {endpoint}")
                 return
             except Exception as exc:
                 last_exc = exc
                 if attempt == 0:
                     logger.warning(
-                        f"WebSocketSTTService: connect attempt 1 failed ({exc}), retrying"
+                        f"{self.name}: connect attempt 1 failed ({exc}) [endpoint={endpoint}], "
+                        f"retrying"
                     )
                     await asyncio.sleep(0.25)
         assert last_exc is not None
         raise last_exc
+
+    def _endpoint_label(self) -> str:
+        kw = self._connect_kwargs
+        if kw.get("socket_path"):
+            return f"unix:{kw['socket_path']}"
+        if kw.get("uri"):
+            return kw["uri"]
+        host = kw.get("host") or "127.0.0.1"
+        port = kw.get("port")
+        return f"ws://{host}:{port}" if port else f"ws://{host}"
 
     async def _discard_stale(self) -> None:
         """Drop a dead client + reader without blocking on a broken socket."""
@@ -257,14 +271,21 @@ class WebSocketSTTService(SegmentedSTTService):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(f"WebSocketSTTService: reader crashed: {exc}")
+            logger.warning(f"{self.name}: reader crashed: {exc}")
             if self._pending and not self._pending.done():
                 self._pending.set_exception(exc)
         finally:
+            was_connected = self._connected
             self._connected = False
-            # If the socket closed (crash or network drop) while a decode was
-            # in flight, fail fast instead of letting run_stt hit its 90 s
-            # timeout. Clean session.closed -> graceful, leave it alone.
+            if saw_session_closed:
+                logger.info(f"{self.name}: session closed cleanly by server")
+            elif was_connected:
+                # Socket dropped without a graceful session.closed — server
+                # crash, launchd restart, or network blip. Next run_stt will
+                # trigger _ensure_connected and we'll log a reconnect there.
+                logger.warning(f"{self.name}: connection lost (no session.closed received)")
+            # If the socket closed while a decode was in flight, fail fast
+            # instead of letting run_stt hit its 90 s timeout.
             if not saw_session_closed and self._pending is not None and not self._pending.done():
                 self._pending.set_exception(
                     ConnectionError("stt_server connection lost mid-decode")
