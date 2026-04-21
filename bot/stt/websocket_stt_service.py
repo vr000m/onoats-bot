@@ -225,7 +225,14 @@ class WebSocketSTTService(SegmentedSTTService):
                     if self._pending and not self._pending.done():
                         self._pending.set_result(ev.get("transcript", ""))
                 elif etype == P.EVT_ERROR:
-                    msg = ev.get("message") or ev.get("code") or "stt_server error"
+                    err = ev.get("error") or {}
+                    msg = (
+                        err.get("message")
+                        or err.get("code")
+                        or ev.get("message")
+                        or ev.get("code")
+                        or "stt_server error"
+                    )
                     if self._pending and not self._pending.done():
                         self._pending.set_exception(RuntimeError(msg))
                     else:
