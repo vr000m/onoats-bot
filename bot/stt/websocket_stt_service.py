@@ -34,6 +34,7 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
 
@@ -71,8 +72,19 @@ class WebSocketSTTService(SegmentedSTTService):
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
-        # so StartFrame cannot silently bump us off-rate.
-        super().__init__(sample_rate=P.AUDIO_SAMPLE_RATE_HZ, **kwargs)
+        # so StartFrame cannot silently bump us off-rate. Supply model +
+        # language explicitly so STTSettings.validate_complete() doesn't
+        # log NOT_GIVEN errors — the server pins the model via launchd env,
+        # we just carry a tag for metrics.
+        settings = kwargs.pop("settings", None) or STTSettings(
+            model="whisper-large-v3-turbo",
+            language=language,
+        )
+        super().__init__(
+            sample_rate=P.AUDIO_SAMPLE_RATE_HZ,
+            settings=settings,
+            **kwargs,
+        )
         self._connect_kwargs = dict(
             socket_path=socket_path,
             host=host,

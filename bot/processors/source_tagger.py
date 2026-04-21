@@ -35,7 +35,11 @@ def _rewrap_vad(
         if isinstance(frame, VADUserStartedSpeakingFrame)
         else BranchVADUserStoppedSpeakingFrame
     )
-    kwargs = {f.name: getattr(frame, f.name) for f in fields(frame) if hasattr(frame, f.name)}
+    # Frame.id / broadcast_sibling_id are init=False; skip them or the
+    # subclass constructor rejects them as unexpected kwargs.
+    kwargs = {
+        f.name: getattr(frame, f.name) for f in fields(frame) if f.init and hasattr(frame, f.name)
+    }
     kwargs["source"] = source
     kwargs["source_order"] = source_order
     try:
