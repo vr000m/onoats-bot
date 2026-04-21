@@ -83,6 +83,29 @@ def _create_stt_service():
     Returns a pipecat STT service instance. Prefers Whisper MLX on Apple Silicon,
     falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
     """
+    if STT_SERVICE == "websocket":
+        from bot.stt.websocket_stt_service import WebSocketSTTService
+
+        socket_path = os.getenv("STT_WS_SOCKET", "").strip() or None
+        host = os.getenv("STT_WS_HOST", "").strip() or None
+        port_raw = os.getenv("STT_WS_PORT", "").strip()
+        port = int(port_raw) if port_raw else None
+        uri = os.getenv("STT_WS_URI", "").strip() or None
+        auth_token = os.getenv("STT_WS_TOKEN", "").strip() or None
+        if not (socket_path or host or uri):
+            # Sensible local default aligned with stt_server's UDS default.
+            socket_path = os.getenv("STT_WS_DEFAULT_SOCKET", "/tmp/koda-stt.sock")
+        target = socket_path or uri or f"{host}:{port}"
+        logger.info(f"STT: websocket (server={target})")
+        return WebSocketSTTService(
+            socket_path=socket_path,
+            host=host,
+            port=port,
+            uri=uri,
+            auth_token=auth_token,
+            language="en",
+        )
+
     if STT_SERVICE == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
 
