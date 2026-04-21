@@ -311,6 +311,15 @@ class WebSocketSTTService(SegmentedSTTService):
                 if etype == P.EVT_TRANSCRIPT_COMPLETED:
                     if self._pending and not self._pending.done():
                         self._pending.set_result(ev.get("transcript", ""))
+                elif etype == P.EVT_TRANSCRIPT_FAILED:
+                    err = ev.get("error") or {}
+                    msg = err.get("message") or err.get("code") or "stt_server transcription failed"
+                    if self._pending and not self._pending.done():
+                        self._pending.set_exception(RuntimeError(msg))
+                    else:
+                        logger.warning(
+                            f"{self.name}: transcription failed with no pending decode: {ev}"
+                        )
                 elif etype == P.EVT_ERROR:
                     err = ev.get("error") or {}
                     msg = (
