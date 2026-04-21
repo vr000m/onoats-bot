@@ -38,6 +38,16 @@ BOT_NAME = "Koda"
 STT_SERVICE = os.getenv("STT_SERVICE", "whisper").lower().strip()
 STT_MODEL = os.getenv("STT_MODEL", "").strip()
 
+
+class SttPreflightError(RuntimeError):
+    """Raised when the stt_server endpoint is not reachable at startup.
+
+    Caught at the CLI entrypoints (``bot/__main__.py``, ``bot/dual.py``) so
+    the user sees the actionable hint — not a Python traceback — when the
+    LaunchAgent isn't loaded.
+    """
+
+
 PIPELINE_SAMPLE_RATE = 16000  # Silero VAD requires 8kHz or 16kHz; 16kHz is standard
 
 PID_FILENAME = "koda.pid"
@@ -156,7 +166,9 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
             # want to re-parse here.
             return
     except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
-        raise RuntimeError(f"STT: stt_server not reachable at {target} ({exc}). {hint}") from exc
+        raise SttPreflightError(
+            f"STT: stt_server not reachable at {target} ({exc}). {hint}"
+        ) from exc
 
 
 def _create_stt_service():

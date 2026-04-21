@@ -44,6 +44,7 @@ from bot.runtime import (  # noqa: E402
     PIPELINE_SAMPLE_RATE,
     STT_MODEL,
     STT_SERVICE,
+    SttPreflightError,
     _remove_pid_file,
     _create_stt_service,
     _install_signal_handlers,
@@ -446,4 +447,8 @@ if __name__ == "__main__":
             )
             sys.exit(1)
         args.category = cat
-    asyncio.run(run_koda_dual(live_terminal=args.live_terminal, locked_category=args.category))
+    try:
+        asyncio.run(run_koda_dual(live_terminal=args.live_terminal, locked_category=args.category))
+    except SttPreflightError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        sys.exit(1)
