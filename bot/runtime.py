@@ -20,6 +20,7 @@ import signal
 import socket
 import sys
 import threading
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -139,6 +140,7 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     sock_path = kwargs.get("socket_path")
     host = kwargs.get("host")
     port = kwargs.get("port")
+    uri = kwargs.get("uri")
 
     hint = (
         "Start it with: ./koda stt start   (or: scripts/install_stt_agent.sh "
@@ -160,10 +162,24 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
         elif host and port is not None:
             with socket.create_connection((host, int(port)), timeout=0.5):
                 pass
+        elif uri:
+            # Parse ws://host[:port]/... or wss://... and TCP-probe so an
+            # STT_WS_URI override gets the same fail-fast treatment as the
+            # socket_path / host+port modes instead of silently deferring
+            # to the lazy websockets reconnect path.
+            parsed = urllib.parse.urlsplit(uri)
+            scheme = parsed.scheme.lower()
+            uri_host = parsed.hostname
+            uri_port = parsed.port
+            if uri_port is None:
+                uri_port = 443 if scheme == "wss" else 80
+            if not uri_host:
+                # Malformed URI — let the real client surface the error so
+                # we don't invent a misleading preflight diagnostic.
+                return
+            with socket.create_connection((uri_host, int(uri_port)), timeout=0.5):
+                pass
         else:
-            # ws://… URI — skip TCP probe; websockets.asyncio.connect handles
-            # reconnects for us and URIs may encode paths/schemes we don't
-            # want to re-parse here.
             return
     except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
         raise SttPreflightError(
