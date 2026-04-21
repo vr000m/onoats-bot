@@ -49,6 +49,9 @@ _DECODE_TIMEOUT_SECONDS = 90.0
 # Bounded wait for session.close to be acknowledged on pipeline shutdown.
 _CLOSE_TIMEOUT_SECONDS = 5.0
 
+# Bounded wait for session.updated after session.update.
+_SESSION_READY_TIMEOUT_SECONDS = 5.0
+
 
 class WebSocketSTTService(SegmentedSTTService):
     """STTService that forwards VAD-delimited audio to the stt_server.
@@ -96,6 +99,10 @@ class WebSocketSTTService(SegmentedSTTService):
         self._client: Optional[TranscriptionClient] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._pending: Optional[asyncio.Future[str]] = None
+        # Resolved by the reader when a session.updated or error event arrives
+        # after session.update; _ensure_connected awaits this before returning
+        # so the first commit cannot race the language config.
+        self._session_ready: Optional[asyncio.Future[None]] = None
         self._run_stt_lock = asyncio.Lock()
         self._connected = False
 
@@ -154,11 +161,16 @@ class WebSocketSTTService(SegmentedSTTService):
                 try:
                     text = await asyncio.wait_for(self._pending, timeout=_DECODE_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError:
-                    logger.warning("WebSocketSTTService: decode timed out waiting for completed")
+                    # The server is still decoding; a late completed would
+                    # otherwise resolve the NEXT segment's pending future with
+                    # stale text (no item_id correlation in V1). Drop the
+                    # socket so the next run_stt reconnects cleanly.
+                    logger.warning(f"{self.name}: decode timed out — resetting connection")
+                    await self._discard_stale()
                     yield ErrorFrame(error="stt_server decode timed out")
                     return
             except Exception as exc:
-                logger.warning(f"WebSocketSTTService: decode failed: {exc}")
+                logger.warning(f"{self.name}: decode failed: {exc}")
                 yield ErrorFrame(error=f"stt_server decode failed: {exc}")
                 return
             finally:
@@ -193,12 +205,23 @@ class WebSocketSTTService(SegmentedSTTService):
             try:
                 client = TranscriptionClient(**self._connect_kwargs)
                 await client.connect()
-                await client.update_session(turn_detection=None, language=self._language)
+                loop = asyncio.get_running_loop()
+                self._session_ready = loop.create_future()
                 self._client = client
                 self._connected = True
+                # Start reader BEFORE update_session so the session.updated /
+                # error response is routed into _session_ready instead of
+                # sitting unread in the socket buffer.
                 self._reader_task = asyncio.create_task(
                     self._read_events(client), name=f"{self.name}:ws_reader"
                 )
+                await client.update_session(turn_detection=None, language=self._language)
+                try:
+                    await asyncio.wait_for(
+                        self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError("stt_server did not ack session.update")
                 if attempt > 0:
                     logger.info(f"{self.name}: reconnected to {endpoint}")
                 else:
@@ -259,15 +282,23 @@ class WebSocketSTTService(SegmentedSTTService):
                         or ev.get("code")
                         or "stt_server error"
                     )
+                    exc = RuntimeError(msg)
+                    # Route the error to whichever future is still waiting;
+                    # errors before session.updated fail the connect path.
+                    if self._session_ready is not None and not self._session_ready.done():
+                        self._session_ready.set_exception(exc)
                     if self._pending and not self._pending.done():
-                        self._pending.set_exception(RuntimeError(msg))
-                    else:
-                        logger.warning(f"WebSocketSTTService: server error: {ev}")
+                        self._pending.set_exception(exc)
+                    elif self._session_ready is None or self._session_ready.done():
+                        logger.warning(f"{self.name}: server error: {ev}")
+                elif etype == P.EVT_SESSION_UPDATED:
+                    if self._session_ready is not None and not self._session_ready.done():
+                        self._session_ready.set_result(None)
                 elif etype == P.EVT_SESSION_CLOSED:
                     saw_session_closed = True
                     break
-                # Other events (delta, committed, session.updated, status)
-                # are ignored; MLX V1 is commit-oriented.
+                # Other events (delta, committed, status) are ignored;
+                # MLX V1 is commit-oriented.
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
