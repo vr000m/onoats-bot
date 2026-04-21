@@ -23,6 +23,14 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from bot.frames import resolve_frame_source
+
+# Reserved source key used in dual mode when a VAD frame arrives without
+# a branch tag. Treating it as a distinct source keeps it inside the
+# gating set so ``_last_vad_stop`` isn't overwritten while a tagged
+# branch is still mid-utterance.
+_UNTAGGED_SOURCE = "_untagged"
+
 # ---------------------------------------------------------------------------
 # Config (from environment with sensible defaults)
 # ---------------------------------------------------------------------------
@@ -253,11 +261,7 @@ class TranscriptBuffer(FrameProcessor):
         source_order = None
         branch_sequence = None
         if self._use_frame_source:
-            # Prefer the namespaced ``koda_source`` attribute written by
-            # SourceTagger; fall back to Pipecat's standard ``user_id`` field
-            # so STT services that diarize natively still flow through.
-            raw_source = getattr(frame, "koda_source", None) or getattr(frame, "user_id", None)
-            source = str(raw_source).strip().lower() if raw_source else None
+            source = resolve_frame_source(frame)
             raw_source_order = getattr(frame, "koda_source_order", None)
             if isinstance(raw_source_order, int):
                 source_order = raw_source_order
@@ -325,10 +329,11 @@ class TranscriptBuffer(FrameProcessor):
     def _frame_source(self, frame: Frame) -> str | None:
         if not self._use_frame_source:
             return None
-        raw = getattr(frame, "source", None) or getattr(frame, "koda_source", None)
-        if not raw:
-            return None
-        return str(raw).strip().lower() or None
+        # In dual mode, every VAD frame must participate in the gating
+        # set — untagged ones get a reserved key so they can't bypass
+        # ``_speaking_sources`` and spuriously advance ``_last_vad_stop``
+        # while a tagged branch is still mid-utterance.
+        return resolve_frame_source(frame) or _UNTAGGED_SOURCE
 
     # ------------------------------------------------------------------
     # Disk I/O

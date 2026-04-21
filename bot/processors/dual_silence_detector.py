@@ -13,6 +13,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from bot.frames import resolve_frame_source
+
 _SILENCE_TIMEOUT_DEFAULT = 300.0
 _POLL_INTERVAL = 10.0
 # Minimum floor for the "speaking staleness" heuristic. A branch that emits
@@ -53,14 +55,7 @@ class DualSilenceDetector(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
-        # Prefer branch-aware first-class `source`; fall back to legacy
-        # dynamic attributes to stay compatible with older frame paths.
-        source = str(
-            getattr(frame, "source", None)
-            or getattr(frame, "koda_source", "")
-            or getattr(frame, "user_id", "")
-            or ""
-        ).strip()
+        source = resolve_frame_source(frame)
         if source:
             if isinstance(frame, VADUserStartedSpeakingFrame):
                 self._on_speech_start(source)
@@ -76,7 +71,10 @@ class DualSilenceDetector(FrameProcessor):
             self._monitoring_loop(),
             name="dual_silence_detector_monitor",
         )
-        logger.info("DualSilenceDetector: monitoring task started")
+        logger.info(
+            f"DualSilenceDetector: monitoring task started "
+            f"(timeout={self._timeout}s, speaking_staleness={self._speaking_staleness}s)"
+        )
 
     async def stop_monitoring(self) -> None:
         if self._monitor_task is None:
