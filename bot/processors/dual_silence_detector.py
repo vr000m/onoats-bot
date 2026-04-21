@@ -133,6 +133,14 @@ class DualSilenceDetector(FrameProcessor):
                 )
                 self._speaking[source] = False
                 self._speaking_since.pop(source, None)
+                # Reset the activity clock to *now* so _check_timeout does not
+                # compare against a stale VADStarted timestamp from minutes
+                # ago. Without this, a long uninterrupted utterance that
+                # trips the staleness floor would immediately appear as
+                # ``elapsed > self._timeout`` and flush mid-utterance. After
+                # the clear, the branch gets a fresh silence window before
+                # any timeout can fire.
+                self._last_vad_activity[source] = now
         return any(self._speaking.values())
 
     async def _monitoring_loop(self) -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import fields
 
+from loguru import logger
+
 from pipecat.frames.frames import (
     Frame,
     TranscriptionFrame,
@@ -38,9 +40,14 @@ def _rewrap_vad(
     kwargs["source_order"] = source_order
     try:
         return cls(**kwargs)
-    except TypeError:
-        # Fall back to the original frame if Pipecat's frame shape ever diverges;
-        # the downstream silence detector has a legacy attribute fallback too.
+    except TypeError as exc:
+        # Surface the incompatibility so a future Pipecat frame-shape change
+        # doesn't silently degrade branch tagging. Fall back to attribute-level
+        # tagging so the downstream resolver still sees a source.
+        logger.warning(
+            f"SourceTagger: could not rewrap {type(frame).__name__} as "
+            f"{cls.__name__} ({exc}); falling back to attribute tagging"
+        )
         setattr(frame, "source", source)
         setattr(frame, "source_order", source_order)
         return frame

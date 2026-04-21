@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pipecat.frames.frames import Frame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from bot.frames import resolve_frame_source
+
 
 def _display_label(source: str) -> str:
     return "Me" if source == "me" else "Them" if source == "them" else source
@@ -21,7 +23,7 @@ class LiveTerminalRenderer(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             text = (frame.text or "").strip()
             finalized = getattr(frame, "finalized", True)
-            source = str(getattr(frame, "user_id", "") or "").strip().lower()
+            source = resolve_frame_source(frame)
             if finalized and text and source:
                 stamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
                 print(f"[{stamp}] {_display_label(source)}: {text}", flush=True)

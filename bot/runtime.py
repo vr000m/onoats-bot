@@ -53,7 +53,10 @@ _MLX_MODEL_MAP: dict[str, str] = {
 }
 
 # Shared across entrypoints: topic-pipeline tasks spawned during
-# post-processing. Drained on shutdown.
+# post-processing. Drained on shutdown. Assumes ``bot/__main__.py`` and
+# ``bot/dual.py`` are mutually exclusive within a single process — both
+# entrypoints drain this set, so running them side-by-side would have them
+# cancelling each other's tasks on shutdown.
 _topic_pipeline_tasks: set[asyncio.Task] = set()
 
 

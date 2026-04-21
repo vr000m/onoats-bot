@@ -41,6 +41,7 @@ load_dotenv(os.path.expanduser("~/.secrets/ai.env"), override=False)
 
 from bot.runtime import (  # noqa: E402
     BOT_NAME,
+    PIPELINE_SAMPLE_RATE,
     STT_MODEL,
     STT_SERVICE,
     _remove_pid_file,
@@ -230,12 +231,11 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         silence_timeout=silence_timeout_sec,
     )
 
-    pipeline_sample_rate = 16000
     mic_transport = LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=False,
-            audio_in_sample_rate=pipeline_sample_rate,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
             input_device_index=mic_dev,
         )
     )
@@ -243,13 +243,13 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=False,
-            audio_in_sample_rate=pipeline_sample_rate,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
             input_device_index=system_dev,
         )
     )
 
-    mic_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=pipeline_sample_rate))
-    system_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=pipeline_sample_rate))
+    mic_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
+    system_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
     mic_stt = _create_stt_service()
     system_stt = _create_stt_service()
 
@@ -286,6 +286,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     pid_path = _write_pid_file(data_dir)
 
     shutdown_done = False
+    old_terminal_settings: object | None = None
 
     async def _wait_or_force(coro_or_future, label: str) -> None:
         wait_task = asyncio.ensure_future(coro_or_future)
@@ -343,6 +344,12 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()
+
+        # Restore terminal and remove PID file inside the ``shutdown_done``
+        # guard so the two call sites (_shutdown_watcher and the outer
+        # ``finally`` block) are truly idempotent regardless of ordering.
+        _restore_terminal(old_terminal_settings)
+        _remove_pid_file(pid_path)
         logger.info("Shutdown: complete")
 
     async def _shutdown_watcher() -> None:
@@ -375,8 +382,6 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         await runner.run(task)
     finally:
         await _on_shutdown()
-        _restore_terminal(old_terminal_settings)
-        _remove_pid_file(pid_path)
 
 
 def _parse_args() -> argparse.Namespace:
