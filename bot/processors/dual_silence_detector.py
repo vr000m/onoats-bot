@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Callable, Optional
 
 from loguru import logger
@@ -14,19 +13,12 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-_SILENCE_TIMEOUT_DEFAULT = 300
+_SILENCE_TIMEOUT_DEFAULT = 300.0
 _POLL_INTERVAL = 10.0
 # If a VADStarted arrives without a matching VADStopped (STT crash, transport
 # drop), treat the branch as idle after this many seconds of silence on that
 # branch. Guards against wedging the flush coordinator open indefinitely.
 _SPEAKING_STALENESS_SECS = 30.0
-
-
-def _silence_timeout() -> float:
-    try:
-        return float(os.environ.get("SILENCE_TIMEOUT_SEC", _SILENCE_TIMEOUT_DEFAULT))
-    except ValueError:
-        return float(_SILENCE_TIMEOUT_DEFAULT)
 
 
 class DualSilenceDetector(FrameProcessor):
@@ -41,7 +33,7 @@ class DualSilenceDetector(FrameProcessor):
     ):
         super().__init__(**kwargs)
         self._on_silence_timeout = on_silence_timeout
-        self._timeout = silence_timeout if silence_timeout is not None else _silence_timeout()
+        self._timeout = silence_timeout if silence_timeout is not None else _SILENCE_TIMEOUT_DEFAULT
         self._poll_interval = poll_interval
         self._last_vad_activity: dict[str, float] = {}
         self._speaking: dict[str, bool] = {}

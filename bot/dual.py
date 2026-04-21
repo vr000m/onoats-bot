@@ -30,7 +30,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from bot.__main__ import (
+from bot.runtime import (
     BOT_NAME,
     STT_MODEL,
     STT_SERVICE,
