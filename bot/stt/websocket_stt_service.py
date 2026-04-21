@@ -12,8 +12,16 @@ Lifecycle wire mapping (matches docs/dev_plans/20260420-design-whisper-websocket
   ``turn_detection=null``, await ``session.updated``
 - ``run_stt(audio)``       -> ``send_audio`` + ``commit``, wait for
   ``conversation.item.input_audio_transcription.completed``
-- ``CancelFrame``          -> best-effort ``session.cancel``, then close
-- ``cleanup()``            -> ``session.close`` + socket close
+- ``process_frame(EndFrame)``    -> graceful ``session.close`` + socket close
+- ``process_frame(CancelFrame)`` -> best-effort ``session.cancel``, then close
+- ``cleanup()``            -> fallback teardown; takes the cancel path if
+  Pipecat is already cancelling so we don't wait out ``session.closed`` on
+  a server that's still mid-decode.
+
+``stop(EndFrame)`` / ``cancel(CancelFrame)`` are intentionally NOT
+overridden — neither exists on the ``SegmentedSTTService`` /
+``FrameProcessor`` hierarchy, so the pipeline would never invoke them.
+Frame-driven teardown must happen inside ``process_frame``.
 
 The MLX V1 backend is commit-oriented, so we emit a single finalised
 ``TranscriptionFrame`` per segment. ``InterimTranscriptionFrame`` is a
@@ -34,6 +42,7 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
@@ -119,19 +128,26 @@ class WebSocketSTTService(SegmentedSTTService):
             )
         await self._ensure_connected()
 
-    async def stop(self, frame: EndFrame) -> None:
-        await super().stop(frame)
-        await self._graceful_close()
-
-    async def cancel(self, frame: CancelFrame) -> None:
-        await super().cancel(frame)
-        await self._cancel_and_close()
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        # Route EndFrame / CancelFrame through here because SegmentedSTTService
+        # / FrameProcessor have no ``stop(EndFrame)`` or ``cancel(CancelFrame)``
+        # hook — overriding those would silently never run.
+        if isinstance(frame, EndFrame):
+            await self._graceful_close()
+        elif isinstance(frame, CancelFrame):
+            await self._cancel_and_close()
+        await super().process_frame(frame, direction)
 
     async def cleanup(self) -> None:
-        # Called by the pipeline on task teardown even when the bot skips
-        # a clean EndFrame (e.g. Ctrl+C paths). Idempotent.
+        # Called by the pipeline on task teardown. If the pipeline is
+        # cancelling (Ctrl+C / CancelFrame), don't wait out session.closed
+        # — the server may still be mid-decode and would burn the full
+        # 5 s timeout. Use the hard cancel path instead.
         try:
-            await self._graceful_close()
+            if getattr(self, "_cancelling", False):
+                await self._cancel_and_close()
+            else:
+                await self._graceful_close()
         finally:
             await super().cleanup()
 
@@ -142,18 +158,27 @@ class WebSocketSTTService(SegmentedSTTService):
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         if not audio:
             return
-        try:
-            await self._ensure_connected()
-        except Exception as exc:
-            logger.warning(f"WebSocketSTTService: connect failed: {exc}")
-            yield ErrorFrame(error=f"stt_server connect failed: {exc}")
-            return
-
-        assert self._client is not None
 
         async with self._run_stt_lock:
+            # Keep _ensure_connected inside the lock so two racing run_stt
+            # calls can't each spawn their own reader task on the same
+            # _client. SegmentedSTTService is single-segment-at-a-time by
+            # VAD design, but pipeline cancel boundaries can still race.
+            try:
+                await self._ensure_connected()
+            except Exception as exc:
+                logger.warning(f"WebSocketSTTService: connect failed: {exc}")
+                yield ErrorFrame(error=f"stt_server connect failed: {exc}")
+                return
+
+            assert self._client is not None
             loop = asyncio.get_running_loop()
             self._pending = loop.create_future()
+            # Scale the decode timeout with audio length so long VAD turns
+            # (the server accepts up to MAX_UNCOMMITTED_SECONDS ≈ 300 s)
+            # don't trip the client while the server is still decoding.
+            audio_seconds = len(audio) / (P.AUDIO_SAMPLE_RATE_HZ * P.AUDIO_SAMPLE_WIDTH_BYTES)
+            decode_timeout = max(_DECODE_TIMEOUT_SECONDS, 1.5 * audio_seconds)
             try:
                 await self.start_processing_metrics()
                 # Chunk under MAX_APPEND_BYTES (1 MiB) so long VAD turns
@@ -164,7 +189,7 @@ class WebSocketSTTService(SegmentedSTTService):
                     await self._client.send_audio(audio[i : i + chunk])
                 await self._client.commit()
                 try:
-                    text = await asyncio.wait_for(self._pending, timeout=_DECODE_TIMEOUT_SECONDS)
+                    text = await asyncio.wait_for(self._pending, timeout=decode_timeout)
                 except asyncio.TimeoutError:
                     # The server is still decoding; a late completed would
                     # otherwise resolve the NEXT segment's pending future with
