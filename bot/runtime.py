@@ -77,12 +77,63 @@ def _mlx_available() -> bool:
         return False
 
 
+def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
+    """Resolve STT_WS_* env vars into the kwargs for ``WebSocketSTTService``.
+
+    Enforces documented precedence ``STT_WS_URI > STT_WS_SOCKET > HOST+PORT``
+    by zeroing lower-priority fields when a higher-priority one is set —
+    ``TranscriptionClient.connect()`` otherwise prefers ``socket_path``
+    whenever it is set, silently ignoring a URI override.
+    """
+    socket_path = (env.get("STT_WS_SOCKET") or "").strip() or None
+    host = (env.get("STT_WS_HOST") or "").strip() or None
+    port_raw = (env.get("STT_WS_PORT") or "").strip()
+    port: Optional[int] = int(port_raw) if port_raw else None
+    uri = (env.get("STT_WS_URI") or "").strip() or None
+    auth_token = (env.get("STT_WS_TOKEN") or "").strip() or None
+
+    if not (socket_path or host or uri):
+        default_sock = os.path.expanduser("~/Library/Caches/koda-stt/stt.sock")
+        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or default_sock
+
+    if uri:
+        socket_path = None
+        host = None
+        port = None
+    elif socket_path:
+        host = None
+        port = None
+
+    return {
+        "socket_path": socket_path,
+        "host": host,
+        "port": port,
+        "uri": uri,
+        "auth_token": auth_token,
+    }
+
+
 def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
     Returns a pipecat STT service instance. Prefers Whisper MLX on Apple Silicon,
     falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
     """
+    if STT_SERVICE == "websocket":
+        try:
+            from bot.stt.websocket_stt_service import WebSocketSTTService
+        except ImportError as exc:
+            raise RuntimeError(
+                "STT_SERVICE=websocket requires the 'websockets' package. "
+                "Install via `uv sync --extra stt-server-client` "
+                f"(or add websockets to the root deps). Original error: {exc}"
+            ) from exc
+
+        kwargs = _resolve_stt_ws_target(os.environ)
+        target = kwargs["uri"] or kwargs["socket_path"] or f"{kwargs['host']}:{kwargs['port']}"
+        logger.info(f"STT: websocket (server={target})")
+        return WebSocketSTTService(language="en", **kwargs)
+
     if STT_SERVICE == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
 
