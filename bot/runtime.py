@@ -89,32 +89,35 @@ def _mlx_available() -> bool:
         return False
 
 
+_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
+
+
 def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     """Resolve STT_WS_* env vars into the kwargs for ``WebSocketSTTService``.
 
-    Enforces documented precedence ``STT_WS_URI > STT_WS_SOCKET > HOST+PORT``
-    by zeroing lower-priority fields when a higher-priority one is set —
-    ``TranscriptionClient.connect()`` otherwise prefers ``socket_path``
-    whenever it is set, silently ignoring a URI override.
+    Delegates precedence handling to ``stt_server.client.resolve_endpoint_from_env``
+    and layers on the Koda-specific default socket plus the ``STT_WS_TOKEN``
+    bearer read. When operators point at a cleartext remote host, warn
+    before attaching the token so a passive on-path observer cannot
+    silently capture it.
     """
-    socket_path = (env.get("STT_WS_SOCKET") or "").strip() or None
-    host = (env.get("STT_WS_HOST") or "").strip() or None
-    port_raw = (env.get("STT_WS_PORT") or "").strip()
-    port: Optional[int] = int(port_raw) if port_raw else None
-    uri = (env.get("STT_WS_URI") or "").strip() or None
+    from stt_server.client import is_cleartext_remote, resolve_endpoint_from_env
+
+    resolved = resolve_endpoint_from_env(env)
+    socket_path = resolved["socket_path"]
+    host = resolved["host"]
+    port = resolved["port"]
+    uri = resolved["uri"]
     auth_token = (env.get("STT_WS_TOKEN") or "").strip() or None
 
     if not (socket_path or host or uri):
-        default_sock = os.path.expanduser("~/Library/Caches/koda-stt/stt.sock")
-        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or default_sock
+        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(_DEFAULT_STT_WS_SOCKET)
 
-    if uri:
-        socket_path = None
-        host = None
-        port = None
-    elif socket_path:
-        host = None
-        port = None
+    if auth_token and uri and is_cleartext_remote(uri):
+        logger.warning(
+            f"STT: STT_WS_TOKEN will be sent in cleartext to {uri}. "
+            "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
+        )
 
     return {
         "socket_path": socket_path,
@@ -147,22 +150,15 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
         "install — only needed once). Verify with: ./koda stt status"
     )
 
+    # Probe order matches the client's precedence (uri > socket_path >
+    # host+port) so the preflight tests exactly the endpoint the runtime
+    # will connect to — even if a future caller passes a non-normalized
+    # kwargs dict with multiple fields set.
     # ``port is not None`` rather than ``port`` — port=0 is not a valid WS
     # endpoint but would be falsy and silently skip the probe, defeating
     # fail-fast when the caller misconfigured host+port.
     try:
-        if sock_path:
-            expanded = os.path.expanduser(sock_path)
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            try:
-                s.connect(expanded)
-            finally:
-                s.close()
-        elif host and port is not None:
-            with socket.create_connection((host, int(port)), timeout=0.5):
-                pass
-        elif uri:
+        if uri:
             # Parse ws://host[:port]/... or wss://... and TCP-probe so an
             # STT_WS_URI override gets the same fail-fast treatment as the
             # socket_path / host+port modes instead of silently deferring
@@ -178,6 +174,17 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
                 # we don't invent a misleading preflight diagnostic.
                 return
             with socket.create_connection((uri_host, int(uri_port)), timeout=0.5):
+                pass
+        elif sock_path:
+            expanded = os.path.expanduser(sock_path)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            try:
+                s.connect(expanded)
+            finally:
+                s.close()
+        elif host and port is not None:
+            with socket.create_connection((host, int(port)), timeout=0.5):
                 pass
         else:
             return
