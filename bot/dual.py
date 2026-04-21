@@ -285,7 +285,8 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     )
     pid_path = _write_pid_file(data_dir)
 
-    shutdown_done = False
+    shutdown_started = False
+    shutdown_complete = asyncio.Event()
     old_terminal_settings: object | None = None
 
     async def _wait_or_force(coro_or_future, label: str) -> None:
@@ -309,11 +310,20 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         await _wait_or_force(asyncio.gather(*tasks, return_exceptions=True), label)
 
     async def _on_shutdown() -> None:
-        nonlocal shutdown_done
-        if shutdown_done:
+        nonlocal shutdown_started
+        if shutdown_started:
+            # Second caller: wait for the first to finish so we don't
+            # return early and let the event loop tear down in-flight
+            # post-processing tasks.
+            await shutdown_complete.wait()
             return
-        shutdown_done = True
+        shutdown_started = True
+        try:
+            await _run_shutdown()
+        finally:
+            shutdown_complete.set()
 
+    async def _run_shutdown() -> None:
         logger.info("Shutdown: graceful dual-input shutdown started. Press Ctrl+C again to force.")
         await silence_detector.stop_monitoring()
 
@@ -345,9 +355,9 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()
 
-        # Restore terminal and remove PID file inside the ``shutdown_done``
-        # guard so the two call sites (_shutdown_watcher and the outer
-        # ``finally`` block) are truly idempotent regardless of ordering.
+        # Restore terminal and remove PID file inside the single-writer
+        # shutdown path so the two call sites (_shutdown_watcher and the
+        # outer ``finally`` block) are truly idempotent regardless of ordering.
         _restore_terminal(old_terminal_settings)
         _remove_pid_file(pid_path)
         logger.info("Shutdown: complete")
