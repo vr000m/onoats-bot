@@ -17,10 +17,8 @@ import asyncio
 import os
 import platform
 import signal
-import socket
 import sys
 import threading
-import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -101,7 +99,11 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     before attaching the token so a passive on-path observer cannot
     silently capture it.
     """
-    from stt_server.client import is_cleartext_remote, resolve_endpoint_from_env
+    from stt_server.client import (
+        _format_host_for_uri,
+        is_cleartext_remote,
+        resolve_endpoint_from_env,
+    )
 
     resolved = resolve_endpoint_from_env(env)
     socket_path = resolved["socket_path"]
@@ -113,9 +115,17 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     if not (socket_path or host or uri):
         socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(_DEFAULT_STT_WS_SOCKET)
 
-    if auth_token and uri and is_cleartext_remote(uri):
+    # Cleartext-token guard covers *any* cleartext-ws endpoint, not just
+    # STT_WS_URI. host+port paths get lowered to ``ws://host:port/`` via
+    # the same formatter the client uses (IPv6 literals bracketed) so the
+    # ``is_cleartext_remote`` check is identical regardless of which
+    # supported config surface the operator chose.
+    effective_uri = uri
+    if not effective_uri and host and port is not None and not socket_path:
+        effective_uri = f"ws://{_format_host_for_uri(host)}:{port}/"
+    if auth_token and effective_uri and is_cleartext_remote(effective_uri):
         logger.warning(
-            f"STT: STT_WS_TOKEN will be sent in cleartext to {uri}. "
+            f"STT: STT_WS_TOKEN will be sent in cleartext to {effective_uri}. "
             "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
         )
 
@@ -128,77 +138,113 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     }
 
 
-def _preflight_stt_ws(kwargs: dict, target: str) -> None:
+_PREFLIGHT_TIMEOUT_SEC = 2.0
+_preflight_done = False
+
+
+async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     """Fail fast if the stt_server endpoint is not reachable at startup.
 
-    Without this, a missing server manifests as a 30–60 s cascade of
-    VAD-driven connect warnings with no transcription, which is easy to
-    miss in a long log stream. A single clear error up front pointing at
-    ``./koda stt start`` is a lot easier to act on than 20 WARN lines.
+    Runs a real websocket handshake (``TranscriptionClient.connect()`` —
+    which awaits ``server.hello`` + ``session.created``), so auth, TLS,
+    wrong path, and "non-STT service on the port" failures are all
+    surfaced here as ``SttPreflightError`` instead of leaking through as
+    generic tracebacks or the old 30–60 s VAD-driven reconnect cascade.
+
+    Idempotent via ``_preflight_done`` so the dual entrypoint can call
+    ``_create_stt_service()`` twice without paying for two handshakes
+    against the same endpoint.
 
     Runtime reconnect during a live session is still handled by
     ``WebSocketSTTService._ensure_connected`` — this check only runs once
     before the pipeline starts.
     """
-    sock_path = kwargs.get("socket_path")
-    host = kwargs.get("host")
-    port = kwargs.get("port")
-    uri = kwargs.get("uri")
+    global _preflight_done
+    if _preflight_done:
+        return
+
+    from stt_server.client import TranscriptionClient
 
     hint = (
         "Start it with: ./koda stt start   (or: scripts/install_stt_agent.sh "
         "install — only needed once). Verify with: ./koda stt status"
     )
 
-    # Probe order matches the client's precedence (uri > socket_path >
-    # host+port) so the preflight tests exactly the endpoint the runtime
-    # will connect to — even if a future caller passes a non-normalized
-    # kwargs dict with multiple fields set.
-    # ``port is not None`` rather than ``port`` — port=0 is not a valid WS
-    # endpoint but would be falsy and silently skip the probe, defeating
-    # fail-fast when the caller misconfigured host+port.
+    # Endpoint completeness. ``TranscriptionClient.__init__`` already
+    # raises ``ValueError`` when nothing is configured, but a half-set
+    # host-without-port (or vice versa) slips through the resolver
+    # precedence as well and deserves the actionable preflight message
+    # instead of a raw ``ValueError`` traceback.
+    uri = kwargs.get("uri")
+    sock_path = kwargs.get("socket_path")
+    host = kwargs.get("host")
+    port = kwargs.get("port")
+    if not (uri or sock_path):
+        if (host and port is None) or (port is not None and not host):
+            raise SttPreflightError(
+                f"STT: incomplete endpoint config (host={host!r}, port={port!r}). "
+                "Set both STT_WS_HOST and STT_WS_PORT, or use STT_WS_URI / "
+                f"STT_WS_SOCKET. {hint}"
+            )
+
+    client = TranscriptionClient(
+        socket_path=sock_path,
+        host=host,
+        port=port,
+        uri=uri,
+        auth_token=kwargs.get("auth_token"),
+    )
     try:
-        if uri:
-            # Parse ws://host[:port]/... or wss://... and TCP-probe so an
-            # STT_WS_URI override gets the same fail-fast treatment as the
-            # socket_path / host+port modes instead of silently deferring
-            # to the lazy websockets reconnect path.
-            parsed = urllib.parse.urlsplit(uri)
-            scheme = parsed.scheme.lower()
-            uri_host = parsed.hostname
-            uri_port = parsed.port
-            if uri_port is None:
-                uri_port = 443 if scheme == "wss" else 80
-            if not uri_host:
-                # Malformed URI — let the real client surface the error so
-                # we don't invent a misleading preflight diagnostic.
-                return
-            with socket.create_connection((uri_host, int(uri_port)), timeout=0.5):
-                pass
-        elif sock_path:
-            expanded = os.path.expanduser(sock_path)
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            try:
-                s.connect(expanded)
-            finally:
-                s.close()
-        elif host and port is not None:
-            with socket.create_connection((host, int(port)), timeout=0.5):
-                pass
-        else:
-            return
-    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
-        raise SttPreflightError(
-            f"STT: stt_server not reachable at {target} ({exc}). {hint}"
-        ) from exc
+        try:
+            await asyncio.wait_for(client.connect(), timeout=_PREFLIGHT_TIMEOUT_SEC)
+        except asyncio.TimeoutError as exc:
+            raise SttPreflightError(
+                f"STT: stt_server did not complete handshake within "
+                f"{_PREFLIGHT_TIMEOUT_SEC:.1f}s at {target}. {hint}"
+            ) from exc
+        except ValueError as exc:
+            # Mis-shaped kwargs slipped past our completeness check
+            # (future callers may build kwargs differently). Still
+            # actionable, still better than a traceback.
+            raise SttPreflightError(f"STT: misconfigured endpoint ({exc}). {hint}") from exc
+        except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
+            raise SttPreflightError(
+                f"STT: stt_server not reachable at {target} ({exc}). {hint}"
+            ) from exc
+        except Exception as exc:
+            # Catches websockets.exceptions.WebSocketException (401/400 on
+            # wrong token / wrong path, TLS errors, protocol errors) and
+            # the RuntimeError branches in ``connect()`` when the server
+            # returns an unexpected first frame. These are all
+            # misconfiguration shapes the bot cannot recover from, so
+            # translate them to the CLI-friendly error rather than
+            # letting them bubble as tracebacks.
+            raise SttPreflightError(
+                f"STT: handshake failed at {target} ({type(exc).__name__}: {exc}). {hint}"
+            ) from exc
+    finally:
+        try:
+            await client.close_session()
+        except Exception:
+            pass
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    _preflight_done = True
 
 
-def _create_stt_service():
+async def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
     Returns a pipecat STT service instance. Prefers Whisper MLX on Apple Silicon,
     falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
+
+    Async because the websocket preflight now does a real handshake
+    (rather than a raw TCP probe), which must be awaited from inside the
+    running event loop. Non-websocket backends don't ``await`` anything
+    but the signature is uniform so callers don't have to branch.
     """
     if STT_SERVICE == "websocket":
         try:
@@ -213,7 +259,7 @@ def _create_stt_service():
         kwargs = _resolve_stt_ws_target(os.environ)
         target = kwargs["uri"] or kwargs["socket_path"] or f"{kwargs['host']}:{kwargs['port']}"
         logger.info(f"STT: websocket (server={target})")
-        _preflight_stt_ws(kwargs, target)
+        await _preflight_stt_ws(kwargs, target)
         return WebSocketSTTService(language="en", **kwargs)
 
     if STT_SERVICE == "deepgram":

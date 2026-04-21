@@ -251,7 +251,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     # ----------------------------------------------------------------
     # Step 6: Build transport (input-only for silent mode)
     # ----------------------------------------------------------------
-    stt = _create_stt_service()
+    stt = await _create_stt_service()
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(

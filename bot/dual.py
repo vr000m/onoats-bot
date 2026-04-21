@@ -251,8 +251,8 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
 
     mic_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
     system_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
-    mic_stt = _create_stt_service()
-    system_stt = _create_stt_service()
+    mic_stt = await _create_stt_service()
+    system_stt = await _create_stt_service()
 
     pipeline = _build_dual_pipeline(
         mic_transport,
