@@ -156,7 +156,12 @@ class WebSocketSTTService(SegmentedSTTService):
             self._pending = loop.create_future()
             try:
                 await self.start_processing_metrics()
-                await self._client.send_audio(audio)
+                # Chunk under MAX_APPEND_BYTES (1 MiB) so long VAD turns
+                # don't hit payload_too_large. 512 KiB leaves headroom for
+                # websocket framing overhead.
+                chunk = 512 * 1024
+                for i in range(0, len(audio), chunk):
+                    await self._client.send_audio(audio[i : i + chunk])
                 await self._client.commit()
                 try:
                     text = await asyncio.wait_for(self._pending, timeout=_DECODE_TIMEOUT_SECONDS)
@@ -229,6 +234,10 @@ class WebSocketSTTService(SegmentedSTTService):
                 return
             except Exception as exc:
                 last_exc = exc
+                # Tear down this attempt's client + reader before retrying so
+                # late events from the superseded socket can't poison the
+                # next attempt's _session_ready / _pending futures.
+                await self._discard_stale()
                 if attempt == 0:
                     logger.warning(
                         f"{self.name}: connect attempt 1 failed ({exc}) [endpoint={endpoint}], "
@@ -269,6 +278,10 @@ class WebSocketSTTService(SegmentedSTTService):
         saw_session_closed = False
         try:
             async for ev in client.events():
+                # Ignore any event from a superseded client (e.g. a failed
+                # handshake that's still draining while a retry is in flight).
+                if client is not self._client:
+                    continue
                 etype = ev.get("type")
                 if etype == P.EVT_TRANSCRIPT_COMPLETED:
                     if self._pending and not self._pending.done():
@@ -303,24 +316,31 @@ class WebSocketSTTService(SegmentedSTTService):
             raise
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"{self.name}: reader crashed: {exc}")
-            if self._pending and not self._pending.done():
+            if client is self._client and self._pending and not self._pending.done():
                 self._pending.set_exception(exc)
         finally:
-            was_connected = self._connected
-            self._connected = False
-            if saw_session_closed:
-                logger.info(f"{self.name}: session closed cleanly by server")
-            elif was_connected:
-                # Socket dropped without a graceful session.closed — server
-                # crash, launchd restart, or network blip. Next run_stt will
-                # trigger _ensure_connected and we'll log a reconnect there.
-                logger.warning(f"{self.name}: connection lost (no session.closed received)")
-            # If the socket closed while a decode was in flight, fail fast
-            # instead of letting run_stt hit its 90 s timeout.
-            if not saw_session_closed and self._pending is not None and not self._pending.done():
-                self._pending.set_exception(
-                    ConnectionError("stt_server connection lost mid-decode")
-                )
+            # Teardown signals only apply when this reader still owns the
+            # live client; superseded readers exit quietly.
+            if client is self._client:
+                was_connected = self._connected
+                self._connected = False
+                if saw_session_closed:
+                    logger.info(f"{self.name}: session closed cleanly by server")
+                elif was_connected:
+                    # Socket dropped without a graceful session.closed — server
+                    # crash, launchd restart, or network blip. Next run_stt
+                    # will trigger _ensure_connected and log a reconnect.
+                    logger.warning(f"{self.name}: connection lost (no session.closed received)")
+                # If the socket closed while a decode was in flight, fail
+                # fast instead of letting run_stt hit its 90 s timeout.
+                if (
+                    not saw_session_closed
+                    and self._pending is not None
+                    and not self._pending.done()
+                ):
+                    self._pending.set_exception(
+                        ConnectionError("stt_server connection lost mid-decode")
+                    )
 
     async def _graceful_close(self) -> None:
         if self._client is None:
