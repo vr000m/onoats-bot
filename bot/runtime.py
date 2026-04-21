@@ -132,10 +132,12 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
 
     hint = (
         "Start it with: ./koda stt start   (or: scripts/install_stt_agent.sh "
-        "install — only needed once)\n"
-        "Verify with:  ./koda stt status"
+        "install — only needed once). Verify with: ./koda stt status"
     )
 
+    # ``port is not None`` rather than ``port`` — port=0 is not a valid WS
+    # endpoint but would be falsy and silently skip the probe, defeating
+    # fail-fast when the caller misconfigured host+port.
     try:
         if sock_path:
             expanded = os.path.expanduser(sock_path)
@@ -145,7 +147,7 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
                 s.connect(expanded)
             finally:
                 s.close()
-        elif host and port:
+        elif host and port is not None:
             with socket.create_connection((host, int(port)), timeout=0.5):
                 pass
         else:
@@ -154,9 +156,7 @@ def _preflight_stt_ws(kwargs: dict, target: str) -> None:
             # want to re-parse here.
             return
     except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
-        logger.error(f"STT: stt_server not reachable at {target} ({exc})")
-        logger.error(hint)
-        raise SystemExit(1)
+        raise RuntimeError(f"STT: stt_server not reachable at {target} ({exc}). {hint}") from exc
 
 
 def _create_stt_service():
