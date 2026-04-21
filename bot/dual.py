@@ -28,9 +28,18 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
 from loguru import logger
 
-from bot.runtime import (
+# Load config before importing bot.runtime — runtime reads STT_SERVICE,
+# STT_MODEL, and BOT_NAME at module load, and later lookups (device ids,
+# KODA_DATA_DIR, API keys) rely on these env vars being populated. ./koda
+# bot runs this module directly as __main__, bypassing bot/__main__.py's
+# load_dotenv, so we repeat it here.
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
+load_dotenv(os.path.expanduser("~/.secrets/ai.env"), override=False)
+
+from bot.runtime import (  # noqa: E402
     BOT_NAME,
     STT_MODEL,
     STT_SERVICE,
