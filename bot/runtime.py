@@ -84,7 +84,14 @@ def _create_stt_service():
     falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
     """
     if STT_SERVICE == "websocket":
-        from bot.stt.websocket_stt_service import WebSocketSTTService
+        try:
+            from bot.stt.websocket_stt_service import WebSocketSTTService
+        except ImportError as exc:
+            raise RuntimeError(
+                "STT_SERVICE=websocket requires the 'websockets' package. "
+                "Install via `uv sync --extra stt-server-client` "
+                f"(or add websockets to the root deps). Original error: {exc}"
+            ) from exc
 
         socket_path = os.getenv("STT_WS_SOCKET", "").strip() or None
         host = os.getenv("STT_WS_HOST", "").strip() or None
@@ -93,8 +100,10 @@ def _create_stt_service():
         uri = os.getenv("STT_WS_URI", "").strip() or None
         auth_token = os.getenv("STT_WS_TOKEN", "").strip() or None
         if not (socket_path or host or uri):
-            # Sensible local default aligned with stt_server's UDS default.
-            socket_path = os.getenv("STT_WS_DEFAULT_SOCKET", "/tmp/koda-stt.sock")
+            # Align with install_stt_agent.sh's default socket location
+            # ($HOME/Library/Caches/koda-stt/stt.sock).
+            default_sock = os.path.expanduser("~/Library/Caches/koda-stt/stt.sock")
+            socket_path = os.getenv("STT_WS_DEFAULT_SOCKET", default_sock)
         target = socket_path or uri or f"{host}:{port}"
         logger.info(f"STT: websocket (server={target})")
         return WebSocketSTTService(
