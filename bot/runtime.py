@@ -171,6 +171,18 @@ def _display_target(kwargs: dict) -> str:
 
 
 _PREFLIGHT_TIMEOUT_SEC = 2.0
+# Cold-start tolerance: a single 2s connect is tight when the
+# LaunchAgent was just kicked (e.g. `./koda stt start && ./koda bot`).
+# `stt_server.serve()` binds the socket AFTER `backend.start()` runs
+# `import mlx_whisper`, which can take 1-3s on a cold Python. Without a
+# retry, preflight rejects the bot on transient "socket-not-yet-bound"
+# conditions that `WebSocketSTTService._ensure_connected` (15.5s total
+# budget) would have tolerated at session time. Retry once on OSError
+# (socket absent / connection refused) after a short delay; auth or
+# protocol failures still fail on the first attempt since those aren't
+# startup races.
+_PREFLIGHT_RETRY_DELAY_SEC = 1.0
+_PREFLIGHT_RETRY_TIMEOUT_SEC = 3.0
 # Keyed on the endpoint tuple, not a bare bool, so that if a future
 # caller builds kwargs for a *different* endpoint on the second call
 # (dual path today uses the same resolved kwargs for both branches, but
@@ -299,6 +311,14 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
                 f"STT_WS_SOCKET. {hint}"
             )
 
+    # Attempt schedule — first is the fast-path, second retries only on
+    # cold-start races (OSError). Other exceptions fail on the first try.
+    attempts = (
+        (_PREFLIGHT_TIMEOUT_SEC, 0.0),
+        (_PREFLIGHT_RETRY_TIMEOUT_SEC, _PREFLIGHT_RETRY_DELAY_SEC),
+    )
+    total_budget = sum(t + d for t, d in attempts)
+
     client = TranscriptionClient(
         socket_path=sock_path,
         host=host,
@@ -307,33 +327,48 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
         auth_token=kwargs.get("auth_token"),
     )
     try:
-        try:
-            await asyncio.wait_for(client.connect(), timeout=_PREFLIGHT_TIMEOUT_SEC)
-        except asyncio.TimeoutError as exc:
-            raise SttPreflightError(
-                f"STT: stt_server did not complete handshake within "
-                f"{_PREFLIGHT_TIMEOUT_SEC:.1f}s at {target}. {hint}"
-            ) from exc
-        except ValueError as exc:
-            # Mis-shaped kwargs slipped past our completeness check
-            # (future callers may build kwargs differently). Still
-            # actionable, still better than a traceback.
-            raise SttPreflightError(f"STT: misconfigured endpoint ({exc}). {hint}") from exc
-        except OSError as exc:  # covers FileNotFoundError + ConnectionRefusedError
-            raise SttPreflightError(
-                f"STT: stt_server not reachable at {target} ({exc}). {hint}"
-            ) from exc
-        except Exception as exc:
-            # Catches websockets.exceptions.WebSocketException (401/400 on
-            # wrong token / wrong path, TLS errors, protocol errors) and
-            # the RuntimeError branches in ``connect()`` when the server
-            # returns an unexpected first frame. These are all
-            # misconfiguration shapes the bot cannot recover from, so
-            # translate them to the CLI-friendly error rather than
-            # letting them bubble as tracebacks.
-            raise SttPreflightError(
-                f"STT: handshake failed at {target} ({type(exc).__name__}: {exc}). {hint}"
-            ) from exc
+        for idx, (timeout_s, delay_s) in enumerate(attempts):
+            is_last = idx == len(attempts) - 1
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            try:
+                await asyncio.wait_for(client.connect(), timeout=timeout_s)
+                break
+            except asyncio.TimeoutError as exc:
+                if not is_last:
+                    continue
+                raise SttPreflightError(
+                    f"STT: stt_server did not complete handshake within "
+                    f"{total_budget:.1f}s at {target}. {hint}"
+                ) from exc
+            except ValueError as exc:
+                # Mis-shaped kwargs slipped past our completeness check
+                # (future callers may build kwargs differently). Still
+                # actionable, still better than a traceback.
+                raise SttPreflightError(f"STT: misconfigured endpoint ({exc}). {hint}") from exc
+            except OSError as exc:  # covers FileNotFoundError + ConnectionRefusedError
+                # Cold-start races live here: socket path doesn't exist
+                # yet, or TCP refused because serve() hasn't bound. Retry
+                # once with a short delay so the bot doesn't exit just
+                # because the LaunchAgent is still doing `import
+                # mlx_whisper`.
+                if not is_last:
+                    continue
+                raise SttPreflightError(
+                    f"STT: stt_server not reachable at {target} ({exc}). {hint}"
+                ) from exc
+            except Exception as exc:
+                # Catches websockets.exceptions.WebSocketException (401/400 on
+                # wrong token / wrong path, TLS errors, protocol errors) and
+                # the RuntimeError branches in ``connect()`` when the server
+                # returns an unexpected first frame. These are all
+                # misconfiguration shapes the bot cannot recover from, so
+                # translate them to the CLI-friendly error rather than
+                # letting them bubble as tracebacks. No retry — this isn't
+                # a race, the config is wrong.
+                raise SttPreflightError(
+                    f"STT: handshake failed at {target} ({type(exc).__name__}: {exc}). {hint}"
+                ) from exc
     finally:
         try:
             await client.close_session()
