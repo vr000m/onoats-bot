@@ -66,6 +66,7 @@ from bot.runtime import (  # noqa: E402
     PIPELINE_SAMPLE_RATE,
     STT_MODEL,
     STT_SERVICE,
+    SttPreflightError,
     _create_stt_service,
     _install_signal_handlers,
     _remove_pid_file,
@@ -250,7 +251,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     # ----------------------------------------------------------------
     # Step 6: Build transport (input-only for silent mode)
     # ----------------------------------------------------------------
-    stt = _create_stt_service()
+    stt = await _create_stt_service()
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
@@ -301,7 +302,8 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     # ----------------------------------------------------------------
     pid_path = _write_pid_file(data_dir)
 
-    _shutdown_done = False
+    _shutdown_started = False
+    _shutdown_complete = asyncio.Event()
 
     async def _wait_or_force(coro_or_future, label: str) -> None:
         """Await a coroutine/future, but cancel it immediately if force_exit_event fires."""
@@ -327,15 +329,22 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
 
     async def _on_shutdown() -> None:
         """Flush in-memory buffer to disk and drain the memory writer queue.
-        Guarded to run exactly once regardless of how many exit paths trigger it.
-        A second Ctrl+C during shutdown sets force_exit_event, which cancels
-        any pending waits immediately.
+        Runs exactly once; concurrent callers await the first caller's
+        completion so the event loop cannot tear down in-flight
+        post-processing. A second Ctrl+C during shutdown sets
+        force_exit_event, which cancels any pending waits immediately.
         """
-        nonlocal _shutdown_done
-        if _shutdown_done:
+        nonlocal _shutdown_started
+        if _shutdown_started:
+            await _shutdown_complete.wait()
             return
-        _shutdown_done = True
+        _shutdown_started = True
+        try:
+            await _run_shutdown()
+        finally:
+            _shutdown_complete.set()
 
+    async def _run_shutdown() -> None:
         logger.info("Shutdown: graceful shutdown started. Press Ctrl+C again to force exit.")
         await silence_detector.stop_monitoring()
 
@@ -469,4 +478,8 @@ if __name__ == "__main__":
             )
             sys.exit(1)
         args.category = cat
-    asyncio.run(run_koda(interactive=args.interactive, locked_category=args.category))
+    try:
+        asyncio.run(run_koda(interactive=args.interactive, locked_category=args.category))
+    except SttPreflightError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        sys.exit(1)

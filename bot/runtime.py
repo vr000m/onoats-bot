@@ -37,6 +37,16 @@ BOT_NAME = "Koda"
 STT_SERVICE = os.getenv("STT_SERVICE", "whisper").lower().strip()
 STT_MODEL = os.getenv("STT_MODEL", "").strip()
 
+
+class SttPreflightError(RuntimeError):
+    """Raised when the stt_server endpoint is not reachable at startup.
+
+    Caught at the CLI entrypoints (``bot/__main__.py``, ``bot/dual.py``) so
+    the user sees the actionable hint — not a Python traceback — when the
+    LaunchAgent isn't loaded.
+    """
+
+
 PIPELINE_SAMPLE_RATE = 16000  # Silero VAD requires 8kHz or 16kHz; 16kHz is standard
 
 PID_FILENAME = "koda.pid"
@@ -77,32 +87,53 @@ def _mlx_available() -> bool:
         return False
 
 
-def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
+_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
+
+
+def _resolve_stt_ws_target(
+    env: dict[str, str], *, warn_on_cleartext: bool = True
+) -> dict[str, object]:
     """Resolve STT_WS_* env vars into the kwargs for ``WebSocketSTTService``.
 
-    Enforces documented precedence ``STT_WS_URI > STT_WS_SOCKET > HOST+PORT``
-    by zeroing lower-priority fields when a higher-priority one is set —
-    ``TranscriptionClient.connect()`` otherwise prefers ``socket_path``
-    whenever it is set, silently ignoring a URI override.
+    Delegates precedence handling to ``stt_server.client.resolve_endpoint_from_env``
+    and layers on the Koda-specific default socket plus the ``STT_WS_TOKEN``
+    bearer read. When operators point at a cleartext remote host, warn
+    before attaching the token so a passive on-path observer cannot
+    silently capture it.
+
+    Set ``warn_on_cleartext=False`` for secondary callers (e.g. the RSS
+    probe at startup/shutdown) that resolve the same endpoint and would
+    otherwise emit the warning repeatedly in a single session.
     """
-    socket_path = (env.get("STT_WS_SOCKET") or "").strip() or None
-    host = (env.get("STT_WS_HOST") or "").strip() or None
-    port_raw = (env.get("STT_WS_PORT") or "").strip()
-    port: Optional[int] = int(port_raw) if port_raw else None
-    uri = (env.get("STT_WS_URI") or "").strip() or None
+    from stt_server.client import (
+        format_host_for_uri,
+        is_cleartext_remote,
+        resolve_endpoint_from_env,
+    )
+
+    resolved = resolve_endpoint_from_env(env)
+    socket_path = resolved["socket_path"]
+    host = resolved["host"]
+    port = resolved["port"]
+    uri = resolved["uri"]
     auth_token = (env.get("STT_WS_TOKEN") or "").strip() or None
 
     if not (socket_path or host or uri):
-        default_sock = os.path.expanduser("~/Library/Caches/koda-stt/stt.sock")
-        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or default_sock
+        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(_DEFAULT_STT_WS_SOCKET)
 
-    if uri:
-        socket_path = None
-        host = None
-        port = None
-    elif socket_path:
-        host = None
-        port = None
+    # Cleartext-token guard covers *any* cleartext-ws endpoint, not just
+    # STT_WS_URI. host+port paths get lowered to ``ws://host:port/`` via
+    # the same formatter the client uses (IPv6 literals bracketed) so the
+    # ``is_cleartext_remote`` check is identical regardless of which
+    # supported config surface the operator chose.
+    effective_uri = uri
+    if not effective_uri and host and port is not None and not socket_path:
+        effective_uri = f"ws://{format_host_for_uri(host)}:{port}/"
+    if warn_on_cleartext and auth_token and effective_uri and is_cleartext_remote(effective_uri):
+        logger.warning(
+            f"STT: STT_WS_TOKEN will be sent in cleartext to {effective_uri}. "
+            "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
+        )
 
     return {
         "socket_path": socket_path,
@@ -113,11 +144,254 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     }
 
 
-def _create_stt_service():
+def _display_target(kwargs: dict) -> str:
+    """Render an endpoint as a safe human-readable string for logs/errors.
+
+    ``STT_WS_URI`` is user-controlled and may contain userinfo
+    (``ws://user:pass@host/``). Strip it before rendering so a typoed
+    secret doesn't echo into stderr or a log line.
+    """
+    uri = kwargs.get("uri")
+    if uri:
+        import urllib.parse
+
+        try:
+            parsed = urllib.parse.urlsplit(uri)
+        except ValueError:
+            return uri
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port is not None:
+                netloc = f"{netloc}:{parsed.port}"
+            return urllib.parse.urlunsplit(
+                (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+            )
+        return uri
+    return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
+
+
+_PREFLIGHT_TIMEOUT_SEC = 2.0
+# Cold-start tolerance: a single 2s connect is tight when the
+# LaunchAgent was just kicked (e.g. `./koda stt start && ./koda bot`).
+# `stt_server.serve()` binds the socket AFTER `backend.start()` runs
+# `import mlx_whisper`, which can take 1-3s on a cold Python. Without a
+# retry, preflight rejects the bot on transient "socket-not-yet-bound"
+# conditions that `WebSocketSTTService._ensure_connected` (15.5s total
+# budget) would have tolerated at session time. Retry once on OSError
+# (socket absent / connection refused) after a short delay; auth or
+# protocol failures still fail on the first attempt since those aren't
+# startup races.
+_PREFLIGHT_RETRY_DELAY_SEC = 1.0
+_PREFLIGHT_RETRY_TIMEOUT_SEC = 3.0
+# Keyed on the endpoint tuple, not a bare bool, so that if a future
+# caller builds kwargs for a *different* endpoint on the second call
+# (dual path today uses the same resolved kwargs for both branches, but
+# nothing in the type system pins that) the probe re-runs against the
+# new endpoint instead of silently trusting a stale success.
+_preflight_cache: set[tuple[object, object, object, object]] = set()
+
+
+_RSS_PROBE_TIMEOUT_SEC = 2.0
+
+
+async def log_stt_server_rss(phase: str) -> None:
+    """Log the stt_server's PID + peak RSS at ``phase`` (``startup`` / ``shutdown``).
+
+    Queries the running server via the ``server.status`` wire probe
+    (``pid`` + ``rss_bytes`` fields) rather than discovering the process
+    by command-line pattern. Topology-agnostic: works the same whether
+    the server runs from a LaunchAgent, a wrapper script, a compiled
+    binary, or a remote host.
+
+    Best-effort: swallows everything and logs ``debug`` on miss so an
+    unreachable server never fails bot lifecycle.
+    """
+    try:
+        from stt_server import protocol as P
+        from stt_server.client import TranscriptionClient
+
+        # The primary STT service path already logged any cleartext-token
+        # warning at session start; suppress here so startup+shutdown
+        # probes don't duplicate it.
+        kwargs = _resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False)
+        client = TranscriptionClient(
+            socket_path=kwargs.get("socket_path"),
+            host=kwargs.get("host"),
+            port=kwargs.get("port"),
+            uri=kwargs.get("uri"),
+            auth_token=kwargs.get("auth_token"),
+        )
+
+        async def _probe() -> None:
+            await client.connect()
+            await client.status()
+            async for event in client.events():
+                if event.get("type") != P.EVT_SERVER_STATUS:
+                    continue
+                pid = event.get("pid")
+                rss = event.get("rss_bytes")
+                uptime = event.get("uptime_seconds")
+                rss_mb = (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
+                uptime_s = float(uptime) if isinstance(uptime, (int, float)) else 0.0
+                logger.info(
+                    f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
+                    f"session_uptime={uptime_s:.1f}s"
+                )
+                return
+            logger.debug(f"stt_server RSS ({phase}): status reply missing")
+
+        try:
+            await asyncio.wait_for(_probe(), timeout=_RSS_PROBE_TIMEOUT_SEC)
+        finally:
+            try:
+                await client.close_session()
+            except Exception:
+                pass
+            try:
+                await client.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug(f"stt_server RSS ({phase}): probe failed ({exc})")
+
+
+def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
+    return (
+        kwargs.get("uri"),
+        kwargs.get("socket_path"),
+        kwargs.get("host"),
+        kwargs.get("port"),
+    )
+
+
+async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
+    """Fail fast if the stt_server endpoint is not reachable at startup.
+
+    Runs a real websocket handshake (``TranscriptionClient.connect()`` —
+    which awaits ``server.hello`` + ``session.created``), so auth, TLS,
+    wrong path, and "non-STT service on the port" failures are all
+    surfaced here as ``SttPreflightError`` instead of leaking through as
+    generic tracebacks or the old 30–60 s VAD-driven reconnect cascade.
+
+    Idempotent per endpoint: the dual entrypoint calls
+    ``_create_stt_service()`` twice and today both use the same resolved
+    kwargs; a repeated call for the same ``(uri, socket_path, host,
+    port)`` tuple is a no-op. A call for a *different* tuple re-runs the
+    probe.
+
+    Runtime reconnect during a live session is still handled by
+    ``WebSocketSTTService._ensure_connected`` — this check only runs once
+    before the pipeline starts.
+    """
+    key = _preflight_key(kwargs)
+    if key in _preflight_cache:
+        return
+
+    from stt_server.client import TranscriptionClient
+
+    hint = (
+        "Start it with: ./koda stt start   (or: scripts/install_stt_agent.sh "
+        "install — only needed once). Verify with: ./koda stt status"
+    )
+
+    # Endpoint completeness. ``TranscriptionClient.__init__`` already
+    # raises ``ValueError`` when nothing is configured, but a half-set
+    # host-without-port (or vice versa) slips through the resolver
+    # precedence as well and deserves the actionable preflight message
+    # instead of a raw ``ValueError`` traceback.
+    uri = kwargs.get("uri")
+    sock_path = kwargs.get("socket_path")
+    host = kwargs.get("host")
+    port = kwargs.get("port")
+    if not (uri or sock_path):
+        if (host and port is None) or (port is not None and not host):
+            raise SttPreflightError(
+                f"STT: incomplete endpoint config (host={host!r}, port={port!r}). "
+                "Set both STT_WS_HOST and STT_WS_PORT, or use STT_WS_URI / "
+                f"STT_WS_SOCKET. {hint}"
+            )
+
+    # Attempt schedule — first is the fast-path, second retries only on
+    # cold-start races (OSError). Other exceptions fail on the first try.
+    attempts = (
+        (_PREFLIGHT_TIMEOUT_SEC, 0.0),
+        (_PREFLIGHT_RETRY_TIMEOUT_SEC, _PREFLIGHT_RETRY_DELAY_SEC),
+    )
+    total_budget = sum(t + d for t, d in attempts)
+
+    client = TranscriptionClient(
+        socket_path=sock_path,
+        host=host,
+        port=port,
+        uri=uri,
+        auth_token=kwargs.get("auth_token"),
+    )
+    try:
+        for idx, (timeout_s, delay_s) in enumerate(attempts):
+            is_last = idx == len(attempts) - 1
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            try:
+                await asyncio.wait_for(client.connect(), timeout=timeout_s)
+                break
+            except asyncio.TimeoutError as exc:
+                if not is_last:
+                    continue
+                raise SttPreflightError(
+                    f"STT: stt_server did not complete handshake within "
+                    f"{total_budget:.1f}s at {target}. {hint}"
+                ) from exc
+            except ValueError as exc:
+                # Mis-shaped kwargs slipped past our completeness check
+                # (future callers may build kwargs differently). Still
+                # actionable, still better than a traceback.
+                raise SttPreflightError(f"STT: misconfigured endpoint ({exc}). {hint}") from exc
+            except OSError as exc:  # covers FileNotFoundError + ConnectionRefusedError
+                # Cold-start races live here: socket path doesn't exist
+                # yet, or TCP refused because serve() hasn't bound. Retry
+                # once with a short delay so the bot doesn't exit just
+                # because the LaunchAgent is still doing `import
+                # mlx_whisper`.
+                if not is_last:
+                    continue
+                raise SttPreflightError(
+                    f"STT: stt_server not reachable at {target} ({exc}). {hint}"
+                ) from exc
+            except Exception as exc:
+                # Catches websockets.exceptions.WebSocketException (401/400 on
+                # wrong token / wrong path, TLS errors, protocol errors) and
+                # the RuntimeError branches in ``connect()`` when the server
+                # returns an unexpected first frame. These are all
+                # misconfiguration shapes the bot cannot recover from, so
+                # translate them to the CLI-friendly error rather than
+                # letting them bubble as tracebacks. No retry — this isn't
+                # a race, the config is wrong.
+                raise SttPreflightError(
+                    f"STT: handshake failed at {target} ({type(exc).__name__}: {exc}). {hint}"
+                ) from exc
+    finally:
+        try:
+            await client.close_session()
+        except Exception:
+            pass
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    _preflight_cache.add(key)
+
+
+async def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
     Returns a pipecat STT service instance. Prefers Whisper MLX on Apple Silicon,
     falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
+
+    Async because the websocket preflight now does a real handshake
+    (rather than a raw TCP probe), which must be awaited from inside the
+    running event loop. Non-websocket backends don't ``await`` anything
+    but the signature is uniform so callers don't have to branch.
     """
     if STT_SERVICE == "websocket":
         try:
@@ -130,8 +404,9 @@ def _create_stt_service():
             ) from exc
 
         kwargs = _resolve_stt_ws_target(os.environ)
-        target = kwargs["uri"] or kwargs["socket_path"] or f"{kwargs['host']}:{kwargs['port']}"
+        target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
+        await _preflight_stt_ws(kwargs, target)
         return WebSocketSTTService(language="en", **kwargs)
 
     if STT_SERVICE == "deepgram":

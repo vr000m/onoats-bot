@@ -44,8 +44,10 @@ from bot.runtime import (  # noqa: E402
     PIPELINE_SAMPLE_RATE,
     STT_MODEL,
     STT_SERVICE,
+    SttPreflightError,
     _remove_pid_file,
     _create_stt_service,
+    log_stt_server_rss,
     _install_signal_handlers,
     _restore_terminal,
     _start_keypress_reader,
@@ -250,8 +252,13 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
 
     mic_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
     system_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
-    mic_stt = _create_stt_service()
-    system_stt = _create_stt_service()
+    mic_stt = await _create_stt_service()
+    system_stt = await _create_stt_service()
+    # RSS baseline for the stt_server at bot start. Pair with the
+    # ``shutdown`` entry logged from `_run_shutdown` to get a free
+    # soak datapoint out of every real-world session — no dedicated
+    # harness needed.
+    await log_stt_server_rss("startup")
 
     pipeline = _build_dual_pipeline(
         mic_transport,
@@ -285,7 +292,8 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     )
     pid_path = _write_pid_file(data_dir)
 
-    shutdown_done = False
+    shutdown_started = False
+    shutdown_complete = asyncio.Event()
     old_terminal_settings: object | None = None
 
     async def _wait_or_force(coro_or_future, label: str) -> None:
@@ -309,11 +317,20 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         await _wait_or_force(asyncio.gather(*tasks, return_exceptions=True), label)
 
     async def _on_shutdown() -> None:
-        nonlocal shutdown_done
-        if shutdown_done:
+        nonlocal shutdown_started
+        if shutdown_started:
+            # Second caller: wait for the first to finish so we don't
+            # return early and let the event loop tear down in-flight
+            # post-processing tasks.
+            await shutdown_complete.wait()
             return
-        shutdown_done = True
+        shutdown_started = True
+        try:
+            await _run_shutdown()
+        finally:
+            shutdown_complete.set()
 
+    async def _run_shutdown() -> None:
         logger.info("Shutdown: graceful dual-input shutdown started. Press Ctrl+C again to force.")
         await silence_detector.stop_monitoring()
 
@@ -341,13 +358,14 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         logger.info("Shutdown: draining dual STT services")
         await _shutdown_stt_service(mic_stt, "mic")
         await _shutdown_stt_service(system_stt, "system")
+        await log_stt_server_rss("shutdown")
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()
 
-        # Restore terminal and remove PID file inside the ``shutdown_done``
-        # guard so the two call sites (_shutdown_watcher and the outer
-        # ``finally`` block) are truly idempotent regardless of ordering.
+        # Restore terminal and remove PID file inside the single-writer
+        # shutdown path so the two call sites (_shutdown_watcher and the
+        # outer ``finally`` block) are truly idempotent regardless of ordering.
         _restore_terminal(old_terminal_settings)
         _remove_pid_file(pid_path)
         logger.info("Shutdown: complete")
@@ -436,4 +454,8 @@ if __name__ == "__main__":
             )
             sys.exit(1)
         args.category = cat
-    asyncio.run(run_koda_dual(live_terminal=args.live_terminal, locked_category=args.category))
+    try:
+        asyncio.run(run_koda_dual(live_terminal=args.live_terminal, locked_category=args.category))
+    except SttPreflightError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        sys.exit(1)
