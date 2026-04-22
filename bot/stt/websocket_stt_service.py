@@ -61,6 +61,16 @@ _CLOSE_TIMEOUT_SECONDS = 5.0
 # Bounded wait for session.updated after session.update.
 _SESSION_READY_TIMEOUT_SECONDS = 5.0
 
+# Reconnect back-off schedule. Doubles 0.5 → 8.0s before giving up, total
+# ~15.5s of wall clock. Sized to cover the LaunchAgent keepalive window
+# (``ThrottleInterval=10`` in scripts/koda-stt.plist.template) plus a
+# couple of seconds for the freshly-respawned server to load its MLX
+# model, which is the common case where our short retry window fired too
+# early and surfaced an ErrorFrame for the segment in flight during a
+# restart. The final entry is the delay *before* the last attempt — if
+# that attempt also fails, ``_ensure_connected`` re-raises.
+_RECONNECT_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
+
 
 class WebSocketSTTService(SegmentedSTTService):
     """STTService that forwards VAD-delimited audio to the stt_server.
@@ -234,10 +244,15 @@ class WebSocketSTTService(SegmentedSTTService):
         # don't leak the websocket or race a dying reader with the new one.
         await self._discard_stale()
 
-        # One quick retry covers the common race where launchd is mid-restart.
+        # Exponential-backoff reconnect: first attempt is immediate, then
+        # the schedule in ``_RECONNECT_BACKOFF_SECONDS`` inserts a delay
+        # before each subsequent attempt. Sized to ride out a LaunchAgent
+        # ``ThrottleInterval=10`` restart plus a few seconds of MLX model
+        # warm-up on the respawned server.
         endpoint = self._endpoint_label()
         last_exc: Exception | None = None
-        for attempt in range(2):
+        total_attempts = 1 + len(_RECONNECT_BACKOFF_SECONDS)
+        for attempt in range(total_attempts):
             try:
                 client = TranscriptionClient(**self._connect_kwargs)
                 await client.connect()
@@ -259,7 +274,7 @@ class WebSocketSTTService(SegmentedSTTService):
                 except asyncio.TimeoutError:
                     raise RuntimeError("stt_server did not ack session.update")
                 if attempt > 0:
-                    logger.info(f"{self.name}: reconnected to {endpoint}")
+                    logger.info(f"{self.name}: reconnected to {endpoint} on attempt {attempt + 1}")
                 else:
                     logger.info(f"{self.name}: connected to {endpoint}")
                 return
@@ -269,13 +284,17 @@ class WebSocketSTTService(SegmentedSTTService):
                 # late events from the superseded socket can't poison the
                 # next attempt's _session_ready / _pending futures.
                 await self._discard_stale()
-                if attempt == 0:
+                if attempt + 1 < total_attempts:
+                    delay = _RECONNECT_BACKOFF_SECONDS[attempt]
                     logger.warning(
-                        f"{self.name}: connect attempt 1 failed ({exc}) [endpoint={endpoint}], "
-                        f"retrying"
+                        f"{self.name}: connect attempt {attempt + 1} failed ({exc}) "
+                        f"[endpoint={endpoint}], retrying in {delay}s"
                     )
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(delay)
         assert last_exc is not None
+        logger.error(
+            f"{self.name}: giving up after {total_attempts} connect attempts to {endpoint}"
+        )
         raise last_exc
 
     def _endpoint_label(self) -> str:
