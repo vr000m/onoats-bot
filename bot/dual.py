@@ -47,6 +47,7 @@ from bot.runtime import (  # noqa: E402
     SttPreflightError,
     _remove_pid_file,
     _create_stt_service,
+    log_stt_server_rss,
     _install_signal_handlers,
     _restore_terminal,
     _start_keypress_reader,
@@ -253,6 +254,11 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     system_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
     mic_stt = await _create_stt_service()
     system_stt = await _create_stt_service()
+    # RSS baseline for the stt_server at bot start. Pair with the
+    # ``shutdown`` entry logged from `_run_shutdown` to get a free
+    # soak datapoint out of every real-world session — no dedicated
+    # harness needed.
+    log_stt_server_rss("startup")
 
     pipeline = _build_dual_pipeline(
         mic_transport,
@@ -352,6 +358,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         logger.info("Shutdown: draining dual STT services")
         await _shutdown_stt_service(mic_stt, "mic")
         await _shutdown_stt_service(system_stt, "system")
+        log_stt_server_rss("shutdown")
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()

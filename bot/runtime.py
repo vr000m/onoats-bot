@@ -147,6 +147,44 @@ _PREFLIGHT_TIMEOUT_SEC = 2.0
 _preflight_cache: set[tuple[object, object, object, object]] = set()
 
 
+def log_stt_server_rss(phase: str) -> None:
+    """Log the stt_server's PID + RSS at ``phase`` (e.g. ``startup`` / ``shutdown``).
+
+    Best-effort: swallows everything and logs ``debug`` on miss so an
+    unreachable server never fails bot lifecycle. Used to get a free RSS
+    before/after trace across real-world sessions without standing up a
+    separate soak harness.
+    """
+    try:
+        import subprocess
+
+        pids = subprocess.check_output(
+            ["pgrep", "-f", "python -m stt_server"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).split()
+        if not pids:
+            logger.debug(f"stt_server RSS ({phase}): not running")
+            return
+        # If multiple PIDs match (e.g. a stale + fresh process during
+        # restart), log each so the trace is unambiguous.
+        for pid in pids:
+            rss = subprocess.check_output(
+                ["ps", "-o", "rss=", "-p", pid],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            etime = subprocess.check_output(
+                ["ps", "-o", "etime=", "-p", pid],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            rss_mb = int(rss) / 1024 if rss.isdigit() else 0
+            logger.info(f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB uptime={etime}")
+    except Exception as exc:
+        logger.debug(f"stt_server RSS ({phase}): probe failed ({exc})")
+
+
 def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
     return (
         kwargs.get("uri"),
