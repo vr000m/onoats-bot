@@ -139,7 +139,21 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
 
 
 _PREFLIGHT_TIMEOUT_SEC = 2.0
-_preflight_done = False
+# Keyed on the endpoint tuple, not a bare bool, so that if a future
+# caller builds kwargs for a *different* endpoint on the second call
+# (dual path today uses the same resolved kwargs for both branches, but
+# nothing in the type system pins that) the probe re-runs against the
+# new endpoint instead of silently trusting a stale success.
+_preflight_cache: set[tuple[object, object, object, object]] = set()
+
+
+def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
+    return (
+        kwargs.get("uri"),
+        kwargs.get("socket_path"),
+        kwargs.get("host"),
+        kwargs.get("port"),
+    )
 
 
 async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
@@ -151,16 +165,18 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     surfaced here as ``SttPreflightError`` instead of leaking through as
     generic tracebacks or the old 30–60 s VAD-driven reconnect cascade.
 
-    Idempotent via ``_preflight_done`` so the dual entrypoint can call
-    ``_create_stt_service()`` twice without paying for two handshakes
-    against the same endpoint.
+    Idempotent per endpoint: the dual entrypoint calls
+    ``_create_stt_service()`` twice and today both use the same resolved
+    kwargs; a repeated call for the same ``(uri, socket_path, host,
+    port)`` tuple is a no-op. A call for a *different* tuple re-runs the
+    probe.
 
     Runtime reconnect during a live session is still handled by
     ``WebSocketSTTService._ensure_connected`` — this check only runs once
     before the pipeline starts.
     """
-    global _preflight_done
-    if _preflight_done:
+    key = _preflight_key(kwargs)
+    if key in _preflight_cache:
         return
 
     from stt_server.client import TranscriptionClient
@@ -232,7 +248,7 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
         except Exception:
             pass
 
-    _preflight_done = True
+    _preflight_cache.add(key)
 
 
 async def _create_stt_service():
