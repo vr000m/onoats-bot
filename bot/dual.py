@@ -258,7 +258,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     # ``shutdown`` entry logged from `_run_shutdown` to get a free
     # soak datapoint out of every real-world session — no dedicated
     # harness needed.
-    log_stt_server_rss("startup")
+    await log_stt_server_rss("startup")
 
     pipeline = _build_dual_pipeline(
         mic_transport,
@@ -358,7 +358,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         logger.info("Shutdown: draining dual STT services")
         await _shutdown_stt_service(mic_stt, "mic")
         await _shutdown_stt_service(system_stt, "system")
-        log_stt_server_rss("shutdown")
+        await log_stt_server_rss("shutdown")
 
         logger.info("Shutdown: closing transcript store")
         await transcript_store.close()

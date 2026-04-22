@@ -100,7 +100,7 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     silently capture it.
     """
     from stt_server.client import (
-        _format_host_for_uri,
+        format_host_for_uri,
         is_cleartext_remote,
         resolve_endpoint_from_env,
     )
@@ -122,7 +122,7 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     # supported config surface the operator chose.
     effective_uri = uri
     if not effective_uri and host and port is not None and not socket_path:
-        effective_uri = f"ws://{_format_host_for_uri(host)}:{port}/"
+        effective_uri = f"ws://{format_host_for_uri(host)}:{port}/"
     if auth_token and effective_uri and is_cleartext_remote(effective_uri):
         logger.warning(
             f"STT: STT_WS_TOKEN will be sent in cleartext to {effective_uri}. "
@@ -147,40 +147,63 @@ _PREFLIGHT_TIMEOUT_SEC = 2.0
 _preflight_cache: set[tuple[object, object, object, object]] = set()
 
 
-def log_stt_server_rss(phase: str) -> None:
-    """Log the stt_server's PID + RSS at ``phase`` (e.g. ``startup`` / ``shutdown``).
+_RSS_PROBE_TIMEOUT_SEC = 2.0
+
+
+async def log_stt_server_rss(phase: str) -> None:
+    """Log the stt_server's PID + peak RSS at ``phase`` (``startup`` / ``shutdown``).
+
+    Queries the running server via the ``server.status`` wire probe
+    (``pid`` + ``rss_bytes`` fields) rather than discovering the process
+    by command-line pattern. Topology-agnostic: works the same whether
+    the server runs from a LaunchAgent, a wrapper script, a compiled
+    binary, or a remote host.
 
     Best-effort: swallows everything and logs ``debug`` on miss so an
-    unreachable server never fails bot lifecycle. Used to get a free RSS
-    before/after trace across real-world sessions without standing up a
-    separate soak harness.
+    unreachable server never fails bot lifecycle.
     """
     try:
-        import subprocess
+        from stt_server import protocol as P
+        from stt_server.client import TranscriptionClient
 
-        pids = subprocess.check_output(
-            ["pgrep", "-f", "python -m stt_server"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).split()
-        if not pids:
-            logger.debug(f"stt_server RSS ({phase}): not running")
-            return
-        # If multiple PIDs match (e.g. a stale + fresh process during
-        # restart), log each so the trace is unambiguous.
-        for pid in pids:
-            rss = subprocess.check_output(
-                ["ps", "-o", "rss=", "-p", pid],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
-            etime = subprocess.check_output(
-                ["ps", "-o", "etime=", "-p", pid],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
-            rss_mb = int(rss) / 1024 if rss.isdigit() else 0
-            logger.info(f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB uptime={etime}")
+        kwargs = _resolve_stt_ws_target(os.environ.copy())
+        client = TranscriptionClient(
+            socket_path=kwargs.get("socket_path"),
+            host=kwargs.get("host"),
+            port=kwargs.get("port"),
+            uri=kwargs.get("uri"),
+            auth_token=kwargs.get("auth_token"),
+        )
+
+        async def _probe() -> None:
+            await client.connect()
+            await client.status()
+            async for event in client.events():
+                if event.get("type") != P.EVT_SERVER_STATUS:
+                    continue
+                pid = event.get("pid")
+                rss = event.get("rss_bytes")
+                uptime = event.get("uptime_seconds")
+                rss_mb = (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
+                uptime_s = float(uptime) if isinstance(uptime, (int, float)) else 0.0
+                logger.info(
+                    f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
+                    f"session_uptime={uptime_s:.1f}s"
+                )
+                return
+            logger.debug(f"stt_server RSS ({phase}): status reply missing")
+
+        try:
+            await asyncio.wait_for(_probe(), timeout=_RSS_PROBE_TIMEOUT_SEC)
+        finally:
+            try:
+                await client.close_session()
+            except Exception:
+                pass
+            try:
+                await client.close()
+            except Exception:
+                pass
     except Exception as exc:
         logger.debug(f"stt_server RSS ({phase}): probe failed ({exc})")
 
