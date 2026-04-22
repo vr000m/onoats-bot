@@ -405,6 +405,10 @@ class WebSocketSTTService(SegmentedSTTService):
         if self._client is None:
             return
         client = self._client
+        # Shutdown-phase timing: the Pipecat 20 s ``wait_for_cancel`` warning
+        # is opaque by the time it fires — "STT close took Ns" from this
+        # wrapper pins the blame here immediately instead.
+        t0 = asyncio.get_running_loop().time()
         try:
             try:
                 await asyncio.wait_for(client.close_session(), timeout=_CLOSE_TIMEOUT_SECONDS)
@@ -421,11 +425,14 @@ class WebSocketSTTService(SegmentedSTTService):
             self._client = None
             self._reader_task = None
             self._connected = False
+            elapsed = asyncio.get_running_loop().time() - t0
+            logger.info(f"{self.name}: graceful close took {elapsed:.3f}s")
 
     async def _cancel_and_close(self) -> None:
         if self._client is None:
             return
         client = self._client
+        t0 = asyncio.get_running_loop().time()
         try:
             try:
                 await client.cancel()
@@ -444,3 +451,5 @@ class WebSocketSTTService(SegmentedSTTService):
             self._client = None
             self._reader_task = None
             self._connected = False
+            elapsed = asyncio.get_running_loop().time() - t0
+            logger.info(f"{self.name}: hard cancel took {elapsed:.3f}s")
