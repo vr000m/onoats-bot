@@ -90,7 +90,9 @@ def _mlx_available() -> bool:
 _DEFAULT_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
 
 
-def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
+def _resolve_stt_ws_target(
+    env: dict[str, str], *, warn_on_cleartext: bool = True
+) -> dict[str, object]:
     """Resolve STT_WS_* env vars into the kwargs for ``WebSocketSTTService``.
 
     Delegates precedence handling to ``stt_server.client.resolve_endpoint_from_env``
@@ -98,6 +100,10 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     bearer read. When operators point at a cleartext remote host, warn
     before attaching the token so a passive on-path observer cannot
     silently capture it.
+
+    Set ``warn_on_cleartext=False`` for secondary callers (e.g. the RSS
+    probe at startup/shutdown) that resolve the same endpoint and would
+    otherwise emit the warning repeatedly in a single session.
     """
     from stt_server.client import (
         format_host_for_uri,
@@ -123,7 +129,7 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
     effective_uri = uri
     if not effective_uri and host and port is not None and not socket_path:
         effective_uri = f"ws://{format_host_for_uri(host)}:{port}/"
-    if auth_token and effective_uri and is_cleartext_remote(effective_uri):
+    if warn_on_cleartext and auth_token and effective_uri and is_cleartext_remote(effective_uri):
         logger.warning(
             f"STT: STT_WS_TOKEN will be sent in cleartext to {effective_uri}. "
             "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
@@ -136,6 +142,32 @@ def _resolve_stt_ws_target(env: dict[str, str]) -> dict[str, object]:
         "uri": uri,
         "auth_token": auth_token,
     }
+
+
+def _display_target(kwargs: dict) -> str:
+    """Render an endpoint as a safe human-readable string for logs/errors.
+
+    ``STT_WS_URI`` is user-controlled and may contain userinfo
+    (``ws://user:pass@host/``). Strip it before rendering so a typoed
+    secret doesn't echo into stderr or a log line.
+    """
+    uri = kwargs.get("uri")
+    if uri:
+        import urllib.parse
+
+        try:
+            parsed = urllib.parse.urlsplit(uri)
+        except ValueError:
+            return uri
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port is not None:
+                netloc = f"{netloc}:{parsed.port}"
+            return urllib.parse.urlunsplit(
+                (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+            )
+        return uri
+    return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
 
 
 _PREFLIGHT_TIMEOUT_SEC = 2.0
@@ -166,7 +198,10 @@ async def log_stt_server_rss(phase: str) -> None:
         from stt_server import protocol as P
         from stt_server.client import TranscriptionClient
 
-        kwargs = _resolve_stt_ws_target(os.environ.copy())
+        # The primary STT service path already logged any cleartext-token
+        # warning at session start; suppress here so startup+shutdown
+        # probes don't duplicate it.
+        kwargs = _resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False)
         client = TranscriptionClient(
             socket_path=kwargs.get("socket_path"),
             host=kwargs.get("host"),
@@ -284,7 +319,7 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
             # (future callers may build kwargs differently). Still
             # actionable, still better than a traceback.
             raise SttPreflightError(f"STT: misconfigured endpoint ({exc}). {hint}") from exc
-        except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
+        except OSError as exc:  # covers FileNotFoundError + ConnectionRefusedError
             raise SttPreflightError(
                 f"STT: stt_server not reachable at {target} ({exc}). {hint}"
             ) from exc
@@ -334,7 +369,7 @@ async def _create_stt_service():
             ) from exc
 
         kwargs = _resolve_stt_ws_target(os.environ)
-        target = kwargs["uri"] or kwargs["socket_path"] or f"{kwargs['host']}:{kwargs['port']}"
+        target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
         await _preflight_stt_ws(kwargs, target)
         return WebSocketSTTService(language="en", **kwargs)
