@@ -248,11 +248,16 @@ class DualSilenceDetector(FrameProcessor):
         now = asyncio.get_running_loop().time()
         if now - self._start_time < _HEARTBEAT_STARTUP_GRACE:
             return
-        if self._effective_speaking():
-            return
         if not self._last_vad_activity:
             return
 
+        # Don't gate on `_effective_speaking()` — its staleness threshold is
+        # tuned for flush correctness (450s by default) and would suppress the
+        # warning during exactly the orphaned-stream case it's meant to catch:
+        # a `VADStarted` with no matching `VADStopped` keeps a branch flagged
+        # speaking even though no audio frames are arriving. Use the raw VAD
+        # activity timestamp instead — within a real utterance, start/stop
+        # events keep `_last_vad_activity` fresh enough to dodge a false alert.
         elapsed = now - max(self._last_vad_activity.values())
         if elapsed < self._heartbeat_threshold:
             return
