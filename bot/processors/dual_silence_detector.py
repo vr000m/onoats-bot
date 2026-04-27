@@ -65,7 +65,7 @@ class DualSilenceDetector(FrameProcessor):
         silence_timeout: Optional[float] = None,
         poll_interval: float = _POLL_INTERVAL,
         heartbeat_threshold: Optional[float] = None,
-        heartbeat_notifier: Callable[[str], None] = fire_desktop_notification,
+        heartbeat_notifier: Optional[Callable[[str], None]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -94,7 +94,9 @@ class DualSilenceDetector(FrameProcessor):
             )
             heartbeat_threshold = clamped
         self._heartbeat_threshold = heartbeat_threshold
-        self._heartbeat_notifier = heartbeat_notifier
+        self._heartbeat_notifier = (
+            heartbeat_notifier if heartbeat_notifier is not None else fire_desktop_notification
+        )
         self._heartbeat_fired = False
         self._ever_seen_vad = False
         # Set in start_monitoring() — the event loop may not be running yet here.
@@ -207,23 +209,21 @@ class DualSilenceDetector(FrameProcessor):
             raise
 
     async def _check_timeout(self) -> None:
-        await self._check_heartbeat()
-
         if self._fired:
             return
-        if self._effective_speaking():
-            return
-        if not self._last_vad_activity:
-            return
 
-        elapsed = asyncio.get_running_loop().time() - max(self._last_vad_activity.values())
-        if elapsed >= self._timeout:
-            logger.info(
-                f"DualSilenceDetector: timeout fired after {elapsed:.1f}s of inactivity "
-                f"(threshold={self._timeout}s)"
-            )
-            self._fired = True
-            await self._invoke_callback()
+        if not self._effective_speaking() and self._last_vad_activity:
+            elapsed = asyncio.get_running_loop().time() - max(self._last_vad_activity.values())
+            if elapsed >= self._timeout:
+                logger.info(
+                    f"DualSilenceDetector: timeout fired after {elapsed:.1f}s of inactivity "
+                    f"(threshold={self._timeout}s)"
+                )
+                self._fired = True
+                await self._invoke_callback()
+                return
+
+        await self._check_heartbeat()
 
     async def _check_heartbeat(self) -> None:
         """Warn when both branches stay silent during what should be an active session.
