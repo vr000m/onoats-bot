@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Callable, Optional
 
 from loguru import logger
@@ -14,6 +15,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from bot.frames import resolve_frame_source
+from bot.processors.heartbeat_notifier import fire_desktop_notification
 
 _SILENCE_TIMEOUT_DEFAULT = 300.0
 _POLL_INTERVAL = 10.0
@@ -25,6 +27,34 @@ _POLL_INTERVAL = 10.0
 _SPEAKING_STALENESS_FLOOR = 60.0
 _SPEAKING_STALENESS_MULTIPLIER = 1.5
 
+# Heartbeat: warn when both branches stay silent during an active session.
+# Catches AirPods BT-profile-switch orphaned PortAudio streams and user-error
+# routing (e.g. call audio bypassing BlackHole) within ~2 min instead of
+# bleeding the entire call.
+_HEARTBEAT_THRESHOLD_DEFAULT = 120.0
+_HEARTBEAT_STARTUP_GRACE = 30.0
+
+
+def _heartbeat_threshold_from_env() -> float:
+    raw = os.environ.get("AUDIO_HEARTBEAT_SEC")
+    if raw is None:
+        return _HEARTBEAT_THRESHOLD_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            f"AUDIO_HEARTBEAT_SEC={raw!r} is not a number; "
+            f"using default {_HEARTBEAT_THRESHOLD_DEFAULT}s"
+        )
+        return _HEARTBEAT_THRESHOLD_DEFAULT
+    if value <= 0:
+        logger.warning(
+            f"AUDIO_HEARTBEAT_SEC={value} must be positive; "
+            f"using default {_HEARTBEAT_THRESHOLD_DEFAULT}s"
+        )
+        return _HEARTBEAT_THRESHOLD_DEFAULT
+    return value
+
 
 class DualSilenceDetector(FrameProcessor):
     """Fire only when the microphone and loopback branches are both idle."""
@@ -34,6 +64,8 @@ class DualSilenceDetector(FrameProcessor):
         on_silence_timeout: Callable,
         silence_timeout: Optional[float] = None,
         poll_interval: float = _POLL_INTERVAL,
+        heartbeat_threshold: Optional[float] = None,
+        heartbeat_notifier: Callable[[str], None] = fire_desktop_notification,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -52,6 +84,22 @@ class DualSilenceDetector(FrameProcessor):
         self._fired = False
         self._monitor_task: Optional[asyncio.Task] = None
 
+        if heartbeat_threshold is None:
+            heartbeat_threshold = _heartbeat_threshold_from_env()
+        if heartbeat_threshold >= self._timeout:
+            clamped = self._timeout / 2
+            logger.warning(
+                f"DualSilenceDetector: heartbeat threshold ({heartbeat_threshold:.0f}s) "
+                f">= silence timeout ({self._timeout:.0f}s); clamping to {clamped:.0f}s"
+            )
+            heartbeat_threshold = clamped
+        self._heartbeat_threshold = heartbeat_threshold
+        self._heartbeat_notifier = heartbeat_notifier
+        self._heartbeat_fired = False
+        self._ever_seen_vad = False
+        # Set in start_monitoring() — the event loop may not be running yet here.
+        self._start_time: Optional[float] = None
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
@@ -67,13 +115,15 @@ class DualSilenceDetector(FrameProcessor):
     async def start_monitoring(self) -> None:
         if self._monitor_task is not None and not self._monitor_task.done():
             return
+        self._start_time = asyncio.get_running_loop().time()
         self._monitor_task = asyncio.create_task(
             self._monitoring_loop(),
             name="dual_silence_detector_monitor",
         )
         logger.info(
             f"DualSilenceDetector: monitoring task started "
-            f"(timeout={self._timeout}s, speaking_staleness={self._speaking_staleness}s)"
+            f"(timeout={self._timeout}s, speaking_staleness={self._speaking_staleness}s, "
+            f"heartbeat={self._heartbeat_threshold}s)"
         )
 
     async def stop_monitoring(self) -> None:
@@ -94,18 +144,23 @@ class DualSilenceDetector(FrameProcessor):
         self._speaking_since[source] = now
         self._last_vad_activity[source] = now
         self._fired = False
+        self._heartbeat_fired = False
+        self._ever_seen_vad = True
 
     def _on_speech_stop(self, source: str) -> None:
         self._speaking[source] = False
         self._speaking_since.pop(source, None)
         self._last_vad_activity[source] = asyncio.get_running_loop().time()
         self._fired = False
+        self._heartbeat_fired = False
+        self._ever_seen_vad = True
 
     def reset_timer(self) -> None:
         self._last_vad_activity = {}
         self._speaking = {}
         self._speaking_since = {}
         self._fired = False
+        self._heartbeat_fired = False
         logger.info("DualSilenceDetector: timer reset")
 
     def _effective_speaking(self) -> bool:
@@ -152,6 +207,8 @@ class DualSilenceDetector(FrameProcessor):
             raise
 
     async def _check_timeout(self) -> None:
+        await self._check_heartbeat()
+
         if self._fired:
             return
         if self._effective_speaking():
@@ -167,6 +224,51 @@ class DualSilenceDetector(FrameProcessor):
             )
             self._fired = True
             await self._invoke_callback()
+
+    async def _check_heartbeat(self) -> None:
+        """Warn when both branches stay silent during what should be an active session.
+
+        Distinct from ``_check_timeout``: the silence-timeout flush is a normal
+        end-of-session signal, while the heartbeat is an *anomaly* signal
+        (audio capture probably broken — wrong device routing, or PortAudio
+        stream orphaned by a Bluetooth profile switch). It fires once per
+        silence period and re-arms when any branch resumes VAD activity.
+        """
+        if self._heartbeat_fired:
+            return
+        if self._fired:
+            # Silence timeout already declared the session over — don't pile on.
+            return
+        if not self._ever_seen_vad:
+            # No branch has produced audio since startup — could be a misconfigured
+            # test environment, not a live regression. Stay quiet.
+            return
+        if self._start_time is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if now - self._start_time < _HEARTBEAT_STARTUP_GRACE:
+            return
+        if self._effective_speaking():
+            return
+        if not self._last_vad_activity:
+            return
+
+        elapsed = now - max(self._last_vad_activity.values())
+        if elapsed < self._heartbeat_threshold:
+            return
+
+        self._heartbeat_fired = True
+        message = f"Koda: both audio branches silent for {elapsed:.0f}s — check call routing"
+        logger.warning(f"DualSilenceDetector: heartbeat fired — {message}")
+        await self._dispatch_heartbeat(message)
+
+    async def _dispatch_heartbeat(self, message: str) -> None:
+        """Call the (synchronous) notifier off the event loop thread."""
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._heartbeat_notifier, message)
+        except Exception as exc:  # noqa: BLE001 — notifier failures must not crash the bot
+            logger.error(f"DualSilenceDetector: heartbeat notifier raised: {exc}")
 
     async def _invoke_callback(self) -> None:
         try:
