@@ -19,6 +19,7 @@ import platform
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -684,8 +685,12 @@ def _write_pid_file(data_dir: Path) -> Path:
             logger.warning("PID file exists, process may be running as different user")
 
     cmdline = _own_ps_cmdline()
+    # Wall-clock start_epoch is included as the 4th line so live-view
+    # readers can distinguish a freshly-started bot from one that
+    # happens to have inherited a recycled pid (see shared.koda_pid).
+    start_epoch = time.time()
     pid_path.write_text(
-        f"{os.getpid()}\n{_PID_MARKER}\n{cmdline}\n",
+        f"{os.getpid()}\n{_PID_MARKER}\n{cmdline}\n{start_epoch}\n",
         encoding="utf-8",
     )
     logger.debug(f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})")
