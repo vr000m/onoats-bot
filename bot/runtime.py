@@ -19,10 +19,13 @@ import platform
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+
+from shared.koda_pid import PID_FILENAME, PID_MARKER, read_pid_file as _read_pid_file  # noqa: F401
 
 # termios/tty are Unix-only — guard for Windows compatibility
 if sys.platform != "win32":
@@ -48,9 +51,6 @@ class SttPreflightError(RuntimeError):
 
 
 PIPELINE_SAMPLE_RATE = 16000  # Silero VAD requires 8kHz or 16kHz; 16kHz is standard
-
-PID_FILENAME = "koda.pid"
-_PID_MARKER = "koda-bot"
 
 # Map simple model name strings to MLXModel enum member names
 _MLX_MODEL_MAP: dict[str, str] = {
@@ -665,20 +665,6 @@ def _own_ps_cmdline() -> str:
     return ""
 
 
-def _read_pid_file(pid_path: Path) -> int | None:
-    """Read and validate a PID file. Returns the PID if valid, None otherwise."""
-    if not pid_path.exists():
-        return None
-    try:
-        lines = pid_path.read_text(encoding="utf-8").strip().splitlines()
-        if len(lines) < 2 or lines[1].strip() != _PID_MARKER:
-            logger.warning(f"PID file {pid_path} missing identity marker — ignoring")
-            return None
-        return int(lines[0].strip())
-    except (ValueError, OSError):
-        return None
-
-
 def _write_pid_file(data_dir: Path) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint."""
     active_dir = data_dir / ".active"
@@ -699,8 +685,12 @@ def _write_pid_file(data_dir: Path) -> Path:
             logger.warning("PID file exists, process may be running as different user")
 
     cmdline = _own_ps_cmdline()
+    # Wall-clock start_epoch is included as the 4th line so live-view
+    # readers can distinguish a freshly-started bot from one that
+    # happens to have inherited a recycled pid (see shared.koda_pid).
+    start_epoch = time.time()
     pid_path.write_text(
-        f"{os.getpid()}\n{_PID_MARKER}\n{cmdline}\n",
+        f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n",
         encoding="utf-8",
     )
     logger.debug(f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})")
