@@ -25,7 +25,7 @@ from typing import Optional
 
 from loguru import logger
 
-from shared.koda_pid import PID_FILENAME, _PID_MARKER, read_pid_file as _read_pid_file  # noqa: F401
+from shared.koda_pid import PID_FILENAME, PID_MARKER, read_pid_file as _read_pid_file  # noqa: F401
 
 # termios/tty are Unix-only — guard for Windows compatibility
 if sys.platform != "win32":
@@ -690,7 +690,7 @@ def _write_pid_file(data_dir: Path) -> Path:
     # happens to have inherited a recycled pid (see shared.koda_pid).
     start_epoch = time.time()
     pid_path.write_text(
-        f"{os.getpid()}\n{_PID_MARKER}\n{cmdline}\n{start_epoch}\n",
+        f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n",
         encoding="utf-8",
     )
     logger.debug(f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})")
