@@ -1,23 +1,30 @@
 """Read-only SmartTurn shadow observer for the dual-input pipeline.
 
-Runs ``LocalSmartTurnAnalyzerV3`` alongside the existing VAD path without
-changing commit behaviour. At each VAD-stopped event the analyser is asked
-whether the turn looks complete; the verdict is logged for offline
-comparison against the VAD-only baseline. No frame is ever swallowed,
-modified, or held back — downstream STT continues to commit on raw VAD
-exactly as before.
+Runs ``LocalSmartTurnAnalyzerV3`` alongside the existing VAD path
+without changing commit behaviour. At each VAD-stopped event the
+analyser is asked whether the turn looks complete; the verdict is
+logged for offline comparison against the VAD-only baseline. No frame
+is ever swallowed, modified, or held back — downstream STT continues
+to commit on raw VAD exactly as before.
 
 Per the dev plan in
-``docs/dev_plans/20260420-design-whisper-websocket-server.md`` the spike
-order is: prototype on ``me`` first, measure mid-turn fragmentation
-against the 2026-04-21 corpus, then mirror to ``them`` and consider
-flipping the commit decision over to SmartTurn.
+``docs/dev_plans/20260420-design-whisper-websocket-server.md`` the
+spike order is: prototype on ``me`` first, measure mid-turn
+fragmentation against the 2026-04-21 corpus, then mirror to ``them``
+and consider flipping the commit decision over to SmartTurn.
 
 Gated by ``KODA_SMART_TURN_SHADOW=1`` so the analyser only loads when
-explicitly enabled — keeps cold-start cost out of the default bot path.
-When enabled, verdicts are mirrored to JSONL under
+explicitly enabled — keeps cold-start cost out of the default bot
+path. When enabled, verdicts are mirrored to JSONL under
 ``<KODA_DATA_DIR>/shadow/verdicts/<YYYY-MM-DD>/<call_id>.jsonl`` so we
 have durable evidence regardless of whether stdout was captured.
+
+Concurrency model: ``append_audio`` and ``analyze_end_of_turn`` share
+the analyser's internal audio buffer. Both are serialised through
+``_analyse_lock`` so the executor thread iterating the buffer cannot
+race with the event loop appending to it. ``started_at`` is captured
+synchronously at the VAD-stopped event so a queued analyse cannot be
+mislabelled with the next turn's timestamp.
 """
 
 from __future__ import annotations
@@ -34,6 +41,8 @@ from loguru import logger
 from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
     Frame,
     InputAudioRawFrame,
     StartFrame,
@@ -49,25 +58,33 @@ def smart_turn_shadow_enabled() -> bool:
 
 
 def resolve_verdict_dir() -> Path:
-    """Resolve the verdict JSONL root, honouring KODA_DATA_DIR."""
-    from shared.store import DEFAULT_DATA_DIR
+    """Resolve today's verdict JSONL root with restrictive perms."""
+    from shared.store import shadow_data_dir
 
-    base = Path(os.environ.get("KODA_DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
     today = datetime.now().strftime("%Y-%m-%d")
-    return base / "shadow" / "verdicts" / today
+    out = shadow_data_dir() / "verdicts" / today
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        out.chmod(0o700)
+    except OSError:
+        pass
+    return out
 
 
 class SmartTurnShadowObserver(FrameProcessor):
     """Log what SmartTurn would have decided at every VAD-stopped event.
 
     One instance per branch; place after the branch's VADProcessor and
-    before STT so plain VAD frames carry implicit branch identity from the
-    pipeline arm. Forwards every frame untouched; never raises on analyser
-    failure (logs and continues — the bot must not depend on shadow output).
+    before STT so plain VAD frames carry implicit branch identity from
+    the pipeline arm. Forwards every frame untouched; never raises on
+    analyser failure (logs and continues — the bot must not depend on
+    shadow output).
 
-    When ``call_id`` and ``verdict_dir`` are provided each verdict is also
-    appended to ``<verdict_dir>/<call_id>.jsonl`` so the data survives even
-    if stdout is not captured (e.g. headless / launchctl runs).
+    When ``call_id`` and ``verdict_dir`` are provided each verdict is
+    also appended to ``<verdict_dir>/<call_id>_<source>.jsonl`` so the
+    data survives even if stdout is not captured. Per-source files
+    avoid byte-level interleaving when the two branches run
+    concurrently.
     """
 
     def __init__(
@@ -82,24 +99,28 @@ class SmartTurnShadowObserver(FrameProcessor):
         super().__init__(**kwargs)
         self._source = source
         # BaseTurnAnalyzer stores the constructor sample_rate as
-        # _init_sample_rate but leaves _sample_rate=0 until set_sample_rate
-        # fires from a StartFrame. Pass it here so set_sample_rate's
-        # ``_init_sample_rate or sample_rate`` clause picks it up.
+        # _init_sample_rate but leaves _sample_rate=0 until
+        # set_sample_rate fires from a StartFrame. Pass it here so
+        # set_sample_rate's ``_init_sample_rate or sample_rate`` clause
+        # picks it up.
         self._analyzer = LocalSmartTurnAnalyzerV3(sample_rate=sample_rate)
         self._configured_sample_rate = sample_rate
         self._in_speech = False
         self._turn_started_at: float | None = None
-        # Serialise analyse calls per branch — overlapping VAD-stopped
-        # events on the same branch would otherwise contend for the
-        # internal audio buffer.
+        # Single lock guards both append_audio and analyze_end_of_turn:
+        # the analyser's _audio_buffer would otherwise be mutated by the
+        # event loop while the executor thread iterates it.
         self._analyse_lock = asyncio.Lock()
+        self._pending_task: asyncio.Task | None = None
 
         self._call_id = call_id
         self._jsonl_path: Path | None = None
         if call_id and verdict_dir is not None:
             try:
                 verdict_dir.mkdir(parents=True, exist_ok=True)
-                self._jsonl_path = verdict_dir / f"{call_id}.jsonl"
+                # Per-source path so concurrent appends from `me` and
+                # `them` instances cannot interleave bytes.
+                self._jsonl_path = verdict_dir / f"{call_id}_{source}.jsonl"
                 logger.info(f"SmartTurnShadow[{source}]: persisting verdicts to {self._jsonl_path}")
             except Exception as exc:
                 logger.warning(
@@ -111,29 +132,44 @@ class SmartTurnShadowObserver(FrameProcessor):
 
         try:
             if isinstance(frame, StartFrame):
-                # Wake the analyser's internal sample-rate state so
-                # append_audio's chunk-duration maths doesn't divide by zero.
                 self._analyzer.set_sample_rate(
                     getattr(frame, "audio_in_sample_rate", self._configured_sample_rate)
                 )
             elif isinstance(frame, InputAudioRawFrame):
-                # Feed every frame to the analyser regardless of VAD state;
-                # the analyser tracks pre-speech buffer + silence internally.
-                self._analyzer.append_audio(frame.audio, is_speech=self._in_speech)
+                # Serialise with analyse — without this, the executor
+                # thread iterating _audio_buffer races the event loop
+                # appending to it.
+                async with self._analyse_lock:
+                    self._analyzer.append_audio(frame.audio, is_speech=self._in_speech)
             elif isinstance(frame, VADUserStartedSpeakingFrame):
                 self._in_speech = True
                 self._turn_started_at = time.monotonic()
             elif isinstance(frame, VADUserStoppedSpeakingFrame):
                 self._in_speech = False
-                asyncio.create_task(self._shadow_analyse())
+                # Capture started_at *now* — a queued analyse running
+                # after the next VAD-started frame would otherwise read
+                # the new turn's timestamp.
+                started_at = self._turn_started_at
+                self._pending_task = asyncio.create_task(self._shadow_analyse(started_at))
+            elif isinstance(frame, (EndFrame, CancelFrame)):
+                await self._drain_pending_task()
         except Exception as exc:
-            # Shadow must never break the live pipeline. Log and move on.
             logger.warning(f"SmartTurnShadow[{self._source}]: observe error: {exc}")
 
         await self.push_frame(frame, direction)
 
-    async def _shadow_analyse(self) -> None:
-        started = self._turn_started_at
+    async def _drain_pending_task(self) -> None:
+        task = self._pending_task
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+        except Exception as exc:
+            logger.warning(f"SmartTurnShadow[{self._source}]: pending task drain failed: {exc}")
+
+    async def _shadow_analyse(self, started_at: float | None) -> None:
         async with self._analyse_lock:
             try:
                 state, metrics = await self._analyzer.analyze_end_of_turn()
@@ -142,10 +178,12 @@ class SmartTurnShadowObserver(FrameProcessor):
                     f"SmartTurnShadow[{self._source}]: analyse_end_of_turn failed: {exc}"
                 )
                 return
-        verdict = "COMPLETE" if state == EndOfTurnState.COMPLETE else "INCOMPLETE"
-        turn_secs = (time.monotonic() - started) if started is not None else None
-        # Single structured line per VAD-stopped event so a grep across the
-        # bot log produces a clean comparison corpus.
+        verdict = (
+            state.name
+            if hasattr(state, "name")
+            else ("COMPLETE" if state == EndOfTurnState.COMPLETE else "INCOMPLETE")
+        )
+        turn_secs = (time.monotonic() - started_at) if started_at is not None else None
         logger.info(
             f"smart_turn_shadow source={self._source} verdict={verdict} turn_secs={turn_secs:.2f}"
             if turn_secs is not None
@@ -163,9 +201,6 @@ class SmartTurnShadowObserver(FrameProcessor):
             "verdict": verdict,
             "turn_secs": turn_secs,
         }
-        # Best-effort metrics serialisation — the analyser returns a
-        # MetricsData dataclass-ish object whose shape isn't stable across
-        # Pipecat versions. Stringify on failure rather than dropping.
         if metrics is not None:
             try:
                 if hasattr(metrics, "__dict__"):
@@ -175,8 +210,21 @@ class SmartTurnShadowObserver(FrameProcessor):
             except Exception:
                 record["metrics"] = None
         try:
-            with open(self._jsonl_path, "a") as fh:
-                fh.write(json.dumps(record) + "\n")
+            line = (json.dumps(record) + "\n").encode("utf-8")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if nofollow:
+                flags |= nofollow
+            fd = os.open(str(self._jsonl_path), flags, 0o600)
+            try:
+                # Single write(2); POSIX guarantees atomicity for
+                # O_APPEND writes <= PIPE_BUF (typically 4096 bytes).
+                # Verdict records are well under that, but per-source
+                # paths in __init__ already eliminate cross-branch
+                # interleaving even for over-PIPE_BUF lines.
+                os.write(fd, line)
+            finally:
+                os.close(fd)
         except Exception as exc:
             logger.warning(f"SmartTurnShadow[{self._source}]: jsonl append failed: {exc}")
 
