@@ -112,6 +112,15 @@ class SmartTurnShadowObserver(FrameProcessor):
         # event loop while the executor thread iterates it.
         self._analyse_lock = asyncio.Lock()
         self._pending_task: asyncio.Task | None = None
+        # While analyse holds the lock, audio frames buffer here instead
+        # of waiting on the lock — otherwise the live pipeline serialises
+        # behind ONNX inference (~50–200 ms). Cap at 10 s of audio
+        # (320 KB at 16 kHz s16le) so a runaway / hung analyse can't
+        # bloat memory; beyond the cap we drop frames from the analyser
+        # only (the live pipeline still forwards them).
+        self._pending_audio: list[tuple[bytes, bool]] = []
+        self._pending_bytes = 0
+        self._pending_audio_cap = 10 * 16000 * 2
 
         self._call_id = call_id
         self._jsonl_path: Path | None = None
@@ -136,11 +145,27 @@ class SmartTurnShadowObserver(FrameProcessor):
                     getattr(frame, "audio_in_sample_rate", self._configured_sample_rate)
                 )
             elif isinstance(frame, InputAudioRawFrame):
-                # Serialise with analyse — without this, the executor
-                # thread iterating _audio_buffer races the event loop
-                # appending to it.
-                async with self._analyse_lock:
-                    self._analyzer.append_audio(frame.audio, is_speech=self._in_speech)
+                # Buffer-and-flush pattern. If analyse is in flight,
+                # don't wait for the lock (that serialises live audio
+                # ingestion with ONNX inference); buffer the bytes.
+                # Otherwise acquire the lock briefly (uncontested ≈ μs),
+                # drain any backlog in order, then append this frame.
+                # `.locked()` -> `async with` is race-free in single-
+                # threaded asyncio: an unlocked acquire returns without
+                # yielding, so no concurrent task can take the lock
+                # between the check and the acquire.
+                if self._analyse_lock.locked():
+                    if self._pending_bytes < self._pending_audio_cap:
+                        self._pending_audio.append((frame.audio, self._in_speech))
+                        self._pending_bytes += len(frame.audio)
+                else:
+                    async with self._analyse_lock:
+                        if self._pending_audio:
+                            for audio, was_speech in self._pending_audio:
+                                self._analyzer.append_audio(audio, is_speech=was_speech)
+                            self._pending_audio.clear()
+                            self._pending_bytes = 0
+                        self._analyzer.append_audio(frame.audio, is_speech=self._in_speech)
             elif isinstance(frame, VADUserStartedSpeakingFrame):
                 self._in_speech = True
                 self._turn_started_at = time.monotonic()
