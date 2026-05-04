@@ -111,10 +111,14 @@ def _build_dual_pipeline(
     system_arm: list = [system_transport.input(), system_vad]
 
     if smart_turn_shadow_enabled():
-        # Per the dev plan spike order, prototype on `me` first; mirror to
-        # `them` only after the live-corpus comparison validates the gain.
-        logger.info("SmartTurn shadow enabled on `me` branch (read-only)")
+        # `me` validated on 2026-05-04 (303 verdicts in one real call, 54 %
+        # reduction in Whisper decodes if commits were SmartTurn-gated).
+        # Mirroring to `them` to characterise the model's behaviour on
+        # loopback audio (codec-compressed remote speech, occasional
+        # music/notifications) before considering the commit-gate flip.
+        logger.info("SmartTurn shadow enabled on `me` and `them` branches (read-only)")
         mic_arm.append(SmartTurnShadowObserver(source="me", sample_rate=PIPELINE_SAMPLE_RATE))
+        system_arm.append(SmartTurnShadowObserver(source="them", sample_rate=PIPELINE_SAMPLE_RATE))
 
     mic_arm.extend([mic_stt, SourceTagger(source="me", source_order=0)])
     system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
