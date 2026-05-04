@@ -101,23 +101,26 @@ def _build_dual_pipeline(
     from pipecat.pipeline.pipeline import Pipeline
 
     from bot.processors.live_terminal import LiveTerminalRenderer
+    from bot.processors.smart_turn_shadow import (
+        SmartTurnShadowObserver,
+        smart_turn_shadow_enabled,
+    )
     from bot.processors.source_tagger import SourceTagger
 
+    mic_arm: list = [mic_transport.input(), mic_vad]
+    system_arm: list = [system_transport.input(), system_vad]
+
+    if smart_turn_shadow_enabled():
+        # Per the dev plan spike order, prototype on `me` first; mirror to
+        # `them` only after the live-corpus comparison validates the gain.
+        logger.info("SmartTurn shadow enabled on `me` branch (read-only)")
+        mic_arm.append(SmartTurnShadowObserver(source="me", sample_rate=PIPELINE_SAMPLE_RATE))
+
+    mic_arm.extend([mic_stt, SourceTagger(source="me", source_order=0)])
+    system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
+
     processors = [
-        ParallelPipeline(
-            [
-                mic_transport.input(),
-                mic_vad,
-                mic_stt,
-                SourceTagger(source="me", source_order=0),
-            ],
-            [
-                system_transport.input(),
-                system_vad,
-                system_stt,
-                SourceTagger(source="them", source_order=1),
-            ],
-        ),
+        ParallelPipeline(mic_arm, system_arm),
         transcript_buffer,
     ]
     if live_terminal:
