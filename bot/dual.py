@@ -100,15 +100,36 @@ def _build_dual_pipeline(
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
 
+    import time as _time
+
+    from bot.processors.audio_dump import (
+        RawAudioDumpProcessor,
+        audio_dump_enabled,
+        resolve_dump_dir,
+    )
     from bot.processors.live_terminal import LiveTerminalRenderer
     from bot.processors.smart_turn_shadow import (
         SmartTurnShadowObserver,
+        resolve_verdict_dir,
         smart_turn_shadow_enabled,
     )
     from bot.processors.source_tagger import SourceTagger
 
+    # One call_id shared by every spike processor wired below so JSONL
+    # verdicts and PCM dumps stamped with the same id can be joined offline.
+    call_id = _time.strftime("%Y%m%d-%H%M%S")
+
     mic_arm: list = [mic_transport.input(), mic_vad]
     system_arm: list = [system_transport.input(), system_vad]
+
+    if audio_dump_enabled():
+        # PCM dump runs *before* the shadow observer in the arm so the file
+        # captures exactly what the analyser sees. Lossless, append-only,
+        # crash-safe — see bot/processors/audio_dump.py for format details.
+        dump_dir = resolve_dump_dir()
+        logger.info(f"Audio dump enabled (call_id={call_id}, dir={dump_dir})")
+        mic_arm.append(RawAudioDumpProcessor(source="me", call_id=call_id, dump_dir=dump_dir))
+        system_arm.append(RawAudioDumpProcessor(source="them", call_id=call_id, dump_dir=dump_dir))
 
     if smart_turn_shadow_enabled():
         # `me` validated on 2026-05-04 (303 verdicts in one real call, 54 %
@@ -116,9 +137,27 @@ def _build_dual_pipeline(
         # Mirroring to `them` to characterise the model's behaviour on
         # loopback audio (codec-compressed remote speech, occasional
         # music/notifications) before considering the commit-gate flip.
-        logger.info("SmartTurn shadow enabled on `me` and `them` branches (read-only)")
-        mic_arm.append(SmartTurnShadowObserver(source="me", sample_rate=PIPELINE_SAMPLE_RATE))
-        system_arm.append(SmartTurnShadowObserver(source="them", sample_rate=PIPELINE_SAMPLE_RATE))
+        verdict_dir = resolve_verdict_dir()
+        logger.info(
+            f"SmartTurn shadow enabled on `me` and `them` (call_id={call_id}, "
+            f"verdicts -> {verdict_dir})"
+        )
+        mic_arm.append(
+            SmartTurnShadowObserver(
+                source="me",
+                sample_rate=PIPELINE_SAMPLE_RATE,
+                call_id=call_id,
+                verdict_dir=verdict_dir,
+            )
+        )
+        system_arm.append(
+            SmartTurnShadowObserver(
+                source="them",
+                sample_rate=PIPELINE_SAMPLE_RATE,
+                call_id=call_id,
+                verdict_dir=verdict_dir,
+            )
+        )
 
     mic_arm.extend([mic_stt, SourceTagger(source="me", source_order=0)])
     system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
