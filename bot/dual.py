@@ -85,6 +85,20 @@ async def _shutdown_stt_service(stt_service, label: str) -> None:
             logger.warning(f"Shutdown: failed to clean up {label} STT service: {exc}")
 
 
+def _generate_call_id() -> str:
+    """Return a per-session id for shadow + dump output joining.
+
+    Timestamp at second granularity plus a 6-hex-char suffix so two
+    pipelines built within the same wall-clock second do not collide
+    (the audio_dump processor opens with append mode — collision would
+    silently interleave bytes).
+    """
+    import secrets
+    import time as _time
+
+    return f"{_time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+
+
 def _build_dual_pipeline(
     mic_transport,
     system_transport,
@@ -96,28 +110,84 @@ def _build_dual_pipeline(
     silence_detector,
     *,
     live_terminal: bool = False,
+    call_id: str | None = None,
 ):
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
 
+    from bot.processors.audio_dump import (
+        RawAudioDumpProcessor,
+        audio_dump_enabled,
+        resolve_dump_dir,
+    )
     from bot.processors.live_terminal import LiveTerminalRenderer
+    from bot.processors.smart_turn_shadow import (
+        SmartTurnShadowObserver,
+        resolve_verdict_dir,
+        smart_turn_shadow_enabled,
+    )
     from bot.processors.source_tagger import SourceTagger
 
+    if call_id is None:
+        call_id = _generate_call_id()
+
+    mic_arm: list = [mic_transport.input(), mic_vad]
+    system_arm: list = [system_transport.input(), system_vad]
+
+    dump_on = audio_dump_enabled()
+    shadow_on = smart_turn_shadow_enabled()
+    if dump_on and not shadow_on:
+        # The dump's stated purpose is offline replay against shadow
+        # verdicts joined by call_id — flag the unjoined-output case so
+        # an operator who set only one flag notices.
+        logger.warning(
+            "KODA_AUDIO_DUMP=1 but KODA_SMART_TURN_SHADOW is unset — "
+            "PCM will not be joinable with shadow verdicts."
+        )
+
+    if dump_on:
+        # PCM dump runs *before* the shadow observer in the arm so the
+        # file captures exactly what the analyser sees. Lossless,
+        # append-only — see bot/processors/audio_dump.py for format and
+        # safety details (O_NOFOLLOW, mode 0o600, size cap).
+        dump_dir = resolve_dump_dir()
+        logger.info(f"Audio dump enabled (call_id={call_id}, dir={dump_dir})")
+        mic_arm.append(RawAudioDumpProcessor(source="me", call_id=call_id, dump_dir=dump_dir))
+        system_arm.append(RawAudioDumpProcessor(source="them", call_id=call_id, dump_dir=dump_dir))
+
+    if shadow_on:
+        # `me` validated on 2026-05-04 (303 verdicts in one real call, 54 %
+        # reduction in Whisper decodes if commits were SmartTurn-gated).
+        # Mirroring to `them` to characterise the model's behaviour on
+        # loopback audio (codec-compressed remote speech, occasional
+        # music/notifications) before considering the commit-gate flip.
+        verdict_dir = resolve_verdict_dir()
+        logger.info(
+            f"SmartTurn shadow enabled on `me` and `them` (call_id={call_id}, "
+            f"verdicts -> {verdict_dir})"
+        )
+        mic_arm.append(
+            SmartTurnShadowObserver(
+                source="me",
+                sample_rate=PIPELINE_SAMPLE_RATE,
+                call_id=call_id,
+                verdict_dir=verdict_dir,
+            )
+        )
+        system_arm.append(
+            SmartTurnShadowObserver(
+                source="them",
+                sample_rate=PIPELINE_SAMPLE_RATE,
+                call_id=call_id,
+                verdict_dir=verdict_dir,
+            )
+        )
+
+    mic_arm.extend([mic_stt, SourceTagger(source="me", source_order=0)])
+    system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
+
     processors = [
-        ParallelPipeline(
-            [
-                mic_transport.input(),
-                mic_vad,
-                mic_stt,
-                SourceTagger(source="me", source_order=0),
-            ],
-            [
-                system_transport.input(),
-                system_vad,
-                system_stt,
-                SourceTagger(source="them", source_order=1),
-            ],
-        ),
+        ParallelPipeline(mic_arm, system_arm),
         transcript_buffer,
     ]
     if live_terminal:
@@ -260,6 +330,9 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     # harness needed.
     await log_stt_server_rss("startup")
 
+    call_id = _generate_call_id()
+    logger.info(f"Dual pipeline session call_id={call_id}")
+
     pipeline = _build_dual_pipeline(
         mic_transport,
         system_transport,
@@ -270,6 +343,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         transcript_buffer,
         silence_detector,
         live_terminal=live_terminal,
+        call_id=call_id,
     )
 
     task = PipelineTask(
