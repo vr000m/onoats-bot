@@ -255,7 +255,7 @@ class WebSocketSTTService(SegmentedSTTService):
         for attempt in range(total_attempts):
             try:
                 client = TranscriptionClient(**self._connect_kwargs)
-                await client.connect()
+                hello = await client.connect()
                 loop = asyncio.get_running_loop()
                 self._session_ready = loop.create_future()
                 self._client = client
@@ -273,10 +273,21 @@ class WebSocketSTTService(SegmentedSTTService):
                     )
                 except asyncio.TimeoutError:
                     raise RuntimeError("stt_server did not ack session.update")
+                # Backend identity from server.hello — surfaces an operational
+                # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log.
+                _backend = hello.get("backend") or {}
+                backend_desc = (
+                    f" [backend={_backend.get('name')} model={_backend.get('model')}]"
+                    if _backend
+                    else ""
+                )
                 if attempt > 0:
-                    logger.info(f"{self.name}: reconnected to {endpoint} on attempt {attempt + 1}")
+                    logger.info(
+                        f"{self.name}: reconnected to {endpoint}{backend_desc} "
+                        f"on attempt {attempt + 1}"
+                    )
                 else:
-                    logger.info(f"{self.name}: connected to {endpoint}")
+                    logger.info(f"{self.name}: connected to {endpoint}{backend_desc}")
                 return
             except Exception as exc:
                 last_exc = exc
