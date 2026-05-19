@@ -529,7 +529,27 @@ async def flush_and_rotate(
     from shared import session_queue
 
     logger.info(f"{reason} — flushing transcript buffer, rotating to pending/")
-    buffer_contents, session_path = await transcript_buffer.flush()
+
+    # Pre-mint the fresh .active/ session BEFORE the flush so the buffer can
+    # swap _session_file atomically under its _write_lock. Without this
+    # pre-mint there is a race window where flush() releases the lock with
+    # _session_file=None and an arriving utterance creates a stray .active/
+    # file before we reassign — the "silently drops audio after manual flush"
+    # risk the plan flags. Crash safety unchanged: a crash between pre-mint
+    # and the rotation leaves both the old file and an empty fresh file in
+    # .active/; run_crash_recovery rotates both into pending/ (the empty one
+    # is a harmless no-op job).
+    next_active_path: Path | None = None
+    if continue_session:
+        try:
+            next_active_path, _next_session_id = session_queue.new_active_session(data_dir)
+        except OSError as exc:
+            logger.error(f"Flush: could not pre-mint fresh .active/ session: {exc}")
+            return
+
+    buffer_contents, session_path = await transcript_buffer.flush(
+        next_session_file=next_active_path
+    )
     if not buffer_contents or session_path is None:
         logger.info("Flush: buffer was empty, nothing to rotate")
         # Persist any unpersisted in-memory entries (defensive — flush()
@@ -538,9 +558,7 @@ async def flush_and_rotate(
         return
 
     try:
-        rotation = session_queue.rotate_to_pending(
-            session_path, continue_session=continue_session, data_dir=data_dir
-        )
+        session_id = session_queue.rotate_active_to_pending(session_path, data_dir=data_dir)
     except FileNotFoundError:
         logger.warning(
             f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
@@ -552,21 +570,18 @@ async def flush_and_rotate(
 
     # Insert the processing_jobs row AFTER the rename (file-first ordering).
     try:
-        _insert_pending_job(rotation.session_id, data_dir)
+        _insert_pending_job(session_id, data_dir)
     except Exception as exc:
         logger.warning(
-            f"Flush: rotated {rotation.session_id} but DB insert failed ({exc}) — "
+            f"Flush: rotated {session_id} but DB insert failed ({exc}) — "
             "claim() will back-fill the row."
         )
 
-    logger.info(f"Flush: rotated {rotation.session_id} → pending/ (worker will post-process it)")
-
-    if continue_session and rotation.next_active_path is not None:
-        # Adopt the fresh .active/ session minted by rotate_to_pending so the
-        # ongoing recording lands there instead of the buffer lazily creating
-        # a separate file. flush() already reset _session_file to None.
-        transcript_buffer._session_file = rotation.next_active_path
-        logger.debug(f"Flush: buffer adopted fresh active session {rotation.next_active_path.name}")
+    logger.info(f"Flush: rotated {session_id} → pending/ (worker will post-process it)")
+    if continue_session and next_active_path is not None:
+        logger.debug(
+            f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
+        )
 
 
 async def run_post_processing(

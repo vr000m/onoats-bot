@@ -190,12 +190,26 @@ class TranscriptBuffer(FrameProcessor):
     # Public API
     # ------------------------------------------------------------------
 
-    async def flush(self) -> tuple[list[dict], Path | None]:
+    async def flush(
+        self,
+        *,
+        next_session_file: Optional[Path] = None,
+    ) -> tuple[list[dict], Path | None]:
         """Return the full in-memory buffer and session path, then reset state.
 
         Before resetting, materializes any entries that failed to write to disk
         so the session file is complete for crash recovery. Acquires the write
         lock to ensure no in-flight disk writes are in progress.
+
+        Args:
+            next_session_file: If provided, ``_session_file`` is atomically
+                swapped to this path under ``_write_lock`` (instead of reset
+                to ``None``). The continuation-flush path uses this to close
+                the race where an utterance arriving between flush and the
+                caller's session-file reassignment would otherwise land in a
+                stray ``.active/`` file. The caller must pre-mint this path
+                (see :func:`shared.session_queue.new_active_session`).
+                Default ``None`` is the terminal-flush behaviour.
 
         Returns:
             Tuple of (entries, session_path). session_path may be None if no
@@ -221,7 +235,10 @@ class TranscriptBuffer(FrameProcessor):
             session_path = self._session_file
             self._buffer = []
             self._last_vad_stop = None
-            self._session_file = None
+            # Atomic swap under the lock — utterances arriving immediately
+            # after we release the lock land in ``next_session_file`` (or
+            # trigger lazy creation if None).
+            self._session_file = next_session_file
             self._persisted_indices = set()
             self._speaking_sources = set()
         logger.info(f"TranscriptBuffer flushed ({len(contents)} entries)")
