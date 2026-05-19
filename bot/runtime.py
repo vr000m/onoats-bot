@@ -595,6 +595,7 @@ async def run_post_processing(
     locked_category: str | None = None,
     *,
     own_topic_tasks: bool = False,
+    require_unique_ingest: bool = False,
 ):
     """Process a flushed transcript buffer through dictionary → segment → cleanup → classify → write.
 
@@ -658,6 +659,8 @@ async def run_post_processing(
             result.status = "empty"
             return result
 
+        from shared.store import DuplicateTranscriptError
+
         for i, seg_entries in enumerate(segments, 1):
             try:
                 classified = await classifier.classify(
@@ -666,7 +669,28 @@ async def run_post_processing(
                     transcript_cleaner=transcript_cleaner,
                     locked_category=locked_category,
                 )
-                transcript_id, path, was_new = await transcript_store.ingest_segment(classified)
+                try:
+                    transcript_id, path, was_new = await transcript_store.ingest_segment(
+                        classified, require_unique=require_unique_ingest
+                    )
+                except DuplicateTranscriptError as dup:
+                    # Worker path with require_unique_ingest=True: another
+                    # job (or a previous successful ingest) already owns
+                    # this deterministic id. Treat as a duplicate output;
+                    # the existing markdown + index stay byte-stable.
+                    logger.info(
+                        f"Post-processing: segment {i}/{len(segments)} is a duplicate "
+                        f"of an already-ingested transcript {dup.transcript_id} — "
+                        "skipping write."
+                    )
+                    result.duplicate_outputs.append(
+                        JobOutput(
+                            ordinal=i,
+                            transcript_id=dup.transcript_id,
+                            file_path="",
+                        )
+                    )
+                    continue
                 logger.info(
                     f"Post-processing: segment {i}/{len(segments)} written — "
                     f"{classified.category} / {path.name} / {transcript_id}"
@@ -801,6 +825,21 @@ async def run_crash_recovery(
     normalised: list[Path] = list(orphans)
     for rec_path in legacy_recovering:
         jsonl_path = rec_path.with_suffix(".jsonl")
+        # Carried Phase 2 minor finding: refuse to silently overwrite a
+        # same-id orphan already present as a ``.jsonl`` in ``.active/``.
+        # Move the legacy file aside instead so a manual inspection can
+        # decide which copy wins.
+        if jsonl_path.exists():
+            stash = rec_path.with_suffix(".recovering.collision")
+            try:
+                os.rename(rec_path, stash)
+                logger.warning(
+                    f"Crash recovery: refused to overwrite {jsonl_path.name} with "
+                    f"legacy {rec_path.name}; moved aside to {stash.name}"
+                )
+            except OSError as exc:
+                logger.warning(f"Crash recovery: could not stash colliding {rec_path.name}: {exc}")
+            continue
         try:
             os.rename(rec_path, jsonl_path)
             normalised.append(jsonl_path)
