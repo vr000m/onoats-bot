@@ -552,19 +552,15 @@ async def run_post_processing(
                     f"Post-processing: segment {i}/{len(segments)} written — "
                     f"{classified.category} / {path.name} / {transcript_id}"
                 )
-                # A fallback-on-LLM-error segment (category=uncategorized, no
-                # summary, empty per-stage hashes) means classification did
+                # A fatal-LLM-error fallback segment means classification did
                 # NOT succeed: the transcript is ingested un-classified and
                 # relies on the `--stale` retry cron. Surface it loudly with
                 # the transcript_id so a recurring failure is greppable — the
                 # preceding `Classifier:` warning carries the actual cause
-                # (network exception vs unparseable JSON). The too-thin
-                # pre-filter is excluded: it stamps the per-stage hashes.
-                if (
-                    classified.category == "uncategorized"
-                    and not (classified.summary or "").strip()
-                    and not classified.topics_prompt_hash
-                ):
+                # (network exception vs unparseable JSON). The `ran_on_llm_error`
+                # flag is set only by the fatal-failure fallback, not the
+                # too-thin pre-filter.
+                if classified.ran_on_llm_error:
                     logger.warning(
                         f"Post-processing: segment {i}/{len(segments)} INGESTED "
                         f"UNCLASSIFIED (LLM classification failed) — {transcript_id} "
