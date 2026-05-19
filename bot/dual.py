@@ -53,8 +53,8 @@ from bot.runtime import (  # noqa: E402
     _start_keypress_reader,
     _topic_pipeline_tasks,
     _write_pid_file,
+    flush_and_rotate,
     run_crash_recovery,
-    run_post_processing,
 )
 
 
@@ -207,11 +207,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     from bot.config.audio_devices import select_dual_input_devices
     from bot.processors.dual_silence_detector import DualSilenceDetector
     from bot.processors.transcript_buffer import TranscriptBuffer
-    from shared.dictionary import Dictionary
-    from shared.llm_client import create_llm_client
-    from shared.migrate import rebuild_index
-    from shared.segmenter import Segmenter
-    from shared.store import TranscriptStore
+    from shared.post_processing_services import build_post_processing_services
 
     data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data")).expanduser()
 
@@ -227,37 +223,14 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         system_input_env=system_input,
     )
 
-    dictionary = Dictionary(data_dir=data_dir, auto_create=True)
-    segmenter = Segmenter(create_llm_client(task="segment"))
-
-    from shared.classifier import Classifier
-    from shared.transcript_cleaner import TranscriptCleaner
-
-    classifier = Classifier(create_llm_client(task="classify"))
-    logger.info("Classifier: loaded")
-
-    try:
-        cleanup_llm = create_llm_client(task="cleanup")
-        transcript_cleaner = TranscriptCleaner(cleanup_llm)
-        logger.info("TranscriptCleaner: loaded")
-    except Exception as exc:
-        logger.warning(f"TranscriptCleaner: not available ({exc}), cleanup will be skipped")
-        transcript_cleaner = None
-
-    transcript_store = TranscriptStore(data_dir=data_dir)
-    await transcript_store.init_db()
-    await rebuild_index(data_dir=data_dir, db_path=transcript_store.db_path, full_rebuild=False)
+    # Shared post-processing service graph — the bot needs the TranscriptStore
+    # (for init_db + rebuild_index) even though it no longer runs the
+    # post-processing pipeline itself. The cron worker uses the same factory.
+    services = await build_post_processing_services(data_dir)
+    transcript_store = services.transcript_store
 
     crash_recovery_task = asyncio.create_task(
-        run_crash_recovery(
-            dictionary,
-            segmenter,
-            classifier,
-            transcript_store,
-            data_dir,
-            transcript_cleaner=transcript_cleaner,
-            locked_category=locked_category,
-        ),
+        run_crash_recovery(data_dir=data_dir),
         name="dual_crash_recovery",
     )
 
@@ -267,35 +240,35 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     # Enabling this restores Segmenter's ability to split short sessions
     # (segmenter fast-skips no-gap buffers with <=10 utterances).
     transcript_buffer = TranscriptBuffer(track_vad_gaps=True, use_frame_source=True)
-    inflight_tasks: set[asyncio.Task] = set()
     flush_lock = asyncio.Lock()
 
-    async def _flush_and_process(reason: str) -> None:
+    async def _rotate_flush(reason: str, *, continue_session: bool) -> None:
+        """Flush the dual buffer and rotate the session file into pending/.
+
+        The bot no longer runs post-processing inline — a cron worker drains
+        the queue. ``continue_session`` distinguishes a continuation flush
+        (silence-timeout / Ctrl+T / SIGUSR1 — opens a fresh .active/ session)
+        from a terminal flush (EndFrame / shutdown).
+        """
         async with flush_lock:
-            logger.info(f"{reason} — flushing dual transcript buffer for post-processing")
-            buffer_contents, session_path = await transcript_buffer.flush()
-            if not buffer_contents:
-                logger.info("Dual flush: buffer was empty, nothing to process")
-                await transcript_buffer.flush_to_disk()
-                return
-            task = asyncio.create_task(
-                run_post_processing(
-                    buffer_contents=buffer_contents,
-                    dictionary=dictionary,
-                    segmenter=segmenter,
-                    classifier=classifier,
-                    transcript_store=transcript_store,
-                    session_path=session_path,
-                    transcript_cleaner=transcript_cleaner,
-                    locked_category=locked_category,
-                ),
-                name="dual_post_processing",
+            await flush_and_rotate(
+                transcript_buffer,
+                reason,
+                continue_session=continue_session,
+                data_dir=data_dir,
             )
-            inflight_tasks.add(task)
-            task.add_done_callback(inflight_tasks.discard)
+
+    async def _flush_continuation(reason: str) -> None:
+        """Continuation-flush entry point for Ctrl+T / SIGUSR1 / silence.
+
+        Signal and keypress handlers call this with a single ``reason``
+        string; it always rotates with ``continue_session=True`` so the
+        ongoing recording gets a fresh .active/ session.
+        """
+        await _rotate_flush(reason, continue_session=True)
 
     async def on_silence_timeout() -> None:
-        await _flush_and_process("Dual silence timeout fired")
+        await _rotate_flush("Dual silence timeout fired", continue_session=True)
 
     silence_timeout_sec = float(os.getenv("SILENCE_TIMEOUT_SEC", "300"))
     silence_detector = DualSilenceDetector(
@@ -357,10 +330,11 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     force_exit_event = asyncio.Event()
+    # SIGUSR1 is a continuation flush — wired to _flush_continuation.
     _install_signal_handlers(
         shutdown_event,
         force_exit_event,
-        _flush_and_process,
+        _flush_continuation,
         silence_detector,
         loop,
     )
@@ -413,20 +387,19 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
             await _wait_or_force(crash_recovery_task, "crash recovery")
 
         if force_exit_event.is_set():
-            logger.warning("Shutdown: force exit — skipping task drain")
+            logger.warning("Shutdown: force exit — skipping flush")
         else:
-            await _drain_tasks(inflight_tasks, "in-flight post-processing task(s)")
-            await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
-
-        if not force_exit_event.is_set():
+            # Terminal flush: rotate the final buffer into pending/ for the
+            # cron worker. The bot no longer runs post-processing inline.
             try:
-                await _flush_and_process("Shutdown")
+                await _rotate_flush("Shutdown", continue_session=False)
             except Exception as exc:
                 logger.error(
-                    f"Shutdown: post-processing failed ({exc}). "
+                    f"Shutdown: flush rotation failed ({exc}). "
                     "Session file preserved in .active/ for crash recovery."
                 )
-            await _drain_tasks(inflight_tasks, "post-processing task(s)")
+            # _topic_pipeline_tasks is no longer populated by the bot, but
+            # drain it defensively in case a legacy task is still pending.
             await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
 
         logger.info("Shutdown: draining dual STT services")
@@ -464,7 +437,8 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     if live_terminal:
         logger.info("  Live terminal:    enabled")
 
-    old_terminal_settings = _start_keypress_reader(_flush_and_process, silence_detector, loop)
+    # Ctrl+T (0x14) is a continuation flush — wired to _flush_continuation.
+    old_terminal_settings = _start_keypress_reader(_flush_continuation, silence_detector, loop)
     runner = PipelineRunner(handle_sigint=False)
     logger.info(
         f"{BOT_NAME} dual-input is listening. "
