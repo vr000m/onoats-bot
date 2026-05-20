@@ -133,7 +133,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     from bot.config.audio_devices import select_input_device
     from bot.processors.silence_detector import SilenceDetector
     from bot.processors.transcript_buffer import TranscriptBuffer
-    from shared.post_processing_services import build_post_processing_services
+    from shared.post_processing_services import build_transcript_store_only
 
     # ----------------------------------------------------------------
     # Step 1: Load config
@@ -146,21 +146,20 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     input_dev = select_input_device(input_device_env=INPUT_DEVICE)
 
     # ----------------------------------------------------------------
-    # Step 3: Build the shared post-processing service graph
+    # Step 3: Build the transcript store
     # ----------------------------------------------------------------
     # The bot no longer runs post-processing inline (a cron worker drains the
-    # pending/ queue) but it still needs the TranscriptStore for init_db +
-    # the startup rebuild_index reconciliation. The same factory drives the
-    # dual bot and the worker so the worker is not a third copy.
-    services = await build_post_processing_services(data_dir)
-    transcript_store = services.transcript_store
+    # pending/ queue) — it only needs the TranscriptStore for init_db + the
+    # startup rebuild_index reconciliation. The cron worker uses the full
+    # ``build_post_processing_services`` factory.
+    transcript_store = await build_transcript_store_only(data_dir)
 
     # ----------------------------------------------------------------
     # Step 4: Crash recovery — rotate any orphaned .active/ files into
     # pending/ (runs in background so the pipeline starts immediately)
     # ----------------------------------------------------------------
     _crash_recovery_task = asyncio.create_task(
-        run_crash_recovery(data_dir=data_dir),
+        run_crash_recovery(data_dir=data_dir, locked_category=locked_category),
         name="crash_recovery",
     )
 
@@ -189,6 +188,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
                 reason,
                 continue_session=continue_session,
                 data_dir=data_dir,
+                locked_category=locked_category,
             )
 
     async def _flush_continuation(reason: str) -> None:

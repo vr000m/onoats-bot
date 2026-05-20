@@ -503,6 +503,7 @@ async def flush_and_rotate(
     *,
     continue_session: bool,
     data_dir: Path,
+    locked_category: str | None = None,
 ) -> None:
     """Flush the transcript buffer and rotate its session file into ``pending/``.
 
@@ -527,6 +528,10 @@ async def flush_and_rotate(
     :func:`session_queue.claim` back-fills the row.
     """
     from shared import session_queue
+
+    # Phase 5 — queue dirs are no longer created at module import; each
+    # rotation site ensures them itself (idempotent mkdir).
+    session_queue.ensure_queue_dirs(data_dir)
 
     logger.info(f"{reason} — flushing transcript buffer, rotating to pending/")
 
@@ -555,6 +560,18 @@ async def flush_and_rotate(
         # Persist any unpersisted in-memory entries (defensive — flush()
         # already materialises them, but mirrors the old behaviour).
         await transcript_buffer.flush_to_disk()
+        # Clean up the pre-minted fresh .active/ file we no longer need —
+        # otherwise an empty .active/ session leaks until the next bot
+        # restart's crash_recovery rotates it as a no-op job.
+        if next_active_path is not None:
+            try:
+                next_active_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug(
+                    f"Flush: could not remove unused pre-minted {next_active_path.name}: {exc}"
+                )
         return
 
     try:
@@ -570,7 +587,7 @@ async def flush_and_rotate(
 
     # Insert the processing_jobs row AFTER the rename (file-first ordering).
     try:
-        _insert_pending_job(session_id, data_dir)
+        _insert_pending_job(session_id, data_dir, locked_category=locked_category)
     except Exception as exc:
         logger.warning(
             f"Flush: rotated {session_id} but DB insert failed ({exc}) — "
@@ -612,13 +629,14 @@ async def run_post_processing(
     (``own_topic_tasks=False``) keeps the legacy behaviour of registering
     topic tasks in the shared set so the bot's shutdown drain still works.
     """
-    from shared.post_processing_services import JobOutput, PostProcessingResult
+    from shared.post_processing_services import PostProcessingResult
+    from shared.session_queue import JobOutput
 
     result = PostProcessingResult(status="empty")
-    # Topic tasks owned by *this* run when own_topic_tasks=True. Attached to
-    # the result object so the worker can await exactly its own job's work.
-    owned_topic_tasks: list[asyncio.Task] = []
-    result._owned_topic_tasks = owned_topic_tasks  # type: ignore[attr-defined]
+    # Topic tasks owned by *this* run when own_topic_tasks=True. Live on the
+    # result as a typed field (promoted from the old _owned_topic_tasks
+    # monkey-patch) so the worker can await exactly its own job's work.
+    owned_topic_tasks = result.owned_topic_tasks
 
     if not buffer_contents:
         logger.debug("Post-processing: empty buffer — nothing to process")
@@ -794,6 +812,8 @@ async def run_crash_recovery(
     from shared.store import koda_data_dir
 
     base = Path(data_dir) if data_dir is not None else koda_data_dir()
+    # Ensure queue dirs exist before crash recovery rotates anything in.
+    session_queue.ensure_queue_dirs(base)
     active_dir = base / session_queue.ACTIVE_DIR
 
     if not active_dir.exists():
@@ -862,7 +882,7 @@ async def run_crash_recovery(
         # ordering). A crash between the two is recoverable: session_queue
         # .claim() back-fills a missing row when a worker claims the file.
         try:
-            _insert_pending_job(rotation.session_id, base)
+            _insert_pending_job(rotation.session_id, base, locked_category=locked_category)
         except Exception as exc:
             logger.warning(
                 f"Crash recovery: rotated {rotation.session_id} but DB insert "
@@ -873,12 +893,21 @@ async def run_crash_recovery(
         )
 
 
-def _insert_pending_job(session_id: str, data_dir: Path) -> None:
+def _insert_pending_job(
+    session_id: str,
+    data_dir: Path,
+    *,
+    locked_category: str | None = None,
+) -> None:
     """Insert a ``pending`` ``processing_jobs`` row for a rotated session.
 
     Uses ``INSERT … ON CONFLICT DO NOTHING`` so a re-rotation (or a
     back-filled row) does not raise. File-rename-first / row-insert-second
     ordering is enforced by the caller — this only does the DB write.
+
+    ``locked_category`` is recorded on the row so the worker classifies the
+    session against the same category lock the bot was launched with
+    (``./koda bot --category ideas``). NULL on rows the bot did not lock.
     """
     from datetime import datetime, timezone
 
@@ -890,11 +919,11 @@ def _insert_pending_job(session_id: str, data_dir: Path) -> None:
         conn.execute(
             """
             INSERT INTO processing_jobs
-                (session_id, state, attempts, created_at, updated_at)
-            VALUES (?, 'pending', 0, ?, ?)
+                (session_id, state, attempts, created_at, updated_at, locked_category)
+            VALUES (?, 'pending', 0, ?, ?, ?)
             ON CONFLICT(session_id) DO NOTHING
             """,
-            (session_id, now, now),
+            (session_id, now, now, locked_category),
         )
         conn.commit()
 

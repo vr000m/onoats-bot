@@ -207,7 +207,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     from bot.config.audio_devices import select_dual_input_devices
     from bot.processors.dual_silence_detector import DualSilenceDetector
     from bot.processors.transcript_buffer import TranscriptBuffer
-    from shared.post_processing_services import build_post_processing_services
+    from shared.post_processing_services import build_transcript_store_only
 
     data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data")).expanduser()
 
@@ -223,14 +223,15 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         system_input_env=system_input,
     )
 
-    # Shared post-processing service graph — the bot needs the TranscriptStore
-    # (for init_db + rebuild_index) even though it no longer runs the
-    # post-processing pipeline itself. The cron worker uses the same factory.
-    services = await build_post_processing_services(data_dir)
-    transcript_store = services.transcript_store
+    # Transcript store — the bot no longer runs post-processing inline (a
+    # cron worker drains the pending/ queue) and only needs the
+    # TranscriptStore for init_db + the startup rebuild_index
+    # reconciliation. The cron worker uses the full
+    # ``build_post_processing_services`` factory.
+    transcript_store = await build_transcript_store_only(data_dir)
 
     crash_recovery_task = asyncio.create_task(
-        run_crash_recovery(data_dir=data_dir),
+        run_crash_recovery(data_dir=data_dir, locked_category=locked_category),
         name="dual_crash_recovery",
     )
 
@@ -256,6 +257,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
                 reason,
                 continue_session=continue_session,
                 data_dir=data_dir,
+                locked_category=locked_category,
             )
 
     async def _flush_continuation(reason: str) -> None:
