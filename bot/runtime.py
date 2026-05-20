@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 from loguru import logger
 
@@ -456,40 +455,18 @@ async def _create_stt_service():
 # ---------------------------------------------------------------------------
 
 
-async def _run_topic_pipeline(transcript_id: str, store) -> None:
-    """Fire-and-forget: match tags → extract passages → refresh collations.
-
-    Also runs legacy collate_for_transcript for ideas transcripts to keep
-    flat-file topics up to date even when directory topics also matched.
-    """
-    try:
-        from shared.llm_client import create_llm_client
-        from shared.topic_pipeline import process_transcript
-
-        llm = create_llm_client(task="collate")
-        matched = await process_transcript(transcript_id, store, llm)
-        if matched:
-            logger.info(f"Topic pipeline: processed {len(matched)} topic(s) for {transcript_id}")
-
-        summary = await store.get_transcript_summary(transcript_id)
-        if summary and summary.category == "ideas":
-            from shared.collation_service import CollationService
-
-            service = CollationService(store, llm)
-            paths = await service.collate_for_transcript(transcript_id)
-            if paths:
-                logger.info(f"Legacy collation: updated {len(paths)} topic(s) for {transcript_id}")
-    except Exception as exc:
-        logger.warning(f"Topic pipeline failed for {transcript_id}: {exc}")
-
-
-def _cleanup_session(session_path: Optional[Path]) -> None:
-    """Delete the .active/ session file after successful post-processing."""
-    if session_path is None:
-        return
-    from shared.memory_writer import delete_session_file
-
-    delete_session_file(session_path)
+# Deep-review A1: ``_run_topic_pipeline``, ``_cleanup_session``, and
+# ``run_post_processing`` were moved to ``shared.post_processing_services``
+# (worker → bot was the wrong layer direction). Thin re-exports are kept here
+# so callers / tests that imported them from ``bot.runtime`` continue to
+# work. The post-processing pipeline now lives entirely in ``shared/``.
+from shared.post_processing_services import _cleanup_session as _cleanup_session  # noqa: E402,PLC0414
+from shared.post_processing_services import (  # noqa: E402,PLC0414
+    _run_topic_pipeline as _run_topic_pipeline,
+)
+from shared.post_processing_services import (  # noqa: E402,PLC0414
+    run_post_processing as run_post_processing,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +564,7 @@ async def flush_and_rotate(
 
     # Insert the processing_jobs row AFTER the rename (file-first ordering).
     try:
-        _insert_pending_job(session_id, data_dir, locked_category=locked_category)
+        session_queue.enqueue_job(session_id, data_dir, locked_category=locked_category)
     except Exception as exc:
         logger.warning(
             f"Flush: rotated {session_id} but DB insert failed ({exc}) — "
@@ -599,181 +576,6 @@ async def flush_and_rotate(
         logger.debug(
             f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
         )
-
-
-async def run_post_processing(
-    buffer_contents: list[dict],
-    dictionary,
-    segmenter,
-    classifier,
-    transcript_store,
-    session_path: Optional[Path],
-    transcript_cleaner=None,
-    locked_category: str | None = None,
-    *,
-    own_topic_tasks: bool = False,
-    require_unique_ingest: bool = False,
-):
-    """Process a flushed transcript buffer through dictionary → segment → cleanup → classify → write.
-
-    Returns a :class:`~shared.post_processing_services.PostProcessingResult`
-    describing the outcome. Success and failure are explicit in that result
-    so a caller (the cron worker) can mark a job ``done`` only from the
-    structured contract, never from "this function returned normally."
-
-    Per-job topic-pipeline ownership: when ``own_topic_tasks=True`` (the
-    worker path) the spawned topic-link tasks are kept on the returned
-    result (``_owned_topic_tasks``) and are NOT added to the shared
-    module-global ``_topic_pipeline_tasks`` set — the worker awaits only its
-    own job's topic work before marking the job ``done``. The bot path
-    (``own_topic_tasks=False``) keeps the legacy behaviour of registering
-    topic tasks in the shared set so the bot's shutdown drain still works.
-    """
-    from shared.post_processing_services import PostProcessingResult
-    from shared.session_queue import JobOutput
-
-    result = PostProcessingResult(status="empty")
-    # Topic tasks owned by *this* run when own_topic_tasks=True. Live on the
-    # result as a typed field (promoted from the old _owned_topic_tasks
-    # monkey-patch) so the worker can await exactly its own job's work.
-    owned_topic_tasks = result.owned_topic_tasks
-
-    if not buffer_contents:
-        logger.debug("Post-processing: empty buffer — nothing to process")
-        return result
-
-    utterance_count = sum(1 for e in buffer_contents if e.get("type") == "utterance")
-    logger.info(
-        f"Post-processing: {len(buffer_contents)} buffer entries ({utterance_count} utterances)"
-    )
-
-    if segmenter is None or classifier is None:
-        msg = (
-            "Post-processing: segmenter or classifier not available — "
-            "skipping classification and write."
-        )
-        logger.warning(msg)
-        result.status = "failed"
-        result.last_error = msg
-        return result
-
-    try:
-        dictionary_hash = ""
-        if dictionary is not None:
-            for entry in buffer_contents:
-                if entry.get("type") != "utterance":
-                    continue
-                text = entry.get("text")
-                if isinstance(text, str) and text:
-                    entry["text"] = dictionary.apply(text)
-            dictionary_hash = dictionary.content_hash()
-
-        segments = await segmenter.segment(buffer_contents)
-        logger.info(f"Post-processing: segmented into {len(segments)} conversation(s)")
-
-        if not segments:
-            logger.info("Post-processing: no segments produced — nothing to write")
-            _cleanup_session(session_path)
-            result.status = "empty"
-            return result
-
-        from shared.store import DuplicateTranscriptError
-
-        for i, seg_entries in enumerate(segments, 1):
-            try:
-                classified = await classifier.classify(
-                    seg_entries,
-                    dictionary_hash=dictionary_hash,
-                    transcript_cleaner=transcript_cleaner,
-                    locked_category=locked_category,
-                )
-                try:
-                    transcript_id, path, was_new = await transcript_store.ingest_segment(
-                        classified, require_unique=require_unique_ingest
-                    )
-                except DuplicateTranscriptError as dup:
-                    # Worker path with require_unique_ingest=True: another
-                    # job (or a previous successful ingest) already owns
-                    # this deterministic id. Treat as a duplicate output;
-                    # the existing markdown + index stay byte-stable.
-                    logger.info(
-                        f"Post-processing: segment {i}/{len(segments)} is a duplicate "
-                        f"of an already-ingested transcript {dup.transcript_id} — "
-                        "skipping write."
-                    )
-                    result.duplicate_outputs.append(
-                        JobOutput(
-                            ordinal=i,
-                            transcript_id=dup.transcript_id,
-                            file_path="",
-                        )
-                    )
-                    continue
-                logger.info(
-                    f"Post-processing: segment {i}/{len(segments)} written — "
-                    f"{classified.category} / {path.name} / {transcript_id}"
-                )
-                job_output = JobOutput(ordinal=i, transcript_id=transcript_id, file_path=str(path))
-                if was_new:
-                    result.outputs.append(job_output)
-                else:
-                    result.duplicate_outputs.append(job_output)
-                # A fatal-LLM-error fallback segment means classification did
-                # NOT succeed: the transcript is ingested un-classified and
-                # relies on the `--stale` retry cron. Surface it loudly with
-                # the transcript_id so a recurring failure is greppable — the
-                # preceding `Classifier:` warning carries the actual cause
-                # (network exception vs unparseable JSON). The `ran_on_llm_error`
-                # flag is set only by the fatal-failure fallback, not the
-                # too-thin pre-filter.
-                if classified.ran_on_llm_error:
-                    logger.warning(
-                        f"Post-processing: segment {i}/{len(segments)} INGESTED "
-                        f"UNCLASSIFIED (LLM classification failed) — {transcript_id} "
-                        f"/ {path.name}; left stale for the --stale retry cron. "
-                        "See the preceding 'Classifier:' warning for the cause."
-                    )
-                    result.failed_segment_count += 1
-                    result.last_error = (
-                        f"segment {i}/{len(segments)} ingested unclassified "
-                        f"(LLM classification failed) — {transcript_id}"
-                    )
-                tp_task = asyncio.create_task(
-                    _run_topic_pipeline(transcript_id, transcript_store),
-                    name=f"topic_pipeline_{transcript_id}",
-                )
-                result.topic_task_ids.append(transcript_id)
-                if own_topic_tasks:
-                    # Worker path: keep the task on this run's result so the
-                    # worker awaits exactly its own job's topic work.
-                    owned_topic_tasks.append(tp_task)
-                else:
-                    # Bot path: register in the shared set so the bot's
-                    # shutdown drain still awaits topic tasks.
-                    _topic_pipeline_tasks.add(tp_task)
-                    tp_task.add_done_callback(_topic_pipeline_tasks.discard)
-            except Exception as exc:
-                logger.error(f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}")
-                result.failed_segment_count += 1
-                result.last_error = f"segment {i}/{len(segments)} write failed: {exc}"
-                # Partial success must not be reported as success.
-                result.status = "failed"
-                return result
-
-        # Mark the result before cleanup so a job with any failed segment
-        # stays "failed" even though we processed every segment.
-        if result.failed_segment_count:
-            result.status = "failed"
-        else:
-            result.status = "ok"
-            _cleanup_session(session_path)
-        return result
-
-    except Exception as exc:
-        logger.error(f"Post-processing: unexpected error: {exc}")
-        result.status = "failed"
-        result.last_error = f"unexpected error: {exc}"
-        return result
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +684,7 @@ async def run_crash_recovery(
         # ordering). A crash between the two is recoverable: session_queue
         # .claim() back-fills a missing row when a worker claims the file.
         try:
-            _insert_pending_job(rotation.session_id, base, locked_category=locked_category)
+            session_queue.enqueue_job(rotation.session_id, base, locked_category=locked_category)
         except Exception as exc:
             logger.warning(
                 f"Crash recovery: rotated {rotation.session_id} but DB insert "
@@ -899,33 +701,18 @@ def _insert_pending_job(
     *,
     locked_category: str | None = None,
 ) -> None:
-    """Insert a ``pending`` ``processing_jobs`` row for a rotated session.
+    """Deprecated thin alias for :func:`shared.session_queue.enqueue_job`.
 
-    Uses ``INSERT … ON CONFLICT DO NOTHING`` so a re-rotation (or a
-    back-filled row) does not raise. File-rename-first / row-insert-second
-    ordering is enforced by the caller — this only does the DB write.
-
-    ``locked_category`` is recorded on the row so the worker classifies the
-    session against the same category lock the bot was launched with
-    (``./koda bot --category ideas``). NULL on rows the bot did not lock.
+    Deep-review A2: the enqueue-side DB write now lives in
+    ``shared.session_queue`` (FSM writes consolidated in one module). This
+    alias is kept ONLY so pre-existing tests that imported
+    ``bot.runtime._insert_pending_job`` (see
+    ``tests/test_processing_worker.py``) continue to import cleanly. New
+    code MUST call :func:`shared.session_queue.enqueue_job` directly.
     """
-    from datetime import datetime, timezone
+    from shared.session_queue import enqueue_job
 
-    from shared.store import _connect, koda_data_dir
-
-    base = data_dir if data_dir is not None else koda_data_dir()
-    now = datetime.now(timezone.utc).isoformat()
-    with _connect(base / "koda.db") as conn:
-        conn.execute(
-            """
-            INSERT INTO processing_jobs
-                (session_id, state, attempts, created_at, updated_at, locked_category)
-            VALUES (?, 'pending', 0, ?, ?, ?)
-            ON CONFLICT(session_id) DO NOTHING
-            """,
-            (session_id, now, now, locked_category),
-        )
-        conn.commit()
+    enqueue_job(session_id, data_dir, locked_category=locked_category)
 
 
 # ---------------------------------------------------------------------------
