@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 from loguru import logger
 
@@ -456,131 +455,138 @@ async def _create_stt_service():
 # ---------------------------------------------------------------------------
 
 
-async def _run_topic_pipeline(transcript_id: str, store) -> None:
-    """Fire-and-forget: match tags → extract passages → refresh collations.
-
-    Also runs legacy collate_for_transcript for ideas transcripts to keep
-    flat-file topics up to date even when directory topics also matched.
-    """
-    try:
-        from shared.llm_client import create_llm_client
-        from shared.topic_pipeline import process_transcript
-
-        llm = create_llm_client(task="collate")
-        matched = await process_transcript(transcript_id, store, llm)
-        if matched:
-            logger.info(f"Topic pipeline: processed {len(matched)} topic(s) for {transcript_id}")
-
-        summary = await store.get_transcript_summary(transcript_id)
-        if summary and summary.category == "ideas":
-            from shared.collation_service import CollationService
-
-            service = CollationService(store, llm)
-            paths = await service.collate_for_transcript(transcript_id)
-            if paths:
-                logger.info(f"Legacy collation: updated {len(paths)} topic(s) for {transcript_id}")
-    except Exception as exc:
-        logger.warning(f"Topic pipeline failed for {transcript_id}: {exc}")
+# Deep-review A1: ``_run_topic_pipeline`` and ``run_post_processing`` were
+# moved to ``shared.post_processing_services`` (worker → bot was the wrong
+# layer direction). Thin re-exports are kept here so callers / tests that
+# imported them from ``bot.runtime`` continue to work. ``_cleanup_session``
+# is intentionally NOT re-exported — it is a private delete-on-success
+# helper that no live external caller needs.
+from shared.post_processing_services import (  # noqa: E402,PLC0414
+    _run_topic_pipeline as _run_topic_pipeline,
+)
+from shared.post_processing_services import (  # noqa: E402,PLC0414
+    run_post_processing as run_post_processing,
+)
 
 
-def _cleanup_session(session_path: Optional[Path]) -> None:
-    """Delete the .active/ session file after successful post-processing."""
-    if session_path is None:
-        return
-    from shared.memory_writer import delete_session_file
-
-    delete_session_file(session_path)
+# ---------------------------------------------------------------------------
+# Bot-side flush: rotate the .active/ file into the pending/ queue
+# ---------------------------------------------------------------------------
 
 
-async def run_post_processing(
-    buffer_contents: list[dict],
-    dictionary,
-    segmenter,
-    classifier,
-    transcript_store,
-    session_path: Optional[Path],
-    transcript_cleaner=None,
+async def flush_and_rotate(
+    transcript_buffer,
+    reason: str,
+    *,
+    continue_session: bool,
+    data_dir: Path,
     locked_category: str | None = None,
 ) -> None:
-    """Process a flushed transcript buffer through dictionary → segment → cleanup → classify → write."""
-    if not buffer_contents:
-        logger.debug("Post-processing: empty buffer — nothing to process")
-        return
+    """Flush the transcript buffer and rotate its session file into ``pending/``.
 
-    utterance_count = sum(1 for e in buffer_contents if e.get("type") == "utterance")
-    logger.info(
-        f"Post-processing: {len(buffer_contents)} buffer entries ({utterance_count} utterances)"
+    Decoupling-plan Phase 2: this replaces the old ``_flush_and_process``
+    body. The bot is now a thin recorder — it does NOT run the
+    post-processing pipeline. It flushes the in-memory buffer to disk, then
+    rotates the finalised ``.active/`` session file into the ``pending/``
+    queue and inserts a ``processing_jobs`` row. A cron-driven worker drains
+    the queue.
+
+    Flush kinds (see the plan's "Flush triggers" table):
+
+    * ``continue_session=False`` — terminal flush (``EndFrame`` / shutdown):
+      rotate ``.active/X.jsonl`` → ``pending/X.jsonl`` and stop.
+    * ``continue_session=True`` — continuation flush (silence-timeout,
+      Ctrl+T, ``SIGUSR1``): rotate FIRST, then a fresh ``.active/`` session
+      is opened by :func:`session_queue.rotate_to_pending` and adopted by
+      the buffer so the ongoing recording has somewhere to land.
+
+    Ordering invariant: file rename FIRST, DB insert SECOND. A crash between
+    the two leaves a ``pending/`` file with no row — recoverable, because
+    :func:`session_queue.claim` back-fills the row.
+    """
+    from shared import session_queue
+
+    # Phase 5 — queue dirs are no longer created at module import; each
+    # rotation site ensures them itself (idempotent mkdir).
+    session_queue.ensure_queue_dirs(data_dir)
+
+    logger.info(f"{reason} — flushing transcript buffer, rotating to pending/")
+
+    # Pre-mint the fresh .active/ session BEFORE the flush so the buffer can
+    # swap _session_file atomically under its _write_lock. Without this
+    # pre-mint there is a race window where flush() releases the lock with
+    # _session_file=None and an arriving utterance creates a stray .active/
+    # file before we reassign — the "silently drops audio after manual flush"
+    # risk the plan flags. Crash safety unchanged: a crash between pre-mint
+    # and the rotation leaves both the old file and an empty fresh file in
+    # .active/; run_crash_recovery rotates both into pending/ (the empty one
+    # is a harmless no-op job).
+    next_active_path: Path | None = None
+    if continue_session:
+        try:
+            next_active_path, _next_session_id = session_queue.new_active_session(data_dir)
+        except OSError as exc:
+            logger.error(f"Flush: could not pre-mint fresh .active/ session: {exc}")
+            return
+
+    buffer_contents, session_path = await transcript_buffer.flush(
+        next_session_file=next_active_path
     )
-
-    if segmenter is None or classifier is None:
-        logger.warning(
-            "Post-processing: segmenter or classifier not available — "
-            "skipping classification and write. "
-            "Implement services/classifier.py to enable full post-processing."
-        )
+    if not buffer_contents or session_path is None:
+        logger.info("Flush: buffer was empty, nothing to rotate")
+        # Persist any unpersisted in-memory entries (defensive — flush()
+        # already materialises them, but mirrors the old behaviour).
+        await transcript_buffer.flush_to_disk()
+        # Clean up the pre-minted fresh .active/ file we no longer need —
+        # otherwise an empty .active/ session leaks until the next bot
+        # restart's crash_recovery rotates it as a no-op job. The buffer
+        # still points at ``next_active_path`` (flush() swapped it under
+        # the write lock); revert that swap atomically before unlinking,
+        # otherwise an utterance arriving between flush release and unlink
+        # writes into the file and the unlink silently deletes it.
+        if next_active_path is not None:
+            reverted = await transcript_buffer.discard_pending_session(next_active_path)
+            if reverted:
+                try:
+                    next_active_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.debug(
+                        f"Flush: could not remove unused pre-minted {next_active_path.name}: {exc}"
+                    )
+            else:
+                logger.debug(
+                    f"Flush: buffer no longer points at {next_active_path.name} — "
+                    "leaving file in place (crash_recovery will rotate as no-op)"
+                )
         return
 
     try:
-        dictionary_hash = ""
-        if dictionary is not None:
-            for entry in buffer_contents:
-                if entry.get("type") != "utterance":
-                    continue
-                text = entry.get("text")
-                if isinstance(text, str) and text:
-                    entry["text"] = dictionary.apply(text)
-            dictionary_hash = dictionary.content_hash()
+        session_id = session_queue.rotate_active_to_pending(session_path, data_dir=data_dir)
+    except FileNotFoundError:
+        logger.warning(
+            f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
+        )
+        return
+    except OSError as exc:
+        logger.error(f"Flush: could not rotate {session_path.name} to pending/: {exc}")
+        return
 
-        segments = await segmenter.segment(buffer_contents)
-        logger.info(f"Post-processing: segmented into {len(segments)} conversation(s)")
-
-        if not segments:
-            logger.info("Post-processing: no segments produced — nothing to write")
-            _cleanup_session(session_path)
-            return
-
-        for i, seg_entries in enumerate(segments, 1):
-            try:
-                classified = await classifier.classify(
-                    seg_entries,
-                    dictionary_hash=dictionary_hash,
-                    transcript_cleaner=transcript_cleaner,
-                    locked_category=locked_category,
-                )
-                transcript_id, path, _was_new = await transcript_store.ingest_segment(classified)
-                logger.info(
-                    f"Post-processing: segment {i}/{len(segments)} written — "
-                    f"{classified.category} / {path.name} / {transcript_id}"
-                )
-                # A fatal-LLM-error fallback segment means classification did
-                # NOT succeed: the transcript is ingested un-classified and
-                # relies on the `--stale` retry cron. Surface it loudly with
-                # the transcript_id so a recurring failure is greppable — the
-                # preceding `Classifier:` warning carries the actual cause
-                # (network exception vs unparseable JSON). The `ran_on_llm_error`
-                # flag is set only by the fatal-failure fallback, not the
-                # too-thin pre-filter.
-                if classified.ran_on_llm_error:
-                    logger.warning(
-                        f"Post-processing: segment {i}/{len(segments)} INGESTED "
-                        f"UNCLASSIFIED (LLM classification failed) — {transcript_id} "
-                        f"/ {path.name}; left stale for the --stale retry cron. "
-                        "See the preceding 'Classifier:' warning for the cause."
-                    )
-                tp_task = asyncio.create_task(
-                    _run_topic_pipeline(transcript_id, transcript_store),
-                    name=f"topic_pipeline_{transcript_id}",
-                )
-                _topic_pipeline_tasks.add(tp_task)
-                tp_task.add_done_callback(_topic_pipeline_tasks.discard)
-            except Exception as exc:
-                logger.error(f"Post-processing: failed to write segment {i}/{len(segments)}: {exc}")
-                return
-
-        _cleanup_session(session_path)
-
+    # Insert the processing_jobs row AFTER the rename (file-first ordering).
+    try:
+        session_queue.enqueue_job(session_id, data_dir, locked_category=locked_category)
     except Exception as exc:
-        logger.error(f"Post-processing: unexpected error: {exc}")
+        logger.warning(
+            f"Flush: rotated {session_id} but DB insert failed ({exc}) — "
+            "claim() will back-fill the row."
+        )
+
+    logger.info(f"Flush: rotated {session_id} → pending/ (worker will post-process it)")
+    if continue_session and next_active_path is not None:
+        logger.debug(
+            f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -589,71 +595,135 @@ async def run_post_processing(
 
 
 async def run_crash_recovery(
-    dictionary,
-    segmenter,
-    classifier,
-    transcript_store,
-    data_dir: Path,
+    dictionary=None,
+    segmenter=None,
+    classifier=None,
+    transcript_store=None,
+    data_dir: Path | None = None,
     transcript_cleaner=None,
     locked_category: str | None = None,
 ) -> None:
-    """Check for orphaned .active/ session files and process them."""
-    from shared.memory_writer import (
-        claim_session_file,
-        list_orphaned_sessions,
-        read_session_file,
-        unclaim_session_file,
-    )
+    """Rotate orphaned ``.active/`` session files into the ``pending/`` queue.
 
-    orphans = list_orphaned_sessions(data_dir)
-    if not orphans:
+    Decoupling-plan Phase 2: crash recovery no longer runs the
+    post-processing pipeline inline. Instead it *rotates* every orphaned
+    ``.active/`` file into ``pending/`` and inserts a ``processing_jobs``
+    row, just like a live flush does — the cron-driven worker then drains
+    it. This removes the bot end-vs-start race entirely.
+
+    First-run backfill: this also picks up any pre-existing
+    ``.active/session_*.jsonl`` AND legacy ``.recovering`` files left behind
+    by the old crash-recovery scheme and rotates them into ``pending/`` so
+    nothing stranded by the previous deploy is lost. The old ``flock`` /
+    ``.recovering`` claim is no longer used on session files — the
+    ``rename(2)`` into ``pending/`` is the only claim now.
+
+    The post-processing service arguments are accepted only for call-site
+    compatibility with the previous signature; they are unused.
+    """
+    from shared import session_queue
+    from shared.store import koda_data_dir
+
+    base = Path(data_dir) if data_dir is not None else koda_data_dir()
+    # Ensure queue dirs exist before crash recovery rotates anything in.
+    session_queue.ensure_queue_dirs(base)
+    active_dir = base / session_queue.ACTIVE_DIR
+
+    if not active_dir.exists():
+        logger.debug("Crash recovery: no .active/ directory — nothing to recover")
+        return
+
+    # Orphans: both normal session files and legacy .recovering files left
+    # by the superseded flock-based scheme. The bot's own live recording
+    # file is created *after* this runs, so anything here at startup is an
+    # orphan from a previous process.
+    try:
+        orphans = sorted(active_dir.glob("session_*.jsonl"))
+        legacy_recovering = sorted(active_dir.glob("session_*.recovering"))
+    except OSError as exc:
+        logger.warning(f"Crash recovery: could not scan {active_dir}: {exc}")
+        return
+
+    if not orphans and not legacy_recovering:
         logger.debug("Crash recovery: no orphaned session files found")
         return
 
-    logger.info(f"Crash recovery: found {len(orphans)} orphaned session file(s)")
+    logger.info(
+        f"Crash recovery: rotating {len(orphans)} orphaned + "
+        f"{len(legacy_recovering)} legacy .recovering file(s) into pending/"
+    )
 
-    for session_path in orphans:
-        claimed_path = claim_session_file(session_path)
-        if claimed_path is None:
+    # Normalise legacy .recovering files back to a .jsonl name so the queue
+    # treats them uniformly. rename(2) within .active/ is atomic.
+    normalised: list[Path] = list(orphans)
+    for rec_path in legacy_recovering:
+        jsonl_path = rec_path.with_suffix(".jsonl")
+        # Carried Phase 2 minor finding: refuse to silently overwrite a
+        # same-id orphan already present as a ``.jsonl`` in ``.active/``.
+        # Move the legacy file aside instead so a manual inspection can
+        # decide which copy wins.
+        if jsonl_path.exists():
+            stash = rec_path.with_suffix(".recovering.collision")
+            try:
+                os.rename(rec_path, stash)
+                logger.warning(
+                    f"Crash recovery: refused to overwrite {jsonl_path.name} with "
+                    f"legacy {rec_path.name}; moved aside to {stash.name}"
+                )
+            except OSError as exc:
+                logger.warning(f"Crash recovery: could not stash colliding {rec_path.name}: {exc}")
+            continue
+        try:
+            os.rename(rec_path, jsonl_path)
+            normalised.append(jsonl_path)
+        except OSError as exc:
+            logger.warning(f"Crash recovery: could not normalise legacy {rec_path.name}: {exc}")
+
+    for session_path in normalised:
+        try:
+            rotation = session_queue.rotate_to_pending(
+                session_path, continue_session=False, data_dir=base
+            )
+        except FileNotFoundError:
+            # Another actor moved it between the glob and the rename.
+            continue
+        except OSError as exc:
+            logger.error(f"Crash recovery: could not rotate {session_path.name} to pending/: {exc}")
             continue
 
-        logger.info(f"Crash recovery: processing {claimed_path.name}")
+        # Insert the processing_jobs row AFTER the rename (file-first
+        # ordering). A crash between the two is recoverable: session_queue
+        # .claim() back-fills a missing row when a worker claims the file.
         try:
-            entries = read_session_file(claimed_path)
-            if entries is None:
-                logger.error(
-                    f"Crash recovery: could not read {claimed_path.name} — "
-                    "renaming back for next retry"
-                )
-                unclaim_session_file(claimed_path)
-                continue
-            if not entries:
-                logger.warning(f"Crash recovery: {claimed_path.name} is empty, deleting")
-                _cleanup_session(claimed_path)
-                continue
-
-            await run_post_processing(
-                buffer_contents=entries,
-                dictionary=dictionary,
-                segmenter=segmenter,
-                classifier=classifier,
-                transcript_store=transcript_store,
-                session_path=claimed_path,
-                transcript_cleaner=transcript_cleaner,
-                locked_category=locked_category,
-            )
-            if claimed_path.exists():
-                logger.warning(
-                    f"Crash recovery: {claimed_path.name} still on disk after "
-                    "post-processing — renaming back for next retry"
-                )
-                unclaim_session_file(claimed_path)
+            session_queue.enqueue_job(rotation.session_id, base, locked_category=locked_category)
         except Exception as exc:
-            logger.error(
-                f"Crash recovery: failed to process {claimed_path.name}: {exc}. "
-                "Renaming back for next retry."
+            logger.warning(
+                f"Crash recovery: rotated {rotation.session_id} but DB insert "
+                f"failed ({exc}) — claim() will back-fill the row."
             )
-            unclaim_session_file(claimed_path)
+        logger.info(
+            f"Crash recovery: rotated {rotation.session_id} → pending/ (worker will process it)"
+        )
+
+
+def _insert_pending_job(
+    session_id: str,
+    data_dir: Path,
+    *,
+    locked_category: str | None = None,
+) -> None:
+    """Deprecated thin alias for :func:`shared.session_queue.enqueue_job`.
+
+    Deep-review A2: the enqueue-side DB write now lives in
+    ``shared.session_queue`` (FSM writes consolidated in one module). This
+    alias is kept ONLY so pre-existing tests that imported
+    ``bot.runtime._insert_pending_job`` (see
+    ``tests/test_processing_worker.py``) continue to import cleanly. New
+    code MUST call :func:`shared.session_queue.enqueue_job` directly.
+    """
+    from shared.session_queue import enqueue_job
+
+    enqueue_job(session_id, data_dir, locked_category=locked_category)
 
 
 # ---------------------------------------------------------------------------

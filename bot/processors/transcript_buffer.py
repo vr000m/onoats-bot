@@ -190,12 +190,26 @@ class TranscriptBuffer(FrameProcessor):
     # Public API
     # ------------------------------------------------------------------
 
-    async def flush(self) -> tuple[list[dict], Path | None]:
+    async def flush(
+        self,
+        *,
+        next_session_file: Optional[Path] = None,
+    ) -> tuple[list[dict], Path | None]:
         """Return the full in-memory buffer and session path, then reset state.
 
         Before resetting, materializes any entries that failed to write to disk
         so the session file is complete for crash recovery. Acquires the write
         lock to ensure no in-flight disk writes are in progress.
+
+        Args:
+            next_session_file: If provided, ``_session_file`` is atomically
+                swapped to this path under ``_write_lock`` (instead of reset
+                to ``None``). The continuation-flush path uses this to close
+                the race where an utterance arriving between flush and the
+                caller's session-file reassignment would otherwise land in a
+                stray ``.active/`` file. The caller must pre-mint this path
+                (see :func:`shared.session_queue.new_active_session`).
+                Default ``None`` is the terminal-flush behaviour.
 
         Returns:
             Tuple of (entries, session_path). session_path may be None if no
@@ -221,11 +235,39 @@ class TranscriptBuffer(FrameProcessor):
             session_path = self._session_file
             self._buffer = []
             self._last_vad_stop = None
-            self._session_file = None
+            # Atomic swap under the lock — utterances arriving immediately
+            # after we release the lock land in ``next_session_file`` (or
+            # trigger lazy creation if None).
+            self._session_file = next_session_file
             self._persisted_indices = set()
             self._speaking_sources = set()
         logger.info(f"TranscriptBuffer flushed ({len(contents)} entries)")
         return contents, session_path
+
+    async def discard_pending_session(self, expected_path: Path) -> bool:
+        """Revert ``_session_file`` to ``None`` under the write lock.
+
+        The continuation-flush no-op path pre-mints ``next_active_path`` and
+        passes it to :meth:`flush`, which atomically swaps ``_session_file``
+        to that path. When the flush turns out to be a no-op (empty buffer),
+        the caller wants to unlink ``next_active_path`` so an empty
+        ``.active/`` session does not leak — but the buffer is still pointing
+        at it. An utterance arriving between flush release and unlink would
+        write into the file under the write lock and then have its line
+        silently deleted by the unlink.
+
+        Closes that race: takes the write lock, swaps ``_session_file`` back
+        to ``None`` if and only if it still matches ``expected_path`` (the
+        path the caller intends to unlink). Returns ``True`` when the swap
+        ran — the caller may now unlink ``expected_path``. Returns ``False``
+        when ``_session_file`` no longer matches (e.g. a sibling flush
+        rotated the buffer again); the caller must not unlink.
+        """
+        async with self._write_lock:
+            if self._session_file != expected_path:
+                return False
+            self._session_file = None
+            return True
 
     async def flush_to_disk(self) -> None:
         """Write any pending in-memory state to .active/ for crash recovery.
