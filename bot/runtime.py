@@ -455,12 +455,12 @@ async def _create_stt_service():
 # ---------------------------------------------------------------------------
 
 
-# Deep-review A1: ``_run_topic_pipeline``, ``_cleanup_session``, and
-# ``run_post_processing`` were moved to ``shared.post_processing_services``
-# (worker → bot was the wrong layer direction). Thin re-exports are kept here
-# so callers / tests that imported them from ``bot.runtime`` continue to
-# work. The post-processing pipeline now lives entirely in ``shared/``.
-from shared.post_processing_services import _cleanup_session as _cleanup_session  # noqa: E402,PLC0414
+# Deep-review A1: ``_run_topic_pipeline`` and ``run_post_processing`` were
+# moved to ``shared.post_processing_services`` (worker → bot was the wrong
+# layer direction). Thin re-exports are kept here so callers / tests that
+# imported them from ``bot.runtime`` continue to work. ``_cleanup_session``
+# is intentionally NOT re-exported — it is a private delete-on-success
+# helper that no live external caller needs.
 from shared.post_processing_services import (  # noqa: E402,PLC0414
     _run_topic_pipeline as _run_topic_pipeline,
 )
@@ -539,15 +539,26 @@ async def flush_and_rotate(
         await transcript_buffer.flush_to_disk()
         # Clean up the pre-minted fresh .active/ file we no longer need —
         # otherwise an empty .active/ session leaks until the next bot
-        # restart's crash_recovery rotates it as a no-op job.
+        # restart's crash_recovery rotates it as a no-op job. The buffer
+        # still points at ``next_active_path`` (flush() swapped it under
+        # the write lock); revert that swap atomically before unlinking,
+        # otherwise an utterance arriving between flush release and unlink
+        # writes into the file and the unlink silently deletes it.
         if next_active_path is not None:
-            try:
-                next_active_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
+            reverted = await transcript_buffer.discard_pending_session(next_active_path)
+            if reverted:
+                try:
+                    next_active_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.debug(
+                        f"Flush: could not remove unused pre-minted {next_active_path.name}: {exc}"
+                    )
+            else:
                 logger.debug(
-                    f"Flush: could not remove unused pre-minted {next_active_path.name}: {exc}"
+                    f"Flush: buffer no longer points at {next_active_path.name} — "
+                    "leaving file in place (crash_recovery will rotate as no-op)"
                 )
         return
 

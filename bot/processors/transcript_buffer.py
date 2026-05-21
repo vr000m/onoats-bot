@@ -244,6 +244,31 @@ class TranscriptBuffer(FrameProcessor):
         logger.info(f"TranscriptBuffer flushed ({len(contents)} entries)")
         return contents, session_path
 
+    async def discard_pending_session(self, expected_path: Path) -> bool:
+        """Revert ``_session_file`` to ``None`` under the write lock.
+
+        The continuation-flush no-op path pre-mints ``next_active_path`` and
+        passes it to :meth:`flush`, which atomically swaps ``_session_file``
+        to that path. When the flush turns out to be a no-op (empty buffer),
+        the caller wants to unlink ``next_active_path`` so an empty
+        ``.active/`` session does not leak — but the buffer is still pointing
+        at it. An utterance arriving between flush release and unlink would
+        write into the file under the write lock and then have its line
+        silently deleted by the unlink.
+
+        Closes that race: takes the write lock, swaps ``_session_file`` back
+        to ``None`` if and only if it still matches ``expected_path`` (the
+        path the caller intends to unlink). Returns ``True`` when the swap
+        ran — the caller may now unlink ``expected_path``. Returns ``False``
+        when ``_session_file`` no longer matches (e.g. a sibling flush
+        rotated the buffer again); the caller must not unlink.
+        """
+        async with self._write_lock:
+            if self._session_file != expected_path:
+                return False
+            self._session_file = None
+            return True
+
     async def flush_to_disk(self) -> None:
         """Write any pending in-memory state to .active/ for crash recovery.
 
