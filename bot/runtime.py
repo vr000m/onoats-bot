@@ -169,6 +169,22 @@ def _display_target(kwargs: dict) -> str:
     return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
 
 
+def stt_banner() -> str:
+    """One-line STT description for the startup banner.
+
+    For the websocket backend the model is pinned by the server (via the
+    LaunchAgent env), not by ``STT_MODEL`` — that env var routes nowhere
+    on this path, so echoing it here is misleading (e.g. printing
+    ``model=large-v3-turbo`` while the server actually runs Parakeet).
+    Show the resolved server target instead; the real backend + model is
+    logged on connect by ``WebSocketSTTService._ensure_connected``.
+    """
+    if STT_SERVICE == "websocket":
+        target = _display_target(_resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False))
+        return f"websocket (server={target}, model pinned by server)"
+    return f"{STT_SERVICE} / model={STT_MODEL or 'default'}"
+
+
 _PREFLIGHT_TIMEOUT_SEC = 2.0
 # Cold-start tolerance: a single 2s connect is tight when the
 # LaunchAgent was just kicked (e.g. `./koda stt start && ./koda bot`).
@@ -232,9 +248,17 @@ async def log_stt_server_rss(phase: str) -> None:
                 uptime = event.get("uptime_seconds")
                 rss_mb = (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
                 uptime_s = float(uptime) if isinstance(uptime, (int, float)) else 0.0
+                # server.status mirrors the server.hello backend identity, so
+                # the probe line names the real ASR behind the socket — a
+                # wrong-model misconfig shows up in the RSS log too, not just
+                # at connect. Additive field: omit cleanly on older servers.
+                backend = event.get("backend") or {}
+                backend_desc = (
+                    f" backend={backend.get('name')}/{backend.get('model')}" if backend else ""
+                )
                 logger.info(
                     f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
-                    f"session_uptime={uptime_s:.1f}s"
+                    f"session_uptime={uptime_s:.1f}s{backend_desc}"
                 )
                 return
             logger.debug(f"stt_server RSS ({phase}): status reply missing")
