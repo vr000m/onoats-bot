@@ -63,7 +63,8 @@ _SESSION_READY_TIMEOUT_SECONDS = 5.0
 
 # Reconnect back-off schedule. Doubles 0.5 → 8.0s before giving up, total
 # ~15.5s of wall clock. Sized to cover the LaunchAgent keepalive window
-# (``ThrottleInterval=10`` in scripts/koda-stt.plist.template) plus a
+# (the ``ThrottleInterval`` rendered by the external
+# ``pipecat-local-stt-server`` repo's plist renderer) plus a
 # couple of seconds for the freshly-respawned server to load its MLX
 # model, which is the common case where our short retry window fired too
 # early and surfaced an ErrorFrame for the segment in flight during a
