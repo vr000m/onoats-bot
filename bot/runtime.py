@@ -86,7 +86,7 @@ def _mlx_available() -> bool:
         return False
 
 
-_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
+_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/pipecat-stt/stt.sock"
 
 
 def _resolve_stt_ws_target(
