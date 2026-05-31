@@ -285,7 +285,9 @@ async def log_stt_server_rss(phase: str) -> None:
                 # at connect. Additive field: omit cleanly on older servers.
                 backend = event.get("backend") or {}
                 backend_desc = (
-                    f" backend={backend.get('name')}/{backend.get('model')}" if backend else ""
+                    f" backend={backend.get('name', '?')}/{backend.get('model', '?')}"
+                    if backend
+                    else ""
                 )
                 logger.info(
                     f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
