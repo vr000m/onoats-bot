@@ -86,7 +86,37 @@ def _mlx_available() -> bool:
         return False
 
 
-_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
+_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/pipecat-stt/stt.sock"
+# Pre-v0.2.0 default socket. The rename to ``pipecat-stt`` (commit 862e12f) is
+# silent for an operator who ran ``uv sync`` but did not reinstall the
+# LaunchAgent: the old agent keeps writing the ``koda-stt`` socket while the bot
+# now defaults to the ``pipecat-stt`` one, so the connection just fails. Detect
+# that exact split and point the operator at the cutover runbook.
+_LEGACY_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
+_legacy_socket_warned = False
+
+
+def _warn_on_legacy_socket(default_socket: str) -> None:
+    """Warn once if the bot fell back to the new default socket but only the
+    pre-rename ``koda-stt`` socket exists on disk.
+
+    Fires only on the pure-default path (no ``STT_WS_*`` set). Module-level
+    latch keeps it to a single line per process even though several callers
+    (banner, preflight, RSS probe, service creation) resolve the same target.
+    """
+    global _legacy_socket_warned
+    if _legacy_socket_warned:
+        return
+    legacy = os.path.expanduser(_LEGACY_STT_WS_SOCKET)
+    if not os.path.exists(default_socket) and os.path.exists(legacy):
+        _legacy_socket_warned = True
+        logger.warning(
+            f"STT: defaulting to {default_socket}, but only the pre-v0.2.0 "
+            f"socket {legacy} exists — the LaunchAgent was likely not "
+            "reinstalled after the koda-stt -> pipecat-stt rename. Re-run the "
+            "cutover (docs/operator-runbook-stt-extraction.md) or set "
+            "STT_WS_SOCKET explicitly."
+        )
 
 
 def _resolve_stt_ws_target(
@@ -119,6 +149,7 @@ def _resolve_stt_ws_target(
 
     if not (socket_path or host or uri):
         socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(_DEFAULT_STT_WS_SOCKET)
+        _warn_on_legacy_socket(socket_path)
 
     # Cleartext-token guard covers *any* cleartext-ws endpoint, not just
     # STT_WS_URI. host+port paths get lowered to ``ws://host:port/`` via
@@ -167,6 +198,22 @@ def _display_target(kwargs: dict) -> str:
             )
         return uri
     return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
+
+
+def stt_banner() -> str:
+    """One-line STT description for the startup banner.
+
+    For the websocket backend the model is pinned by the server (via the
+    LaunchAgent env), not by ``STT_MODEL`` — that env var routes nowhere
+    on this path, so echoing it here is misleading (e.g. printing
+    ``model=large-v3-turbo`` while the server actually runs Parakeet).
+    Show the resolved server target instead; the real backend + model is
+    logged on connect by ``WebSocketSTTService._ensure_connected``.
+    """
+    if STT_SERVICE == "websocket":
+        target = _display_target(_resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False))
+        return f"websocket (server={target}, model pinned by server)"
+    return f"{STT_SERVICE} / model={STT_MODEL or 'default'}"
 
 
 _PREFLIGHT_TIMEOUT_SEC = 2.0
@@ -232,9 +279,19 @@ async def log_stt_server_rss(phase: str) -> None:
                 uptime = event.get("uptime_seconds")
                 rss_mb = (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
                 uptime_s = float(uptime) if isinstance(uptime, (int, float)) else 0.0
+                # server.status mirrors the server.hello backend identity, so
+                # the probe line names the real ASR behind the socket — a
+                # wrong-model misconfig shows up in the RSS log too, not just
+                # at connect. Additive field: omit cleanly on older servers.
+                backend = event.get("backend") or {}
+                backend_desc = (
+                    f" backend={backend.get('name', '?')}/{backend.get('model', '?')}"
+                    if backend
+                    else ""
+                )
                 logger.info(
                     f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
-                    f"session_uptime={uptime_s:.1f}s"
+                    f"session_uptime={uptime_s:.1f}s{backend_desc}"
                 )
                 return
             logger.debug(f"stt_server RSS ({phase}): status reply missing")
@@ -289,8 +346,8 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     from stt_server.client import TranscriptionClient
 
     hint = (
-        "Start it with: ./koda stt start   (or: scripts/install_stt_agent.sh "
-        "install — only needed once). Verify with: ./koda stt status"
+        "Start it with: ./koda stt start   (or: ./koda stt install — only "
+        "needed once). Verify with: ./koda stt status"
     )
 
     # Endpoint completeness. ``TranscriptionClient.__init__`` already
@@ -397,9 +454,9 @@ async def _create_stt_service():
             from bot.stt.websocket_stt_service import WebSocketSTTService
         except ImportError as exc:
             raise RuntimeError(
-                "STT_SERVICE=websocket requires the 'websockets' package. "
-                "Install via `uv sync --extra stt-server-client` "
-                f"(or add websockets to the root deps). Original error: {exc}"
+                "STT_SERVICE=websocket requires the 'websockets' package, "
+                "a root dependency installed by `uv sync`. Re-run `uv sync` "
+                f"to repair the environment. Original error: {exc}"
             ) from exc
 
         kwargs = _resolve_stt_ws_target(os.environ)

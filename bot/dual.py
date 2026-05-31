@@ -42,8 +42,6 @@ load_dotenv(os.path.expanduser("~/.secrets/ai.env"), override=False)
 from bot.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
-    STT_MODEL,
-    STT_SERVICE,
     SttPreflightError,
     _remove_pid_file,
     _create_stt_service,
@@ -55,6 +53,7 @@ from bot.runtime import (  # noqa: E402
     _write_pid_file,
     flush_and_rotate,
     run_crash_recovery,
+    stt_banner,
 )
 
 
@@ -431,7 +430,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     if locked_category:
         logger.info(f"  Category:         {locked_category} (locked via --category)")
     logger.info(f"  Data dir:         {data_dir}")
-    logger.info(f"  STT:              {STT_SERVICE} / model={STT_MODEL or 'default'}")
+    logger.info(f"  STT:              {stt_banner()}")
     logger.info(f"  LLM:              {os.getenv('LLM_PROVIDER', 'gemini')}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
     logger.info(f"  Mic input:        {mic_dev}")

@@ -64,8 +64,6 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 from bot.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
-    STT_MODEL,
-    STT_SERVICE,
     SttPreflightError,
     _create_stt_service,
     _install_signal_handlers,
@@ -76,6 +74,7 @@ from bot.runtime import (  # noqa: E402
     _write_pid_file,
     flush_and_rotate,
     run_crash_recovery,
+    stt_banner,
 )
 
 _input_dev_env = os.getenv("INPUT_DEVICE", "").strip()
@@ -358,7 +357,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     if locked_category:
         logger.info(f"  Category:  {locked_category} (locked via --category)")
     logger.info(f"  Data dir:  {data_dir}")
-    logger.info(f"  STT:       {STT_SERVICE} / model={STT_MODEL or 'default'}")
+    logger.info(f"  STT:       {stt_banner()}")
     logger.info(f"  LLM:       {os.getenv('LLM_PROVIDER', 'gemini')}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
     logger.info(f"  Input device: {input_dev if input_dev is not None else 'system default'}")

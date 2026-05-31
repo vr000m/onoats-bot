@@ -63,7 +63,8 @@ _SESSION_READY_TIMEOUT_SECONDS = 5.0
 
 # Reconnect back-off schedule. Doubles 0.5 → 8.0s before giving up, total
 # ~15.5s of wall clock. Sized to cover the LaunchAgent keepalive window
-# (``ThrottleInterval=10`` in scripts/koda-stt.plist.template) plus a
+# (the ``ThrottleInterval`` rendered by the external
+# ``pipecat-local-stt-server`` repo's plist renderer) plus a
 # couple of seconds for the freshly-respawned server to load its MLX
 # model, which is the common case where our short retry window fired too
 # early and surfaced an ErrorFrame for the segment in flight during a
@@ -124,6 +125,31 @@ class WebSocketSTTService(SegmentedSTTService):
         self._session_ready: Optional[asyncio.Future[None]] = None
         self._run_stt_lock = asyncio.Lock()
         self._connected = False
+        # Backend identity from the most recent server.hello. The model is
+        # pinned server-side (launchd env), so the client cannot know it
+        # until the handshake completes — these stay None until the first
+        # successful connect, then reflect whatever ASR is actually serving.
+        self._backend_name: Optional[str] = None
+        self._backend_model: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Backend identity (populated on connect from server.hello)
+    # ------------------------------------------------------------------
+
+    @property
+    def backend_name(self) -> Optional[str]:
+        """ASR backend the server reported on connect (e.g. ``parakeet``).
+
+        ``None`` until the first successful handshake — the model is pinned
+        server-side, so the client cannot know it before connecting.
+        """
+        return self._backend_name
+
+    @property
+    def backend_model(self) -> Optional[str]:
+        """Model id the server reported on connect (e.g.
+        ``mlx-community/parakeet-tdt-0.6b-v3``). ``None`` until connected."""
+        return self._backend_model
 
     # ------------------------------------------------------------------
     # Pipecat lifecycle
@@ -274,10 +300,14 @@ class WebSocketSTTService(SegmentedSTTService):
                 except asyncio.TimeoutError:
                     raise RuntimeError("stt_server did not ack session.update")
                 # Backend identity from server.hello — surfaces an operational
-                # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log.
+                # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
+                # and is stashed on the instance so callers (banner, metrics,
+                # health) can report the real model the server pinned.
                 _backend = hello.get("backend") or {}
+                self._backend_name = _backend.get("name")
+                self._backend_model = _backend.get("model")
                 backend_desc = (
-                    f" [backend={_backend.get('name')} model={_backend.get('model')}]"
+                    f" [backend={self._backend_name} model={self._backend_model}]"
                     if _backend
                     else ""
                 )
