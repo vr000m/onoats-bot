@@ -463,7 +463,15 @@ async def _create_stt_service():
         target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
         await _preflight_stt_ws(kwargs, target)
-        return WebSocketSTTService(language="en", **kwargs)
+        # The language is forwarded to the server's decoder via
+        # ``update_session`` (see ``WebSocketSTTService``). Default ``en``
+        # preserves prior behavior for the whisper/mlx and parakeet backends;
+        # set ``STT_WS_LANGUAGE=auto`` for the nemotron backend's multilingual
+        # language-ID (40 locales). Not threaded through
+        # ``_resolve_stt_ws_target`` because that dict also feeds
+        # ``TranscriptionClient``, which takes no ``language`` kwarg.
+        language = (os.environ.get("STT_WS_LANGUAGE") or "en").strip() or "en"
+        return WebSocketSTTService(language=language, **kwargs)
 
     if STT_SERVICE == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
