@@ -465,12 +465,17 @@ async def _create_stt_service():
         await _preflight_stt_ws(kwargs, target)
         # The language is forwarded to the server's decoder via
         # ``update_session`` (see ``WebSocketSTTService``). Default ``en``
-        # preserves prior behavior for the whisper/mlx and parakeet backends;
-        # set ``STT_WS_LANGUAGE=auto`` for the nemotron backend's multilingual
-        # language-ID (40 locales). Not threaded through
+        # preserves prior behavior. ``auto`` maps to ``None`` (omit the field)
+        # rather than the literal string "auto": ``None`` is the only value
+        # that means auto-detect uniformly across backends — whisper/mlx
+        # *rejects* a literal "auto" (ValueError -> failed decode) and uses
+        # ``None`` for built-in detection, while nemotron maps client-``None``
+        # to its own "auto" language-ID. Koda is backend-agnostic over the
+        # socket, so it cannot branch per backend. Not threaded through
         # ``_resolve_stt_ws_target`` because that dict also feeds
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
-        language = (os.environ.get("STT_WS_LANGUAGE") or "en").strip() or "en"
+        raw = (os.environ.get("STT_WS_LANGUAGE") or "en").strip() or "en"
+        language = None if raw.lower() == "auto" else raw
         return WebSocketSTTService(language=language, **kwargs)
 
     if STT_SERVICE == "deepgram":

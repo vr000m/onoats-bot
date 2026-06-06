@@ -91,7 +91,7 @@ class WebSocketSTTService(SegmentedSTTService):
         port: int | None = None,
         uri: str | None = None,
         auth_token: str | None = None,
-        language: str = "en",
+        language: str | None = "en",
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
