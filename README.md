@@ -15,6 +15,9 @@ analysis; onoats itself stays files-only.
 ## Quickstart
 
 ```bash
+# Linux: PortAudio dev headers are needed to build pyaudio
+#   sudo apt-get install -y portaudio19-dev   # (macOS Homebrew ships them)
+
 uv tool install onoats            # baseline (PortAudio + Deepgram/TCP STT)
 # uv tool install 'onoats[macos]' # Apple Silicon: Whisper-MLX + Kokoro
 

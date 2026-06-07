@@ -11,6 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pyaudio (via pipecat-ai[local]) builds a C extension against PortAudio,
+      # whose dev headers ship with macOS/Homebrew but not ubuntu-latest. This
+      # is the off-mac system dep the cross-platform baseline assumes.
+      - name: Install system deps (PortAudio for pyaudio)
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
