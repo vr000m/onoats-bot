@@ -465,8 +465,9 @@ async def run_onoats_dual(
         await _on_shutdown()
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="onoats bot",
         description="onoats dual-input recorder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -496,11 +497,12 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Print finalized `Me:` / `Them:` lines to stdout for routing checks.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for the dual-input recorder (``onoats bot``)."""
+    args = _parse_args(argv)
     if args.interactive:
         logger.warning(
             "Interactive mode is not implemented for the dual-input recorder. "
@@ -513,7 +515,7 @@ if __name__ == "__main__":
             args.category = validate_category(args.category)
         except InvalidCategoryError as exc:
             print(f"Error: {exc}")
-            sys.exit(1)
+            return 1
     try:
         asyncio.run(
             run_onoats_dual(
@@ -522,4 +524,9 @@ if __name__ == "__main__":
         )
     except SttPreflightError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

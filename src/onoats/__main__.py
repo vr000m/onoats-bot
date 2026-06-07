@@ -393,8 +393,9 @@ async def run_onoats(
 # ---------------------------------------------------------------------------
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="onoats bot-single",
         description="onoats — always-on voice recorder (single-input)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -415,11 +416,12 @@ def _parse_args() -> argparse.Namespace:
             "contract as a session_meta line so a consumer can honor it."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for the single-input recorder (``onoats bot-single``)."""
+    args = _parse_args(argv)
     if args.category:
         from onoats.categories import InvalidCategoryError, validate_category
 
@@ -427,11 +429,16 @@ if __name__ == "__main__":
             args.category = validate_category(args.category)
         except InvalidCategoryError as exc:
             print(f"Error: {exc}")
-            sys.exit(1)
+            return 1
     try:
         asyncio.run(
             run_onoats(interactive=args.interactive, locked_category=args.category)
         )
     except SttPreflightError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
