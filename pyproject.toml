@@ -43,7 +43,10 @@ allow-direct-references = true
 packages = ["src/onoats"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+# ruff is pinned to a minor range so CI's `ruff format --check` matches the
+# formatter version contributors run locally (formatter output can shift
+# across ruff minors).
+dev = ["pytest>=8", "ruff>=0.15,<0.16"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
