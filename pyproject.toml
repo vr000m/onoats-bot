@@ -1,0 +1,20 @@
+# Minimal Phase 1 stub. The P4 packaging phase completes this:
+# full runtime deps (pipecat-ai etc.), console_scripts, and the [macos] extra.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onoats"
+version = "0.0.0"
+description = "Standalone onoats voice recorder bot (extracted from koda)."
+requires-python = ">=3.11"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onoats"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

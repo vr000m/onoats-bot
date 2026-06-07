@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# uv / venv
+.venv/
+
+# onoats runtime/data (XDG dirs are out-of-tree; guard local overrides)
+.conduct/
+*.db
+secrets.env
