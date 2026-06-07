@@ -1,23 +1,21 @@
-"""Dual-input Koda listener.
+"""Dual-input onoats recorder.
 
 Runs separate microphone and loopback capture branches, keeps them isolated
 through VAD and STT, tags final transcription frames as `me` / `them`, and
-merges only after STT into the shared post-processing path.
+writes a single chronological session file to the pending/ queue.
 
 Run::
 
-    ./koda bot
-    ./koda bot --live-terminal
-    ./koda bot-dual
-    ./koda bot-dual --live-terminal
+    onoats bot
+    onoats bot --live-terminal
 
 Config:
     MIC_INPUT_DEVICE     - Microphone input device index or stable name
     SYSTEM_INPUT_DEVICE  - Loopback input device index or stable name
 
 Notes:
-    - INPUT_DEVICE is ignored by the dual-input listener.
-    - The legacy mic-only path remains available as `./koda bot-single`.
+    - INPUT_DEVICE is ignored by the dual-input recorder.
+    - The legacy mic-only path remains available as `onoats bot-single`.
 """
 
 from __future__ import annotations
@@ -26,20 +24,17 @@ import argparse
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
 
-# Load config before importing bot.runtime — runtime reads STT_SERVICE,
-# STT_MODEL, and BOT_NAME at module load, and later lookups (device ids,
-# KODA_DATA_DIR, API keys) rely on these env vars being populated. ./koda
-# bot runs this module directly as __main__, bypassing bot/__main__.py's
-# load_dotenv, so we repeat it here.
+# Load STT secrets before importing onoats.runtime — runtime reads STT_SERVICE,
+# STT_MODEL, and BOT_NAME at module load. onoats's consolidated config
+# (config.toml + secrets.env) is the source of truth; this dotenv load is a
+# convenience for a project-local .env in dev. Env vars still override.
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
-load_dotenv(os.path.expanduser("~/.secrets/ai.env"), override=False)
 
-from bot.runtime import (  # noqa: E402
+from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
     SttPreflightError,
@@ -75,7 +70,9 @@ async def _shutdown_stt_service(stt_service, label: str) -> None:
         try:
             await stop(EndFrame())
         except Exception as exc:
-            logger.warning(f"Shutdown: failed to stop {label} STT service cleanly: {exc}")
+            logger.warning(
+                f"Shutdown: failed to stop {label} STT service cleanly: {exc}"
+            )
 
     if cleanup is not None:
         try:
@@ -114,18 +111,18 @@ def _build_dual_pipeline(
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
 
-    from bot.processors.audio_dump import (
+    from onoats.processors.audio_dump import (
         RawAudioDumpProcessor,
         audio_dump_enabled,
         resolve_dump_dir,
     )
-    from bot.processors.live_terminal import LiveTerminalRenderer
-    from bot.processors.smart_turn_shadow import (
+    from onoats.processors.live_terminal import LiveTerminalRenderer
+    from onoats.processors.smart_turn_shadow import (
         SmartTurnShadowObserver,
         resolve_verdict_dir,
         smart_turn_shadow_enabled,
     )
-    from bot.processors.source_tagger import SourceTagger
+    from onoats.processors.source_tagger import SourceTagger
 
     if call_id is None:
         call_id = _generate_call_id()
@@ -140,7 +137,7 @@ def _build_dual_pipeline(
         # verdicts joined by call_id — flag the unjoined-output case so
         # an operator who set only one flag notices.
         logger.warning(
-            "KODA_AUDIO_DUMP=1 but KODA_SMART_TURN_SHADOW is unset — "
+            "ONOATS_AUDIO_DUMP=1 but ONOATS_SMART_TURN_SHADOW is unset — "
             "PCM will not be joinable with shadow verdicts."
         )
 
@@ -151,8 +148,12 @@ def _build_dual_pipeline(
         # safety details (O_NOFOLLOW, mode 0o600, size cap).
         dump_dir = resolve_dump_dir()
         logger.info(f"Audio dump enabled (call_id={call_id}, dir={dump_dir})")
-        mic_arm.append(RawAudioDumpProcessor(source="me", call_id=call_id, dump_dir=dump_dir))
-        system_arm.append(RawAudioDumpProcessor(source="them", call_id=call_id, dump_dir=dump_dir))
+        mic_arm.append(
+            RawAudioDumpProcessor(source="me", call_id=call_id, dump_dir=dump_dir)
+        )
+        system_arm.append(
+            RawAudioDumpProcessor(source="them", call_id=call_id, dump_dir=dump_dir)
+        )
 
     if shadow_on:
         # `me` validated on 2026-05-04 (303 verdicts in one real call, 54 %
@@ -196,19 +197,24 @@ def _build_dual_pipeline(
     return Pipeline(processors)
 
 
-async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | None = None) -> None:
+async def run_onoats_dual(
+    *, live_terminal: bool = False, locked_category: str | None = None
+) -> None:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
-    from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+    from pipecat.transports.local.audio import (
+        LocalAudioTransport,
+        LocalAudioTransportParams,
+    )
 
-    from bot.config.audio_devices import select_dual_input_devices
-    from bot.processors.dual_silence_detector import DualSilenceDetector
-    from bot.processors.transcript_buffer import TranscriptBuffer
-    from shared.post_processing_services import build_transcript_store_only
+    from onoats._vendor.store import onoats_data_dir
+    from onoats.config.audio_devices import select_dual_input_devices
+    from onoats.processors.dual_silence_detector import DualSilenceDetector
+    from onoats.processors.transcript_buffer import TranscriptBuffer
 
-    data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data")).expanduser()
+    data_dir = onoats_data_dir()
 
     if os.getenv("INPUT_DEVICE", "").strip():
         logger.info(
@@ -222,12 +228,8 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         system_input_env=system_input,
     )
 
-    # Transcript store — the bot no longer runs post-processing inline (a
-    # cron worker drains the pending/ queue) and only needs the
-    # TranscriptStore for init_db + the startup rebuild_index
-    # reconciliation. The cron worker uses the full
-    # ``build_post_processing_services`` factory.
-    transcript_store = await build_transcript_store_only(data_dir)
+    # Zero SQLite: the recorder opens no database. It emits files only —
+    # a downstream consumer drains the pending/ queue.
 
     crash_recovery_task = asyncio.create_task(
         run_crash_recovery(data_dir=data_dir, locked_category=locked_category),
@@ -239,7 +241,11 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
     # overlapping speech won't produce spurious silence_gap entries.
     # Enabling this restores Segmenter's ability to split short sessions
     # (segmenter fast-skips no-gap buffers with <=10 utterances).
-    transcript_buffer = TranscriptBuffer(track_vad_gaps=True, use_frame_source=True)
+    transcript_buffer = TranscriptBuffer(
+        track_vad_gaps=True,
+        use_frame_source=True,
+        locked_category=locked_category,
+    )
     flush_lock = asyncio.Lock()
 
     async def _rotate_flush(reason: str, *, continue_session: bool) -> None:
@@ -294,8 +300,12 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         )
     )
 
-    mic_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
-    system_vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
+    mic_vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE)
+    )
+    system_vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE)
+    )
     mic_stt = await _create_stt_service()
     system_stt = await _create_stt_service()
     # RSS baseline for the stt_server at bot start. Pair with the
@@ -347,8 +357,12 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
 
     async def _wait_or_force(coro_or_future, label: str) -> None:
         wait_task = asyncio.ensure_future(coro_or_future)
-        force_task = asyncio.create_task(force_exit_event.wait(), name="force_exit_wait_dual")
-        done, _ = await asyncio.wait({wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED)
+        force_task = asyncio.create_task(
+            force_exit_event.wait(), name="force_exit_wait_dual"
+        )
+        done, _ = await asyncio.wait(
+            {wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED
+        )
         if force_task in done:
             logger.warning(f"Shutdown: force-cancelling {label}")
             wait_task.cancel()
@@ -380,7 +394,9 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
             shutdown_complete.set()
 
     async def _run_shutdown() -> None:
-        logger.info("Shutdown: graceful dual-input shutdown started. Press Ctrl+C again to force.")
+        logger.info(
+            "Shutdown: graceful dual-input shutdown started. Press Ctrl+C again to force."
+        )
         await silence_detector.stop_monitoring()
 
         if crash_recovery_task and not crash_recovery_task.done():
@@ -408,9 +424,6 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         await _shutdown_stt_service(system_stt, "system")
         await log_stt_server_rss("shutdown")
 
-        logger.info("Shutdown: closing transcript store")
-        await transcript_store.close()
-
         # Restore terminal and remove PID file inside the single-writer
         # shutdown path so the two call sites (_shutdown_watcher and the
         # outer ``finally`` block) are truly idempotent regardless of ordering.
@@ -431,7 +444,6 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         logger.info(f"  Category:         {locked_category} (locked via --category)")
     logger.info(f"  Data dir:         {data_dir}")
     logger.info(f"  STT:              {stt_banner()}")
-    logger.info(f"  LLM:              {os.getenv('LLM_PROVIDER', 'gemini')}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
     logger.info(f"  Mic input:        {mic_dev}")
     logger.info(f"  System input:     {system_dev}")
@@ -439,7 +451,9 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
         logger.info("  Live terminal:    enabled")
 
     # Ctrl+T (0x14) is a continuation flush — wired to _flush_continuation.
-    old_terminal_settings = _start_keypress_reader(_flush_continuation, silence_detector, loop)
+    old_terminal_settings = _start_keypress_reader(
+        _flush_continuation, silence_detector, loop
+    )
     runner = PipelineRunner(handle_sigint=False)
     logger.info(
         f"{BOT_NAME} dual-input is listening. "
@@ -453,7 +467,7 @@ async def run_koda_dual(*, live_terminal: bool = False, locked_category: str | N
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Koda dual-input listener",
+        description="onoats dual-input recorder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -489,22 +503,23 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.interactive:
         logger.warning(
-            "Interactive mode is not implemented for the dual-input listener. "
+            "Interactive mode is not implemented for the dual-input recorder. "
             "Running in silent mode."
         )
     if args.category:
-        from shared.models import VALID_CATEGORIES
+        from onoats.categories import InvalidCategoryError, validate_category
 
-        cat = args.category.lower().strip()
-        if cat not in VALID_CATEGORIES or cat == "uncategorized":
-            print(
-                "Error: --category must be one of: "
-                f"{', '.join(sorted(VALID_CATEGORIES - {'uncategorized'}))}"
-            )
+        try:
+            args.category = validate_category(args.category)
+        except InvalidCategoryError as exc:
+            print(f"Error: {exc}")
             sys.exit(1)
-        args.category = cat
     try:
-        asyncio.run(run_koda_dual(live_terminal=args.live_terminal, locked_category=args.category))
+        asyncio.run(
+            run_onoats_dual(
+                live_terminal=args.live_terminal, locked_category=args.category
+            )
+        )
     except SttPreflightError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         sys.exit(1)

@@ -1,6 +1,6 @@
 """Raw PCM dump for offline SmartTurn A/B replay.
 
-Gated by ``KODA_AUDIO_DUMP=1``. Writes append-only 16-bit signed
+Gated by ``ONOATS_AUDIO_DUMP=1``. Writes append-only 16-bit signed
 little-endian PCM, one file per branch per call, opened with
 ``O_NOFOLLOW`` and mode ``0o600`` so the directory cannot be tricked
 into appending through a symlink and the audio is not world-readable.
@@ -11,12 +11,6 @@ Lossless is required for the A/B premise — feeding decoded AAC/Opus
 back through the analyser would attribute encoder artifacts to algorithm
 differences. The handle is opened with ``buffering=0`` so a hard kill
 preserves every byte already passed to ``write(2)``.
-
-Per the spike plan in
-``docs/dev_plans/20260420-design-whisper-websocket-server.md`` this
-infrastructure is intended to outlive shadow-mode. Once the offline
-replay is in place we can flip the SmartTurn commit gate with evidence
-rather than guesswork.
 """
 
 from __future__ import annotations
@@ -45,12 +39,12 @@ MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024  # refuse to start dumping below 5 GB fr
 
 def audio_dump_enabled() -> bool:
     """Whether the raw PCM dump processor should be wired into the pipeline."""
-    return os.environ.get("KODA_AUDIO_DUMP", "").lower() in {"1", "true", "yes"}
+    return os.environ.get("ONOATS_AUDIO_DUMP", "").lower() in {"1", "true", "yes"}
 
 
 def resolve_dump_dir() -> Path:
     """Resolve the dump root, creating it with restrictive perms."""
-    from shared.store import shadow_data_dir
+    from onoats._vendor.store import shadow_data_dir
 
     raw = shadow_data_dir() / "raw"
     raw.mkdir(parents=True, exist_ok=True)
@@ -62,7 +56,7 @@ def resolve_dump_dir() -> Path:
 
 
 def _max_bytes() -> int:
-    raw = os.environ.get("KODA_AUDIO_DUMP_MAX_BYTES", "").strip()
+    raw = os.environ.get("ONOATS_AUDIO_DUMP_MAX_BYTES", "").strip()
     if not raw:
         return DEFAULT_MAX_BYTES
     try:
@@ -92,7 +86,7 @@ class RawAudioDumpProcessor(FrameProcessor):
     One instance per branch. Writes to ``<dump_dir>/<call_id>_<source>.pcm``.
     Opens with ``O_NOFOLLOW``, mode ``0o600``, and ``buffering=0`` so
     bytes are durable on hard crash and the path cannot be redirected
-    via a symlink. Stops writing past ``KODA_AUDIO_DUMP_MAX_BYTES``
+    via a symlink. Stops writing past ``ONOATS_AUDIO_DUMP_MAX_BYTES``
     (default 2 GiB / branch) and refuses to start when the disk has
     less than 5 GiB free.
     """
@@ -133,7 +127,9 @@ class RawAudioDumpProcessor(FrameProcessor):
         try:
             self._fh = _open_append_secure(self._pcm_path)
         except OSError as exc:
-            logger.warning(f"RawAudioDump[{source}]: cannot open {self._pcm_path}: {exc}")
+            logger.warning(
+                f"RawAudioDump[{source}]: cannot open {self._pcm_path}: {exc}"
+            )
             return
 
         logger.info(

@@ -23,7 +23,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from bot.frames import resolve_frame_source
+from onoats.frames import resolve_frame_source
 
 # Reserved source key used in dual mode when a VAD frame arrives without
 # a branch tag. Treating it as a distinct source keeps it inside the
@@ -36,21 +36,22 @@ _UNTAGGED_SOURCE = "_untagged"
 # ---------------------------------------------------------------------------
 
 # Gap (seconds) between VAD stop events that triggers a silence_gap hint.
-# Default: 120s (2 minutes), as per the dev plan.
+# Default: 120s (2 minutes).
 _SEGMENT_HINT_THRESHOLD_DEFAULT = 120
-
-# Root data directory. Default: ~/koda-data
-_KODA_DATA_DIR_DEFAULT = Path.home() / "koda-data"
 
 
 def _data_dir() -> Path:
-    raw = os.environ.get("KODA_DATA_DIR", "")
-    return Path(raw).expanduser() if raw else _KODA_DATA_DIR_DEFAULT
+    # XDG-aware data-dir resolution (ONOATS_DATA_DIR + legacy var).
+    from onoats._vendor.store import onoats_data_dir
+
+    return onoats_data_dir()
 
 
 def _segment_hint_threshold() -> float:
     try:
-        return float(os.environ.get("SEGMENT_HINT_THRESHOLD", _SEGMENT_HINT_THRESHOLD_DEFAULT))
+        return float(
+            os.environ.get("SEGMENT_HINT_THRESHOLD", _SEGMENT_HINT_THRESHOLD_DEFAULT)
+        )
     except ValueError:
         return float(_SEGMENT_HINT_THRESHOLD_DEFAULT)
 
@@ -111,7 +112,10 @@ class TranscriptBuffer(FrameProcessor):
         {"time": "ISO8601", "type": "silence_gap", "duration_seconds": N}
 
     The session file is created on first write and lives in
-    ``<KODA_DATA_DIR>/.active/session_<date>_<time>.jsonl``.
+    ``<data_dir>/.active/session_<date>_<time>.jsonl``. When a category lock
+    is set, the first line written is a typed ``session_meta`` entry
+    (``{"type": "session_meta", "category": ...}``) so the queue contract
+    carries the user's ``--category`` to a downstream consumer.
 
     Construction:
         buf = TranscriptBuffer()
@@ -128,6 +132,7 @@ class TranscriptBuffer(FrameProcessor):
         *,
         track_vad_gaps: bool = True,
         use_frame_source: bool = False,
+        locked_category: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -140,6 +145,11 @@ class TranscriptBuffer(FrameProcessor):
         self._data_dir = Path(data_dir) if data_dir is not None else _data_dir()
         self._track_vad_gaps = track_vad_gaps
         self._use_frame_source = use_frame_source
+        # The user's --category lock. Written as the typed ``session_meta``
+        # FIRST line of every session file (the queue contract carries it so
+        # a consumer can honor the lock without a DB row). ``None`` writes no
+        # session_meta line; the consumer defaults to ``uncategorized``.
+        self._locked_category = locked_category
 
         # In-memory buffer of JSONL entry dicts
         self._buffer: list[dict] = []
@@ -304,10 +314,10 @@ class TranscriptBuffer(FrameProcessor):
         branch_sequence = None
         if self._use_frame_source:
             source = resolve_frame_source(frame)
-            raw_source_order = getattr(frame, "koda_source_order", None)
+            raw_source_order = getattr(frame, "onoats_source_order", None)
             if isinstance(raw_source_order, int):
                 source_order = raw_source_order
-            raw_branch_sequence = getattr(frame, "koda_branch_sequence", None)
+            raw_branch_sequence = getattr(frame, "onoats_branch_sequence", None)
             if isinstance(raw_branch_sequence, int):
                 branch_sequence = raw_branch_sequence
 
@@ -397,7 +407,9 @@ class TranscriptBuffer(FrameProcessor):
         # Reject symlinks in data_dir or .active before creating/writing
         for component in (self._data_dir, active_dir):
             if component.exists() and component.is_symlink():
-                raise RuntimeError(f"Symlink detected in working storage path: {component}")
+                raise RuntimeError(
+                    f"Symlink detected in working storage path: {component}"
+                )
 
         active_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -408,14 +420,50 @@ class TranscriptBuffer(FrameProcessor):
 
         # Verify session path resolves within .active/
         if not self._session_file.resolve().parent == active_dir.resolve():
-            raise RuntimeError(f"Session file {self._session_file} escapes .active/ directory")
+            raise RuntimeError(
+                f"Session file {self._session_file} escapes .active/ directory"
+            )
         logger.info(f"TranscriptBuffer: session file created at {self._session_file}")
+        self._maybe_write_session_meta(self._session_file)
         return self._session_file
+
+    def _maybe_write_session_meta(self, path: Path) -> None:
+        """Write the typed ``session_meta`` FIRST line for a fresh session file.
+
+        Only fires when a category lock is set AND the file has no
+        session_meta yet (empty file, or a pre-minted continuation file). The
+        line carries the ``--category`` lock in the queue contract so a
+        consumer can honor it without a DB row. Idempotent: a file that
+        already starts with a session_meta line is left untouched.
+        """
+        if not self._locked_category:
+            return
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                with path.open("r", encoding="utf-8") as fh:
+                    first = fh.readline()
+                if first.strip():
+                    try:
+                        if json.loads(first).get("type") == "session_meta":
+                            return
+                    except json.JSONDecodeError:
+                        pass
+            from onoats.categories import session_meta_line
+
+            _append_line(path, session_meta_line(self._locked_category))
+        except OSError as exc:
+            logger.warning(
+                f"TranscriptBuffer: could not write session_meta line: {exc}"
+            )
 
     async def _write_entry(self, entry: dict) -> bool:
         """Append a single JSONL entry to the session file. Returns True on success."""
         try:
             session_file = self._ensure_session_file()
+            # Pre-minted continuation files (created by new_active_session)
+            # bypass _ensure_session_file's creation path, so ensure the
+            # session_meta first line is present before the first entry.
+            self._maybe_write_session_meta(session_file)
             line = json.dumps(entry, ensure_ascii=False)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, _append_line, session_file, line)

@@ -75,7 +75,9 @@ class SilenceDetector(FrameProcessor):
         super().__init__(**kwargs)
 
         self._on_silence_timeout = on_silence_timeout
-        self._timeout = silence_timeout if silence_timeout is not None else _silence_timeout()
+        self._timeout = (
+            silence_timeout if silence_timeout is not None else _silence_timeout()
+        )
         self._poll_interval = poll_interval
 
         # Monotonic timestamp of last VAD activity (set on start/stop speaking frames).

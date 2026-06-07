@@ -14,8 +14,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from bot.frames import resolve_frame_source
-from bot.processors.heartbeat_notifier import fire_desktop_notification
+from onoats.frames import resolve_frame_source
+from onoats.processors.heartbeat_notifier import fire_desktop_notification
 
 _SILENCE_TIMEOUT_DEFAULT = 300.0
 _POLL_INTERVAL = 10.0
@@ -70,7 +70,9 @@ class DualSilenceDetector(FrameProcessor):
     ):
         super().__init__(**kwargs)
         self._on_silence_timeout = on_silence_timeout
-        self._timeout = silence_timeout if silence_timeout is not None else _SILENCE_TIMEOUT_DEFAULT
+        self._timeout = (
+            silence_timeout if silence_timeout is not None else _SILENCE_TIMEOUT_DEFAULT
+        )
         # Staleness must be >= the silence timeout, otherwise we'd clear an
         # actively speaking branch before the idle threshold is even reached.
         self._speaking_staleness = max(
@@ -95,7 +97,9 @@ class DualSilenceDetector(FrameProcessor):
             heartbeat_threshold = clamped
         self._heartbeat_threshold = heartbeat_threshold
         self._heartbeat_notifier = (
-            heartbeat_notifier if heartbeat_notifier is not None else fire_desktop_notification
+            heartbeat_notifier
+            if heartbeat_notifier is not None
+            else fire_desktop_notification
         )
         self._heartbeat_fired = False
         self._ever_seen_vad = False
@@ -213,7 +217,9 @@ class DualSilenceDetector(FrameProcessor):
             return
 
         if not self._effective_speaking() and self._last_vad_activity:
-            elapsed = asyncio.get_running_loop().time() - max(self._last_vad_activity.values())
+            elapsed = asyncio.get_running_loop().time() - max(
+                self._last_vad_activity.values()
+            )
             if elapsed >= self._timeout:
                 logger.info(
                     f"DualSilenceDetector: timeout fired after {elapsed:.1f}s of inactivity "
@@ -263,7 +269,7 @@ class DualSilenceDetector(FrameProcessor):
             return
 
         self._heartbeat_fired = True
-        message = f"Koda: both audio branches silent for {elapsed:.0f}s — check call routing"
+        message = f"onoats: both audio branches silent for {elapsed:.0f}s — check call routing"
         logger.warning(f"DualSilenceDetector: heartbeat fired — {message}")
         await self._dispatch_heartbeat(message)
 
@@ -281,4 +287,6 @@ class DualSilenceDetector(FrameProcessor):
             if asyncio.iscoroutine(result):
                 await result
         except Exception as exc:
-            logger.error(f"DualSilenceDetector: on_silence_timeout callback raised: {exc}")
+            logger.error(
+                f"DualSilenceDetector: on_silence_timeout callback raised: {exc}"
+            )

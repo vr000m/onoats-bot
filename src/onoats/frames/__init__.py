@@ -1,6 +1,6 @@
-"""Koda-local frame types that extend Pipecat's frame hierarchy."""
+"""onoats-local frame types that extend Pipecat's frame hierarchy."""
 
-from bot.frames.branch_vad import (
+from onoats.frames.branch_vad import (
     BranchVADUserStartedSpeakingFrame,
     BranchVADUserStoppedSpeakingFrame,
 )
@@ -21,14 +21,14 @@ KNOWN_BRANCH_SOURCES: frozenset[str] = frozenset({"me", "them"})
 def resolve_frame_source(frame) -> str | None:
     """Return the normalized branch identity for *frame*, or None.
 
-    Canonical lookup order — SourceTagger sets ``koda_source`` on every
+    Canonical lookup order — SourceTagger sets ``onoats_source`` on every
     branch-tagged frame; ``source`` is the dataclass field on the
     BranchVAD subclasses; ``user_id`` is Pipecat's native attribute for
     STTs that diarize. Only values in :data:`KNOWN_BRANCH_SOURCES` are
     returned — a diarizing STT that emits ``speaker_1`` on ``user_id``
     will not leak through as a phantom branch.
     """
-    for attr in ("koda_source", "source", "user_id"):
+    for attr in ("onoats_source", "source", "user_id"):
         raw = getattr(frame, attr, None)
         if not raw:
             continue

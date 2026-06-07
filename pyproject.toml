@@ -1,5 +1,7 @@
-# Minimal Phase 1 stub. The P4 packaging phase completes this:
-# full runtime deps (pipecat-ai etc.), console_scripts, and the [macos] extra.
+# P2 adds the baseline runtime deps so `import onoats.runtime` works off-mac.
+# P4 finalizes console_scripts (onoats=onoats.cli:main) and the [macos] extra
+# (mlx-whisper, kokoro-onnx, future CoreAudio bridge). mlx-whisper is NOT a
+# baseline dep — the off-mac baseline ships MLX-free; MLX imports are lazy.
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -7,8 +9,20 @@ build-backend = "hatchling.build"
 [project]
 name = "onoats"
 version = "0.0.0"
-description = "Standalone onoats voice recorder bot (extracted from koda)."
-requires-python = ">=3.11"
+description = "Standalone onoats voice recorder (extracted from koda)."
+# >=3.12: the pinned pipecat-local-stt-server requires Python >=3.12.
+requires-python = ">=3.12"
+dependencies = [
+    "pipecat-ai[deepgram,google,local,runner,silero,soundfile,webrtc,whisper]>=1.0.0,<2.0.0",
+    "pipecat-local-stt-server @ git+https://github.com/vr000m/pipecat-local-stt-server.git@5062b984b164baec1e2396cf412888b2b64f2fa1",
+    "websockets>=13.0",
+    "python-dotenv>=1.2.1",
+    "loguru>=0.7.0",
+]
+
+[tool.hatch.metadata]
+# Allow the git+https direct reference for pipecat-local-stt-server.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/onoats"]

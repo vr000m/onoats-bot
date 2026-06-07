@@ -1,30 +1,23 @@
-"""Koda — Always-on voice listener with memory.
+"""onoats — Always-on voice recorder (single-input / mic-only path).
 
-Captures mic audio, transcribes with Whisper MLX (or Deepgram), and after a
-configurable silence timeout classifies and stores the transcript to cold storage.
-
-Modes:
-  silent (default) — listens and transcribes, does NOT speak
-  interactive      — voice responses enabled (Phase 2; flag accepted, not yet wired)
+Captures mic audio, transcribes with Whisper (MLX on Apple Silicon, CPU
+otherwise) or Deepgram, and after a configurable silence timeout rotates the
+session file into the pending/ queue. The recorder opens no database and runs
+no post-processing — a downstream consumer drains the queue.
 
 Run::
 
-    ./koda bot                           # silent listener
-    ./koda bot --interactive             # voice responses enabled (Phase 2 stub)
+    onoats bot-single                    # silent mic-only recorder
 
-Config (.env or environment):
-    STT_SERVICE          - STT backend: "whisper" (default, local MLX) or "deepgram"
+Config (config.toml / secrets.env or environment):
+    STT_SERVICE          - STT backend: "whisper" (default, local) or "deepgram"
     STT_MODEL            - Model override for chosen STT backend
-    LLM_PROVIDER         - LLM provider for post-processing: "gemini" (default)
-    KODA_DATA_DIR        - Override default ~/koda-data storage root
+    ONOATS_DATA_DIR      - Override the XDG data root
     INPUT_DEVICE         - Override mic device index (int); skips interactive picker
     SILENCE_TIMEOUT_SEC  - Seconds of mic silence before flushing buffer (default 300)
     SEGMENT_HINT_THRESHOLD - Seconds of silence to mark a segment hint (default 120)
 
-Required API keys (set in ~/.secrets/ai.env):
-    GEMINI_API_KEY       - Google Generative AI (default LLM provider for post-processing)
-
-Optional API keys:
+Optional STT secrets (secrets.env):
     DEEPGRAM_API_KEY     - Deepgram STT (only when STT_SERVICE=deepgram)
 """
 
@@ -34,18 +27,16 @@ import argparse
 import asyncio
 import os
 import sys
-from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from loguru import logger
 
 # ---------------------------------------------------------------------------
-# Load config before anything else
+# Load dev-local .env (convenience; config.toml / secrets.env is canonical)
 # ---------------------------------------------------------------------------
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
-load_dotenv(os.path.expanduser("~/.secrets/ai.env"), override=False)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -55,13 +46,11 @@ logger.remove()
 logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 
 # ---------------------------------------------------------------------------
-# Config from environment
+# Runtime helpers live in onoats/runtime.py so dual.py does not have to reach
+# into this module for leading-underscore symbols.
 # ---------------------------------------------------------------------------
-# Shared runtime helpers live in bot/runtime.py so bot/dual.py does not have
-# to reach into this module for leading-underscore symbols or for the shared
-# _topic_pipeline_tasks set.
 
-from bot.runtime import (  # noqa: E402
+from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
     SttPreflightError,
@@ -87,7 +76,7 @@ INPUT_DEVICE: Optional[int] = int(_input_dev_env) if _input_dev_env else None
 
 
 def _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_detector):
-    """Assemble the Koda pipecat pipeline.
+    """Assemble the onoats pipecat pipeline.
 
     Pipeline: Mic → VADProcessor (Silero) → Whisper STT → TranscriptBuffer → SilenceDetector
 
@@ -113,8 +102,10 @@ def _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_de
 # ---------------------------------------------------------------------------
 
 
-async def run_koda(*, interactive: bool = False, locked_category: str | None = None) -> None:
-    """Build and run the full Koda listener pipeline.
+async def run_onoats(
+    *, interactive: bool = False, locked_category: str | None = None
+) -> None:
+    """Build and run the full onoats recorder pipeline.
 
     Args:
         interactive: If True, voice response mode is enabled (Phase 2 stub —
@@ -127,31 +118,30 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
-    from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+    from pipecat.transports.local.audio import (
+        LocalAudioTransport,
+        LocalAudioTransportParams,
+    )
 
-    from bot.config.audio_devices import select_input_device
-    from bot.processors.silence_detector import SilenceDetector
-    from bot.processors.transcript_buffer import TranscriptBuffer
-    from shared.post_processing_services import build_transcript_store_only
-
-    # ----------------------------------------------------------------
-    # Step 1: Load config
-    # ----------------------------------------------------------------
-    data_dir = Path(os.getenv("KODA_DATA_DIR", Path.home() / "koda-data")).expanduser()
+    from onoats._vendor.store import onoats_data_dir
+    from onoats.config.audio_devices import select_input_device
+    from onoats.processors.silence_detector import SilenceDetector
+    from onoats.processors.transcript_buffer import TranscriptBuffer
 
     # ----------------------------------------------------------------
-    # Step 2: Select audio device (input only — silent listener)
+    # Step 1: Resolve the data dir (XDG-aware; ONOATS_DATA_DIR wins)
+    # ----------------------------------------------------------------
+    data_dir = onoats_data_dir()
+
+    # ----------------------------------------------------------------
+    # Step 2: Select audio device (input only — silent recorder)
     # ----------------------------------------------------------------
     input_dev = select_input_device(input_device_env=INPUT_DEVICE)
 
     # ----------------------------------------------------------------
-    # Step 3: Build the transcript store
+    # Step 3: Zero SQLite — the recorder opens no database. It emits files
+    # only; a downstream consumer drains the pending/ queue.
     # ----------------------------------------------------------------
-    # The bot no longer runs post-processing inline (a cron worker drains the
-    # pending/ queue) — it only needs the TranscriptStore for init_db + the
-    # startup rebuild_index reconciliation. The cron worker uses the full
-    # ``build_post_processing_services`` factory.
-    transcript_store = await build_transcript_store_only(data_dir)
 
     # ----------------------------------------------------------------
     # Step 4: Crash recovery — rotate any orphaned .active/ files into
@@ -167,7 +157,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     # ----------------------------------------------------------------
 
     # TranscriptBuffer: accumulates utterances + silence_gap hints → .active/session_*.jsonl
-    transcript_buffer = TranscriptBuffer()
+    transcript_buffer = TranscriptBuffer(locked_category=locked_category)
 
     _flush_lock = asyncio.Lock()
 
@@ -223,12 +213,16 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
         )
     )
 
-    vad_processor = VADProcessor(vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE))
+    vad_processor = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE)
+    )
 
     # ----------------------------------------------------------------
     # Step 7: Assemble pipeline
     # ----------------------------------------------------------------
-    pipeline = _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_detector)
+    pipeline = _build_pipeline(
+        transport, vad_processor, stt, transcript_buffer, silence_detector
+    )
 
     task = PipelineTask(
         pipeline,
@@ -245,7 +239,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     # ----------------------------------------------------------------
     # Step 8: Graceful shutdown wiring + signal handlers
     # (must be installed BEFORE the PID file is published, otherwise a
-    # `./koda flush` during the startup window will send SIGUSR1 to a
+    # `onoats flush` during the startup window will send SIGUSR1 to a
     # process that still has the default disposition for that signal —
     # terminating the fresh bot instead of flushing.)
     # ----------------------------------------------------------------
@@ -258,7 +252,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     )
 
     # ----------------------------------------------------------------
-    # Step 9: Write PID file for ./koda flush discovery
+    # Step 9: Write PID file for onoats flush discovery
     # (after signal handlers so SIGUSR1 is already wired by the time
     # the PID file is visible.)
     # ----------------------------------------------------------------
@@ -270,8 +264,12 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     async def _wait_or_force(coro_or_future, label: str) -> None:
         """Await a coroutine/future, but cancel it immediately if force_exit_event fires."""
         wait_task = asyncio.ensure_future(coro_or_future)
-        force_task = asyncio.create_task(force_exit_event.wait(), name="force_exit_wait")
-        done, _ = await asyncio.wait({wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED)
+        force_task = asyncio.create_task(
+            force_exit_event.wait(), name="force_exit_wait"
+        )
+        done, _ = await asyncio.wait(
+            {wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED
+        )
         if force_task in done:
             logger.warning(f"Shutdown: force-cancelling {label}")
             wait_task.cancel()
@@ -307,7 +305,9 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
             _shutdown_complete.set()
 
     async def _run_shutdown() -> None:
-        logger.info("Shutdown: graceful shutdown started. Press Ctrl+C again to force exit.")
+        logger.info(
+            "Shutdown: graceful shutdown started. Press Ctrl+C again to force exit."
+        )
         await silence_detector.stop_monitoring()
 
         # Wait for crash recovery to finish if still running
@@ -331,9 +331,6 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
             # drain it defensively in case a legacy task is still pending.
             await _drain_tasks(_topic_pipeline_tasks, "topic pipeline task(s)")
 
-        logger.info("Shutdown: closing transcript store")
-        await transcript_store.close()
-
         logger.info("Shutdown: complete")
 
     # Monitor the shutdown event in the background and cancel the pipeline task
@@ -351,27 +348,29 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
     # ----------------------------------------------------------------
     # Step 9: Log startup info
     # ----------------------------------------------------------------
-    mode = "interactive (Phase 2 stub)" if interactive else "silent listener"
+    mode = "interactive (stub)" if interactive else "silent recorder"
     logger.info(f"--- {BOT_NAME} starting ---")
     logger.info(f"  Mode:      {mode}")
     if locked_category:
         logger.info(f"  Category:  {locked_category} (locked via --category)")
     logger.info(f"  Data dir:  {data_dir}")
     logger.info(f"  STT:       {stt_banner()}")
-    logger.info(f"  LLM:       {os.getenv('LLM_PROVIDER', 'gemini')}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
-    logger.info(f"  Input device: {input_dev if input_dev is not None else 'system default'}")
+    logger.info(
+        f"  Input device: {input_dev if input_dev is not None else 'system default'}"
+    )
     if interactive:
         logger.warning(
-            "Interactive mode is not yet fully implemented (Phase 2). "
-            "Running in silent listener mode."
+            "Interactive mode is not implemented. Running in silent recorder mode."
         )
 
     # ----------------------------------------------------------------
     # Step 10: Start Ctrl+T keypress reader (cbreak mode)
     # ----------------------------------------------------------------
     # Ctrl+T (0x14) is a continuation flush — wired to _flush_continuation.
-    _old_terminal_settings = _start_keypress_reader(_flush_continuation, silence_detector, loop)
+    _old_terminal_settings = _start_keypress_reader(
+        _flush_continuation, silence_detector, loop
+    )
 
     # ----------------------------------------------------------------
     # Step 11: Run the pipeline — cleanup runs on ALL exit paths
@@ -396,7 +395,7 @@ async def run_koda(*, interactive: bool = False, locked_category: str | None = N
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Koda — always-on voice listener with memory",
+        description="onoats — always-on voice recorder (single-input)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -404,10 +403,7 @@ def _parse_args() -> argparse.Namespace:
         "--interactive",
         action="store_true",
         default=False,
-        help=(
-            "Enable voice response mode for brain dumps and memory queries. "
-            "(Phase 2 — flag accepted, full interactive mode not yet implemented)"
-        ),
+        help="Accepted for CLI compatibility; the recorder still runs silently.",
     )
     parser.add_argument(
         "--category",
@@ -415,10 +411,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         metavar="NAME",
         help=(
-            "Lock all segments to this category (e.g., seminars, work, advisory). "
-            "Useful when you know the context upfront — attending a talk, a specific "
-            "meeting type, etc. The classifier still runs to extract summary/tags/actions "
-            "but the category is forced."
+            "Lock the session to this category. The category rides in the queue "
+            "contract as a session_meta line so a consumer can honor it."
         ),
     )
     return parser.parse_args()
@@ -427,18 +421,17 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_args()
     if args.category:
-        from shared.models import VALID_CATEGORIES
+        from onoats.categories import InvalidCategoryError, validate_category
 
-        cat = args.category.lower().strip()
-        if cat not in VALID_CATEGORIES or cat == "uncategorized":
-            print(
-                f"Error: --category must be one of: "
-                f"{', '.join(sorted(VALID_CATEGORIES - {'uncategorized'}))}"
-            )
+        try:
+            args.category = validate_category(args.category)
+        except InvalidCategoryError as exc:
+            print(f"Error: {exc}")
             sys.exit(1)
-        args.category = cat
     try:
-        asyncio.run(run_koda(interactive=args.interactive, locked_category=args.category))
+        asyncio.run(
+            run_onoats(interactive=args.interactive, locked_category=args.category)
+        )
     except SttPreflightError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         sys.exit(1)

@@ -3,19 +3,18 @@
 Provides interactive device picker with last-used memory, env var
 overrides, and device validation.
 
-Koda is a silent listener — it only needs a mic (input) device in
-normal operation. Output devices are only required in interactive
-mode (Phase 2, when Koda responds with voice).
+onoats is a silent recorder — it only needs a mic (input) device in
+normal operation. Output devices are only required in interactive mode.
 
-Usage — silent listener mode (input only)::
+Usage — silent recorder mode (input only)::
 
-    from bot.config.audio_devices import select_input_device
+    from onoats.config.audio_devices import select_input_device
 
     mic = select_input_device(input_device_env=os.getenv("INPUT_DEVICE"))
 
 Usage — interactive mode (input + output)::
 
-    from bot.config.audio_devices import select_audio_devices
+    from onoats.config.audio_devices import select_audio_devices
 
     mic, speaker = select_audio_devices(
         input_device_env=os.getenv("INPUT_DEVICE"),
@@ -23,13 +22,22 @@ Usage — interactive mode (input + output)::
     )
 """
 
+import os
 import sys
 from pathlib import Path
 
 from loguru import logger
 
-LAST_DEVICE_FILE = Path(__file__).parents[2] / ".last_audio_devices"
-LAST_DUAL_DEVICE_FILE = Path(__file__).parents[2] / ".last_dual_audio_devices"
+
+def _device_state_dir() -> Path:
+    """Last-used device files live under the XDG config dir, not the repo."""
+    raw = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(raw).expanduser() if raw else Path.home() / ".config"
+    return base / "onoats"
+
+
+LAST_DEVICE_FILE = _device_state_dir() / ".last_audio_devices"
+LAST_DUAL_DEVICE_FILE = _device_state_dir() / ".last_dual_audio_devices"
 
 # Pipeline sample rate — 16kHz for Silero VAD compatibility.
 # Silero VAD requires 8kHz or 16kHz. All tested devices support 16kHz.
@@ -102,7 +110,9 @@ def _find_device_by_name(pa, query: str, *, need_input: bool) -> int | None:
     if not matches:
         return None
     if len(matches) > 1:
-        names = ", ".join(str(pa.get_device_info_by_index(idx)["name"]) for idx in matches[:5])
+        names = ", ".join(
+            str(pa.get_device_info_by_index(idx)["name"]) for idx in matches[:5]
+        )
         logger.warning(
             f"Device query '{query}' matched multiple devices for "
             f"{'input' if need_input else 'output'} selection: {names}. Using [{matches[0]}]."
@@ -128,7 +138,9 @@ def validate_audio_device(device_query, label, need_input=False):
         if isinstance(query, int):
             device_index = query
             if device_index >= pa.get_device_count():
-                logger.warning(f"{label}={device_index} not found, using system default")
+                logger.warning(
+                    f"{label}={device_index} not found, using system default"
+                )
                 return None
         else:
             device_index = _find_device_by_name(pa, query, need_input=need_input)
@@ -166,7 +178,7 @@ def validate_audio_device(device_query, label, need_input=False):
 def select_input_device(input_device_env=None):
     """Select an audio input (mic) device. No output device required.
 
-    Use this in silent listener mode (Phase 1). Koda only needs a mic.
+    Use this in silent recorder mode. onoats only needs a mic.
 
     Args:
         input_device_env: INPUT_DEVICE env var value (int or None).
@@ -179,7 +191,9 @@ def select_input_device(input_device_env=None):
     pa = pyaudio.PyAudio()
     try:
         # Check env var override
-        env_in = validate_audio_device(input_device_env, "INPUT_DEVICE", need_input=True)
+        env_in = validate_audio_device(
+            input_device_env, "INPUT_DEVICE", need_input=True
+        )
         if env_in is not None:
             in_info = pa.get_device_info_by_index(env_in)
             logger.info(f"Audio input:  [{env_in}] {in_info['name']} (from env)")
@@ -242,8 +256,12 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
 
     pa = pyaudio.PyAudio()
     try:
-        env_mic = validate_audio_device(mic_input_env, "MIC_INPUT_DEVICE", need_input=True)
-        env_system = validate_audio_device(system_input_env, "SYSTEM_INPUT_DEVICE", need_input=True)
+        env_mic = validate_audio_device(
+            mic_input_env, "MIC_INPUT_DEVICE", need_input=True
+        )
+        env_system = validate_audio_device(
+            system_input_env, "SYSTEM_INPUT_DEVICE", need_input=True
+        )
         if env_mic is not None and env_system is not None:
             _ensure_distinct_dual_inputs(env_mic, env_system, pa)
             _log_dual_inputs(pa, env_mic, env_system, env_label="from env")
@@ -252,8 +270,12 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
         inputs = _enumerate_input_devices(pa)
 
         last_mic_name, last_system_name = _load_last_dual_inputs()
-        last_mic = validate_audio_device(last_mic_name, "last_mic_input", need_input=True)
-        last_system = validate_audio_device(last_system_name, "last_system_input", need_input=True)
+        last_mic = validate_audio_device(
+            last_mic_name, "last_mic_input", need_input=True
+        )
+        last_system = validate_audio_device(
+            last_system_name, "last_system_input", need_input=True
+        )
 
         if sys.stdin.isatty():
             picked_mic, picked_system = _pick_dual_input_devices(
@@ -275,7 +297,7 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
         if system_dev is None:
             raise RuntimeError(
                 "No system loopback input selected. Set SYSTEM_INPUT_DEVICE or run "
-                "`./koda bot-dual` in an interactive terminal to choose one."
+                "`onoats bot` in an interactive terminal to choose one."
             )
 
         for dev_idx, label in [
@@ -316,7 +338,7 @@ def _enumerate_input_devices(pa) -> list[tuple[int, str, int]]:
 def select_audio_devices(input_device_env=None, output_device_env=None):
     """Select audio input and output devices interactively.
 
-    Use this in interactive mode (Phase 2) when Koda responds with voice.
+    Use this in interactive mode when onoats responds with voice.
 
     Args:
         input_device_env:  INPUT_DEVICE env var value (int or None).
@@ -331,8 +353,12 @@ def select_audio_devices(input_device_env=None, output_device_env=None):
     pa = pyaudio.PyAudio()
     try:
         # Check env var overrides
-        env_in = validate_audio_device(input_device_env, "INPUT_DEVICE", need_input=True)
-        env_out = validate_audio_device(output_device_env, "OUTPUT_DEVICE", need_input=False)
+        env_in = validate_audio_device(
+            input_device_env, "INPUT_DEVICE", need_input=True
+        )
+        env_out = validate_audio_device(
+            output_device_env, "OUTPUT_DEVICE", need_input=False
+        )
 
         # If both env vars are set, skip interactive selection entirely
         if env_in is not None and env_out is not None:
@@ -478,6 +504,7 @@ def _load_last_input():
 def _save_last_input(input_dev):
     """Write the last-used input device index to disk."""
     try:
+        LAST_DEVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
         # Preserve existing output device line if present
         existing_out = None
         if LAST_DEVICE_FILE.exists():
@@ -513,6 +540,7 @@ def _load_last_devices():
 def _save_last_devices(input_dev, output_dev):
     """Write the last-used input and output device indices to disk."""
     try:
+        LAST_DEVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
         LAST_DEVICE_FILE.write_text(f"{input_dev}\n{output_dev}\n")
     except OSError:
         pass
@@ -536,6 +564,7 @@ def _load_last_dual_inputs():
 def _save_last_dual_inputs(pa, mic_dev, system_dev):
     """Persist dual-input device names so selection survives index drift."""
     try:
+        LAST_DUAL_DEVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
         mic_name = str(pa.get_device_info_by_index(mic_dev)["name"]).strip()
         system_name = str(pa.get_device_info_by_index(system_dev)["name"]).strip()
         LAST_DUAL_DEVICE_FILE.write_text(f"{mic_name}\n{system_name}\n")
@@ -551,7 +580,9 @@ def _save_last_dual_inputs(pa, mic_dev, system_dev):
 def _pick_input_device(inputs, last_in):
     """Interactive input-only device picker."""
     last_in_name = (
-        next((n for i, n, _ in inputs if i == last_in), None) if last_in is not None else None
+        next((n for i, n, _ in inputs if i == last_in), None)
+        if last_in is not None
+        else None
     )
 
     print("\n--- Mic Device Selection ---")
@@ -581,25 +612,35 @@ def _pick_input_device(inputs, last_in):
     return input_dev
 
 
-def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_output=False):
+def _pick_devices(
+    inputs, outputs, last_in, last_out, *, skip_input=False, skip_output=False
+):
     """Interactive device picker showing both input and output."""
     last_in_name = (
-        next((n for i, n, _ in inputs if i == last_in), None) if last_in is not None else None
+        next((n for i, n, _ in inputs if i == last_in), None)
+        if last_in is not None
+        else None
     )
     last_out_name = (
-        next((n for i, n, _ in outputs if i == last_out), None) if last_out is not None else None
+        next((n for i, n, _ in outputs if i == last_out), None)
+        if last_out is not None
+        else None
     )
 
     print("\n--- Audio Device Selection ---")
     if last_in_name and last_out_name and not skip_input and not skip_output:
-        print(f"Last used: IN=[{last_in}] {last_in_name}, OUT=[{last_out}] {last_out_name}")
+        print(
+            f"Last used: IN=[{last_in}] {last_in_name}, OUT=[{last_out}] {last_out_name}"
+        )
         print("Press Enter to reuse, or pick new devices.\n")
 
     # Input device
     if skip_input:
         input_dev = last_in
         in_name = (
-            next((n for i, n, _ in inputs if i == last_in), "?") if last_in is not None else "?"
+            next((n for i, n, _ in inputs if i == last_in), "?")
+            if last_in is not None
+            else "?"
         )
         print(f"Input device: [{last_in}] {in_name} (from env)")
     else:
@@ -624,7 +665,9 @@ def _pick_devices(inputs, outputs, last_in, last_out, *, skip_input=False, skip_
     if skip_output:
         output_dev = last_out
         out_name = (
-            next((n for i, n, _ in outputs if i == last_out), "?") if last_out is not None else "?"
+            next((n for i, n, _ in outputs if i == last_out), "?")
+            if last_out is not None
+            else "?"
         )
         print(f"Output device: [{last_out}] {out_name} (from env)")
     else:
@@ -671,7 +714,9 @@ def _pick_dual_input_devices(
             print(f"  [{idx}] {name}{marker}")
         try:
             default_label = f" [{default_idx}]" if default_idx is not None else ""
-            choice = input(f"Select {label.lower()} input device{default_label}: ").strip()
+            choice = input(
+                f"Select {label.lower()} input device{default_label}: "
+            ).strip()
             if choice:
                 picked = int(choice)
                 if not any(d[0] == picked for d in inputs):
@@ -710,7 +755,9 @@ def _ensure_distinct_dual_inputs(mic_dev: int, system_dev: int, pa) -> None:
         )
 
 
-def _log_dual_inputs(pa, mic_dev: int, system_dev: int, env_label: str | None = None) -> None:
+def _log_dual_inputs(
+    pa, mic_dev: int, system_dev: int, env_label: str | None = None
+) -> None:
     mic_info = pa.get_device_info_by_index(mic_dev)
     system_info = pa.get_device_info_by_index(system_dev)
     suffix = f" ({env_label})" if env_label else ""

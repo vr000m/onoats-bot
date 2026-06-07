@@ -7,16 +7,14 @@ logged for offline comparison against the VAD-only baseline. No frame
 is ever swallowed, modified, or held back — downstream STT continues
 to commit on raw VAD exactly as before.
 
-Per the dev plan in
-``docs/dev_plans/20260420-design-whisper-websocket-server.md`` the
-spike order is: prototype on ``me`` first, measure mid-turn
-fragmentation against the 2026-04-21 corpus, then mirror to ``them``
-and consider flipping the commit decision over to SmartTurn.
+The spike order is: prototype on ``me`` first, measure mid-turn
+fragmentation, then mirror to ``them`` and consider flipping the commit
+decision over to SmartTurn.
 
-Gated by ``KODA_SMART_TURN_SHADOW=1`` so the analyser only loads when
-explicitly enabled — keeps cold-start cost out of the default bot
+Gated by ``ONOATS_SMART_TURN_SHADOW=1`` so the analyser only loads when
+explicitly enabled — keeps cold-start cost out of the default recorder
 path. When enabled, verdicts are mirrored to JSONL under
-``<KODA_DATA_DIR>/shadow/verdicts/<YYYY-MM-DD>/<call_id>.jsonl`` so we
+``<data_dir>/shadow/verdicts/<YYYY-MM-DD>/<call_id>.jsonl`` so we
 have durable evidence regardless of whether stdout was captured.
 
 Concurrency model: ``append_audio`` and ``analyze_end_of_turn`` share
@@ -54,12 +52,16 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 def smart_turn_shadow_enabled() -> bool:
     """Whether the shadow observer should be wired into the pipeline."""
-    return os.environ.get("KODA_SMART_TURN_SHADOW", "").lower() in {"1", "true", "yes"}
+    return os.environ.get("ONOATS_SMART_TURN_SHADOW", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def resolve_verdict_dir() -> Path:
     """Resolve today's verdict JSONL root with restrictive perms."""
-    from shared.store import shadow_data_dir
+    from onoats._vendor.store import shadow_data_dir
 
     today = datetime.now().strftime("%Y-%m-%d")
     out = shadow_data_dir() / "verdicts" / today
@@ -130,7 +132,9 @@ class SmartTurnShadowObserver(FrameProcessor):
                 # Per-source path so concurrent appends from `me` and
                 # `them` instances cannot interleave bytes.
                 self._jsonl_path = verdict_dir / f"{call_id}_{source}.jsonl"
-                logger.info(f"SmartTurnShadow[{source}]: persisting verdicts to {self._jsonl_path}")
+                logger.info(
+                    f"SmartTurnShadow[{source}]: persisting verdicts to {self._jsonl_path}"
+                )
             except Exception as exc:
                 logger.warning(
                     f"SmartTurnShadow[{source}]: could not open verdict dir {verdict_dir}: {exc}"
@@ -165,7 +169,9 @@ class SmartTurnShadowObserver(FrameProcessor):
                                 self._analyzer.append_audio(audio, is_speech=was_speech)
                             self._pending_audio.clear()
                             self._pending_bytes = 0
-                        self._analyzer.append_audio(frame.audio, is_speech=self._in_speech)
+                        self._analyzer.append_audio(
+                            frame.audio, is_speech=self._in_speech
+                        )
             elif isinstance(frame, VADUserStartedSpeakingFrame):
                 self._in_speech = True
                 self._turn_started_at = time.monotonic()
@@ -175,7 +181,9 @@ class SmartTurnShadowObserver(FrameProcessor):
                 # after the next VAD-started frame would otherwise read
                 # the new turn's timestamp.
                 started_at = self._turn_started_at
-                self._pending_task = asyncio.create_task(self._shadow_analyse(started_at))
+                self._pending_task = asyncio.create_task(
+                    self._shadow_analyse(started_at)
+                )
             elif isinstance(frame, (EndFrame, CancelFrame)):
                 await self._drain_pending_task()
         except Exception as exc:
@@ -192,7 +200,9 @@ class SmartTurnShadowObserver(FrameProcessor):
         except (asyncio.TimeoutError, asyncio.CancelledError):
             task.cancel()
         except Exception as exc:
-            logger.warning(f"SmartTurnShadow[{self._source}]: pending task drain failed: {exc}")
+            logger.warning(
+                f"SmartTurnShadow[{self._source}]: pending task drain failed: {exc}"
+            )
 
     async def _shadow_analyse(self, started_at: float | None) -> None:
         async with self._analyse_lock:
@@ -229,7 +239,9 @@ class SmartTurnShadowObserver(FrameProcessor):
         if metrics is not None:
             try:
                 if hasattr(metrics, "__dict__"):
-                    record["metrics"] = {k: v for k, v in vars(metrics).items() if _is_jsonable(v)}
+                    record["metrics"] = {
+                        k: v for k, v in vars(metrics).items() if _is_jsonable(v)
+                    }
                 else:
                     record["metrics"] = str(metrics)
             except Exception:
@@ -251,7 +263,9 @@ class SmartTurnShadowObserver(FrameProcessor):
             finally:
                 os.close(fd)
         except Exception as exc:
-            logger.warning(f"SmartTurnShadow[{self._source}]: jsonl append failed: {exc}")
+            logger.warning(
+                f"SmartTurnShadow[{self._source}]: jsonl append failed: {exc}"
+            )
 
 
 def _is_jsonable(v) -> bool:

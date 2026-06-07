@@ -1,4 +1,4 @@
-"""Platform-aware desktop notification helper for Koda heartbeat alerts.
+"""Platform-aware desktop notification helper for onoats heartbeat alerts.
 
 Isolated from ``DualSilenceDetector`` so tests can mock the notification call
 without spawning ``osascript`` and so non-macOS platforms degrade gracefully
@@ -13,7 +13,7 @@ import sys
 from loguru import logger
 
 
-def fire_desktop_notification(message: str, title: str = "Koda") -> None:
+def fire_desktop_notification(message: str, title: str = "onoats") -> None:
     """Fire a macOS desktop notification, falling back to a WARNING log.
 
     On macOS, runs ``osascript`` synchronously with a 5 s timeout. On any

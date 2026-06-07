@@ -1,1 +1,1 @@
-"""Koda STT adapters."""
+"""onoats STT adapters."""

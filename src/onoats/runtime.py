@@ -1,14 +1,15 @@
-"""Shared runtime helpers for the Koda listener entrypoints.
+"""Shared runtime helpers for the onoats recorder entrypoints.
 
-Both ``bot/__main__.py`` (single-input) and ``bot/dual.py`` (dual-input)
-need the same PID-file discipline, signal handlers, STT service builder,
-crash recovery, and post-processing pipeline. Extracting them here avoids
-having ``bot/dual.py`` reach into ``bot/__main__.py`` for leading-underscore
-symbols, and gives both entrypoints a single canonical home for the
-``_topic_pipeline_tasks`` set that previously lived at module scope on the
-single-input runner but was mutated by both.
+Both ``onoats/__main__.py`` (single-input) and ``onoats/dual.py`` (dual-input)
+need the same PID-file discipline, signal handlers, STT service builder, and
+crash recovery. Extracting them here avoids having ``dual.py`` reach into
+``__main__.py`` for leading-underscore symbols, and gives both entrypoints a
+single canonical home for the ``_topic_pipeline_tasks`` set.
 
-Nothing here is public API — the module is internal to ``bot/``.
+The recorder emits files only — it opens no SQLite and runs no
+post-processing. A downstream consumer drains the ``pending/`` queue.
+
+Nothing here is public API — the module is internal to ``onoats``.
 """
 
 from __future__ import annotations
@@ -24,7 +25,11 @@ from pathlib import Path
 
 from loguru import logger
 
-from shared.koda_pid import PID_FILENAME, PID_MARKER, read_pid_file as _read_pid_file  # noqa: F401
+from onoats._vendor.pid import (  # noqa: F401
+    PID_FILENAME,
+    PID_MARKER,
+    read_pid_file as _read_pid_file,
+)
 
 # termios/tty are Unix-only — guard for Windows compatibility
 if sys.platform != "win32":
@@ -35,7 +40,7 @@ if sys.platform != "win32":
 # Config
 # ---------------------------------------------------------------------------
 
-BOT_NAME = "Koda"
+BOT_NAME = "onoats"
 STT_SERVICE = os.getenv("STT_SERVICE", "whisper").lower().strip()
 STT_MODEL = os.getenv("STT_MODEL", "").strip()
 
@@ -87,36 +92,6 @@ def _mlx_available() -> bool:
 
 
 _DEFAULT_STT_WS_SOCKET = "~/Library/Caches/pipecat-stt/stt.sock"
-# Pre-v0.2.0 default socket. The rename to ``pipecat-stt`` (commit 862e12f) is
-# silent for an operator who ran ``uv sync`` but did not reinstall the
-# LaunchAgent: the old agent keeps writing the ``koda-stt`` socket while the bot
-# now defaults to the ``pipecat-stt`` one, so the connection just fails. Detect
-# that exact split and point the operator at the cutover runbook.
-_LEGACY_STT_WS_SOCKET = "~/Library/Caches/koda-stt/stt.sock"
-_legacy_socket_warned = False
-
-
-def _warn_on_legacy_socket(default_socket: str) -> None:
-    """Warn once if the bot fell back to the new default socket but only the
-    pre-rename ``koda-stt`` socket exists on disk.
-
-    Fires only on the pure-default path (no ``STT_WS_*`` set). Module-level
-    latch keeps it to a single line per process even though several callers
-    (banner, preflight, RSS probe, service creation) resolve the same target.
-    """
-    global _legacy_socket_warned
-    if _legacy_socket_warned:
-        return
-    legacy = os.path.expanduser(_LEGACY_STT_WS_SOCKET)
-    if not os.path.exists(default_socket) and os.path.exists(legacy):
-        _legacy_socket_warned = True
-        logger.warning(
-            f"STT: defaulting to {default_socket}, but only the pre-v0.2.0 "
-            f"socket {legacy} exists — the LaunchAgent was likely not "
-            "reinstalled after the koda-stt -> pipecat-stt rename. Re-run the "
-            "cutover (docs/operator-runbook-stt-extraction.md) or set "
-            "STT_WS_SOCKET explicitly."
-        )
 
 
 def _resolve_stt_ws_target(
@@ -125,7 +100,7 @@ def _resolve_stt_ws_target(
     """Resolve STT_WS_* env vars into the kwargs for ``WebSocketSTTService``.
 
     Delegates precedence handling to ``stt_server.client.resolve_endpoint_from_env``
-    and layers on the Koda-specific default socket plus the ``STT_WS_TOKEN``
+    and layers on the onoats default socket plus the ``STT_WS_TOKEN``
     bearer read. When operators point at a cleartext remote host, warn
     before attaching the token so a passive on-path observer cannot
     silently capture it.
@@ -149,7 +124,6 @@ def _resolve_stt_ws_target(
 
     if not (socket_path or host or uri):
         socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(_DEFAULT_STT_WS_SOCKET)
-        _warn_on_legacy_socket(socket_path)
 
     # Cleartext-token guard covers *any* cleartext-ws endpoint, not just
     # STT_WS_URI. host+port paths get lowered to ``ws://host:port/`` via
@@ -218,7 +192,7 @@ def stt_banner() -> str:
 
 _PREFLIGHT_TIMEOUT_SEC = 2.0
 # Cold-start tolerance: a single 2s connect is tight when the
-# LaunchAgent was just kicked (e.g. `./koda stt start && ./koda bot`).
+# LaunchAgent was just kicked (e.g. starting the STT server then the recorder).
 # `stt_server.serve()` binds the socket AFTER `backend.start()` runs
 # `import mlx_whisper`, which can take 1-3s on a cold Python. Without a
 # retry, preflight rejects the bot on transient "socket-not-yet-bound"
@@ -346,8 +320,8 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     from stt_server.client import TranscriptionClient
 
     hint = (
-        "Start it with: ./koda stt start   (or: ./koda stt install — only "
-        "needed once). Verify with: ./koda stt status"
+        "Start the local STT server (pipecat-local-stt-server) and verify it "
+        "is reachable, or set STT_WS_SOCKET / STT_WS_URI explicitly."
     )
 
     # Endpoint completeness. ``TranscriptionClient.__init__`` already
@@ -438,20 +412,45 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     _preflight_cache.add(key)
 
 
+def _vocabulary_bias() -> list[str]:
+    """Return the dictionary's vocabulary terms for STT recognition bias.
+
+    These feed Deepgram ``keywords`` and the Whisper ``initial_prompt`` so the
+    backend is biased toward the user's domain terms. The dictionary ships
+    empty (seeds stripped); an empty list is the common case. Best-effort — a
+    read failure must not block STT creation.
+    """
+    try:
+        from onoats._vendor.dictionary import Dictionary
+
+        return Dictionary().get_vocabulary()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(f"STT: could not load vocabulary bias: {exc}")
+        return []
+
+
 async def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
     Returns a pipecat STT service instance. Prefers Whisper MLX on Apple Silicon,
     falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
 
+    Dictionary vocabulary terms (if any) are fed to the backend as recognition
+    bias (Deepgram ``keywords`` / Whisper ``initial_prompt``).
+
     Async because the websocket preflight now does a real handshake
     (rather than a raw TCP probe), which must be awaited from inside the
     running event loop. Non-websocket backends don't ``await`` anything
     but the signature is uniform so callers don't have to branch.
+
+    MLX / Whisper imports are kept lazy (inside the backend branch) so a plain
+    ``import onoats.runtime`` with no ``STT_SERVICE`` set never imports
+    ``mlx_whisper`` — the off-mac baseline ships MLX-free.
     """
+    vocabulary = _vocabulary_bias()
     if STT_SERVICE == "websocket":
         try:
-            from bot.stt.websocket_stt_service import WebSocketSTTService
+            from onoats.stt.websocket_stt_service import WebSocketSTTService
         except ImportError as exc:
             raise RuntimeError(
                 "STT_SERVICE=websocket requires the 'websockets' package, "
@@ -470,7 +469,7 @@ async def _create_stt_service():
         # that means auto-detect uniformly across backends — whisper/mlx
         # *rejects* a literal "auto" (ValueError -> failed decode) and uses
         # ``None`` for built-in detection, while nemotron maps client-``None``
-        # to its own "auto" language-ID. Koda is backend-agnostic over the
+        # to its own "auto" language-ID. onoats is backend-agnostic over the
         # socket, so it cannot branch per backend. Not threaded through
         # ``_resolve_stt_ws_target`` because that dict also feeds
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
@@ -481,23 +480,36 @@ async def _create_stt_service():
     if STT_SERVICE == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
 
-        from shared.config import looks_like_bearer_token, require_secret
+        from onoats.config import load_config, looks_like_bearer_token
 
         dg_kwargs: dict = {
-            "api_key": require_secret(
+            "api_key": load_config().require_secret(
                 "DEEPGRAM_API_KEY",
                 validate=looks_like_bearer_token,
                 hint="Get one at https://console.deepgram.com",
             )
         }
+        live_opts: dict = {}
         if STT_MODEL:
+            live_opts["model"] = STT_MODEL
+        if vocabulary:
+            # Deepgram keyword boosting: bias recognition toward dictionary terms.
+            live_opts["keywords"] = list(vocabulary)
+        if live_opts:
             from deepgram import LiveOptions
 
-            dg_kwargs["live_options"] = LiveOptions(model=STT_MODEL)
-        logger.info(f"STT: deepgram (model={STT_MODEL or 'default'})")
+            dg_kwargs["live_options"] = LiveOptions(**live_opts)
+        logger.info(
+            f"STT: deepgram (model={STT_MODEL or 'default'}, "
+            f"vocabulary_bias={len(vocabulary)} term(s))"
+        )
         return DeepgramSTTService(**dg_kwargs)
 
-    # Default: Whisper (MLX on Apple Silicon, CPU otherwise)
+    # Whisper recognition bias is supplied via the initial_prompt seed text.
+    initial_prompt = ", ".join(vocabulary) if vocabulary else None
+
+    # Default: Whisper (MLX on Apple Silicon, CPU otherwise). The MLX import
+    # lives inside this branch so the off-mac baseline never imports it.
     if _mlx_available():
         from pipecat.services.whisper.stt import MLXModel, WhisperSTTServiceMLX
 
@@ -507,40 +519,23 @@ async def _create_stt_service():
             logger.warning(f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo")
             mlx_model = MLXModel.LARGE_V3_TURBO
         logger.info(f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon)")
-        return WhisperSTTServiceMLX(
-            settings=WhisperSTTServiceMLX.Settings(model=mlx_model.value, language="en")
-        )
+        mlx_settings: dict = {"model": mlx_model.value, "language": "en"}
+        if initial_prompt:
+            mlx_settings["initial_prompt"] = initial_prompt
+        return WhisperSTTServiceMLX(settings=WhisperSTTServiceMLX.Settings(**mlx_settings))
     else:
         from pipecat.services.whisper.stt import WhisperSTTService
 
         model = STT_MODEL or "base"
         logger.info(f"STT: whisper-cpu (model={model})")
-        return WhisperSTTService(
-            settings=WhisperSTTService.Settings(model=model, device="cpu", language="en")
-        )
+        cpu_settings: dict = {"model": model, "device": "cpu", "language": "en"}
+        if initial_prompt:
+            cpu_settings["initial_prompt"] = initial_prompt
+        return WhisperSTTService(settings=WhisperSTTService.Settings(**cpu_settings))
 
 
 # ---------------------------------------------------------------------------
-# Post-processing: segment → classify → write
-# ---------------------------------------------------------------------------
-
-
-# Deep-review A1: ``_run_topic_pipeline`` and ``run_post_processing`` were
-# moved to ``shared.post_processing_services`` (worker → bot was the wrong
-# layer direction). Thin re-exports are kept here so callers / tests that
-# imported them from ``bot.runtime`` continue to work. ``_cleanup_session``
-# is intentionally NOT re-exported — it is a private delete-on-success
-# helper that no live external caller needs.
-from shared.post_processing_services import (  # noqa: E402,PLC0414
-    _run_topic_pipeline as _run_topic_pipeline,
-)
-from shared.post_processing_services import (  # noqa: E402,PLC0414
-    run_post_processing as run_post_processing,
-)
-
-
-# ---------------------------------------------------------------------------
-# Bot-side flush: rotate the .active/ file into the pending/ queue
+# Flush: rotate the .active/ file into the pending/ queue
 # ---------------------------------------------------------------------------
 
 
@@ -554,27 +549,27 @@ async def flush_and_rotate(
 ) -> None:
     """Flush the transcript buffer and rotate its session file into ``pending/``.
 
-    Decoupling-plan Phase 2: this replaces the old ``_flush_and_process``
-    body. The bot is now a thin recorder — it does NOT run the
-    post-processing pipeline. It flushes the in-memory buffer to disk, then
-    rotates the finalised ``.active/`` session file into the ``pending/``
-    queue and inserts a ``processing_jobs`` row. A cron-driven worker drains
-    the queue.
+    The recorder emits files only — no SQLite, no ``processing_jobs`` row. It
+    flushes the in-memory buffer to disk, then rotates the finalised
+    ``.active/`` session file into the ``pending/`` queue. A downstream
+    consumer drains the queue and back-fills its own bookkeeping from the
+    rowless file.
 
-    Flush kinds (see the plan's "Flush triggers" table):
+    ``locked_category`` (the ``--category`` lock) is carried in the queue
+    contract as a typed ``session_meta`` FIRST line, written by the transcript
+    buffer when the session file is created — NOT recorded here (there is no
+    DB to record it in). See ``onoats.categories.session_meta_line``.
+
+    Flush kinds:
 
     * ``continue_session=False`` — terminal flush (``EndFrame`` / shutdown):
       rotate ``.active/X.jsonl`` → ``pending/X.jsonl`` and stop.
     * ``continue_session=True`` — continuation flush (silence-timeout,
       Ctrl+T, ``SIGUSR1``): rotate FIRST, then a fresh ``.active/`` session
-      is opened by :func:`session_queue.rotate_to_pending` and adopted by
-      the buffer so the ongoing recording has somewhere to land.
-
-    Ordering invariant: file rename FIRST, DB insert SECOND. A crash between
-    the two leaves a ``pending/`` file with no row — recoverable, because
-    :func:`session_queue.claim` back-fills the row.
+      is opened and adopted by the buffer so the ongoing recording has
+      somewhere to land.
     """
-    from shared import session_queue
+    from onoats._vendor import session_queue
 
     # Phase 5 — queue dirs are no longer created at module import; each
     # rotation site ensures them itself (idempotent mkdir).
@@ -643,16 +638,11 @@ async def flush_and_rotate(
         logger.error(f"Flush: could not rotate {session_path.name} to pending/: {exc}")
         return
 
-    # Insert the processing_jobs row AFTER the rename (file-first ordering).
-    try:
-        session_queue.enqueue_job(session_id, data_dir, locked_category=locked_category)
-    except Exception as exc:
-        logger.warning(
-            f"Flush: rotated {session_id} but DB insert failed ({exc}) — "
-            "claim() will back-fill the row."
-        )
-
-    logger.info(f"Flush: rotated {session_id} → pending/ (worker will post-process it)")
+    # File-only: no DB row. The category travels in the session_meta first
+    # line (written by the transcript buffer); a consumer back-fills from the
+    # rowless pending/ file. ``locked_category`` is accepted for call-site
+    # compatibility but is not recorded here.
+    logger.info(f"Flush: rotated {session_id} → pending/ (consumer will process it)")
     if continue_session and next_active_path is not None:
         logger.debug(
             f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
@@ -665,36 +655,25 @@ async def flush_and_rotate(
 
 
 async def run_crash_recovery(
-    dictionary=None,
-    segmenter=None,
-    classifier=None,
-    transcript_store=None,
     data_dir: Path | None = None,
-    transcript_cleaner=None,
     locked_category: str | None = None,
 ) -> None:
     """Rotate orphaned ``.active/`` session files into the ``pending/`` queue.
 
-    Decoupling-plan Phase 2: crash recovery no longer runs the
-    post-processing pipeline inline. Instead it *rotates* every orphaned
-    ``.active/`` file into ``pending/`` and inserts a ``processing_jobs``
-    row, just like a live flush does — the cron-driven worker then drains
-    it. This removes the bot end-vs-start race entirely.
+    Crash recovery *rotates* every orphaned ``.active/`` file into
+    ``pending/`` (file-only — no DB row), just like a live flush does; a
+    downstream consumer then drains it. This removes the recorder
+    end-vs-start race entirely.
 
     First-run backfill: this also picks up any pre-existing
-    ``.active/session_*.jsonl`` AND legacy ``.recovering`` files left behind
-    by the old crash-recovery scheme and rotates them into ``pending/`` so
-    nothing stranded by the previous deploy is lost. The old ``flock`` /
-    ``.recovering`` claim is no longer used on session files — the
-    ``rename(2)`` into ``pending/`` is the only claim now.
-
-    The post-processing service arguments are accepted only for call-site
-    compatibility with the previous signature; they are unused.
+    ``.active/session_*.jsonl`` AND legacy ``.recovering`` files and rotates
+    them into ``pending/`` so nothing stranded by a previous deploy is lost.
+    The ``rename(2)`` into ``pending/`` is the only claim.
     """
-    from shared import session_queue
-    from shared.store import koda_data_dir
+    from onoats._vendor import session_queue
+    from onoats._vendor.store import onoats_data_dir
 
-    base = Path(data_dir) if data_dir is not None else koda_data_dir()
+    base = Path(data_dir) if data_dir is not None else onoats_data_dir()
     # Ensure queue dirs exist before crash recovery rotates anything in.
     session_queue.ensure_queue_dirs(base)
     active_dir = base / session_queue.ACTIVE_DIR
@@ -761,39 +740,12 @@ async def run_crash_recovery(
             logger.error(f"Crash recovery: could not rotate {session_path.name} to pending/: {exc}")
             continue
 
-        # Insert the processing_jobs row AFTER the rename (file-first
-        # ordering). A crash between the two is recoverable: session_queue
-        # .claim() back-fills a missing row when a worker claims the file.
-        try:
-            session_queue.enqueue_job(rotation.session_id, base, locked_category=locked_category)
-        except Exception as exc:
-            logger.warning(
-                f"Crash recovery: rotated {rotation.session_id} but DB insert "
-                f"failed ({exc}) — claim() will back-fill the row."
-            )
+        # File-only: no DB row. A consumer back-fills its own bookkeeping
+        # from the rowless pending/ file; the category travels in the
+        # session_meta first line.
         logger.info(
-            f"Crash recovery: rotated {rotation.session_id} → pending/ (worker will process it)"
+            f"Crash recovery: rotated {rotation.session_id} → pending/ (consumer will process it)"
         )
-
-
-def _insert_pending_job(
-    session_id: str,
-    data_dir: Path,
-    *,
-    locked_category: str | None = None,
-) -> None:
-    """Deprecated thin alias for :func:`shared.session_queue.enqueue_job`.
-
-    Deep-review A2: the enqueue-side DB write now lives in
-    ``shared.session_queue`` (FSM writes consolidated in one module). This
-    alias is kept ONLY so pre-existing tests that imported
-    ``bot.runtime._insert_pending_job`` (see
-    ``tests/test_processing_worker.py``) continue to import cleanly. New
-    code MUST call :func:`shared.session_queue.enqueue_job` directly.
-    """
-    from shared.session_queue import enqueue_job
-
-    enqueue_job(session_id, data_dir, locked_category=locked_category)
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +794,7 @@ def _write_pid_file(data_dir: Path) -> Path:
     cmdline = _own_ps_cmdline()
     # Wall-clock start_epoch is included as the 4th line so live-view
     # readers can distinguish a freshly-started bot from one that
-    # happens to have inherited a recycled pid (see shared.koda_pid).
+    # happens to have inherited a recycled pid (see onoats._vendor.pid).
     start_epoch = time.time()
     pid_path.write_text(
         f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n",
@@ -875,7 +827,7 @@ def _install_signal_handlers(
     - SIGINT (Ctrl+C once): graceful shutdown (flush + drain tasks)
     - SIGINT (Ctrl+C again during shutdown): force exit (cancel pending tasks)
     - SIGTERM: graceful shutdown
-    - SIGUSR1: flush current transcript, keep listening (used by ``./koda flush``)
+    - SIGUSR1: flush current transcript, keep listening (used by ``onoats flush``)
     """
 
     def _handle_shutdown(sig):

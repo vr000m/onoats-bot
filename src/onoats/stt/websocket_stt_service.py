@@ -2,11 +2,11 @@
 
 Subclasses Pipecat's ``SegmentedSTTService`` so VAD-driven buffering, branch
 VAD subclass dispatch, and ``TranscriptionFrame.finalized=True`` all continue
-to work. Each instance owns exactly one websocket session, so Koda's dual
-bot ends up with two independent sessions (``me`` / ``them``) exactly like
-the two-in-process Whisper setup it replaces.
+to work. Each instance owns exactly one websocket session, so onoats's dual
+recorder ends up with two independent sessions (``me`` / ``them``) exactly
+like the two-in-process Whisper setup it replaces.
 
-Lifecycle wire mapping (matches docs/dev_plans/20260420-design-whisper-websocket-server.md):
+Lifecycle wire mapping:
 
 - ``start(StartFrame)``    -> open websocket, ``session.update`` with
   ``turn_detection=null``, await ``session.updated``
@@ -157,7 +157,10 @@ class WebSocketSTTService(SegmentedSTTService):
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)
-        if frame.audio_in_sample_rate and frame.audio_in_sample_rate != P.AUDIO_SAMPLE_RATE_HZ:
+        if (
+            frame.audio_in_sample_rate
+            and frame.audio_in_sample_rate != P.AUDIO_SAMPLE_RATE_HZ
+        ):
             raise RuntimeError(
                 f"WebSocketSTTService requires {P.AUDIO_SAMPLE_RATE_HZ} Hz "
                 f"input; StartFrame declared {frame.audio_in_sample_rate} Hz"
@@ -219,7 +222,9 @@ class WebSocketSTTService(SegmentedSTTService):
             # Scale the decode timeout with audio length so long VAD turns
             # (the server accepts up to MAX_UNCOMMITTED_SECONDS ≈ 300 s)
             # don't trip the client while the server is still decoding.
-            audio_seconds = len(audio) / (P.AUDIO_SAMPLE_RATE_HZ * P.AUDIO_SAMPLE_WIDTH_BYTES)
+            audio_seconds = len(audio) / (
+                P.AUDIO_SAMPLE_RATE_HZ * P.AUDIO_SAMPLE_WIDTH_BYTES
+            )
             decode_timeout = max(_DECODE_TIMEOUT_SECONDS, 1.5 * audio_seconds)
             try:
                 await self.start_processing_metrics()
@@ -237,7 +242,9 @@ class WebSocketSTTService(SegmentedSTTService):
                     # otherwise resolve the NEXT segment's pending future with
                     # stale text (no item_id correlation in V1). Drop the
                     # socket so the next run_stt reconnects cleanly.
-                    logger.warning(f"{self.name}: decode timed out — resetting connection")
+                    logger.warning(
+                        f"{self.name}: decode timed out — resetting connection"
+                    )
                     await self._discard_stale()
                     yield ErrorFrame(error="stt_server decode timed out")
                     return
@@ -292,7 +299,9 @@ class WebSocketSTTService(SegmentedSTTService):
                 self._reader_task = asyncio.create_task(
                     self._read_events(client), name=f"{self.name}:ws_reader"
                 )
-                await client.update_session(turn_detection=None, language=self._language)
+                await client.update_session(
+                    turn_detection=None, language=self._language
+                )
                 try:
                     await asyncio.wait_for(
                         self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
@@ -379,7 +388,11 @@ class WebSocketSTTService(SegmentedSTTService):
                         self._pending.set_result(ev.get("transcript", ""))
                 elif etype == P.EVT_TRANSCRIPT_FAILED:
                     err = ev.get("error") or {}
-                    msg = err.get("message") or err.get("code") or "stt_server transcription failed"
+                    msg = (
+                        err.get("message")
+                        or err.get("code")
+                        or "stt_server transcription failed"
+                    )
                     if self._pending and not self._pending.done():
                         self._pending.set_exception(RuntimeError(msg))
                     else:
@@ -398,14 +411,20 @@ class WebSocketSTTService(SegmentedSTTService):
                     exc = RuntimeError(msg)
                     # Route the error to whichever future is still waiting;
                     # errors before session.updated fail the connect path.
-                    if self._session_ready is not None and not self._session_ready.done():
+                    if (
+                        self._session_ready is not None
+                        and not self._session_ready.done()
+                    ):
                         self._session_ready.set_exception(exc)
                     if self._pending and not self._pending.done():
                         self._pending.set_exception(exc)
                     elif self._session_ready is None or self._session_ready.done():
                         logger.warning(f"{self.name}: server error: {ev}")
                 elif etype == P.EVT_SESSION_UPDATED:
-                    if self._session_ready is not None and not self._session_ready.done():
+                    if (
+                        self._session_ready is not None
+                        and not self._session_ready.done()
+                    ):
                         self._session_ready.set_result(None)
                 elif etype == P.EVT_SESSION_CLOSED:
                     saw_session_closed = True
@@ -430,7 +449,9 @@ class WebSocketSTTService(SegmentedSTTService):
                     # Socket dropped without a graceful session.closed — server
                     # crash, launchd restart, or network blip. Next run_stt
                     # will trigger _ensure_connected and log a reconnect.
-                    logger.warning(f"{self.name}: connection lost (no session.closed received)")
+                    logger.warning(
+                        f"{self.name}: connection lost (no session.closed received)"
+                    )
                 # If the socket closed while a decode was in flight, fail
                 # fast instead of letting run_stt hit its 90 s timeout.
                 if (
@@ -452,13 +473,17 @@ class WebSocketSTTService(SegmentedSTTService):
         t0 = asyncio.get_running_loop().time()
         try:
             try:
-                await asyncio.wait_for(client.close_session(), timeout=_CLOSE_TIMEOUT_SECONDS)
+                await asyncio.wait_for(
+                    client.close_session(), timeout=_CLOSE_TIMEOUT_SECONDS
+                )
             except Exception:
                 pass
             # Give the reader a bounded window to observe session.closed.
             if self._reader_task is not None:
                 try:
-                    await asyncio.wait_for(self._reader_task, timeout=_CLOSE_TIMEOUT_SECONDS)
+                    await asyncio.wait_for(
+                        self._reader_task, timeout=_CLOSE_TIMEOUT_SECONDS
+                    )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     self._reader_task.cancel()
         finally:

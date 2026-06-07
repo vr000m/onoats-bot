@@ -14,7 +14,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from bot.frames import (
+from onoats.frames import (
     BranchVADUserStartedSpeakingFrame,
     BranchVADUserStoppedSpeakingFrame,
 )
@@ -38,7 +38,9 @@ def _rewrap_vad(
     # Frame.id / broadcast_sibling_id are init=False; skip them or the
     # subclass constructor rejects them as unexpected kwargs.
     kwargs = {
-        f.name: getattr(frame, f.name) for f in fields(frame) if f.init and hasattr(frame, f.name)
+        f.name: getattr(frame, f.name)
+        for f in fields(frame)
+        if f.init and hasattr(frame, f.name)
     }
     kwargs["source"] = source
     kwargs["source_order"] = source_order
@@ -60,11 +62,14 @@ def _rewrap_vad(
 class SourceTagger(FrameProcessor):
     """Tag downstream frames with a coarse speaker/source identity.
 
-    ``TranscriptionFrame.user_id`` is overwritten so downstream processors and
-    persisted buffer entries can treat the source as authoritative instead of
-    relying on backend-specific STT behaviour. VAD frames are rewrapped as
-    branch-aware subclasses so the dual-idle coordinator can read source from
-    a first-class field.
+    ``TranscriptionFrame.user_id`` is overwritten with the canonical
+    ``me``/``them`` enum so downstream processors and persisted buffer entries
+    treat the source as authoritative instead of relying on backend-specific
+    STT behaviour. That enum is the frozen wire contract written into the JSONL
+    ``source`` field — configurable display labels are a render-time concern
+    (the converter) and are NEVER written here. VAD frames are rewrapped as
+    branch-aware subclasses so the dual-idle coordinator can read source from a
+    first-class field.
     """
 
     def __init__(self, source: str, source_order: int, **kwargs):
@@ -77,12 +82,19 @@ class SourceTagger(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
+            # The canonical ``me``/``them`` enum is written into ``user_id`` —
+            # this is the frozen wire contract a consumer (e.g. a
+            # classifier) keys on. Display labels are a render-time concern and
+            # never reach this value. The ``onoats_*`` attributes are a private
+            # intra-pipeline channel (read by TranscriptBuffer).
             frame.user_id = self._source
-            setattr(frame, "koda_source", self._source)
-            setattr(frame, "koda_source_order", self._source_order)
-            setattr(frame, "koda_branch_sequence", self._branch_sequence)
+            setattr(frame, "onoats_source", self._source)
+            setattr(frame, "onoats_source_order", self._source_order)
+            setattr(frame, "onoats_branch_sequence", self._branch_sequence)
             self._branch_sequence += 1
-        elif isinstance(frame, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)):
+        elif isinstance(
+            frame, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)
+        ):
             frame = _rewrap_vad(frame, self._source, self._source_order)
 
         await self.push_frame(frame, direction)

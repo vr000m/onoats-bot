@@ -1,4 +1,4 @@
-"""Filtered live terminal output for the experimental dual-input bot."""
+"""Filtered live terminal output for the dual-input recorder."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pipecat.frames.frames import Frame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from bot.frames import resolve_frame_source
+from onoats.frames import resolve_frame_source
 
 
 def _display_label(source: str) -> str:
