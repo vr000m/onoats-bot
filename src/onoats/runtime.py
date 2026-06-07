@@ -123,7 +123,9 @@ def _resolve_stt_ws_target(
     auth_token = (env.get("STT_WS_TOKEN") or "").strip() or None
 
     if not (socket_path or host or uri):
-        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(_DEFAULT_STT_WS_SOCKET)
+        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(
+            _DEFAULT_STT_WS_SOCKET
+        )
 
     # Cleartext-token guard covers *any* cleartext-ws endpoint, not just
     # STT_WS_URI. host+port paths get lowered to ``ws://host:port/`` via
@@ -133,7 +135,12 @@ def _resolve_stt_ws_target(
     effective_uri = uri
     if not effective_uri and host and port is not None and not socket_path:
         effective_uri = f"ws://{format_host_for_uri(host)}:{port}/"
-    if warn_on_cleartext and auth_token and effective_uri and is_cleartext_remote(effective_uri):
+    if (
+        warn_on_cleartext
+        and auth_token
+        and effective_uri
+        and is_cleartext_remote(effective_uri)
+    ):
         logger.warning(
             f"STT: STT_WS_TOKEN will be sent in cleartext to {effective_uri}. "
             "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
@@ -185,7 +192,9 @@ def stt_banner() -> str:
     logged on connect by ``WebSocketSTTService._ensure_connected``.
     """
     if STT_SERVICE == "websocket":
-        target = _display_target(_resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False))
+        target = _display_target(
+            _resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False)
+        )
         return f"websocket (server={target}, model pinned by server)"
     return f"{STT_SERVICE} / model={STT_MODEL or 'default'}"
 
@@ -251,7 +260,9 @@ async def log_stt_server_rss(phase: str) -> None:
                 pid = event.get("pid")
                 rss = event.get("rss_bytes")
                 uptime = event.get("uptime_seconds")
-                rss_mb = (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
+                rss_mb = (
+                    (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
+                )
                 uptime_s = float(uptime) if isinstance(uptime, (int, float)) else 0.0
                 # server.status mirrors the server.hello backend identity, so
                 # the probe line names the real ASR behind the socket — a
@@ -375,7 +386,9 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
                 # Mis-shaped kwargs slipped past our completeness check
                 # (future callers may build kwargs differently). Still
                 # actionable, still better than a traceback.
-                raise SttPreflightError(f"STT: misconfigured endpoint ({exc}). {hint}") from exc
+                raise SttPreflightError(
+                    f"STT: misconfigured endpoint ({exc}). {hint}"
+                ) from exc
             except OSError as exc:  # covers FileNotFoundError + ConnectionRefusedError
                 # Cold-start races live here: socket path doesn't exist
                 # yet, or TCP refused because serve() hasn't bound. Retry
@@ -513,16 +526,22 @@ async def _create_stt_service():
     if _mlx_available():
         from pipecat.services.whisper.stt import MLXModel, WhisperSTTServiceMLX
 
-        mlx_key = _MLX_MODEL_MAP.get(STT_MODEL or "large-v3-turbo", "LARGE_V3_TURBO").upper()
+        mlx_key = _MLX_MODEL_MAP.get(
+            STT_MODEL or "large-v3-turbo", "LARGE_V3_TURBO"
+        ).upper()
         mlx_model = getattr(MLXModel, mlx_key, None)
         if mlx_model is None:
-            logger.warning(f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo")
+            logger.warning(
+                f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo"
+            )
             mlx_model = MLXModel.LARGE_V3_TURBO
         logger.info(f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon)")
         mlx_settings: dict = {"model": mlx_model.value, "language": "en"}
         if initial_prompt:
             mlx_settings["initial_prompt"] = initial_prompt
-        return WhisperSTTServiceMLX(settings=WhisperSTTServiceMLX.Settings(**mlx_settings))
+        return WhisperSTTServiceMLX(
+            settings=WhisperSTTServiceMLX.Settings(**mlx_settings)
+        )
     else:
         from pipecat.services.whisper.stt import WhisperSTTService
 
@@ -589,7 +608,9 @@ async def flush_and_rotate(
     next_active_path: Path | None = None
     if continue_session:
         try:
-            next_active_path, _next_session_id = session_queue.new_active_session(data_dir)
+            next_active_path, _next_session_id = session_queue.new_active_session(
+                data_dir
+            )
         except OSError as exc:
             logger.error(f"Flush: could not pre-mint fresh .active/ session: {exc}")
             return
@@ -628,7 +649,9 @@ async def flush_and_rotate(
         return
 
     try:
-        session_id = session_queue.rotate_active_to_pending(session_path, data_dir=data_dir)
+        session_id = session_queue.rotate_active_to_pending(
+            session_path, data_dir=data_dir
+        )
     except FileNotFoundError:
         logger.warning(
             f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
@@ -720,13 +743,17 @@ async def run_crash_recovery(
                     f"legacy {rec_path.name}; moved aside to {stash.name}"
                 )
             except OSError as exc:
-                logger.warning(f"Crash recovery: could not stash colliding {rec_path.name}: {exc}")
+                logger.warning(
+                    f"Crash recovery: could not stash colliding {rec_path.name}: {exc}"
+                )
             continue
         try:
             os.rename(rec_path, jsonl_path)
             normalised.append(jsonl_path)
         except OSError as exc:
-            logger.warning(f"Crash recovery: could not normalise legacy {rec_path.name}: {exc}")
+            logger.warning(
+                f"Crash recovery: could not normalise legacy {rec_path.name}: {exc}"
+            )
 
     for session_path in normalised:
         try:
@@ -737,7 +764,9 @@ async def run_crash_recovery(
             # Another actor moved it between the glob and the rename.
             continue
         except OSError as exc:
-            logger.error(f"Crash recovery: could not rotate {session_path.name} to pending/: {exc}")
+            logger.error(
+                f"Crash recovery: could not rotate {session_path.name} to pending/: {exc}"
+            )
             continue
 
         # File-only: no DB row. A consumer back-fills its own bookkeeping
@@ -800,7 +829,9 @@ def _write_pid_file(data_dir: Path) -> Path:
         f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n",
         encoding="utf-8",
     )
-    logger.debug(f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})")
+    logger.debug(
+        f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})"
+    )
     return pid_path
 
 
@@ -832,7 +863,9 @@ def _install_signal_handlers(
 
     def _handle_shutdown(sig):
         if shutdown_event.is_set():
-            logger.warning("Received second Ctrl+C — forcing exit (cancelling pending tasks)")
+            logger.warning(
+                "Received second Ctrl+C — forcing exit (cancelling pending tasks)"
+            )
             loop.call_soon_threadsafe(force_exit_event.set)
         else:
             logger.info(f"Received signal {sig.name} — initiating graceful shutdown")
