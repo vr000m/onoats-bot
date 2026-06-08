@@ -1,10 +1,12 @@
 """Shared runtime helpers for the onoats recorder entrypoints.
 
 Both ``onoats/__main__.py`` (single-input) and ``onoats/dual.py`` (dual-input)
-need the same PID-file discipline, signal handlers, STT service builder, and
-crash recovery. Extracting them here avoids having ``dual.py`` reach into
-``__main__.py`` for leading-underscore symbols, and gives both entrypoints a
-single canonical home for the ``_topic_pipeline_tasks`` set.
+need the same PID-file discipline, signal handlers, STT service builder, crash
+recovery, and graceful shutdown / pipeline-lifecycle coordination
+(``wait_or_force``, ``stop_pipeline_for_shutdown``). Extracting them here avoids
+having ``dual.py`` reach into ``__main__.py`` for leading-underscore symbols,
+and gives both entrypoints a single canonical home for the
+``_topic_pipeline_tasks`` set.
 
 The recorder emits files only — it opens no SQLite and runs no
 post-processing. A downstream consumer drains the ``pending/`` queue.
@@ -55,6 +57,146 @@ class SttPreflightError(RuntimeError):
 
 
 PIPELINE_SAMPLE_RATE = 16000  # Silero VAD requires 8kHz or 16kHz; 16kHz is standard
+
+
+def _env_float(
+    env_name: str, default: float, *, min_value: float | None = None
+) -> float:
+    """Read a float tunable from the environment, falling back on bad input.
+
+    A malformed value must not crash the recorder at import time — log and
+    use the default instead. Mirrors the ValueError-tolerance of
+    ``OnoatsConfig._tuning_float`` for the env-only tunables read here.
+
+    ``min_value`` clamps an out-of-range value (e.g. a negative timeout, which
+    would otherwise make ``asyncio.wait(timeout=...)`` fire immediately and
+    silently defeat the feature) up to the floor, with a warning.
+    """
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(f"{env_name}={raw!r} is not a number; using {default}")
+        return default
+    if min_value is not None and value < min_value:
+        logger.warning(f"{env_name}={value} is below minimum {min_value}; clamping")
+        return min_value
+    return value
+
+
+# --- Shutdown timing -------------------------------------------------------
+#
+# Graceful two-phase shutdown (see _shutdown_watcher in __main__/dual):
+#
+#   1. DRAIN — queue an EndFrame (``task.stop_when_done()``). An EndFrame, unlike
+#      a CancelFrame, lets an in-flight segment finish: SegmentedSTTService
+#      awaits ``run_stt`` inline in ``process_frame``, so the EndFrame queues
+#      behind it, the final ``TranscriptionFrame`` is delivered to
+#      TranscriptBuffer, and only then does the pipeline end. This is what makes
+#      the terminal flush capture the last spoken segment. The drain ends as
+#      soon as the pipeline finishes, so the common (nothing-pending) case exits
+#      promptly; SHUTDOWN_DRAIN_TIMEOUT_SEC bounds a stalled drain.
+#
+#   2. CANCEL (fallback) — if the drain stalls past its timeout, or a second
+#      Ctrl+C forces exit, hard-cancel with ``task.cancel()`` (a CancelFrame).
+#      pipecat then waits up to ``cancel_timeout_secs`` for that frame to reach
+#      the pipeline end; the local-audio transport tends to block it, so this is
+#      capped at SHUTDOWN_CANCEL_TIMEOUT_SEC instead of pipecat's 20s default to
+#      avoid a hung-feeling exit. A CancelFrame *aborts* in-flight STT, so this
+#      fallback is best-effort teardown, not a transcript-preserving path.
+#
+# Both are env-only operator escape hatches (no config.toml [tuning] key),
+# matching how ``__main__`` reads its other tunables (e.g. SILENCE_TIMEOUT_SEC)
+# raw from the environment without loading config.
+SHUTDOWN_DRAIN_TIMEOUT_SEC = _env_float(
+    "SHUTDOWN_DRAIN_TIMEOUT_SEC", 8.0, min_value=0.0
+)
+SHUTDOWN_CANCEL_TIMEOUT_SEC = _env_float(
+    "SHUTDOWN_CANCEL_TIMEOUT_SEC", 2.0, min_value=0.0
+)
+
+
+async def wait_or_force(coro_or_future, label: str, *, force_exit_event) -> None:
+    """Await a coroutine/future, cancelling it immediately if force_exit fires.
+
+    Shared by both recorders' shutdown paths (crash-recovery wait, task drain)
+    so a second Ctrl+C (``force_exit_event``) can interrupt a stuck wait.
+    """
+    wait_task = asyncio.ensure_future(coro_or_future)
+    force_task = asyncio.create_task(force_exit_event.wait(), name="force_exit_wait")
+    done, _ = await asyncio.wait(
+        {wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    if force_task in done:
+        logger.warning(f"Shutdown: force-cancelling {label}")
+        wait_task.cancel()
+        try:
+            await wait_task
+        except asyncio.CancelledError:
+            pass
+    else:
+        force_task.cancel()
+
+
+async def stop_pipeline_for_shutdown(
+    task, force_exit_event, *, drain_timeout_sec: float = SHUTDOWN_DRAIN_TIMEOUT_SEC
+) -> None:
+    """Graceful two-phase pipeline shutdown shared by both recorders.
+
+    Despite the "stop" name this both drains and (as a fallback) hard-cancels.
+
+    Phase 1 (drain): queue an EndFrame via ``task.stop_when_done()`` so an STT
+    segment whose transcription is in flight finishes and reaches
+    TranscriptBuffer before teardown. Wait for the pipeline to finish, bounded
+    by ``drain_timeout_sec`` and by a second Ctrl+C (``force_exit_event``). The
+    wait ends as soon as the pipeline drains, so the common case (nothing
+    pending) returns promptly.
+
+    Phase 2 (fallback): if the drain stalls past its timeout or is force-exited,
+    hard-cancel with ``task.cancel()`` (a CancelFrame, internally capped at the
+    task's ``cancel_timeout_secs`` = SHUTDOWN_CANCEL_TIMEOUT_SEC). A CancelFrame
+    aborts in-flight STT, so this is best-effort teardown only.
+
+    The caller flushes (rotates the buffer into pending/) AFTER this returns —
+    in the drained case that flush captures the final segment.
+    """
+    if task.has_finished():
+        return
+
+    await task.stop_when_done()
+
+    # pipecat's PipelineTask exposes no awaitable "finished" event, only the
+    # synchronous has_finished() predicate — poll it at 50ms (cheap on a
+    # one-shot shutdown path) and race it against force_exit + the drain bound.
+    async def _await_finished() -> None:
+        while not task.has_finished():
+            await asyncio.sleep(0.05)
+
+    finished_task = asyncio.ensure_future(_await_finished())
+    force_task = asyncio.ensure_future(force_exit_event.wait())
+    try:
+        await asyncio.wait(
+            {finished_task, force_task},
+            timeout=drain_timeout_sec,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        # Cancel the loser AND await both so a still-pending task settles its
+        # CancelledError this turn (no "Task was destroyed but it is pending").
+        for t in (finished_task, force_task):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(finished_task, force_task, return_exceptions=True)
+
+    if task.has_finished():
+        return
+
+    reason = "forced (2nd Ctrl+C)" if force_exit_event.is_set() else "drain timed out"
+    logger.info(f"Shutdown: {reason} — hard-cancelling pipeline")
+    await task.cancel()
+
 
 # Map simple model name strings to MLXModel enum member names
 _MLX_MODEL_MAP: dict[str, str] = {

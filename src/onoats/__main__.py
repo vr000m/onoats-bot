@@ -16,6 +16,10 @@ Config (config.toml / secrets.env or environment):
     INPUT_DEVICE         - Override mic device index (int); skips interactive picker
     SILENCE_TIMEOUT_SEC  - Seconds of mic silence before flushing buffer (default 300)
     SEGMENT_HINT_THRESHOLD - Seconds of silence to mark a segment hint (default 120)
+    SHUTDOWN_DRAIN_TIMEOUT_SEC - Max seconds to drain the pipeline on Ctrl+C so a
+                           final in-flight transcript lands before flush (default 8.0)
+    SHUTDOWN_CANCEL_TIMEOUT_SEC - Hard-cancel grace (s) if the drain stalls;
+                           caps pipecat's 20s default so exit isn't slow (default 2.0)
 
 Optional STT secrets (secrets.env):
     DEEPGRAM_API_KEY     - Deepgram STT (only when STT_SERVICE=deepgram)
@@ -53,8 +57,11 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
+    SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     _create_stt_service,
+    stop_pipeline_for_shutdown,
+    wait_or_force,
     _install_signal_handlers,
     _remove_pid_file,
     _restore_terminal,
@@ -136,7 +143,9 @@ async def run_onoats(
     # ----------------------------------------------------------------
     # Step 2: Select audio device (input only — silent recorder)
     # ----------------------------------------------------------------
-    input_dev = select_input_device(input_device_env=INPUT_DEVICE)
+    # INPUT_DEVICE is read only from the environment (single-input mode has no
+    # config.toml key), so the provenance is unambiguously "from env".
+    input_dev = select_input_device(input_device_env=INPUT_DEVICE, source="from env")
 
     # ----------------------------------------------------------------
     # Step 3: Zero SQLite — the recorder opens no database. It emits files
@@ -231,6 +240,7 @@ async def run_onoats(
             enable_usage_metrics=True,
         ),
         idle_timeout_secs=None,
+        cancel_timeout_secs=SHUTDOWN_CANCEL_TIMEOUT_SEC,
     )
 
     # Start the silence detector's background monitoring loop
@@ -261,31 +271,16 @@ async def run_onoats(
     _shutdown_started = False
     _shutdown_complete = asyncio.Event()
 
-    async def _wait_or_force(coro_or_future, label: str) -> None:
-        """Await a coroutine/future, but cancel it immediately if force_exit_event fires."""
-        wait_task = asyncio.ensure_future(coro_or_future)
-        force_task = asyncio.create_task(
-            force_exit_event.wait(), name="force_exit_wait"
-        )
-        done, _ = await asyncio.wait(
-            {wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if force_task in done:
-            logger.warning(f"Shutdown: force-cancelling {label}")
-            wait_task.cancel()
-            try:
-                await wait_task
-            except asyncio.CancelledError:
-                pass
-        else:
-            force_task.cancel()
-
     async def _drain_tasks(tasks: set[asyncio.Task], label: str) -> None:
         """Wait for a set of tasks, interruptible by force exit."""
         if not tasks:
             return
         logger.info(f"Shutdown: waiting for {len(tasks)} {label}")
-        await _wait_or_force(asyncio.gather(*tasks, return_exceptions=True), label)
+        await wait_or_force(
+            asyncio.gather(*tasks, return_exceptions=True),
+            label,
+            force_exit_event=force_exit_event,
+        )
 
     async def _on_shutdown() -> None:
         """Flush in-memory buffer to disk and drain the memory writer queue.
@@ -313,7 +308,11 @@ async def run_onoats(
         # Wait for crash recovery to finish if still running
         if _crash_recovery_task and not _crash_recovery_task.done():
             logger.info("Shutdown: waiting for crash recovery to finish")
-            await _wait_or_force(_crash_recovery_task, "crash recovery")
+            await wait_or_force(
+                _crash_recovery_task,
+                "crash recovery",
+                force_exit_event=force_exit_event,
+            )
 
         if force_exit_event.is_set():
             logger.warning("Shutdown: force exit — skipping flush")
@@ -336,11 +335,12 @@ async def run_onoats(
     # Monitor the shutdown event in the background and cancel the pipeline task
     async def _shutdown_watcher() -> None:
         await shutdown_event.wait()
-        # Stop the STT pipeline first — no point capturing audio during shutdown.
-        # Race against force_exit_event so a second Ctrl+C can interrupt a stuck
-        # pipeline teardown (e.g. hung transport/STT cleanup).
-        logger.info("Shutdown: stopping pipeline (STT/VAD)")
-        await _wait_or_force(task.cancel(), "pipeline cancel")
+        # Graceful drain first: an EndFrame lets a segment whose transcription
+        # is in flight finish and reach TranscriptBuffer before teardown, so the
+        # terminal flush in _on_shutdown captures the last spoken segment. Falls
+        # back to a hard cancel if the drain stalls or a second Ctrl+C forces.
+        logger.info("Shutdown: draining pipeline (Ctrl+C again to force)")
+        await stop_pipeline_for_shutdown(task, force_exit_event)
         await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")

@@ -80,12 +80,31 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
-def _env_or(env_name: str, file_value: Any) -> Any:
-    """Process env var wins; else the config.toml value; else None."""
+def _env_or_with_source(env_name: str, file_value: Any) -> tuple[Any, str]:
+    """Resolve a value and its provenance in one place.
+
+    Encodes the precedence (env var > config.toml > default) exactly once so
+    the resolved value and the "where did this come from" label can never
+    drift apart. Returns ``(value, label)`` where ``label`` is one of
+    "from env" / "from config" / "default".
+    """
     env = os.environ.get(env_name, "")
     if env.strip():
-        return env
-    return file_value
+        return env, "from env"
+    if file_value not in (None, ""):
+        return file_value, "from config"
+    # file_value is None or "" here — caller falls through to a built-in default.
+    return file_value, "default"
+
+
+def _env_or(env_name: str, file_value: Any) -> Any:
+    """Process env var wins; else the config.toml value; else None."""
+    return _env_or_with_source(env_name, file_value)[0]
+
+
+def _source_of(env_name: str, file_value: Any) -> str:
+    """Provenance label for the value :func:`_env_or` would return."""
+    return _env_or_with_source(env_name, file_value)[1]
 
 
 @dataclass(frozen=True)
@@ -103,6 +122,18 @@ class OnoatsConfig:
     @property
     def system_device(self) -> str | None:
         return _env_or("SYSTEM_INPUT_DEVICE", self.raw.get("devices", {}).get("system"))
+
+    @property
+    def mic_device_source(self) -> str:
+        """Where ``mic_device`` resolved from: "from env" / "from config" / "default"."""
+        return _source_of("MIC_INPUT_DEVICE", self.raw.get("devices", {}).get("mic"))
+
+    @property
+    def system_device_source(self) -> str:
+        """Where ``system_device`` resolved from: "from env" / "from config" / "default"."""
+        return _source_of(
+            "SYSTEM_INPUT_DEVICE", self.raw.get("devices", {}).get("system")
+        )
 
     # ---- storage ----
     @property
@@ -193,6 +224,12 @@ class OnoatsConfig:
         return result
 
     # ---- tuning ----
+    # Note: the shutdown timers (SHUTDOWN_DRAIN_TIMEOUT_SEC /
+    # SHUTDOWN_CANCEL_TIMEOUT_SEC) are intentionally NOT exposed here — they are
+    # env-only operator escape hatches read raw in ``onoats.runtime`` (which
+    # never loads config), matching how ``__main__`` reads SILENCE_TIMEOUT_SEC.
+    # Don't add ``_tuning_float`` accessors for them without also routing the
+    # runtime reads through config, or you create a second config path.
     def _tuning_float(self, key: str, env_name: str) -> float:
         val = _env_or(env_name, self.raw.get("tuning", {}).get(key))
         if val is None:
