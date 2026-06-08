@@ -11,17 +11,42 @@ Pure function: no network, no DB, no segmentation, no classification.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from onoats.jsonl import Session, Utterance
 
 _DEFAULT_LABELS = {"me": "Me", "them": "Them"}
 
 
 def session_date(session: Session) -> str:
-    """Best-effort YYYY-MM-DD from the first utterance, else the session id."""
+    """Best-effort ``YYYY-MM-DD`` (LOCAL date) from the first utterance.
+
+    Utterance timestamps are stored in UTC (``...+00:00``); transcripts are
+    grouped by **local** calendar date so an evening recording files under the
+    day it happened, not the next UTC day (e.g. 19:21 PDT = 02:21 UTC tomorrow).
+    This follows the project-wide convention: UTC storage, local grouping.
+
+    A timezone-aware timestamp is converted to the local zone; a naive one is
+    taken as-is. Falls back to the session-id stamp, then ``unknown-date``.
+    """
     for utt in session.utterances:
-        if utt.time and len(utt.time) >= 10:
-            return utt.time[:10]
-    # session id form: session_YYYYMMDD_HHMMSS_<short>
+        if not utt.time:
+            continue
+        try:
+            dt = datetime.fromisoformat(utt.time)
+        except ValueError:
+            # Unparseable but plausibly date-prefixed (``YYYY-MM-DD...``).
+            return (
+                utt.time[:10] if len(utt.time) >= 10 else _date_from_session_id(session)
+            )
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()  # aware UTC -> local system zone
+        return dt.strftime("%Y-%m-%d")
+    return _date_from_session_id(session)
+
+
+def _date_from_session_id(session: Session) -> str:
+    # session id form: session_YYYYMMDD_HHMMSS_<short> (the stamp is local).
     parts = session.session_id.split("_")
     if len(parts) >= 2 and len(parts[1]) == 8 and parts[1].isdigit():
         d = parts[1]
