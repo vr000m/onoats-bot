@@ -9,7 +9,7 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # pyaudio (via pipecat-ai[local]) builds a C extension against PortAudio,
       # whose dev headers ship with macOS/Homebrew but not ubuntu-latest. This
@@ -18,7 +18,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
 
