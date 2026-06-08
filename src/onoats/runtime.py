@@ -56,6 +56,16 @@ class SttPreflightError(RuntimeError):
 
 PIPELINE_SAMPLE_RATE = 16000  # Silero VAD requires 8kHz or 16kHz; 16kHz is standard
 
+# On shutdown, pipecat's PipelineWorker pushes a CancelFrame and waits up to
+# ``cancel_timeout_secs`` (pipecat default 20s) for it to reach the end of the
+# pipeline. The recorder has already flushed + rotated the active session in
+# ``_on_shutdown`` (independent of the pipeline), so this teardown is pure
+# cleanup of the transport/STT — no audio is lost when it is cut short. The
+# default 20s just makes a single Ctrl+C feel hung. Cap it at a short grace
+# window so any in-flight STT frame can still land before teardown. Override
+# via SHUTDOWN_CANCEL_TIMEOUT_SEC if a slow STT backend needs longer.
+SHUTDOWN_CANCEL_TIMEOUT_SEC = float(os.getenv("SHUTDOWN_CANCEL_TIMEOUT_SEC", "2.0"))
+
 # Map simple model name strings to MLXModel enum member names
 _MLX_MODEL_MAP: dict[str, str] = {
     "tiny": "TINY",

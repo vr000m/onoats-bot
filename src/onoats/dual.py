@@ -37,6 +37,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=Fals
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
+    SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     _remove_pid_file,
     _create_stt_service,
@@ -343,6 +344,7 @@ async def run_onoats_dual(
         pipeline,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
         idle_timeout_secs=None,
+        cancel_timeout_secs=SHUTDOWN_CANCEL_TIMEOUT_SEC,
     )
 
     await silence_detector.start_monitoring()

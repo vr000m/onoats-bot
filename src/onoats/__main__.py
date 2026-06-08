@@ -53,6 +53,7 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
+    SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     _create_stt_service,
     _install_signal_handlers,
@@ -231,6 +232,7 @@ async def run_onoats(
             enable_usage_metrics=True,
         ),
         idle_timeout_secs=None,
+        cancel_timeout_secs=SHUTDOWN_CANCEL_TIMEOUT_SEC,
     )
 
     # Start the silence detector's background monitoring loop
