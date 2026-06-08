@@ -132,16 +132,30 @@ def _cmd_flush(rest: list[str]) -> int:
     args = parser.parse_args(rest)
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    pid = _read_pid(data_dir)
-    if pid is None:
-        print(
-            f"onoats flush: no running recorder found (no valid pid file at {_pid_path(data_dir)})",
-            file=sys.stderr,
-        )
+    from onoats._vendor.pid import resolve_flush_target
+
+    pid_path = _pid_path(data_dir)
+    target = resolve_flush_target(pid_path)
+    if target.pid is None:
+        # Identity could not be confirmed. Drop a now-untrustworthy pid file so
+        # the next run starts clean, but never signal an unverified pid.
+        if target.stale:
+            try:
+                pid_path.unlink()
+            except OSError:
+                pass
+        print(f"onoats flush: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
+    pid = target.pid
     try:
         os.kill(pid, signal.SIGUSR1)
     except ProcessLookupError:
+        # Raced: the verified recorder exited between the identity check and
+        # the signal. Treat as stale rather than signalling a recycled pid.
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
         print(
             f"onoats flush: recorder pid {pid} is not running (stale pid file)",
             file=sys.stderr,
