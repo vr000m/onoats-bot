@@ -224,6 +224,12 @@ class OnoatsConfig:
         return result
 
     # ---- tuning ----
+    # Note: the shutdown timers (SHUTDOWN_DRAIN_TIMEOUT_SEC /
+    # SHUTDOWN_CANCEL_TIMEOUT_SEC) are intentionally NOT exposed here — they are
+    # env-only operator escape hatches read raw in ``onoats.runtime`` (which
+    # never loads config), matching how ``__main__`` reads SILENCE_TIMEOUT_SEC.
+    # Don't add ``_tuning_float`` accessors for them without also routing the
+    # runtime reads through config, or you create a second config path.
     def _tuning_float(self, key: str, env_name: str) -> float:
         val = _env_or(env_name, self.raw.get("tuning", {}).get(key))
         if val is None:

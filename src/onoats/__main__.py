@@ -60,7 +60,8 @@ from onoats.runtime import (  # noqa: E402
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     _create_stt_service,
-    drain_pipeline_for_shutdown,
+    stop_pipeline_for_shutdown,
+    wait_or_force,
     _install_signal_handlers,
     _remove_pid_file,
     _restore_terminal,
@@ -270,31 +271,16 @@ async def run_onoats(
     _shutdown_started = False
     _shutdown_complete = asyncio.Event()
 
-    async def _wait_or_force(coro_or_future, label: str) -> None:
-        """Await a coroutine/future, but cancel it immediately if force_exit_event fires."""
-        wait_task = asyncio.ensure_future(coro_or_future)
-        force_task = asyncio.create_task(
-            force_exit_event.wait(), name="force_exit_wait"
-        )
-        done, _ = await asyncio.wait(
-            {wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if force_task in done:
-            logger.warning(f"Shutdown: force-cancelling {label}")
-            wait_task.cancel()
-            try:
-                await wait_task
-            except asyncio.CancelledError:
-                pass
-        else:
-            force_task.cancel()
-
     async def _drain_tasks(tasks: set[asyncio.Task], label: str) -> None:
         """Wait for a set of tasks, interruptible by force exit."""
         if not tasks:
             return
         logger.info(f"Shutdown: waiting for {len(tasks)} {label}")
-        await _wait_or_force(asyncio.gather(*tasks, return_exceptions=True), label)
+        await wait_or_force(
+            asyncio.gather(*tasks, return_exceptions=True),
+            label,
+            force_exit_event=force_exit_event,
+        )
 
     async def _on_shutdown() -> None:
         """Flush in-memory buffer to disk and drain the memory writer queue.
@@ -322,7 +308,11 @@ async def run_onoats(
         # Wait for crash recovery to finish if still running
         if _crash_recovery_task and not _crash_recovery_task.done():
             logger.info("Shutdown: waiting for crash recovery to finish")
-            await _wait_or_force(_crash_recovery_task, "crash recovery")
+            await wait_or_force(
+                _crash_recovery_task,
+                "crash recovery",
+                force_exit_event=force_exit_event,
+            )
 
         if force_exit_event.is_set():
             logger.warning("Shutdown: force exit — skipping flush")
@@ -350,7 +340,7 @@ async def run_onoats(
         # terminal flush in _on_shutdown captures the last spoken segment. Falls
         # back to a hard cancel if the drain stalls or a second Ctrl+C forces.
         logger.info("Shutdown: draining pipeline (Ctrl+C again to force)")
-        await drain_pipeline_for_shutdown(task, force_exit_event)
+        await stop_pipeline_for_shutdown(task, force_exit_event)
         await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")
