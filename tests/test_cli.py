@@ -223,6 +223,32 @@ def test_flush_refuses_legacy_pid_file_without_fingerprint(monkeypatch, _isolate
     assert pid_path.exists()
 
 
+def test_flush_keeps_pid_file_when_ps_probe_fails(monkeypatch, capsys, _isolate_env):
+    """A live recorder whose ``ps`` identity probe fails (ps missing/timeout)
+    must NOT be signalled and must NOT have its pid file deleted — a transient
+    probe failure is indeterminate, not proof the recorder is gone."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            return  # liveness probe succeeds → process is alive
+        raise AssertionError("flush must not signal an unverifiable pid")
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    # Identity probe fails (e.g. ps unavailable / timed out).
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
+
+    rc = cli.main(["flush"])
+    err = capsys.readouterr().err.lower()
+
+    assert rc == 1
+    assert "could not verify" in err
+    # Live recorder's pid file must survive an indeterminate probe.
+    assert pid_path.exists()
+
+
 def test_flush_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
     """Regression: a recycled pid pointing at an unrelated *live* process must
     not be signalled. Mirrors koda's shell-guard regression.

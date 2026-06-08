@@ -176,8 +176,21 @@ def resolve_flush_target(pid_path: Path) -> FlushTarget:
 
     live = _live_ps_cmdline(rec.pid)
     if live is None:
+        # Liveness was positively established above (``os.kill(pid, 0)`` did not
+        # raise ``ProcessLookupError``), so a missing readback here is NOT proof
+        # the recorder is gone — it means the identity probe itself failed:
+        # ``ps`` unavailable, non-zero, or timed out (or, rarely, the process
+        # exited in the window since the liveness check). This is indeterminate.
+        # Refuse to signal, but do NOT mark stale: deleting a live recorder's
+        # pid file on a transient ``ps`` hiccup would orphan it from ``status``
+        # and future ``flush``, and could let a later startup miss the active
+        # instance. A genuinely-dead pid is caught by the ``os.kill`` check on
+        # the next invocation, which re-probes and unlinks then.
         return FlushTarget(
-            None, f"recorder pid {rec.pid} is not running (stale pid file)", stale=True
+            None,
+            f"could not verify recorder identity for pid {rec.pid} "
+            f"(ps probe failed) — refusing to signal",
+            stale=False,
         )
     if live != rec.cmdline:
         return FlushTarget(
