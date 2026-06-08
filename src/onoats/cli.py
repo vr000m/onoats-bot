@@ -33,6 +33,24 @@ PID_FILENAME = "onoats.pid"
 # ---------------------------------------------------------------------------
 
 
+def _apply_config_data_dir() -> None:
+    """Export ``ONOATS_DATA_DIR`` from config.toml ``[storage].data_dir`` so every
+    downstream resolver (store, queue, recorder, flush, status) sees the
+    configured location via the existing env path — keeping ``_vendor/store.py``
+    free of any config import.
+
+    Precedence is preserved: if ``ONOATS_DATA_DIR`` is already in the env
+    (koda-driven / CI injection), it wins and this is a no-op.
+    """
+    if os.environ.get("ONOATS_DATA_DIR", "").strip():
+        return
+    from onoats.config import load_config
+
+    configured = load_config().data_dir
+    if configured:
+        os.environ["ONOATS_DATA_DIR"] = os.path.expanduser(str(configured))
+
+
 def _resolve_data_dir() -> Path:
     """Resolve the recorder data dir without importing the heavy runtime."""
     from onoats._vendor.store import onoats_data_dir
@@ -243,6 +261,10 @@ def main(argv: list[str] | None = None) -> int:
         # Let argparse render the standard "invalid choice" error + usage.
         parser.parse_args(raw)
         return 2
+    # Honor config.toml [storage].data_dir for every command (env still wins).
+    # `init` writes config to XDG_CONFIG_HOME, unaffected by the data dir.
+    if command != "init":
+        _apply_config_data_dir()
     return handler(rest)
 
 

@@ -268,13 +268,18 @@ def _render_config_toml(
     speakers: dict,
     categories: list[str],
     tuning: dict,
+    data_dir: str | None = None,
 ) -> str:
     lines: list[str] = [
         "# onoats configuration — written by `onoats init`.",
         "# Env vars override these values at runtime (process env > config.toml > default).",
         "",
-        "[devices]",
     ]
+    if data_dir:
+        lines.append("[storage]")
+        lines.append(f'data_dir = "{_toml_escape(data_dir)}"')
+        lines.append("")
+    lines.append("[devices]")
     lines.append(f'mic = "{_toml_escape(mic)}"' if mic else '# mic = "..."')
     lines.append(f'system = "{_toml_escape(system)}"' if system else '# system = "..."')
     lines.append("")
@@ -375,6 +380,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--them-name", default=None, help="Render-only display label for 'them'."
     )
     parser.add_argument(
+        "--data-dir",
+        default=None,
+        help=(
+            "Recorder data root (non-interactive). Point at e.g. ~/koda-data so a "
+            "downstream worker drains the same queue. Default: XDG "
+            "($XDG_DATA_HOME/onoats)."
+        ),
+    )
+    parser.add_argument(
         "--import-dictionary",
         default=None,
         help="Seed dictionary.txt from this existing file.",
@@ -424,6 +438,7 @@ def _any_scripted_flag(args: argparse.Namespace) -> bool:
             args.deepgram_key,
             args.stt_model,
             args.ws_socket,
+            args.data_dir,
         )
     )
 
@@ -512,6 +527,22 @@ def main(argv: list[str] | None = None) -> int:
         them = args.them_name or existing.speaker_label_them
     speakers = {"me": me, "them": them}
 
+    # ---- storage (optional non-default data root) ----
+    existing_data_dir = existing.raw.get("storage", {}).get("data_dir")
+    if args.data_dir is not None:
+        data_dir = args.data_dir.strip() or None
+    elif interactive:
+        data_dir = (
+            _prompt(
+                "Data dir (recordings + queue; blank = default ~/.local/share/onoats; "
+                "set ~/koda-data to feed koda)",
+                existing_data_dir,
+            ).strip()
+            or None
+        )
+    else:
+        data_dir = existing_data_dir
+
     # ---- 5/6. tuning + dictionary ----
     tuning = {
         "silence_timeout_sec": existing.silence_timeout_sec,
@@ -528,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
         speakers=speakers,
         categories=categories,
         tuning=tuning,
+        data_dir=data_dir,
     )
     _write_config_toml(config_path, content)
     _write_secrets_env(secrets_path, secrets, merge_existing=True)
@@ -538,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"STT backend: {stt.get('service')}")
     print(f"Categories: {', '.join(categories)}")
     print(f"Speakers: me={me!r} them={them!r}")
+    if data_dir:
+        print(f"Data dir: {data_dir}  (recordings + queue; a worker here drains it)")
     print("\nNext: `onoats bot` to record, `onoats convert` to render transcripts.")
     return 0
 

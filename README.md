@@ -54,8 +54,9 @@ either Deepgram or a TCP-reachable `pipecat-local-stt-server`.
 
 `onoats init` writes:
 
-- `$XDG_CONFIG_HOME/onoats/config.toml` — `[devices]` (by name), `[stt]`,
-  `[speakers]` (render-only display labels), `[categories]`, `[tuning]`.
+- `$XDG_CONFIG_HOME/onoats/config.toml` — `[storage]` (`data_dir`), `[devices]`
+  (by name), `[stt]`, `[speakers]` (render-only display labels), `[categories]`,
+  `[tuning]`.
 - `$XDG_CONFIG_HOME/onoats/secrets.env` — `0600`, STT secrets only
   (`DEEPGRAM_API_KEY` / `STT_WS_TOKEN`). **No LLM keys.**
 - `$XDG_CONFIG_HOME/onoats/dictionary.txt` — `wrong: correct` substitutions
@@ -64,6 +65,31 @@ either Deepgram or a TCP-reachable `pipecat-local-stt-server`.
 Precedence: **process env var > config.toml / secrets.env > built-in default**.
 So an automation driver can env-inject `ONOATS_DATA_DIR`, `STT_SERVICE`, etc.
 without editing the file.
+
+### Data location
+
+By default onoats stores everything under `$XDG_DATA_HOME/onoats`
+(`~/.local/share/onoats`): `sessions/{pending,claimed,done,failed}/` (the queue),
+`.active/` (live recording), `transcripts/{category}/{date}/` (converter output).
+
+Point it elsewhere with `[storage] data_dir` (or `ONOATS_DATA_DIR`):
+
+```bash
+onoats init --data-dir ~/some/other/root
+```
+
+**Feeding another worker the same queue.** Because the queue layout is shared,
+setting `data_dir` to a tree another tool drains makes onoats a drop-in
+recorder for it:
+
+```bash
+onoats init --data-dir ~/koda-data   # write into the consumer's queue root
+onoats bot                           # record → ~/koda-data/sessions/pending/
+```
+
+In this mode, let the **downstream worker** drain and render the queue — do
+**not** also run `onoats convert` against the same root (the two would race for
+the same `pending/` files). Run only one recorder against a given root at a time.
 
 ## The queue contract
 

@@ -164,6 +164,7 @@ def test_interactive_hosted_branch(_isolate_env, monkeypatch):
             "work,personal",  # categories
             "Varun",  # me name
             "Them",  # them label
+            "",  # data dir (default XDG)
         ],
     )
     rc = init_mod.main(["--no-preflight"])
@@ -194,6 +195,7 @@ def test_interactive_local_websocket_branch_runs_preflight(_isolate_env, monkeyp
             "",  # categories (none)
             "Me",  # me name
             "Them",  # them label
+            "",  # data dir (default XDG)
         ],
     )
 
@@ -229,6 +231,7 @@ def test_interactive_warns_when_loopback_absent(_isolate_env, monkeypatch, capsy
             "",  # categories
             "Me",  # me
             "Them",  # them
+            "",  # data dir (default XDG)
         ],
     )
     rc = init_mod.main(["--no-preflight"])
@@ -252,6 +255,7 @@ def test_interactive_rejects_same_device(_isolate_env, monkeypatch):
             "",  # categories
             "Me",
             "Them",
+            "",  # data dir (default XDG)
         ],
     )
     rc = init_mod.main(["--no-preflight"])
@@ -268,7 +272,7 @@ def test_secrets_env_mode_0600_interactive(_isolate_env, monkeypatch):
     _patch_devices(monkeypatch, [(0, "Mic", 16000), (1, "BlackHole", 16000)])
     _patch_inputs(
         monkeypatch,
-        ["0", "1", "n", "", "k" * 40, "", "Me", "Them"],
+        ["0", "1", "n", "", "k" * 40, "", "Me", "Them", ""],
     )
     assert init_mod.main(["--no-preflight"]) == 0
     from onoats.config import secrets_env_path

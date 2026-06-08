@@ -13,6 +13,7 @@ anything. A missing ``config.toml`` is not an error — sensible defaults apply.
 
 ``config.toml`` sections::
 
+    [storage]   data_dir = "..."                       # recorder data root (else XDG)
     [devices]   mic = "...", system = "..."           # by stable device name
     [stt]       service = "...", model = "...", ws_socket/ws_host/ws_port/ws_uri = "..."
     [speakers]  me = "Me", them = "Them"               # RENDER-ONLY display labels
@@ -102,6 +103,17 @@ class OnoatsConfig:
     @property
     def system_device(self) -> str | None:
         return _env_or("SYSTEM_INPUT_DEVICE", self.raw.get("devices", {}).get("system"))
+
+    # ---- storage ----
+    @property
+    def data_dir(self) -> str | None:
+        """Recorder data root: env ``ONOATS_DATA_DIR`` > config.toml ``[storage].data_dir``.
+
+        ``None`` falls through to the XDG default in ``_vendor/store.py``.
+        Setting this lets onoats write its queue into another tree (e.g.
+        ``~/koda-data``) so a downstream worker drains the same ``sessions/``.
+        """
+        return _env_or("ONOATS_DATA_DIR", self.raw.get("storage", {}).get("data_dir"))
 
     # ---- stt ----
     @property
