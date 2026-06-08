@@ -49,6 +49,54 @@ def test_stt_service_defaults_to_whisper_when_unset(monkeypatch):
     assert OnoatsConfig(raw={}).stt_service == "whisper"
 
 
+# --- A2. the RSS probe resolves the SAME endpoint as the data path ----------
+
+
+def test_rss_probe_uses_config_socket_not_env_default(monkeypatch):
+    """`log_stt_server_rss` must resolve from the config-layered env.
+
+    Regression for the probe reporting the wrong stt_server: it resolved its
+    endpoint from bare `os.environ`, missed the config.toml `[stt] ws_socket`,
+    and fell back to the default socket (a stale/wrong server). The data path
+    (`_create_stt_service`) and banner both go through `_ws_env(cfg)`; the
+    probe must too. Pin it by capturing the socket the probe hands to the
+    client and asserting it is the configured one, not the default.
+    """
+    import asyncio
+
+    import stt_server.client as stt_client
+
+    monkeypatch.delenv("STT_WS_SOCKET", raising=False)
+    monkeypatch.setattr(
+        "onoats.config.load_config",
+        lambda: OnoatsConfig(
+            raw={"stt": {"service": "websocket", "ws_socket": "~/x/nemotron.sock"}}
+        ),
+    )
+
+    captured: dict = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def connect(self):
+            raise OSError("no server in test")  # swallowed by the probe
+
+        async def close_session(self):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(stt_client, "TranscriptionClient", _FakeClient)
+
+    asyncio.run(runtime.log_stt_server_rss("startup"))
+
+    assert captured["socket_path"] == os.path.expanduser("~/x/nemotron.sock")
+    assert captured["socket_path"] != os.path.expanduser(runtime._DEFAULT_STT_WS_SOCKET)
+
+
 # --- B. whisper-cpu Settings must not carry `device` ------------------------
 
 

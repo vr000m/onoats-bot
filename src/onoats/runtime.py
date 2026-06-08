@@ -261,13 +261,20 @@ async def log_stt_server_rss(phase: str) -> None:
     unreachable server never fails bot lifecycle.
     """
     try:
+        from onoats.config import load_config
         from stt_server import protocol as P
         from stt_server.client import TranscriptionClient
 
         # The primary STT service path already logged any cleartext-token
         # warning at session start; suppress here so startup+shutdown
         # probes don't duplicate it.
-        kwargs = _resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False)
+        #
+        # Resolve from the config-layered env (``_ws_env``), not bare
+        # ``os.environ`` — the socket lives in config.toml ``[stt] ws_socket``,
+        # which the data path (``_create_stt_service``) and banner
+        # (``stt_banner``) both layer in. Skipping it lands on the default
+        # socket and probes a stale/wrong server (e.g. mlx instead of nemotron).
+        kwargs = _resolve_stt_ws_target(_ws_env(load_config()), warn_on_cleartext=False)
         client = TranscriptionClient(
             socket_path=kwargs.get("socket_path"),
             host=kwargs.get("host"),
@@ -551,8 +558,11 @@ async def _create_stt_service():
     # Whisper recognition bias would be supplied via an initial_prompt seed,
     # but pipecat 1.3.0's Whisper wrapper exposes no such field (Settings =
     # model/language/extra/no_speech_prob[/temperature,engine for MLX]); passing
-    # it crashes. Log-and-skip when the dictionary has terms; Deepgram/the ws
-    # server still honour vocabulary bias.
+    # it crashes. Log-and-skip when the dictionary has terms. Only Deepgram
+    # honours vocabulary bias (keywords). The websocket/stt_server path does
+    # NOT: the runtime never forwards `vocabulary` to WebSocketSTTService, and
+    # the wire protocol's `update_session` carries no hotwords field — so the
+    # dictionary is silently ignored there too, same as Whisper.
     if vocabulary:
         logger.debug(
             f"Whisper: dictionary vocabulary bias ({len(vocabulary)} term(s)) is "
