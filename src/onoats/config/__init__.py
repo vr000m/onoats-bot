@@ -122,6 +122,24 @@ class OnoatsConfig:
             or _DEFAULTS["stt"]["model"]
         ).strip()
 
+    # websocket endpoint (env wins; else config.toml [stt].ws_*). None when
+    # neither set — the runtime then falls back to the built-in default socket.
+    @property
+    def stt_ws_socket(self) -> str | None:
+        return _env_or("STT_WS_SOCKET", self.raw.get("stt", {}).get("ws_socket"))
+
+    @property
+    def stt_ws_host(self) -> str | None:
+        return _env_or("STT_WS_HOST", self.raw.get("stt", {}).get("ws_host"))
+
+    @property
+    def stt_ws_port(self) -> str | None:
+        return _env_or("STT_WS_PORT", self.raw.get("stt", {}).get("ws_port"))
+
+    @property
+    def stt_ws_uri(self) -> str | None:
+        return _env_or("STT_WS_URI", self.raw.get("stt", {}).get("ws_uri"))
+
     # ---- speakers (render-only display labels) ----
     @property
     def speaker_label_me(self) -> str:

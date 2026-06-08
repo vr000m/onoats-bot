@@ -221,8 +221,15 @@ async def run_onoats_dual(
             "Dual-input bot ignores INPUT_DEVICE; use MIC_INPUT_DEVICE and SYSTEM_INPUT_DEVICE"
         )
 
-    mic_input = os.getenv("MIC_INPUT_DEVICE", "").strip() or None
-    system_input = os.getenv("SYSTEM_INPUT_DEVICE", "").strip() or None
+    # Resolve devices through the config loader: env (MIC_INPUT_DEVICE /
+    # SYSTEM_INPUT_DEVICE) wins, else config.toml [devices] mic/system written
+    # by `onoats init`. Without this the recorder ignored the saved config and
+    # re-prompted on every launch.
+    from onoats.config import load_config
+
+    cfg = load_config()
+    mic_input = cfg.mic_device or None
+    system_input = cfg.system_device or None
     mic_dev, system_dev = select_dual_input_devices(
         mic_input_env=mic_input,
         system_input_env=system_input,

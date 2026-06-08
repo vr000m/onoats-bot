@@ -191,12 +191,37 @@ def stt_banner() -> str:
     Show the resolved server target instead; the real backend + model is
     logged on connect by ``WebSocketSTTService._ensure_connected``.
     """
-    if STT_SERVICE == "websocket":
+    from onoats.config import load_config
+
+    cfg = load_config()
+    if cfg.stt_service == "websocket":
         target = _display_target(
-            _resolve_stt_ws_target(os.environ.copy(), warn_on_cleartext=False)
+            _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
         )
         return f"websocket (server={target}, model pinned by server)"
-    return f"{STT_SERVICE} / model={STT_MODEL or 'default'}"
+    return f"{cfg.stt_service} / model={cfg.stt_model or 'default'}"
+
+
+def _ws_env(cfg) -> dict[str, str]:
+    """``os.environ`` with config.toml ``[stt]`` ws_* layered in (env wins).
+
+    ``cfg.stt_ws_*`` already resolve env-over-file, so assigning their values
+    back is env-preserving. The socket path is ``expanduser``-ed so a ``~`` in
+    config.toml resolves the same way the built-in default socket does. This is
+    what lets ``onoats init``'s written ``ws_socket`` actually reach the
+    recorder — env vars are no longer the only source.
+    """
+    env = dict(os.environ)
+    socket = cfg.stt_ws_socket
+    if socket:
+        env["STT_WS_SOCKET"] = os.path.expanduser(str(socket))
+    if cfg.stt_ws_host:
+        env["STT_WS_HOST"] = str(cfg.stt_ws_host)
+    if cfg.stt_ws_port:
+        env["STT_WS_PORT"] = str(cfg.stt_ws_port)
+    if cfg.stt_ws_uri:
+        env["STT_WS_URI"] = str(cfg.stt_ws_uri)
+    return env
 
 
 _PREFLIGHT_TIMEOUT_SEC = 2.0
@@ -460,8 +485,13 @@ async def _create_stt_service():
     ``import onoats.runtime`` with no ``STT_SERVICE`` set never imports
     ``mlx_whisper`` — the off-mac baseline ships MLX-free.
     """
+    from onoats.config import load_config
+
+    cfg = load_config()
+    service = cfg.stt_service
+    model_name = cfg.stt_model
     vocabulary = _vocabulary_bias()
-    if STT_SERVICE == "websocket":
+    if service == "websocket":
         try:
             from onoats.stt.websocket_stt_service import WebSocketSTTService
         except ImportError as exc:
@@ -471,7 +501,7 @@ async def _create_stt_service():
                 f"to repair the environment. Original error: {exc}"
             ) from exc
 
-        kwargs = _resolve_stt_ws_target(os.environ)
+        kwargs = _resolve_stt_ws_target(_ws_env(cfg))
         target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
         await _preflight_stt_ws(kwargs, target)
@@ -490,21 +520,21 @@ async def _create_stt_service():
         language = None if raw.lower() == "auto" else raw
         return WebSocketSTTService(language=language, **kwargs)
 
-    if STT_SERVICE == "deepgram":
+    if service == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
 
-        from onoats.config import load_config, looks_like_bearer_token
+        from onoats.config import looks_like_bearer_token
 
         dg_kwargs: dict = {
-            "api_key": load_config().require_secret(
+            "api_key": cfg.require_secret(
                 "DEEPGRAM_API_KEY",
                 validate=looks_like_bearer_token,
                 hint="Get one at https://console.deepgram.com",
             )
         }
         live_opts: dict = {}
-        if STT_MODEL:
-            live_opts["model"] = STT_MODEL
+        if model_name:
+            live_opts["model"] = model_name
         if vocabulary:
             # Deepgram keyword boosting: bias recognition toward dictionary terms.
             live_opts["keywords"] = list(vocabulary)
@@ -513,13 +543,21 @@ async def _create_stt_service():
 
             dg_kwargs["live_options"] = LiveOptions(**live_opts)
         logger.info(
-            f"STT: deepgram (model={STT_MODEL or 'default'}, "
+            f"STT: deepgram (model={model_name or 'default'}, "
             f"vocabulary_bias={len(vocabulary)} term(s))"
         )
         return DeepgramSTTService(**dg_kwargs)
 
-    # Whisper recognition bias is supplied via the initial_prompt seed text.
-    initial_prompt = ", ".join(vocabulary) if vocabulary else None
+    # Whisper recognition bias would be supplied via an initial_prompt seed,
+    # but pipecat 1.3.0's Whisper wrapper exposes no such field (Settings =
+    # model/language/extra/no_speech_prob[/temperature,engine for MLX]); passing
+    # it crashes. Log-and-skip when the dictionary has terms; Deepgram/the ws
+    # server still honour vocabulary bias.
+    if vocabulary:
+        logger.debug(
+            f"Whisper: dictionary vocabulary bias ({len(vocabulary)} term(s)) is "
+            "not supported by this pipecat Whisper wrapper; ignoring."
+        )
 
     # Default: Whisper (MLX on Apple Silicon, CPU otherwise). The MLX import
     # lives inside this branch so the off-mac baseline never imports it.
@@ -527,30 +565,29 @@ async def _create_stt_service():
         from pipecat.services.whisper.stt import MLXModel, WhisperSTTServiceMLX
 
         mlx_key = _MLX_MODEL_MAP.get(
-            STT_MODEL or "large-v3-turbo", "LARGE_V3_TURBO"
+            model_name or "large-v3-turbo", "LARGE_V3_TURBO"
         ).upper()
         mlx_model = getattr(MLXModel, mlx_key, None)
         if mlx_model is None:
             logger.warning(
-                f"Unknown MLX model name '{STT_MODEL}', falling back to large-v3-turbo"
+                f"Unknown MLX model name '{model_name}', falling back to large-v3-turbo"
             )
             mlx_model = MLXModel.LARGE_V3_TURBO
         logger.info(f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon)")
-        mlx_settings: dict = {"model": mlx_model.value, "language": "en"}
-        if initial_prompt:
-            mlx_settings["initial_prompt"] = initial_prompt
         return WhisperSTTServiceMLX(
-            settings=WhisperSTTServiceMLX.Settings(**mlx_settings)
+            settings=WhisperSTTServiceMLX.Settings(model=mlx_model.value, language="en")
         )
     else:
         from pipecat.services.whisper.stt import WhisperSTTService
 
-        model = STT_MODEL or "base"
+        model = model_name or "base"
         logger.info(f"STT: whisper-cpu (model={model})")
-        cpu_settings: dict = {"model": model, "device": "cpu", "language": "en"}
-        if initial_prompt:
-            cpu_settings["initial_prompt"] = initial_prompt
-        return WhisperSTTService(settings=WhisperSTTService.Settings(**cpu_settings))
+        # device/compute_type are WhisperSTTService constructor kwargs, NOT
+        # Settings fields — passing device into Settings raises TypeError.
+        return WhisperSTTService(
+            device="cpu",
+            settings=WhisperSTTService.Settings(model=model, language="en"),
+        )
 
 
 # ---------------------------------------------------------------------------
