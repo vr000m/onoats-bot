@@ -12,7 +12,9 @@ Run::
 Config:
     MIC_INPUT_DEVICE     - Microphone input device index or stable name
     SYSTEM_INPUT_DEVICE  - Loopback input device index or stable name
-    SHUTDOWN_CANCEL_TIMEOUT_SEC - Grace period (s) for pipeline cancel on Ctrl+C;
+    SHUTDOWN_DRAIN_TIMEOUT_SEC - Max seconds to drain the pipeline on Ctrl+C so a
+                           final in-flight transcript lands before flush (default 8.0)
+    SHUTDOWN_CANCEL_TIMEOUT_SEC - Hard-cancel grace (s) if the drain stalls;
                            caps pipecat's 20s default so exit isn't slow (default 2.0)
 
 Notes:
@@ -41,6 +43,7 @@ from onoats.runtime import (  # noqa: E402
     PIPELINE_SAMPLE_RATE,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
+    drain_pipeline_for_shutdown,
     _remove_pid_file,
     _create_stt_service,
     log_stt_server_rss,
@@ -446,8 +449,10 @@ async def run_onoats_dual(
 
     async def _shutdown_watcher() -> None:
         await shutdown_event.wait()
-        logger.info("Shutdown: stopping dual pipeline (STT/VAD)")
-        await _wait_or_force(task.cancel(), "dual pipeline cancel")
+        # Graceful drain first (EndFrame) so an in-flight transcription reaches
+        # TranscriptBuffer before the flush; hard-cancel fallback on stall/force.
+        logger.info("Shutdown: draining dual pipeline (Ctrl+C again to force)")
+        await drain_pipeline_for_shutdown(task, force_exit_event)
         await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher_dual")

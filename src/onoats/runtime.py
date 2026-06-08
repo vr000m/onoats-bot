@@ -74,30 +74,81 @@ def _env_float(env_name: str, default: float) -> float:
         return default
 
 
-# On shutdown the watcher calls ``task.cancel()`` (a CancelFrame), and pipecat's
-# PipelineWorker then waits up to ``cancel_timeout_secs`` (pipecat default 20s)
-# for that frame to reach the end of the pipeline before tearing down. In
-# practice the local-audio transport keeps the frame from arriving, so the wait
-# always burns the full timeout — a single Ctrl+C feels hung for ~20s.
+# --- Shutdown timing -------------------------------------------------------
 #
-# Shortening it to 2s does NOT drop transcripts: a CancelFrame *aborts* the STT
-# (see WebSocketSTTService.cancel — it resolves any in-flight ``_pending`` so
-# ``run_stt`` unwinds promptly rather than emitting a final frame), so a longer
-# cancel wait captures no extra transcript. The terminal flush runs afterwards
-# in ``_on_shutdown`` over whatever already reached TranscriptBuffer, and the
-# dual path's graceful ``stop(EndFrame)`` is sequenced after that flush purely
-# for MLX/transport resource teardown.
+# Graceful two-phase shutdown (see _shutdown_watcher in __main__/dual):
 #
-# Known limitation (pre-existing, not changed by this cap): a segment still
-# being transcribed at the instant of Ctrl+C is lost on either timeout, because
-# the cancel aborts it instead of draining it. Capturing it would need a
-# graceful EndFrame drain *before* the flush — a deliberate shutdown redesign,
-# not a timeout tweak.
+#   1. DRAIN — queue an EndFrame (``task.stop_when_done()``). An EndFrame, unlike
+#      a CancelFrame, lets an in-flight segment finish: SegmentedSTTService
+#      awaits ``run_stt`` inline in ``process_frame``, so the EndFrame queues
+#      behind it, the final ``TranscriptionFrame`` is delivered to
+#      TranscriptBuffer, and only then does the pipeline end. This is what makes
+#      the terminal flush capture the last spoken segment. The drain ends as
+#      soon as the pipeline finishes, so the common (nothing-pending) case exits
+#      promptly; SHUTDOWN_DRAIN_TIMEOUT_SEC bounds a stalled drain.
 #
-# Env-only (not a config.toml [tuning] knob): an operator escape hatch that
-# matches how ``__main__`` reads its other tunables (e.g. SILENCE_TIMEOUT_SEC)
+#   2. CANCEL (fallback) — if the drain stalls past its timeout, or a second
+#      Ctrl+C forces exit, hard-cancel with ``task.cancel()`` (a CancelFrame).
+#      pipecat then waits up to ``cancel_timeout_secs`` for that frame to reach
+#      the pipeline end; the local-audio transport tends to block it, so this is
+#      capped at SHUTDOWN_CANCEL_TIMEOUT_SEC instead of pipecat's 20s default to
+#      avoid a hung-feeling exit. A CancelFrame *aborts* in-flight STT, so this
+#      fallback is best-effort teardown, not a transcript-preserving path.
+#
+# Both are env-only operator escape hatches (no config.toml [tuning] key),
+# matching how ``__main__`` reads its other tunables (e.g. SILENCE_TIMEOUT_SEC)
 # raw from the environment without loading config.
+SHUTDOWN_DRAIN_TIMEOUT_SEC = _env_float("SHUTDOWN_DRAIN_TIMEOUT_SEC", 8.0)
 SHUTDOWN_CANCEL_TIMEOUT_SEC = _env_float("SHUTDOWN_CANCEL_TIMEOUT_SEC", 2.0)
+
+
+async def drain_pipeline_for_shutdown(task, force_exit_event) -> None:
+    """Graceful two-phase pipeline shutdown shared by both recorders.
+
+    Phase 1 (drain): queue an EndFrame via ``task.stop_when_done()`` so an STT
+    segment whose transcription is in flight finishes and reaches
+    TranscriptBuffer before teardown. Wait for the pipeline to finish, bounded
+    by SHUTDOWN_DRAIN_TIMEOUT_SEC and by a second Ctrl+C (``force_exit_event``).
+    The wait ends as soon as the pipeline drains, so the common case (nothing
+    pending) returns promptly.
+
+    Phase 2 (fallback): if the drain stalls past its timeout or is force-exited,
+    hard-cancel with ``task.cancel()`` (a CancelFrame, internally capped at the
+    task's ``cancel_timeout_secs`` = SHUTDOWN_CANCEL_TIMEOUT_SEC). A CancelFrame
+    aborts in-flight STT, so this is best-effort teardown only.
+
+    The caller flushes (rotates the buffer into pending/) AFTER this returns —
+    in the drained case that flush captures the final segment.
+    """
+    if task.has_finished():
+        return
+
+    await task.stop_when_done()
+
+    async def _await_finished() -> None:
+        while not task.has_finished():
+            await asyncio.sleep(0.05)
+
+    finished_task = asyncio.ensure_future(_await_finished())
+    force_task = asyncio.ensure_future(force_exit_event.wait())
+    try:
+        await asyncio.wait(
+            {finished_task, force_task},
+            timeout=SHUTDOWN_DRAIN_TIMEOUT_SEC,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in (finished_task, force_task):
+            if not t.done():
+                t.cancel()
+
+    if task.has_finished():
+        return
+
+    reason = "forced (2nd Ctrl+C)" if force_exit_event.is_set() else "drain timed out"
+    logger.info(f"Shutdown: {reason} — hard-cancelling pipeline")
+    await task.cancel()
+
 
 # Map simple model name strings to MLXModel enum member names
 _MLX_MODEL_MAP: dict[str, str] = {

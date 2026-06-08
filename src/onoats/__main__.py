@@ -16,7 +16,9 @@ Config (config.toml / secrets.env or environment):
     INPUT_DEVICE         - Override mic device index (int); skips interactive picker
     SILENCE_TIMEOUT_SEC  - Seconds of mic silence before flushing buffer (default 300)
     SEGMENT_HINT_THRESHOLD - Seconds of silence to mark a segment hint (default 120)
-    SHUTDOWN_CANCEL_TIMEOUT_SEC - Grace period (s) for pipeline cancel on Ctrl+C;
+    SHUTDOWN_DRAIN_TIMEOUT_SEC - Max seconds to drain the pipeline on Ctrl+C so a
+                           final in-flight transcript lands before flush (default 8.0)
+    SHUTDOWN_CANCEL_TIMEOUT_SEC - Hard-cancel grace (s) if the drain stalls;
                            caps pipecat's 20s default so exit isn't slow (default 2.0)
 
 Optional STT secrets (secrets.env):
@@ -58,6 +60,7 @@ from onoats.runtime import (  # noqa: E402
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     _create_stt_service,
+    drain_pipeline_for_shutdown,
     _install_signal_handlers,
     _remove_pid_file,
     _restore_terminal,
@@ -342,11 +345,12 @@ async def run_onoats(
     # Monitor the shutdown event in the background and cancel the pipeline task
     async def _shutdown_watcher() -> None:
         await shutdown_event.wait()
-        # Stop the STT pipeline first — no point capturing audio during shutdown.
-        # Race against force_exit_event so a second Ctrl+C can interrupt a stuck
-        # pipeline teardown (e.g. hung transport/STT cleanup).
-        logger.info("Shutdown: stopping pipeline (STT/VAD)")
-        await _wait_or_force(task.cancel(), "pipeline cancel")
+        # Graceful drain first: an EndFrame lets a segment whose transcription
+        # is in flight finish and reach TranscriptBuffer before teardown, so the
+        # terminal flush in _on_shutdown captures the last spoken segment. Falls
+        # back to a hard cancel if the drain stalls or a second Ctrl+C forces.
+        logger.info("Shutdown: draining pipeline (Ctrl+C again to force)")
+        await drain_pipeline_for_shutdown(task, force_exit_event)
         await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")
