@@ -74,13 +74,25 @@ def _env_float(env_name: str, default: float) -> float:
         return default
 
 
-# On shutdown, pipecat's PipelineWorker pushes a CancelFrame and waits up to
-# ``cancel_timeout_secs`` (pipecat default 20s) for it to reach the end of the
-# pipeline. The recorder has already flushed + rotated the active session in
-# ``_on_shutdown`` (independent of the pipeline), so this teardown is pure
-# cleanup of the transport/STT — no audio is lost when it is cut short. The
-# default 20s just makes a single Ctrl+C feel hung. Cap it at a short grace
-# window so any in-flight STT frame can still land before teardown.
+# On shutdown the watcher calls ``task.cancel()`` (a CancelFrame), and pipecat's
+# PipelineWorker then waits up to ``cancel_timeout_secs`` (pipecat default 20s)
+# for that frame to reach the end of the pipeline before tearing down. In
+# practice the local-audio transport keeps the frame from arriving, so the wait
+# always burns the full timeout — a single Ctrl+C feels hung for ~20s.
+#
+# Shortening it to 2s does NOT drop transcripts: a CancelFrame *aborts* the STT
+# (see WebSocketSTTService.cancel — it resolves any in-flight ``_pending`` so
+# ``run_stt`` unwinds promptly rather than emitting a final frame), so a longer
+# cancel wait captures no extra transcript. The terminal flush runs afterwards
+# in ``_on_shutdown`` over whatever already reached TranscriptBuffer, and the
+# dual path's graceful ``stop(EndFrame)`` is sequenced after that flush purely
+# for MLX/transport resource teardown.
+#
+# Known limitation (pre-existing, not changed by this cap): a segment still
+# being transcribed at the instant of Ctrl+C is lost on either timeout, because
+# the cancel aborts it instead of draining it. Capturing it would need a
+# graceful EndFrame drain *before* the flush — a deliberate shutdown redesign,
+# not a timeout tweak.
 #
 # Env-only (not a config.toml [tuning] knob): an operator escape hatch that
 # matches how ``__main__`` reads its other tunables (e.g. SILENCE_TIMEOUT_SEC)
