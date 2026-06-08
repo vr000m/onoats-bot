@@ -175,13 +175,18 @@ def validate_audio_device(device_query, label, need_input=False):
 # ---------------------------------------------------------------------------
 
 
-def select_input_device(input_device_env=None):
+def select_input_device(input_device_env=None, *, source="from env"):
     """Select an audio input (mic) device. No output device required.
 
     Use this in silent recorder mode. onoats only needs a mic.
 
     Args:
         input_device_env: INPUT_DEVICE env var value (int or None).
+        source: Provenance label for ``input_device_env`` (e.g. "from env",
+            "from config"), used only for the log line. The single-input
+            recorder consults only the INPUT_DEVICE env var today, so the
+            default is accurate; the param keeps the label honest if a
+            config-derived value is ever threaded in.
 
     Returns:
         Input device index (int), or None for system default.
@@ -196,7 +201,7 @@ def select_input_device(input_device_env=None):
         )
         if env_in is not None:
             in_info = pa.get_device_info_by_index(env_in)
-            logger.info(f"Audio input:  [{env_in}] {in_info['name']} (from env)")
+            logger.info(f"Audio input:  [{env_in}] {in_info['name']} ({source})")
             return env_in
 
         # Build input device list
@@ -245,12 +250,22 @@ def select_input_device(input_device_env=None):
         pa.terminate()
 
 
-def select_dual_input_devices(mic_input_env=None, system_input_env=None):
+def select_dual_input_devices(
+    mic_input_env=None,
+    system_input_env=None,
+    *,
+    mic_source="from env",
+    system_source="from env",
+):
     """Select separate microphone and system-loopback input devices.
 
     ``mic_input_env`` and ``system_input_env`` may be indices or stable device
     names. The dual-input picker persists the last-used device names so the
     selection remains stable across host-side PortAudio reindexing.
+
+    ``mic_source`` / ``system_source`` are provenance labels (e.g. "from env",
+    "from config") describing where each resolved value came from, used only
+    for the log/picker line so it reads accurately instead of always "from env".
     """
     import pyaudio
 
@@ -264,7 +279,13 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
         )
         if env_mic is not None and env_system is not None:
             _ensure_distinct_dual_inputs(env_mic, env_system, pa)
-            _log_dual_inputs(pa, env_mic, env_system, env_label="from env")
+            _log_dual_inputs(
+                pa,
+                env_mic,
+                env_system,
+                mic_label=mic_source,
+                system_label=system_source,
+            )
             return env_mic, env_system
 
         inputs = _enumerate_input_devices(pa)
@@ -284,6 +305,8 @@ def select_dual_input_devices(mic_input_env=None, system_input_env=None):
                 env_system if env_system is not None else last_system,
                 skip_mic=env_mic is not None,
                 skip_system=env_system is not None,
+                mic_source=mic_source,
+                system_source=system_source,
             )
         else:
             picked_mic = env_mic if env_mic is not None else last_mic
@@ -699,13 +722,15 @@ def _pick_dual_input_devices(
     *,
     skip_mic: bool = False,
     skip_system: bool = False,
+    mic_source: str = "from env",
+    system_source: str = "from env",
 ):
     """Interactive picker for separate mic and loopback input devices."""
 
-    def _pick(label, default_idx, *, skip: bool = False):
+    def _pick(label, default_idx, *, skip: bool = False, source: str = "from env"):
         if skip:
             name = next((n for i, n, _ in inputs if i == default_idx), "?")
-            print(f"{label}: [{default_idx}] {name} (from env)")
+            print(f"{label}: [{default_idx}] {name} ({source})")
             return default_idx
 
         print(f"{label} input devices:")
@@ -739,9 +764,9 @@ def _pick_dual_input_devices(
     if last_mic is not None or last_system is not None:
         print("Press Enter to reuse a highlighted device.\n")
 
-    mic_dev = _pick("Microphone", last_mic, skip=skip_mic)
+    mic_dev = _pick("Microphone", last_mic, skip=skip_mic, source=mic_source)
     print()
-    system_dev = _pick("System", last_system, skip=skip_system)
+    system_dev = _pick("System", last_system, skip=skip_system, source=system_source)
     print()
     return mic_dev, system_dev
 
@@ -756,10 +781,16 @@ def _ensure_distinct_dual_inputs(mic_dev: int, system_dev: int, pa) -> None:
 
 
 def _log_dual_inputs(
-    pa, mic_dev: int, system_dev: int, env_label: str | None = None
+    pa,
+    mic_dev: int,
+    system_dev: int,
+    *,
+    mic_label: str | None = None,
+    system_label: str | None = None,
 ) -> None:
     mic_info = pa.get_device_info_by_index(mic_dev)
     system_info = pa.get_device_info_by_index(system_dev)
-    suffix = f" ({env_label})" if env_label else ""
-    logger.info(f"Mic input:    [{mic_dev}] {mic_info['name']}{suffix}")
-    logger.info(f"System input: [{system_dev}] {system_info['name']}{suffix}")
+    mic_suffix = f" ({mic_label})" if mic_label else ""
+    system_suffix = f" ({system_label})" if system_label else ""
+    logger.info(f"Mic input:    [{mic_dev}] {mic_info['name']}{mic_suffix}")
+    logger.info(f"System input: [{system_dev}] {system_info['name']}{system_suffix}")

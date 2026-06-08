@@ -233,6 +233,8 @@ async def run_onoats_dual(
     mic_dev, system_dev = select_dual_input_devices(
         mic_input_env=mic_input,
         system_input_env=system_input,
+        mic_source=cfg.mic_device_source,
+        system_source=cfg.system_device_source,
     )
 
     # Zero SQLite: the recorder opens no database. It emits files only —

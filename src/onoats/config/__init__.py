@@ -88,6 +88,20 @@ def _env_or(env_name: str, file_value: Any) -> Any:
     return file_value
 
 
+def _source_of(env_name: str, file_value: Any) -> str:
+    """Provenance label for a value resolved by :func:`_env_or`.
+
+    Mirrors the same precedence (env var > config.toml > default) so the
+    device picker can report where a value actually resolved instead of
+    always claiming "from env".
+    """
+    if os.environ.get(env_name, "").strip():
+        return "from env"
+    if file_value not in (None, ""):
+        return "from config"
+    return "default"
+
+
 @dataclass(frozen=True)
 class OnoatsConfig:
     """Resolved configuration, env-overridden over config.toml over defaults."""
@@ -103,6 +117,18 @@ class OnoatsConfig:
     @property
     def system_device(self) -> str | None:
         return _env_or("SYSTEM_INPUT_DEVICE", self.raw.get("devices", {}).get("system"))
+
+    @property
+    def mic_device_source(self) -> str:
+        """Where ``mic_device`` resolved from: "from env" / "from config" / "default"."""
+        return _source_of("MIC_INPUT_DEVICE", self.raw.get("devices", {}).get("mic"))
+
+    @property
+    def system_device_source(self) -> str:
+        """Where ``system_device`` resolved from: "from env" / "from config" / "default"."""
+        return _source_of(
+            "SYSTEM_INPUT_DEVICE", self.raw.get("devices", {}).get("system")
+        )
 
     # ---- storage ----
     @property
