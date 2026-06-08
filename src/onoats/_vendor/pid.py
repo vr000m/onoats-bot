@@ -152,7 +152,9 @@ def resolve_flush_target(pid_path: Path) -> FlushTarget:
     """
     rec = _parse_pid_file(pid_path)
     if rec is None:
-        return FlushTarget(None, "no valid pid file", stale=False)
+        return FlushTarget(
+            None, "no running recorder found (no valid pid file)", stale=False
+        )
     if not rec.cmdline:
         return FlushTarget(
             None,

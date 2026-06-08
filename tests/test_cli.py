@@ -225,8 +225,17 @@ def test_flush_refuses_legacy_pid_file_without_fingerprint(monkeypatch, _isolate
 
 def test_flush_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
     """Regression: a recycled pid pointing at an unrelated *live* process must
-    not be signalled. Mirrors koda's shell-guard regression."""
+    not be signalled. Mirrors koda's shell-guard regression.
+
+    Integration-flavoured: exercises the real ``ps`` readback path. Skips on
+    the (rare) host without ``ps``/``sleep`` rather than misreporting the
+    mismatch as a "not running" stale path.
+    """
+    import shutil
     import subprocess
+
+    if not shutil.which("ps") or not shutil.which("sleep"):
+        pytest.skip("requires ps and sleep for the live identity readback")
 
     # A real, unrelated live process whose cmdline will not match the stored
     # fingerprint. SIGUSR1 would terminate it if flush signalled blindly.
