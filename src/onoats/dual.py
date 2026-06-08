@@ -12,6 +12,8 @@ Run::
 Config:
     MIC_INPUT_DEVICE     - Microphone input device index or stable name
     SYSTEM_INPUT_DEVICE  - Loopback input device index or stable name
+    SHUTDOWN_CANCEL_TIMEOUT_SEC - Grace period (s) for pipeline cancel on Ctrl+C;
+                           caps pipecat's 20s default so exit isn't slow (default 2.0)
 
 Notes:
     - INPUT_DEVICE is ignored by the dual-input recorder.

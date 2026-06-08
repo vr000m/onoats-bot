@@ -16,6 +16,8 @@ Config (config.toml / secrets.env or environment):
     INPUT_DEVICE         - Override mic device index (int); skips interactive picker
     SILENCE_TIMEOUT_SEC  - Seconds of mic silence before flushing buffer (default 300)
     SEGMENT_HINT_THRESHOLD - Seconds of silence to mark a segment hint (default 120)
+    SHUTDOWN_CANCEL_TIMEOUT_SEC - Grace period (s) for pipeline cancel on Ctrl+C;
+                           caps pipecat's 20s default so exit isn't slow (default 2.0)
 
 Optional STT secrets (secrets.env):
     DEEPGRAM_API_KEY     - Deepgram STT (only when STT_SERVICE=deepgram)
