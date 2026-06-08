@@ -64,7 +64,9 @@ either Deepgram or a TCP-reachable `pipecat-local-stt-server`.
 
 Precedence: **process env var > config.toml / secrets.env > built-in default**.
 So an automation driver can env-inject `ONOATS_DATA_DIR`, `STT_SERVICE`, etc.
-without editing the file.
+without editing the file. A few runtime-only knobs are env-only (no `config.toml`
+key) — notably `SHUTDOWN_CANCEL_TIMEOUT_SEC` (grace period in seconds for pipeline
+cancel on Ctrl+C; caps pipecat's 20 s default, default `2.0`).
 
 ### Data location
 
