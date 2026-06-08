@@ -137,7 +137,9 @@ async def run_onoats(
     # ----------------------------------------------------------------
     # Step 2: Select audio device (input only — silent recorder)
     # ----------------------------------------------------------------
-    input_dev = select_input_device(input_device_env=INPUT_DEVICE)
+    # INPUT_DEVICE is read only from the environment (single-input mode has no
+    # config.toml key), so the provenance is unambiguously "from env".
+    input_dev = select_input_device(input_device_env=INPUT_DEVICE, source="from env")
 
     # ----------------------------------------------------------------
     # Step 3: Zero SQLite — the recorder opens no database. It emits files

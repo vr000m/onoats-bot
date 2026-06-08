@@ -254,8 +254,8 @@ def select_dual_input_devices(
     mic_input_env=None,
     system_input_env=None,
     *,
-    mic_source="from env",
-    system_source="from env",
+    mic_source: str,
+    system_source: str,
 ):
     """Select separate microphone and system-loopback input devices.
 
@@ -263,9 +263,11 @@ def select_dual_input_devices(
     names. The dual-input picker persists the last-used device names so the
     selection remains stable across host-side PortAudio reindexing.
 
-    ``mic_source`` / ``system_source`` are provenance labels (e.g. "from env",
-    "from config") describing where each resolved value came from, used only
-    for the log/picker line so it reads accurately instead of always "from env".
+    ``mic_source`` / ``system_source`` are required provenance labels (e.g.
+    "from env", "from config") describing where each resolved value came from,
+    used only for the log/picker line. They are mandatory — rather than
+    defaulting to "from env" — so a caller passing a config-derived value can
+    never silently mislabel it.
     """
     import pyaudio
 

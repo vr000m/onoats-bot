@@ -80,26 +80,31 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
-def _env_or(env_name: str, file_value: Any) -> Any:
-    """Process env var wins; else the config.toml value; else None."""
+def _env_or_with_source(env_name: str, file_value: Any) -> tuple[Any, str]:
+    """Resolve a value and its provenance in one place.
+
+    Encodes the precedence (env var > config.toml > default) exactly once so
+    the resolved value and the "where did this come from" label can never
+    drift apart. Returns ``(value, label)`` where ``label`` is one of
+    "from env" / "from config" / "default".
+    """
     env = os.environ.get(env_name, "")
     if env.strip():
-        return env
-    return file_value
+        return env, "from env"
+    if file_value not in (None, ""):
+        return file_value, "from config"
+    # file_value is None or "" here — caller falls through to a built-in default.
+    return file_value, "default"
+
+
+def _env_or(env_name: str, file_value: Any) -> Any:
+    """Process env var wins; else the config.toml value; else None."""
+    return _env_or_with_source(env_name, file_value)[0]
 
 
 def _source_of(env_name: str, file_value: Any) -> str:
-    """Provenance label for a value resolved by :func:`_env_or`.
-
-    Mirrors the same precedence (env var > config.toml > default) so the
-    device picker can report where a value actually resolved instead of
-    always claiming "from env".
-    """
-    if os.environ.get(env_name, "").strip():
-        return "from env"
-    if file_value not in (None, ""):
-        return "from config"
-    return "default"
+    """Provenance label for the value :func:`_env_or` would return."""
+    return _env_or_with_source(env_name, file_value)[1]
 
 
 @dataclass(frozen=True)
