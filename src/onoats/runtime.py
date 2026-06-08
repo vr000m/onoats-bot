@@ -558,8 +558,11 @@ async def _create_stt_service():
     # Whisper recognition bias would be supplied via an initial_prompt seed,
     # but pipecat 1.3.0's Whisper wrapper exposes no such field (Settings =
     # model/language/extra/no_speech_prob[/temperature,engine for MLX]); passing
-    # it crashes. Log-and-skip when the dictionary has terms; Deepgram/the ws
-    # server still honour vocabulary bias.
+    # it crashes. Log-and-skip when the dictionary has terms. Only Deepgram
+    # honours vocabulary bias (keywords). The websocket/stt_server path does
+    # NOT: the runtime never forwards `vocabulary` to WebSocketSTTService, and
+    # the wire protocol's `update_session` carries no hotwords field — so the
+    # dictionary is silently ignored there too, same as Whisper.
     if vocabulary:
         logger.debug(
             f"Whisper: dictionary vocabulary bias ({len(vocabulary)} term(s)) is "
