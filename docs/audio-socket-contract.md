@@ -239,6 +239,15 @@ surviving child (the teardown does not give up just because the leader is gone).
 On platforms without process groups the teardown falls back to a single-PID
 signal.
 
+> **Residual race (accepted, same-UID; close in Phase 4).** The group is targeted
+> by the leader's PID (`os.killpg(pid, …)`). If, on the crash path, the leader is
+> reaped **and** every surviving group member also exits before a `killpg` fires,
+> the PGID is released and that PID can be recycled — so a late `SIGTERM`/`SIGKILL`
+> could land on an unrelated **same-user** process group. The window is sub-second
+> and same-UID only (no privilege crossing), and macOS lacks a race-free
+> `pidfd`-style handle. Phase 4 should narrow it — e.g. gate the final `SIGKILL`
+> sweep on a confirmed live group member, or use `pidfd_send_signal` on Linux.
+
 **Environment (deny-by-default allowlist).** The capturer is launched with an
 **explicit, allowlisted** environment — **not** a copy of the recorder's full
 env. It receives ONLY:
@@ -248,10 +257,15 @@ env. It receives ONLY:
   set); and
 - a fixed runtime/OS allowlist needed to launch a native macOS/Linux process:
   `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `USER`, `LOGNAME`, `LANG`, `SHELL`,
-  plus any present `LC_*` (locale) and `DYLD_*` / `__CF*` (macOS dynamic-loader)
-  vars — **except** the dylib-**injection** members `DYLD_INSERT_LIBRARIES` and
-  `DYLD_FORCE_FLAT_NAMESPACE`, which are denied even though the rest of the
-  `DYLD_*` family (framework/dylib resolution) is forwarded.
+  plus any present `LC_*` (locale) and `__CF*` (CoreFoundation) vars.
+
+The **entire `DYLD_*` family is excluded** — it is a dynamic-loader injection
+surface end to end: `DYLD_INSERT_LIBRARIES` (dylib injection),
+`DYLD_LIBRARY_PATH` / `DYLD_FRAMEWORK_PATH` / `DYLD_FALLBACK_*` (planted-dylib
+search-path redirection), `DYLD_PRINT_TO_FILE` (arbitrary file write), etc. A
+Phase-4 capturer that genuinely needs a specific `DYLD_*` var for framework
+resolution must add it **explicitly** to the allowlist in source (see the Phase-4
+limitation below) — it is never forwarded by default.
 
 STT / application **secrets are never forwarded** to the capturer — anything not
 on the allowlist (e.g. `DEEPGRAM_API_KEY`, any `*_API_KEY` / `*_TOKEN` /

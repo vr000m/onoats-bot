@@ -1017,8 +1017,10 @@ def test_capturer_env_allowlist_constant_excludes_secret_families():
     # Socket paths + nonce are set explicitly by the builder, not via the
     # passthrough tuple.
     assert "PATH" in cli._CAPTURER_ENV_POLICY.exact
-    # The dylib-injection DYLD members are explicitly denied even though the
-    # DYLD_* prefix family is otherwise forwarded for framework resolution.
+    # DYLD_* is not in the prefix allowlist at all (the whole family is an
+    # injection surface); the deny set is a defense-in-depth backstop in case a
+    # future edit re-adds a DYLD_/library prefix.
+    assert "DYLD_" not in cli._CAPTURER_ENV_POLICY.prefixes
     assert "DYLD_INSERT_LIBRARIES" in cli._CAPTURER_ENV_POLICY.deny
     assert "DYLD_FORCE_FLAT_NAMESPACE" in cli._CAPTURER_ENV_POLICY.deny
 
@@ -1027,15 +1029,18 @@ def test_build_capturer_env_unit_allowlist_deny_and_overrides():
     """Pure-function unit test for `_build_capturer_env` (no spawn).
 
     Exercises the allowlist directly against a synthetic env: allowlisted exact +
-    prefix vars pass through, secrets and the DYLD-injection denylist are dropped,
-    and the three socket/nonce vars are always set (overriding any inbound value).
+    prefix vars pass through, secrets and the WHOLE DYLD_* dynamic-loader family
+    are dropped, and the three socket/nonce vars are always set (overriding any
+    inbound value).
     """
     base = {
         "PATH": "/usr/bin",
         "LANG": "en_US.UTF-8",
-        "LC_CTYPE": "UTF-8",  # prefix family
-        "DYLD_FRAMEWORK_PATH": "/Frameworks",  # DYLD_* resolution → forwarded
-        "DYLD_INSERT_LIBRARIES": "/evil.dylib",  # injection → denied
+        "LC_CTYPE": "UTF-8",  # prefix family → forwarded
+        "DYLD_FRAMEWORK_PATH": "/Frameworks",  # loader search path → NOT forwarded
+        "DYLD_LIBRARY_PATH": "/evil",  # planted-dylib redirection → NOT forwarded
+        "DYLD_INSERT_LIBRARIES": "/evil.dylib",  # injection → NOT forwarded
+        "DYLD_PRINT_TO_FILE": "/tmp/x",  # arbitrary file write → NOT forwarded
         "DEEPGRAM_API_KEY": "secret",  # not allowlisted → dropped
         "ONOATS_MIC_SOCKET": "/stale/mic.sock",  # must be overridden
     }
@@ -1046,8 +1051,11 @@ def test_build_capturer_env_unit_allowlist_deny_and_overrides():
     assert env["PATH"] == "/usr/bin"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_CTYPE"] == "UTF-8"
-    assert env["DYLD_FRAMEWORK_PATH"] == "/Frameworks"
-    assert "DYLD_INSERT_LIBRARIES" not in env, "dylib-injection var must be denied"
+    # The ENTIRE DYLD_* family is a dynamic-loader injection surface — none of it
+    # is forwarded (a Phase-4 capturer needing a specific DYLD_* var adds it then).
+    assert not any(k.startswith("DYLD_") for k in env), (
+        "no DYLD_* var may reach the capturer — the whole family is injection-capable"
+    )
     assert "DEEPGRAM_API_KEY" not in env, "non-allowlisted secret must be dropped"
     # Socket/nonce always set explicitly, overriding any inbound value.
     assert env["ONOATS_MIC_SOCKET"] == "/run/mic.sock"

@@ -794,9 +794,19 @@ tests updated; suite 161 passed, ruff clean.
     capturer-death. (`551aab4`)
   - **I2 (env):** the capturer receives only `onoats.cli._CAPTURER_ENV_POLICY`'s
     allowlist (OS/runtime vars + socket/nonce) — never STT/application secrets, and
-    never the dylib-injection `DYLD_*` members. Deny-by-default: a new secret can't
-    leak by omission. (`fae0c6d`, `f4e29f9`)
+    never **any** `DYLD_*` var (the whole dynamic-loader family is an injection
+    surface; tightened from a deny-two list after the delta deep-review). Deny-by-default:
+    a new secret can't leak by omission. (`fae0c6d`, `f4e29f9`, env-policy delta)
   - **I3 (teardown):** after `_stop_capturer`, no process in the capturer's group
     survives — it is swept by leader PID (== PGID), on both the graceful and
     crash (leader-already-reaped) paths — so no helper/child can outlive the session
     holding the audio device. (`b739463`, `eceab13`)
+- **Phase-4 follow-up — capturer-teardown PID-reuse race (deferred, accepted).**
+  The group teardown targets `os.killpg(leader_pid, …)`. On the crash path, if the
+  leader is reaped and every surviving member exits before a `killpg`, the PGID can
+  be recycled and a late signal could hit an unrelated **same-UID** process group.
+  Sub-second, same-user, no privilege crossing; macOS has no race-free `pidfd`
+  handle. Surfaced by the delta deep-review (Logic + Security lenses). **Close in
+  Phase 4:** gate the final `SIGKILL` sweep on a confirmed-live group member, or use
+  `pidfd_send_signal` on Linux. Documented in `docs/audio-socket-contract.md`
+  (teardown section, "Residual race").

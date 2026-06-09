@@ -183,11 +183,20 @@ SYSTEM_SOCKET_NAME = "system.sock"
 # *_TOKEN / *_SECRET, STT_*) are NEVER forwarded. New secrets can't leak by
 # omission: anything not listed here is excluded by construction.
 #
-# Exact names pulled individually; prefix families (LC_*, DYLD_*, __CF*) matched
-# by iterating os.environ so locale + macOS dynamic-loader vars pass through only
-# when actually present. `exact`, `prefixes`, and `deny` are ONE policy — kept in
-# a single object so a future edit can't add a rule to the wrong tuple and
-# silently change what reaches the capturer.
+# Exact names pulled individually; prefix families (LC_*, __CF*) matched by
+# iterating os.environ so locale + CoreFoundation vars pass through only when
+# actually present. `exact`, `prefixes`, and `deny` are ONE policy — kept in a
+# single object so a future edit can't add a rule to the wrong tuple and silently
+# change what reaches the capturer.
+#
+# DYLD_* is deliberately NOT forwarded. The whole family is a dynamic-loader
+# injection surface: DYLD_INSERT_LIBRARIES (dylib injection), DYLD_LIBRARY_PATH /
+# DYLD_FRAMEWORK_PATH / DYLD_FALLBACK_* (planted-dylib search-path redirection),
+# DYLD_PRINT_TO_FILE (arbitrary file write), etc. A native capturer that genuinely
+# needs a specific DYLD_* var (framework resolution) must add it explicitly in
+# Phase 4 — see docs/audio-socket-contract.md. `deny` is a defense-in-depth
+# backstop: even if a future edit re-adds a DYLD_/library prefix, the classic
+# injection pair never forwards.
 class _CapturerEnvPolicy(NamedTuple):
     exact: tuple[str, ...]  # forwarded verbatim when present in the recorder env
     prefixes: tuple[str, ...]  # var-name prefixes whose whole family is forwarded
@@ -206,10 +215,7 @@ _CAPTURER_ENV_POLICY = _CapturerEnvPolicy(
         "LANG",
         "SHELL",
     ),
-    prefixes=("LC_", "DYLD_", "__CF"),
-    # DYLD_* is forwarded for framework/dylib RESOLUTION, but the dylib-INJECTION
-    # members are denied: forwarding them into a native child would reintroduce an
-    # injection channel in the very path whose job is to NOT forward sensitive env.
+    prefixes=("LC_", "__CF"),
     deny=frozenset({"DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE"}),
 )
 
