@@ -42,8 +42,17 @@ cask) is deferred until a paid ($99/yr) membership and is **out of scope here**.
 ## Requirements
 
 - **No BlackHole on the happy path.** A fresh macOS user records me+them system
-  audio with no virtual-audio driver installed, only the native capturer + granted
-  Screen Recording permission.
+  audio with no virtual-audio driver installed, only the native capturer + the
+  required permission grants.
+- **Two separate TCC grants — mic AND system audio.** Microphone capture (`me`)
+  and Core Audio system-audio capture (`them`) are **distinct macOS privacy paths**
+  (Apple's modern UI splits "System Audio Recording Only" / "Screen & System Audio
+  Recording" from "Microphone"). The bundle must declare **both**
+  `NSMicrophoneUsageDescription` (mic) and `NSAudioCaptureUsageDescription`
+  (system audio); a fresh machine can pass the system-audio prompt and still
+  silence the `me` branch if mic is denied. Both grants must be handled, both
+  denials must fail loud, and acceptance must confirm both. (The plan previously
+  said only "Screen Recording" — that label covers neither path precisely.)
 - **Same queue files, same tags.** The socket path must produce `me`/`them` queue
   files identical in tagging to the existing PortAudio path (the keystone never-mix
   invariant: mic ⇒ only `me`, system ⇒ only `them`). An **A/B parity check** (same
@@ -51,12 +60,15 @@ cask) is deferred until a paid ($99/yr) membership and is **out of scope here**.
   acceptance evidence.
 - **Stable TCC identity** *(assumption — verify first via the Phase 4 Pre-req
   spike).* The capturer/menu-bar bundle is signed with a stable self-signed
-  identity *on the premise that* this obtains and persists the Screen Recording
-  grant across rebuilds without re-prompt. This is an unverified Apple-platform
+  identity *on the premise that* this obtains and persists the mic + system-audio
+  TCC grants across rebuilds without re-prompt. This is an unverified Apple-platform
   behavior, not an in-repo fact — the Pre-req spike must confirm it before any
-  Swift is written. Ad-hoc signing (`codesign -s -`) is explicitly disallowed for
-  the shipped build target. The one-time self-signed-cert creation is **step 0** of
-  Phase 4, documented in `native/README.md` before the first `make sign`.
+  Swift is written. Persistence is keyed to the **designated requirement / bundle
+  identity**, **not** the cdhash (the cdhash changes every rebuild — that is
+  expected, not a failure). Ad-hoc signing (`codesign -s -`) is explicitly
+  disallowed for the shipped build target. The one-time self-signed-cert creation
+  is **step 0** of Phase 4, documented in `native/README.md` before the first
+  `make sign`.
 - **One native bundle.** The menu-bar `.app` is the single native artifact; the
   capturer is embedded at `Onoats.app/Contents/MacOS/onoats-capturer`. One bundle
   ID ⇒ one TCC identity. The Python wheel **never** bundles native code; it
@@ -85,27 +97,46 @@ cask) is deferred until a paid ($99/yr) membership and is **out of scope here**.
 > 14.4+.** The **Phase 4 Pre-req spike** (machine `sw_vers ≥ 14.4` + the
 > self-signed-cert/TCC verification) must pass before any Phase 4 Swift is written.
 
-### Phase 4 Pre-req: TCC/self-signed-cert spike + environment gate  *(do FIRST)*
+### Phase 4 Pre-req: blocking spikes (TCC + Core Audio tap) before any Phase 4 code  *(do FIRST)*
 
-**This is a verification spike, not coding — it de-risks the whole $0 path before
-any Swift is written.** The plan's premise that a *self-signed* cert obtains and
-*persists* a Screen Recording grant across rebuilds is an **unverified Apple-platform
-assumption** (see Open Questions / Assumptions), not an in-repo fact. Resolve it first:
+**These are verification spikes, not coding — they de-risk the whole $0 path AND
+the capture primitive before any production Swift is written.** Two premises are
+**unverified Apple-platform assumptions** (see Open Questions / Assumptions), not
+in-repo facts: (A) that a *self-signed* cert obtains and *persists* the mic +
+system-audio TCC grants across rebuilds, and (B) that the Core Audio tap recipe
+works on the target OS. Resolve **both** before Phase 4, gated:
 
-1. Confirm the target machine meets the OS floor: `sw_vers -productVersion` **≥ 14.4**
-   (Core Audio process-tap requirement). If below, Phase 4 is blocked — fall back to
+1. **OS floor.** Confirm `sw_vers -productVersion` **≥ 14.4** (Core Audio
+   process-tap requirement). If below, Phase 4 is blocked — fall back to
    ScreenCaptureKit (13+) or BlackHole.
-2. Create a stable self-signed **"Code Signing"** certificate in the login keychain
-   (Keychain Access → Certificate Assistant). Document the one-time step in
-   `native/README.md`. Record its designated requirement: `codesign -dvvv` on a
-   signed stub.
-3. Sign a minimal stub `.app` with it, grant Screen Recording once, then **rebuild +
-   re-sign 3×** and confirm macOS does **not** re-prompt and the grant persists
-   (compare `codesign -dvvv` designated requirement before/after — it must be byte-
-   stable; bundle ID + identity must not drift across `make app`).
-4. **If the grant cannot be obtained or does not persist under self-signed:** STOP —
-   the "no notarization / $0" conclusion (Open Question 2) is reopened and needs the
-   paid Developer ID path. Do not proceed to Phase 4 coding on a false premise.
+2. **Cert.** Create a stable self-signed **"Code Signing"** certificate in the login
+   keychain (Keychain Assistant). Document the one-time step in `native/README.md`.
+   Capture the **designated requirement** with `codesign -dr -` (NOT `-dvvv`, which
+   does not print the DR) on a signed stub; record the cdhash separately with
+   `codesign -dvvv`.
+3. **TCC persistence spike — on the FINAL launch topology, not a bare stub.** Build
+   the real bundle shape (`Onoats.app` with the helper embedded at
+   `Contents/MacOS/onoats-capturer`) and exercise the **actual supervisor exec path**
+   — the Python supervisor launching the embedded binary via `ONOATS_CAPTURER_BIN`,
+   not double-clicking the `.app`. Grant **both** mic and system-audio once, then
+   **rebuild + re-sign 3×** and confirm macOS does **not** re-prompt and both grants
+   persist. Compare `codesign -dr -` output **byte-for-byte** across rebuilds (it must
+   be stable; the cdhash will change — that is expected). Rationale: a binary launched
+   by the supervisor may be attributed to a different TCC identity than the GUI-launched
+   app — test the path you ship. (Cite Apple TN2206 on designated-requirement stability.)
+4. **Core Audio tap recipe spike — blocking, executable.** Prove the exact capture
+   primitive with a throwaway executable **before** Phase 4 coding: create the
+   process tap (empty process list + `isExclusive`), build the **private aggregate
+   device**, install an IOProc, and confirm a real system-audio stream arrives. Prove
+   **teardown leaves no residue**: `AudioDeviceStop` → destroy IOProc → destroy
+   aggregate → destroy tap on exit, then a **start/kill/start ×3** loop with no stale
+   aggregate/tap surviving and no exclusive-tap contention on relaunch. If the recipe
+   is wrong on this OS, Phase 4 must be built around a different primitive — find that
+   out now, not mid-implementation.
+5. **If grant cannot be obtained/persisted under self-signed (spike 3):** STOP — the
+   "no notarization / $0" conclusion (Open Question 2) is reopened and needs the paid
+   Developer ID path. **If the tap recipe fails (spike 4):** revisit Open Question 1.
+   Do not proceed to Phase 4 coding on a false premise.
 
 ### Phase 4: Swift system-audio capturer  *(macOS native; NOT conduct-runnable)*
 
@@ -117,12 +148,22 @@ assumption** (see Open Questions / Assumptions), not an in-repo fact. Resolve it
 - **System-audio API (Open Question 1 — RESOLVED 2026-06-09): Core Audio
   process-tap** (`AudioHardwareCreateProcessTap` / `CATapDescription`, macOS
   **14.4+**). ScreenCaptureKit (13+) is explicitly deferred — revisit only if a
-  13.x floor is later required. **Assumption (not in-repo-verified):** "tap all
-  processes via empty process list + `isExclusive`, feeding an aggregate device"
-  is the intended recipe — confirm against Apple's "Capturing system audio with
-  Core Audio taps" sample during the Phase-4 smoke (step 1).
+  13.x floor is later required. The "tap all processes via empty process list +
+  `isExclusive`, feeding a private aggregate device" recipe is **proven in Pre-req
+  spike 4 before this phase starts** (no longer deferred to the smoke).
 - Capture system output (Core Audio tap) **and** mic; resample each to **16 kHz
   PCM16 mono LE**.
+- **Aggregate/tap lifecycle invariant:** on every exit path (graceful and crash),
+  the capturer MUST `AudioDeviceStop` → destroy the IOProc → destroy the private
+  aggregate device → destroy the process tap, leaving **no stale Core Audio object**
+  that would cause exclusive-tap contention on the next launch. Use a uniquely-named
+  private aggregate UID so a leaked object is identifiable.
+- **Clock domains / timestamps:** mic and system tap may run in **different clock
+  domains**; resampling alone does not align them. Derive **one capturer-wide
+  monotonic mapping** (host-time → ns) and stamp `captured_monotonic_ns` from it for
+  both streams — not from unrelated per-callback times — so `me`/`them` drift is
+  measurable and bounded. Specify the host-time conversion and a resampler drift
+  budget; a long-running soak (OQ4 smoke) must bound drift over a realistic session.
 - **Wire format — emit JSON-object frames, NOT raw PCM** (per
   `docs/audio-socket-contract.md`): after the handshake line, each frame is a
   **4-byte big-endian length prefix** followed by a JSON object
@@ -138,6 +179,17 @@ assumption** (see Open Questions / Assumptions), not an in-repo fact. Resolve it
 - **Socket role:** the capturer is the **server** — it `bind()`+`listen()`s and
   **creates both socket files** (this is what unblocks the supervisor's bounded
   `_wait_for_sockets`). The recorder is the client.
+- **Startup barrier (both-connected before streaming):** socket-file existence is
+  NOT proof the recorder connected. The capturer MUST **accept both** connections
+  and **write both handshakes** before it starts *either* capture stream — otherwise
+  early audio is lost, the two streams offset, or one branch hits the read-idle
+  watchdog. If either socket misses a bounded startup deadline, fail **both** branches
+  loud.
+- **Write invariant (stream socket, not datagram):** a `SOCK_STREAM` write can be
+  partial. The capturer MUST treat each frame as a looped `writeAll` (full
+  prefix+payload or fail-loud exit), suppress `SIGPIPE` (handle `EPIPE` as a normal
+  terminal condition), and — if **one** branch's socket closes while the other is
+  still writable — tear down **both** branches cleanly (never half-stream).
 - **Handshake** (one line UTF-8 JSON + `\n`, before any frame):
   `{"rate":16000,"width":2,"channels":1,"v":WIRE_VERSION,"nonce":"<echoed>"}`. The
   capturer MUST **echo the `--nonce`/`ONOATS_CAPTURER_NONCE` value verbatim** in
@@ -148,8 +200,11 @@ assumption** (see Open Questions / Assumptions), not an in-repo fact. Resolve it
 - **Device-change survival (contract MUST):** the capturer MUST survive a
   default-input-device change mid-session (e.g. AirPods disconnect) and MUST NOT
   exit on a recoverable device change — keep streaming to the same sockets.
-- Screen Recording / audio-capture **permission handling** with a clear denial
-  message and non-hanging exit (so the supervisor rotates a partial session).
+- **Permission handling for BOTH grants** — mic (`NSMicrophoneUsageDescription`)
+  and system audio (`NSAudioCaptureUsageDescription`) are separate TCC services.
+  Each denial must produce a clear message and a non-hanging exit (so the supervisor
+  rotates a partial session). A mic denial silences `me`; a system-audio denial
+  silences `them` — handle and fail loud on **each** independently.
 - Sign the build output with the **stable self-signed cert** from the Pre-req spike
   (never ad-hoc).
 - **Manual macOS smoke checklist** (the Test slot for this phase):
@@ -165,18 +220,26 @@ assumption** (see Open Questions / Assumptions), not an in-repo fact. Resolve it
   4. **A/B check** — record the same source via PortAudio and socket paths; compare
      `me`/`them` **transcription quality** (not just tag parity) to also catch a
      resample bug (declared 16 kHz but feeding 48 kHz passes the handshake).
-  5. **Deny Screen Recording** → confirm the 4-part fail-loud observable:
+  5. **Deny system-audio grant** → confirm the 4-part fail-loud observable:
      `ErrorFrame` logged, supervisor exit code ≠ 0, WARNING/ERROR line, partial
      session rotated into `pending/`. No hang.
-  6. **Kill the capturer mid-session** → same 4-part observable; supervisor tears
+  6. **Deny mic grant** (separate TCC service) → `me` branch fails loud with the
+     same 4-part observable; no silent silenced-`me` session.
+  7. **Kill the capturer mid-session** → same 4-part observable; supervisor tears
      down the whole process group, partial session rotates.
-  7. **Default-device change mid-session** (disconnect AirPods) → capturer keeps
-     streaming, `me`/`them` timeline stays continuous, no exit.
-  8. **(OQ4)** drive under load and inspect `metadata["socket_seq"]` / drift to
-     inform the final backpressure policy.
-  9. **(OQ5)** listen for own-voice echo leaking into `them` (note: the A/B tag
-     check passes even if echo contaminates content — this listen-test is the only
-     content-correctness coverage for echo).
+  8. **Aggregate/tap residue** — start/kill/start ×3: confirm no stale private
+     aggregate device or process tap survives between runs and no exclusive-tap
+     contention on relaunch (the lifecycle invariant above).
+  9. **One-socket disconnect** — close one branch's socket mid-session: confirm the
+     capturer tears down **both** branches cleanly (no half-stream, no hang, EPIPE
+     handled).
+  10. **Default-device change mid-session** (disconnect AirPods) → capturer keeps
+      streaming, `me`/`them` timeline stays continuous, no exit.
+  11. **(OQ4)** long soak under load: inspect `metadata["socket_seq"]` and bound
+      `me`/`them` drift to inform the final backpressure policy.
+  12. **(OQ5)** listen for own-voice echo leaking into `them` (note: the A/B tag
+      check passes even if echo contaminates content — this listen-test is the only
+      content-correctness coverage for echo).
 
 ### Phase 5a: Python status file  *(pure Python; conduct-runnable)*
 
@@ -215,9 +278,14 @@ embeds the Phase-4 capturer at `Contents/MacOS/onoats-capturer`
 **Test files:** manual macOS smoke checklist (below)
 **Test command:** _n/a — manual macOS smoke checklist; not in Python CI_
 
-- Menu-bar app: Start / Stop / Flush (shell out to `onoats {bot,flush}` or signal
-  the pid), running indicator, **profiles** (device + STT config sets), device
-  pickers (reuse `onoats devices`).
+- Menu-bar app: Start / Stop / Flush, running indicator, **profiles** (device + STT
+  config sets), device pickers (reuse `onoats devices`).
+- **Stop MUST signal the recorder/supervisor, never the capturer directly.** Start
+  shells out to `onoats bot`; Stop sends `SIGTERM` to that `onoats` process (or
+  `onoats` stop path); Flush → `onoats flush`. Signaling the embedded capturer
+  directly would convert a graceful user-stop into the Milestone-A *fatal
+  capturer-death* path (mis-read as a crash) — the supervisor owns the capturer
+  lifecycle, so the GUI must go through it.
 - **Consumer:** reads the same status file defined in Phase 5a for its
   running/stopped indicator.
 - Package as the single notarization-ready `.app` bundle with the capturer
@@ -321,25 +389,35 @@ _(to be filled during implementation)_
 
 ## Acceptance Criteria
 
-- [ ] **Phase 4 Pre-req spike passed:** `sw_vers ≥ 14.4` confirmed; self-signed
-      cert obtains the Screen Recording grant and it survives 3 rebuilds without
-      re-prompt (`codesign -dvvv` designated requirement byte-stable). *(If failed,
-      Open Question 2 is reopened — paid Developer ID path.)*
+- [ ] **Pre-req spike 3 (TCC) passed:** `sw_vers ≥ 14.4`; self-signed cert obtains
+      **both** mic + system-audio grants and they survive 3 rebuilds without
+      re-prompt, **exercised on the real `.app`+embedded-helper+supervisor-exec path**
+      (`codesign -dr -` designated requirement byte-stable; cdhash expected to
+      change). *(If failed, Open Question 2 reopened — paid Developer ID path.)*
+- [ ] **Pre-req spike 4 (Core Audio tap) passed:** tap + private aggregate device
+      yields a real system-audio stream, and start/kill/start ×3 leaves no stale
+      aggregate/tap and no exclusive-tap contention.
 - [ ] Native capturer produces me+them socket streams with **no BlackHole
       installed**, emitting **JSON-object frames** (`seq`/`captured_monotonic_ns`/
-      `pcm_b64`) per the wire contract, echoing the supervisor nonce.
+      `pcm_b64`) per the wire contract, echoing the supervisor nonce, with a
+      capturer-wide monotonic timestamp source and bounded `me`/`them` drift over a soak.
 - [ ] **Keystone never-mix proven by the asymmetric routing test** (mic-only signal
       ⇒ `them` silent + `me` has it; inverted ⇒ vice-versa), not just tag parity.
+- [ ] Startup barrier: capturer accepts both connections + writes both handshakes
+      before streaming; bounded startup deadline fails both branches loud.
+- [ ] Write path survives partial writes / `EPIPE` (looped `writeAll`, `SIGPIPE`
+      suppressed); closing one branch tears down both cleanly.
 - [ ] Capturer survives a default-input-device change mid-session without exiting.
 - [ ] `onoats status` reads the status file with the pid backstop (4-cell truth
       table); recorder writes the file atomically on start/stop;
       `tests/test_status_file.py` green (incl. producer test); full suite green.
-- [ ] Menu-bar `.app` launches, embeds the capturer, tracks the status file,
-      Start/Stop/Flush work.
+- [ ] Menu-bar `.app` launches, embeds the capturer, tracks the status file;
+      Start/Stop/Flush work and **Stop signals the supervisor, never the capturer**.
 - [ ] BlackHole demoted to fallback in docs (kept for <14.4); `[macos]` extra
       points at the native build; min macOS version documented.
-- [ ] Deny-permission and capturer-crash paths show the 4-part fail-loud observable
-      (ErrorFrame + rc≠0 + WARNING/ERROR + `pending/` rotation), no hang.
+- [ ] **Both** mic-denial and system-audio-denial, plus capturer-crash, show the
+      4-part fail-loud observable (ErrorFrame + rc≠0 + WARNING/ERROR + `pending/`
+      rotation), no hang.
 
 ## Review Focus
 
@@ -350,10 +428,18 @@ _(to be filled during implementation)_
   `167-213`). This is the only thing protecting the pip/local-build decoupling.
 - **Status-file liveness backstop** — a stale status file must never report a dead
   recorder as live; the pid check must win (`cli.py:777-797`).
-- **TCC stability** — verify the build target uses the stable self-signed cert, not
-  ad-hoc, so the Screen Recording grant persists.
-- **Fail-loud teardown parity** with Milestone A's supervisor (denied permission /
-  crash / no device → rotate partial, no hang).
+- **TCC stability (two grants)** — verify the build target uses the stable
+  self-signed cert (not ad-hoc) and that **both** mic and system-audio grants
+  persist; persistence is keyed to the designated requirement (`codesign -dr -`),
+  not the cdhash.
+- **Process-boundary correctness** — startup barrier (accept-both before stream),
+  `writeAll`/`EPIPE`/`SIGPIPE` handling, one-socket-closes-tears-down-both, and
+  Core Audio aggregate/tap cleanup (no residue on relaunch). See AGENTS.md
+  "Reviewing a subprocess / process-boundary change".
+- **Menu-bar Stop routing** — GUI Stop must signal the supervisor (`onoats`), never
+  the embedded capturer, so a user-stop isn't mis-read as a capturer crash.
+- **Fail-loud teardown parity** with Milestone A's supervisor (each permission
+  denial / crash / no device → rotate partial, no hang).
 
 ## Open Questions
 
