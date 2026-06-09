@@ -1,6 +1,6 @@
 # Task: Socket Supervisor Hardening — Capturer Process-Group Teardown
 
-**Status**: Complete — implemented directly (not via /conduct) on `feat/socket-audio-transport-milestone-a`. All 3 phases shipped; full suite green (159 passed, +1 new I3 test); `ruff` clean. The new regression test was verified to FAIL against the pre-fix single-PID teardown.
+**Status**: Complete — implemented directly (not via /conduct) on `feat/socket-audio-transport-milestone-a`. Initial fix (commit `b739463`) covered the graceful-shutdown path. A review follow-up extended it to the **crash path**: `_stop_capturer` no longer early-returns when the leader is already reaped, and targets the group by leader PID (== PGID via `start_new_session`) instead of `os.getpgid` (which fails post-reap). Full suite green (161 passed; two I3 regression tests — graceful + crash); `ruff` clean. Both regression tests were verified to FAIL against the respective pre-fix teardown.
 **Component**: cli (socket supervisor)
 **Assigned to**: vr000m
 **Priority**: High (no-ship — blocks shipping socket-supervisor mode)
@@ -36,9 +36,11 @@ possible device lock).
   capturer's process group remains alive* — not just the direct child. Because the capturer is a
   group leader (`start_new_session=True`), its PGID equals its PID, so signalling the group via
   `os.killpg(pgid, …)` reaches every descendant.
-  **Evidence:** a regression test where a fake capturer spawns a long-lived child, run the
-  supervisor to clean shutdown, then assert the child PID is gone (`os.kill(pid, 0)` raises
-  `ProcessLookupError`).
+  **Evidence:** two regression tests where a fake capturer spawns a long-lived child, then
+  assert the child PID is gone after teardown (`os.kill(pid, 0)` raises `ProcessLookupError`) —
+  one on the graceful-shutdown path (leader alive at teardown), one on the crash path (leader
+  already reaped, so the group is swept by leader PID since the kernel keeps the PGID reserved
+  while the group is non-empty).
 
 ---
 

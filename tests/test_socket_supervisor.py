@@ -775,17 +775,84 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
 # ---------------------------------------------------------------------------
 
 
-def test_capturer_teardown_reaps_whole_process_group(
+def _read_recorded_child_pid(fake_capturer, timeout: float) -> int:
+    """Read the PID the fake capturer recorded for its spawned child.
+
+    The capturer writes ``<script>.child_pid`` at startup (before serving), so
+    by the time the supervisor returns the file exists — but poll briefly so the
+    test never races a slow filesystem flush.
+    """
+    import time
+
+    child_pid_file = Path(str(fake_capturer) + ".child_pid")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            text = child_pid_file.read_text().strip()
+        except OSError:
+            text = ""
+        if text:
+            return int(text)
+        time.sleep(0.05)
+    raise AssertionError(
+        f"fake capturer never recorded its child PID at {child_pid_file} — "
+        "spawn_child wiring broke"
+    )
+
+
+def _poll_pid_gone(pid: int, timeout: float) -> bool:
+    """True if ``pid`` is gone (or becomes gone) within ``timeout`` seconds."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            # Exists but not ours to signal — still "alive" for our purpose.
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def _assert_capturer_child_reaped(fake_capturer, *, rc_check) -> None:
+    """Shared body for the I3 regression tests.
+
+    Reads the child PID the fake capturer recorded, asserts it is gone after the
+    supervisor's teardown, and best-effort cleans it up so a regression does not
+    leak a stray ``sleep`` across the session.
+    """
+    child_pid: int | None = None
+    try:
+        rc = _run_supervisor_bounded()
+        rc_check(rc)
+        child_pid = _read_recorded_child_pid(fake_capturer, timeout=SUP_TIMEOUT)
+        assert _poll_pid_gone(child_pid, timeout=SUP_TIMEOUT), (
+            f"capturer child PID {child_pid} survived supervisor teardown — the "
+            "supervisor signalled only the leader PID, not the whole process "
+            "group; an orphaned capture path can outlive shutdown"
+        )
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def test_capturer_teardown_reaps_group_on_clean_shutdown(
     sup_env, monkeypatch, set_capturer_behaviour, fake_capturer
 ):
-    """Regression for invariant I3 (process-group teardown).
+    """Regression for invariant I3 (process-group teardown), graceful path.
 
     The fake capturer spawns a long-lived child (``sleep 3600``) that inherits
     the capturer's process group, and records the child PID. After a clean
     recorder shutdown (recorder finishes first, capturer still streaming), the
-    supervisor stops the capturer via ``_stop_capturer``. We then assert the
-    recorded child PID is GONE — proving the teardown signalled the whole group,
-    not just the leader.
+    supervisor stops the capturer via ``_stop_capturer``. The recorded child PID
+    must be GONE — proving the teardown signalled the whole group, not just the
+    leader.
 
     Without the fix (single-PID terminate/kill), the leader dies but the
     orphaned ``sleep`` child keeps running and this assertion fails.
@@ -813,48 +880,38 @@ def test_capturer_teardown_reaps_whole_process_group(
 
     monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
 
-    child_pid_file = Path(str(fake_capturer) + ".child_pid")
-    child_pid: int | None = None
-    try:
-        rc = _run_supervisor_bounded()
-
+    def _rc_check(rc: int) -> None:
         assert rc == 0, f"a graceful recorder shutdown must yield rc=0, got {rc}"
         assert state["frames_read"] > 0, "recorder read no frames from the capturer"
-        assert child_pid_file.exists(), (
-            "fake capturer did not record its child PID — spawn_child wiring broke"
-        )
-        child_pid = int(child_pid_file.read_text().strip())
 
-        # I3: the child (in the capturer's process group) must be gone. The
-        # supervisor's _stop_capturer awaits the leader's exit but the group
-        # children are reaped by init, so poll briefly for the PID to clear.
-        import time
+    _assert_capturer_child_reaped(fake_capturer, rc_check=_rc_check)
 
-        deadline = time.monotonic() + SUP_TIMEOUT
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                alive = False
-                break
-            except PermissionError:
-                # Exists but not ours to signal — still "alive" for our purpose.
-                pass
-            time.sleep(0.05)
-        assert not alive, (
-            f"capturer child PID {child_pid} survived supervisor teardown — the "
-            "supervisor signalled only the leader PID, not the whole process "
-            "group; an orphaned capture path can outlive shutdown"
-        )
-    finally:
-        # Best-effort cleanup so a regression (child survives) does not leak a
-        # stray `sleep` process across the test session.
-        if child_pid is not None:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+
+def test_capturer_teardown_reaps_group_on_crash(
+    sup_env, log_sink, monkeypatch, set_capturer_behaviour, fake_capturer
+):
+    """Regression for invariant I3 on the CRASH path.
+
+    Here the capturer LEADER exits on its own (crash behaviour: serve frames,
+    then die), so by the time ``_stop_capturer`` runs the leader is already
+    reaped (``returncode`` set). A teardown that early-returned on a reaped
+    leader — or that resolved the group via ``os.getpgid`` (which now fails) —
+    would never sweep the orphaned ``sleep`` child. The fix targets the group by
+    the leader PID (== PGID via ``start_new_session``), which the kernel keeps
+    reserved while the group is non-empty, so the child is still reaped.
+    """
+    _data_dir, pending_dir = sup_env
+    set_capturer_behaviour("crash", nframes=5, spawn_child=True)
+    # Drain must outlast the capturer's ~0.5s post-close exit so the supervisor
+    # observes capturer PROCESS death first and takes its crash branch — leaving
+    # _stop_capturer to run against an already-reaped leader.
+    _install_fake_recorder(monkeypatch, post_eof_drain=1.5)
+
+    def _rc_check(rc: int) -> None:
+        assert rc != 0, f"capturer crash must yield a NON-ZERO exit, got {rc}"
+        assert _pending_files(pending_dir), "crash must still rotate a partial session"
+
+    _assert_capturer_child_reaped(fake_capturer, rc_check=_rc_check)
 
 
 # ---------------------------------------------------------------------------

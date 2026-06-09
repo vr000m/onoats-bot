@@ -221,18 +221,23 @@ session/process group**, a terminal `Ctrl+C`/`SIGTERM` (delivered by the OS to
 the whole foreground process group) is **NOT relayed to the capturer**. The
 supervisor owns the capturer's lifecycle end to end: it stops the capturer
 **explicitly** (SIGTERM → bounded wait → SIGKILL, via `_stop_capturer`) **after
-the recorder finishes**, never via an inherited terminal signal.
+the recorder finishes**, never via an inherited terminal signal. This is what
+makes a graceful Ctrl+C a *recorder-finishes-first* event (rc=0) rather than a
+spurious *capturer-died-mid-session* event (rc=1): the recorder always wins the
+shutdown race because the OS cannot kill the capturer out from under it.
 
 **Process-group teardown.** Because the capturer is a process-group leader
-(`start_new_session=True`), `_stop_capturer` signals the **whole process group**
-(`os.killpg`), not just the leader PID — so any helper/child the capturer
-spawned (a wrapper script, a CoreAudio helper) is torn down with it. Signalling
-only the leader would orphan such a descendant, leaving it holding the audio
-device after the supervisor reports success and removes the socket dir. On
-platforms without process groups the teardown falls back to a single-PID signal. This is what makes a graceful Ctrl+C a *recorder-finishes-first*
-event (rc=0) rather than a spurious *capturer-died-mid-session* event (rc=1): the
-recorder always wins the shutdown race because the OS cannot kill the capturer
-out from under it.
+(`start_new_session=True`), its PGID equals its PID, and `_stop_capturer`
+signals the **whole process group** (`os.killpg` by that PID), not just the
+leader — so any helper/child the capturer spawned (a wrapper script, a CoreAudio
+helper) is torn down with it. Signalling only the leader would orphan such a
+descendant, leaving it holding the audio device after the supervisor reports
+success and removes the socket dir. This holds on the **crash path** too: even
+once the capturer leader has exited and been reaped, the kernel keeps the PGID
+reserved while the group is non-empty, so the group sweep still reaches a
+surviving child (the teardown does not give up just because the leader is gone).
+On platforms without process groups the teardown falls back to a single-PID
+signal.
 
 **Environment (deny-by-default allowlist).** The capturer is launched with an
 **explicit, allowlisted** environment — **not** a copy of the recorder's full

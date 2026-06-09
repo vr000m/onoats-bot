@@ -374,8 +374,9 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 # whole foreground process group, so without this it would hit
                 # BOTH onoats and the capturer. Terminal signals must NOT reach
                 # the capturer: the supervisor owns capturer teardown explicitly
-                # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the pid)
-                # AFTER the recorder finishes. This isolation is what makes the
+                # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the
+                # whole process group) AFTER the recorder finishes. This
+                # isolation is what makes the
                 # recorder-finishes-first branch in _run_recorder_with_capturer
                 # correct under Ctrl+C — without it, the capturer could win the
                 # race and a graceful shutdown would be mis-classified as
@@ -572,37 +573,39 @@ def _signal_capturer_group(capturer_proc, sig, logger) -> bool:
     """Send ``sig`` to the capturer's entire process group.
 
     The capturer is spawned with ``start_new_session=True`` (see
-    ``_supervise_socket_session``), so it is a session/process-group leader and
-    its PGID equals its PID. Signalling the group via ``os.killpg`` reaches any
-    helper/child the capturer spawned (a wrapper script, a CoreAudio helper) —
-    signalling only the parent PID would orphan those descendants while they
-    still hold the audio device, even though the supervisor reports success and
-    removes the socket dir.
+    ``_supervise_socket_session``), which makes it a session/process-group
+    leader, so its **PGID is equal to its PID by construction**. We target the
+    group by that PID rather than resolving it with ``os.getpgid``: once the
+    leader has been reaped (the crash path — asyncio sets ``returncode`` only
+    after reaping), ``os.getpgid`` raises ``ProcessLookupError`` even though the
+    group can still hold living children. The kernel keeps the PGID reserved
+    while the group is non-empty, so ``os.killpg(pid, …)`` still reaches those
+    children and we can sweep them.
 
-    Returns True if a signal was delivered, False if the group/process was
-    already gone. Falls back to a single-PID signal on platforms without
-    process groups (``os.getpgid``/``os.killpg`` unavailable, e.g. Windows).
+    Signalling only the lone PID would orphan any helper/child the capturer
+    spawned (a wrapper script, a CoreAudio helper) — leaving it holding the
+    audio device after the supervisor reports success and removes the socket
+    dir.
+
+    Returns True if a signal was delivered (group/process existed), False if it
+    was already gone. ``sig`` may be ``0`` to probe existence without delivering
+    a signal. Falls back to a single-PID signal on platforms without process
+    groups (``os.killpg`` unavailable, e.g. Windows).
     """
     pid = capturer_proc.pid
-    pgid = None
     try:
-        pgid = os.getpgid(pid)
+        os.killpg(pid, sig)
+        return True
     except ProcessLookupError:
         return False
-    except (AttributeError, OSError):
-        # No process-group support — fall through to the per-PID path.
-        pgid = None
-    if pgid is not None:
-        try:
-            os.killpg(pgid, sig)
-            return True
-        except ProcessLookupError:
-            return False
-        except (AttributeError, OSError) as exc:
-            logger.warning(
-                f"Socket supervisor: killpg({pgid}, {sig}) failed ({exc}); "
-                "falling back to single-process signal."
-            )
+    except AttributeError:
+        # No process-group support (e.g. Windows) — fall through to per-PID.
+        pass
+    except OSError as exc:
+        logger.warning(
+            f"Socket supervisor: killpg({pid}, {sig}) failed ({exc}); "
+            "falling back to single-process signal."
+        )
     try:
         os.kill(pid, sig)
         return True
@@ -611,28 +614,54 @@ def _signal_capturer_group(capturer_proc, sig, logger) -> bool:
 
 
 async def _stop_capturer(capturer_proc, logger) -> None:
-    """Stop the capturer's whole process group: SIGTERM, bounded wait, then
+    """Stop the capturer's whole process group: SIGTERM, bounded grace, then
     SIGKILL. Idempotent.
 
     Signals the process group rather than the lone capturer PID, so a
-    helper/child subprocess the capturer spawned cannot survive teardown while
-    still holding the audio device (see ``_signal_capturer_group``).
+    helper/child the capturer spawned cannot survive teardown holding the audio
+    device — including on the **crash path**, where the capturer *leader* has
+    already exited (``returncode`` set) but its children may still be alive.
+    See ``_signal_capturer_group``.
     """
     import asyncio
 
-    if capturer_proc.returncode is not None:
-        return
+    leader_alive = capturer_proc.returncode is None
+    # SIGTERM the whole group. If nothing in the group is left, we're done.
     if not _signal_capturer_group(capturer_proc, signal.SIGTERM, logger):
         return
+
+    # Give the group a bounded grace to exit on SIGTERM. When the leader is
+    # still alive we await it directly. When it has already been reaped (crash
+    # path) we cannot await it, so we poll the group with signal 0 until it
+    # drains or the grace elapses.
+    drained = False
     try:
-        await asyncio.wait_for(capturer_proc.wait(), timeout=_CAPTURER_TERM_GRACE_SEC)
+        if leader_alive:
+            await asyncio.wait_for(
+                capturer_proc.wait(), timeout=_CAPTURER_TERM_GRACE_SEC
+            )
+            drained = True
+        else:
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + _CAPTURER_TERM_GRACE_SEC
+            while loop.time() < deadline:
+                if not _signal_capturer_group(capturer_proc, 0, logger):
+                    drained = True
+                    break
+                await asyncio.sleep(0.05)
     except asyncio.TimeoutError:
+        pass
+    if drained:
+        return
+
+    # Stragglers remain (a live leader that ignored SIGTERM, or orphaned
+    # children of a dead leader) — SIGKILL the whole group.
+    if _signal_capturer_group(capturer_proc, signal.SIGKILL, logger):
         logger.warning(
-            "Socket supervisor: capturer did not exit on SIGTERM within "
-            f"{_CAPTURER_TERM_GRACE_SEC}s — sending SIGKILL to the process group."
+            "Socket supervisor: capturer process group did not exit on SIGTERM "
+            f"within {_CAPTURER_TERM_GRACE_SEC}s — sent SIGKILL to the group."
         )
-        if not _signal_capturer_group(capturer_proc, signal.SIGKILL, logger):
-            return
+    if leader_alive:
         try:
             await capturer_proc.wait()
         except ProcessLookupError:
