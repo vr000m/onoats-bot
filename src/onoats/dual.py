@@ -580,19 +580,27 @@ async def run_onoats_dual(
     ended_by_error = False
     try:
         await runner.run(task)
-        # runner.run returned. If nobody requested shutdown (no Ctrl+C / SIGINT
-        # set shutdown_event), the pipeline ended on its own. This is keyed on the
-        # load-bearing invariant that **the only self-end path for this recorder
-        # is a fatal ErrorFrame** cancelling the task (a capture branch hit EOF /
-        # read-idle / a framing or pump failure and surfaced one): there is no
-        # EndFrame source other than shutdown, so "ended without a shutdown
-        # request" is exactly "ended on a fatal error". Report it as a failure so
-        # a supervisor can honour the fail-loud contract, even when the capturer
-        # process is still alive.
-        #
-        # (pipecat 1.3.0 exposes no on_pipeline_error event or PipelineTask
-        # observer hook to read the ErrorFrame directly; if a future version adds
-        # one, switch to observing the fatal frame and drop this inference.)
+        # runner.run returned. runner.run returns on ANY terminal state: a
+        # graceful EndFrame, a StopFrame, or a CancelFrame (the fatal-error path).
+        # We report a failure when the task ended WITHOUT a shutdown request,
+        # which is keyed on the load-bearing invariant that — for this recorder's
+        # pipeline composition — the only such self-end is a fatal ErrorFrame
+        # cancelling the task (a capture branch hit EOF / read-idle / a framing or
+        # pump failure and surfaced one). The invariant rests on three concrete
+        # guarantees, all of which must hold:
+        #   1. the ONLY EndFrame queued into this task is task.stop_when_done() in
+        #      runtime.stop_pipeline_for_shutdown, which runs only from
+        #      _shutdown_watcher (gated on shutdown_event) — so an EndFrame end
+        #      always has shutdown_event set;
+        #   2. idle_timeout_secs=None (above) disables the idle self-end;
+        #   3. no processor in the dual pipeline emits an EndFrame/StopFrame, and a
+        #      socket failure surfaces a CancelFrame (fatal ErrorFrame), not an
+        #      EndFrame.
+        # If a future processor pushes its own EndFrame/StopFrame outside the
+        # shutdown path, this inference breaks — revisit it then. pipecat 1.3.0
+        # exposes no on_pipeline_error event or PipelineTask observer hook to read
+        # the fatal ErrorFrame directly; if a future version adds one, switch to
+        # observing the frame and drop this inference.
         if not shutdown_event.is_set():
             ended_by_error = True
             logger.error(
