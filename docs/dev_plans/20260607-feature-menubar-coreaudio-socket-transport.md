@@ -278,7 +278,6 @@ audio **without** a virtual device, removing that setup step and failure class.
 - **Create the `src/onoats/transports/` package** (new `__init__.py`) and check
   `tests/test_package_layout.py` doesn't need updating in the same commit (it
   enumerates packages) so the Phase-1 boundary stays green.
-- **Create the `src/onoats/transports/` package** (above) before the transport.
 - Subclass `BaseInputTransport`. **Override `async start(self, frame)`** (the
   verified reference hook — see "The pipecat transport seam" above, *not*
   `start_audio_in_streaming`), in this **order** (the order is load-bearing):
@@ -535,8 +534,12 @@ input_device_index=…))`): branch on `AUDIO_SOURCE`, construct two
   `{"rate":16000,"width":2,"channels":1,"v":1,"nonce":…}` lets the transport
   validate/negotiate format and carry the generation nonce before the stream —
   recommended for forward-compat, decide in review.
-- Each frame carries the capturer's **monotonic sequence number** so drops are
-  observable and `me`/`them` drift is measurable.
+- Each frame carries explicit timing metadata in the length-prefixed payload:
+  `seq` (monotonic per stream), `captured_monotonic_ns`, and `pcm` bytes. The
+  transport copies these into `InputAudioRawFrame.metadata` (and sets `pts` from
+  `captured_monotonic_ns` if downstream processors use Pipecat PTS), so drops are
+  observable and `me`/`them` drift is measurable after the Pipecat frame is
+  created.
 - Backpressure: bounded buffer; **default** policy drop-oldest with a logged
   WARNING that includes queue depth (audio realtime > completeness). **Keep the
   policy configurable, not frozen** — drop-oldest vs drop-newest vs bounded-block
@@ -640,4 +643,4 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ 92bfac4ad2c25b1b6119680350bbda9b2d1216bd -->
+<!-- reviewed: 2026-06-08 @ eeb13fe39cab08b25f10e4e3bb83569661e48393 -->
