@@ -14,3 +14,4 @@ dist/
 .conduct/
 *.db
 secrets.env
+.deep-review/

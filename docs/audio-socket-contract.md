@@ -203,6 +203,27 @@ The capturer (Phase 4, not yet built) MUST: create both sockets, accept one
 connection each, write the v1 handshake (echoing the nonce), then stream
 length-prefixed v1 frames per branch.
 
+### Default-device changes (Phase 4 capturer requirement)
+
+The capturer MUST survive a **default-input-device change** mid-session — e.g. the
+user's AirPods disconnect and macOS switches the default input to the built-in
+mic — by **re-binding to the new default device and continuing to stream to the
+same sockets**. It MUST NOT exit on a recoverable device change.
+
+This is deliberately the capturer's job, not the supervisor's: the recorder/
+transport only ever see bytes on a socket and cannot distinguish a device switch
+from any other gap. Handling it in the capturer keeps the session continuous and
+the `me`/`them` timeline intact.
+
+Conversely, any capturer exit **before** the recorder ends is treated as
+fail-loud by the supervisor **regardless of exit code** (even `rc=0`): the
+supervisor outlives the capturer by design, so a capturer-initiated exit means
+the audio stream stopped mid-session and the recording is truncated. A deliberate
+"clean stop" signal (e.g. a capturer `rc=0` that the supervisor would honour as
+success) is **reserved for a future capturer exit-code contract** — adopting it
+would also require redefining the transport's EOF-is-fatal rule, so it is out of
+scope for v1.
+
 ## Fail-loud observable (acceptance shape)
 
 For every failure path — capturer crash, permission denied, slow/silent reader —
@@ -215,6 +236,11 @@ the contract requires all of:
    existing `flush_and_rotate` shutdown path) — **no hang**.
 
 ## Constants (mirror of `socket_audio.py`)
+
+> **Parity is enforced.** `tests/test_audio_socket_contract_parity.py` parses the
+> table below and asserts each value equals the live `socket_audio.py` constant.
+> A `WIRE_VERSION` / constant bump that updates only the code (or only this doc)
+> fails CI — change both together.
 
 | Constant                  | Value     |
 |---------------------------|-----------|

@@ -44,7 +44,12 @@ onoats status       # recorder pid / running state + data dir
 | Local STT over TCP (stt_server)   | ✅ baseline                  | ✅ baseline        |
 | Local Whisper-MLX (on-device)     | —                           | ✅ `[macos]` extra |
 | Kokoro TTS                        | —                           | ✅ `[macos]` extra |
-| System loopback (BlackHole/etc.)  | driver-dependent            | BlackHole         |
+| System loopback (BlackHole/etc.)  | driver-dependent            | BlackHole ⁺       |
+
+⁺ A native socket-audio capture path (`AUDIO_SOURCE=socket`) is in development and
+will retire the BlackHole loopback story on macOS once the native capturer ships
+(see [Audio source](#audio-source-experimental) below and
+[`docs/audio-socket-contract.md`](docs/audio-socket-contract.md)).
 
 The baseline ships **MLX-free**: `mlx-whisper` is only in the `[macos]` extra
 and its imports are lazy, so `onoats bot` runs off-mac with PortAudio plus
@@ -69,6 +74,34 @@ key) — notably the shutdown timers: on Ctrl+C the recorder drains the pipeline
 (up to `SHUTDOWN_DRAIN_TIMEOUT_SEC`, default `8.0`) so a final in-flight
 transcript lands before the flush, then hard-cancels (capped at
 `SHUTDOWN_CANCEL_TIMEOUT_SEC`, default `2.0`) if the drain stalls.
+
+### Audio source (experimental)
+
+By default onoats captures audio through **PortAudio** (`AUDIO_SOURCE=portaudio`).
+An experimental **socket** source (`AUDIO_SOURCE=socket`) reads framed PCM16 from
+two per-branch unix sockets (mic → `me`, system → `them`) written by an external
+native capturer, instead of enumerating PortAudio devices. Select it via env
+`AUDIO_SOURCE` or `config.toml`:
+
+```toml
+[audio]
+source = "socket"                 # "portaudio" (default) | "socket"
+mic_socket = "~/onoats/mic.sock"      # or env ONOATS_MIC_SOCKET
+system_socket = "~/onoats/system.sock"  # or env ONOATS_SYSTEM_SOCKET
+capturer_nonce = ""                # or env ONOATS_CAPTURER_NONCE (usually supervisor-set)
+```
+
+When `AUDIO_SOURCE=socket`, `onoats bot` runs a supervisor that mints a private
+socket directory + generation nonce and spawns the capturer named by
+`ONOATS_CAPTURER_BIN`. The capturer↔recorder wire format (framing, handshake,
+endianness, backpressure, versioning) is pinned in
+[`docs/audio-socket-contract.md`](docs/audio-socket-contract.md).
+
+> **Status:** the Python transport, supervisor, and wire contract are in place,
+> but the native capturer (`ONOATS_CAPTURER_BIN`) is not yet shipped — so
+> `AUDIO_SOURCE=socket` is **not runnable end-to-end yet**. Leave the default
+> `portaudio` source unless you are wiring up your own capturer against the
+> contract.
 
 ### Data location
 
