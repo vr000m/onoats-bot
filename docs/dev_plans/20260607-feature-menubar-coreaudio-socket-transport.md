@@ -662,7 +662,7 @@ frozen queue-contract value koda's classifier keys on).
 ## Progress
 
 Milestone A (Phases 1–3) implemented via `/skein:conduct` on branch
-`feat/socket-audio-transport-milestone-a` (2026-06-08). Full suite 144 passed,
+`feat/socket-audio-transport-milestone-a` (2026-06-08). Full suite 153 passed,
 ruff clean. Phases 4–6 (native macOS) deliberately not started — they can't run
 in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 
@@ -691,6 +691,21 @@ failure paths: `0df1aa6` (transport failures are now fatal so the recorder
 actually ends), `9f848d5` (controlled recorder-launch failures map to a clean
 `rc=1`), and `f4ca89e` (`~` is expanded in socket paths before they reach the
 transport).
+
+Deep-review hardening + experimental docs: `e8c7d0e` adds a total-byte staging
+cap (`max_buffered_bytes`, 16 MiB) alongside the frame-count cap so a few maximal
+frames can't blow memory past count × 1 MiB; bounds the BLOCK backpressure path
+by the read-idle watchdog (a stalled *consumer* now surfaces a fatal
+`_ConsumerStallTimeout` instead of parking the reader forever); makes the staging
+pump fail loud on a `push_audio_frame` exception; and shares recorder-arg handling
+between `dual.main` and the socket supervisor via `dual._apply_recorder_args` so
+interactive/category handling can't drift (errors now go to stderr). `bc545ef`
+documents `AUDIO_SOURCE` (README "Audio source (experimental)" section, marked
+**not runnable end-to-end** until the Phase-4 capturer ships — the default stays
+`portaudio` and BlackHole is untouched), adds `AGENTS.md`, pins the Phase-4
+capturer device-change + capturer-exit-before-recorder contract in
+`docs/audio-socket-contract.md`, and adds a parity test asserting the contract
+constants table mirrors `socket_audio.py`.
 
 ## Findings
 
