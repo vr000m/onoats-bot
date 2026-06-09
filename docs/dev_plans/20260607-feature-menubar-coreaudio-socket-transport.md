@@ -1,12 +1,12 @@
 # Task: macOS Menu-bar Launcher + CoreAudio Socket Audio Transport (retire BlackHole)
 
-**Status**: Milestone A (Phases 1–3) shipped (PR #4 merged); Milestone B (Phases 4–6) not started
+**Status**: Milestone A (Phases 1–3 + post-adversarial-review hardening) on **open** PR #4, pending merge; Milestone B (Phases 4–6) not started
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
 **Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); Milestone B TBD
 **Created**: 2026-06-07
-**Completed**: Milestone A 2026-06-08 (Phases 1–3); Milestone B pending (native, macOS-only)
+**Completed**: Milestone A core 2026-06-08 (Phases 1–3); post-adversarial-review supervisor hardening 2026-06-09; Milestone B pending (native, macOS-only)
 
 > **Provenance.** This work was scoped out of koda's recorder-extraction plan
 > (`koda-pipecat: docs/dev_plans/20260606-refactor-extract-onoats-recorder.md`,
@@ -657,7 +657,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ 2d84b130fb24d8d3beded40aeac5b2711880a66f -->
+<!-- reviewed: 2026-06-08 @ 6354758fa66863c876fc29606eca82fbda4bb6e5 -->
 
 ## Progress
 
@@ -738,6 +738,36 @@ both queues end-to-end (~2× worst case; base-queue bytes bounded by count × th
 without the gate and pass with it (DROP keeps both queues ≤ cap; BLOCK surfaces the
 fatal consumer-stall through the real pump). Contract doc + `AGENTS.md` updated.
 
+Adversarial-review continuation 2 (Codex, capturer-supervisor hardening —
+2026-06-09): a second full-branch adversarial pass found three pre-ship defects
+in the supervisor that spawns/owns the native capturer. All three are folded in
+here (originally drafted as two now-removed sibling fix-plans;
+git history carries the per-phase detail). **(1) Signal isolation** — `551aab4`:
+the capturer was spawned without session isolation, so a terminal Ctrl+C/SIGTERM
+reached it via the foreground process group; if it exited first,
+`_run_recorder_with_capturer` mis-classified a *graceful* shutdown as fail-loud
+capturer-death (force-cancel drain, `rc=1`). Now spawned with
+`start_new_session=True`. **(2) Env allowlist** — `fae0c6d` + `f4e29f9`: the
+capturer env was `dict(os.environ)`, forwarding STT secrets (`DEEPGRAM_API_KEY`,
+`*_API_KEY`/`*_TOKEN`/`*_SECRET`, `STT_*`) into a native child that needs none;
+replaced with a deny-by-default `_CAPTURER_ENV_POLICY` (exact/prefixes/deny) that
+forwards only an OS/runtime allowlist + the socket/nonce vars, and additionally
+denies the dylib-**injection** vars `DYLD_INSERT_LIBRARIES` /
+`DYLD_FORCE_FLAT_NAMESPACE` while still forwarding the rest of `DYLD_*` for
+framework resolution. **(3) Process-group teardown** — `b739463` (graceful) +
+`eceab13` (crash): `_stop_capturer` signalled only the leader PID, so a
+helper/child the capturer spawns inside the isolated group could survive teardown
+holding the audio device; it now sweeps the whole group by leader PID (== PGID,
+single-PID fallback) on both the graceful and crash (leader-already-reaped)
+paths. Each invariant has a regression test confirmed to fail against the
+pre-fix code (signal: spawn-kwarg + `rc=0`; env: planted secrets stripped, `PATH`
+survives, DYLD-injection denied, plus a pure-function `_build_capturer_env` unit
+test; teardown: two I3 tests where the fake capturer spawns a long-lived child,
+asserting it is gone after teardown on both paths). The deep-review pass on this
+work surfaced no Critical/logic defects; its Architecture/Security findings (DYLD
+denial, single-policy object, unit test) landed in `f4e29f9`. Contract doc +
+tests updated; suite 161 passed, ruff clean.
+
 ## Findings
 
 - **`AUDIO_SOURCE=socket` is seam-complete but NOT user-runnable until Phase 4.**
@@ -755,3 +785,18 @@ fatal consumer-stall through the real pump). Contract doc + `AGENTS.md` updated.
   recorder for `run_onoats_dual` (the real one needs the MLX STT stack, not CI-viable).
   They prove the *supervisor* contract (exit code, rotation, fresh dir, nonce reject);
   the `ErrorFrame`-on-EOF/idle behaviour itself is covered at the transport layer (Phase 1).
+- **Capturer-supervisor hardening invariants (post-adversarial-review, 2026-06-09).**
+  Three invariants now guard the capturer's process boundary, each with a
+  fail-against-pre-fix regression test:
+  - **I1 (signal):** a terminal SIGINT/SIGTERM is never OS-delivered to the capturer
+    (it runs in its own session via `start_new_session=True`); the supervisor stops it
+    explicitly. A graceful recorder shutdown is therefore never mis-read as
+    capturer-death. (`551aab4`)
+  - **I2 (env):** the capturer receives only `onoats.cli._CAPTURER_ENV_POLICY`'s
+    allowlist (OS/runtime vars + socket/nonce) — never STT/application secrets, and
+    never the dylib-injection `DYLD_*` members. Deny-by-default: a new secret can't
+    leak by omission. (`fae0c6d`, `f4e29f9`)
+  - **I3 (teardown):** after `_stop_capturer`, no process in the capturer's group
+    survives — it is swept by leader PID (== PGID), on both the graceful and
+    crash (leader-already-reaped) paths — so no helper/child can outlive the session
+    holding the audio device. (`b739463`, `eceab13`)
