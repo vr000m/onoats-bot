@@ -396,16 +396,30 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     )
 
     if recorder_task in done:
-        # Normal shutdown / EndFrame (or recorder raised). Surface any exception
-        # by re-awaiting; the caller maps SttPreflightError to rc=1.
+        # The recorder coroutine finished. Re-await to surface any exception
+        # (the caller maps SttPreflightError to rc=1), then honour its return
+        # code: run_onoats_dual returns non-zero when the pipeline ended via a
+        # fatal ErrorFrame (e.g. a silent/dead capturer tripped the read-idle
+        # watchdog) rather than a clean shutdown. That must propagate as a
+        # non-zero supervisor exit per the fail-loud contract — the capturer
+        # process is still alive (capturer_task pending), so we cannot infer
+        # success from "recorder finished first".
         capturer_task.cancel()
         try:
             await capturer_task
         except (asyncio.CancelledError, ProcessLookupError):
             pass
-        recorder_task.result()  # re-raise if the recorder failed
-        logger.info("Socket supervisor: recorder exited; stopping capturer")
-        return 0
+        rc = recorder_task.result()  # re-raise if the recorder failed
+        rc = rc if rc is not None else 0
+        if rc != 0:
+            logger.error(
+                f"Socket supervisor: recorder exited non-zero (rc={rc}) — a "
+                "capture branch surfaced a fatal ErrorFrame (silent/failed "
+                "capturer); stopping capturer and exiting non-zero."
+            )
+        else:
+            logger.info("Socket supervisor: recorder exited; stopping capturer")
+        return rc
 
     # Capturer finished first → it died mid-session. The recorder's own
     # ErrorFrame path is draining (flush + rotate). Give it a bounded grace, then

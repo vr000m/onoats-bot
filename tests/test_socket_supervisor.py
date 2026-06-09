@@ -309,6 +309,10 @@ def _install_fake_recorder(
                 "fake recorder: branch ended (capturer death / idle); "
                 "rotated partial session into pending/"
             )
+        # This fake only ever ends via a branch error (EOF / read-idle), never a
+        # clean shutdown — so it mirrors the real run_onoats_dual's non-zero
+        # return for an ErrorFrame-terminated pipeline.
+        return 1
 
     monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
     return state
@@ -528,7 +532,9 @@ def test_hung_but_alive_does_not_hang_and_rotates(sup_env, log_sink, monkeypatch
     ALIVE, this exercises the recorder-finishes-first teardown branch: the
     supervisor must still return promptly (bounded join), stop the capturer, and
     leave the rotated session in pending/. Critically, the test proves the
-    session ends rather than waiting forever for an EOF that never comes.
+    session ends rather than waiting forever for an EOF that never comes — AND
+    that a silent/failed capturer fails loud (non-zero exit), not silently
+    succeeds, even though the capturer process is still alive.
     """
     _data_dir, pending_dir = sup_env
     monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "silent")
@@ -538,12 +544,13 @@ def test_hung_but_alive_does_not_hang_and_rotates(sup_env, log_sink, monkeypatch
 
     rc = _run_supervisor_bounded()
 
-    # The recorder ended first (idle), so the supervisor treats this as a normal
-    # recorder exit (rc=0): the no-hang + rotation guarantees are what the
-    # hung-but-alive criterion actually protects.
-    assert rc == 0, (
-        "a silent capturer that the recorder's idle-watchdog ends is a normal "
-        f"recorder exit; expected rc=0, got {rc}"
+    # The recorder ended first (idle) via a fatal ErrorFrame, NOT a clean
+    # shutdown — the fail-loud contract requires a non-zero supervisor exit even
+    # though the capturer process is still alive (the recorder-finishes-first
+    # branch must honour the recorder's non-zero rc, not assume success).
+    assert rc != 0, (
+        "a silent capturer that trips the recorder's idle-watchdog is a FAILURE, "
+        f"not a clean exit; expected non-zero rc, got {rc}"
     )
     assert _pending_files(pending_dir), (
         "the idle-ended session must still rotate into pending/ "

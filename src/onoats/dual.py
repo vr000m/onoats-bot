@@ -313,7 +313,7 @@ def _build_socket_transports(cfg):
 
 async def run_onoats_dual(
     *, live_terminal: bool = False, locked_category: str | None = None
-) -> None:
+) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
@@ -559,10 +559,25 @@ async def run_onoats_dual(
         f"{BOT_NAME} dual-input is listening. "
         "Ctrl+T = flush transcript. Ctrl+C = quit. Ctrl+C twice = force quit."
     )
+    ended_by_error = False
     try:
         await runner.run(task)
+        # runner.run returned. If nobody requested shutdown (no Ctrl+C / SIGINT
+        # set shutdown_event), the pipeline ended on its own — for this recorder
+        # the only such path is a fatal ErrorFrame cancelling the task (e.g. a
+        # socket branch hit EOF / read-idle and surfaced an ErrorFrame). Report
+        # that as a failure so a supervisor can honour the fail-loud contract,
+        # even when the capturer process is still alive.
+        if not shutdown_event.is_set():
+            ended_by_error = True
+            logger.error(
+                "Dual pipeline ended without a shutdown request — a capture "
+                "branch surfaced a fatal ErrorFrame (e.g. capturer EOF / "
+                "read-idle). Reporting non-zero exit."
+            )
     finally:
         await _on_shutdown()
+    return 1 if ended_by_error else 0
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -617,7 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}")
             return 1
     try:
-        asyncio.run(
+        rc = asyncio.run(
             run_onoats_dual(
                 live_terminal=args.live_terminal, locked_category=args.category
             )
@@ -625,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
     except SttPreflightError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
