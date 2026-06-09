@@ -336,12 +336,15 @@ async def run_onoats_dual(
     # branch MUST short-circuit PortAudio device resolution entirely — it must
     # neither import nor invoke the PyAudio device-enumeration path
     # (select_dual_input_devices), or socket mode would still touch PortAudio.
+    # The last two tuple elements are the source-appropriate input identifier
+    # for the startup banner: a PortAudio device index in portaudio mode, a
+    # resolved socket path in socket mode. Name them source-neutrally here.
     if audio_source == "socket":
-        mic_transport, system_transport, mic_dev, system_dev = _build_socket_transports(
-            cfg
+        mic_transport, system_transport, mic_input_label, system_input_label = (
+            _build_socket_transports(cfg)
         )
     elif audio_source == "portaudio":
-        mic_transport, system_transport, mic_dev, system_dev = (
+        mic_transport, system_transport, mic_input_label, system_input_label = (
             _build_portaudio_transports(cfg)
         )
     else:
@@ -542,8 +545,8 @@ async def run_onoats_dual(
     logger.info(f"  Data dir:         {data_dir}")
     logger.info(f"  STT:              {stt_banner()}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
-    logger.info(f"  Mic input:        {mic_dev}")
-    logger.info(f"  System input:     {system_dev}")
+    logger.info(f"  Mic input:        {mic_input_label}")
+    logger.info(f"  System input:     {system_input_label}")
     if live_terminal:
         logger.info("  Live terminal:    enabled")
 

@@ -321,6 +321,29 @@ def test_pcm16_le_round_trip():
     assert samples_from_pcm(pcm) == samples
 
 
+def test_decode_frame_accepts_whole_sample_pcm(path):
+    """A PCM payload that is a whole number of PCM16 samples decodes cleanly."""
+    transport = _make_transport(path)
+    # _decode_frame takes the inner JSON payload; make_frame prefixes a 4-byte
+    # length, so strip it.
+    frame = transport._decode_frame(make_frame(7, pcm_from_samples([1, -2, 3]))[4:])
+    assert isinstance(frame, InputAudioRawFrame)
+    assert samples_from_pcm(frame.audio) == [1, -2, 3]
+    assert frame.metadata["socket_seq"] == 7
+
+
+def test_decode_frame_rejects_odd_byte_pcm_as_desync(path):
+    """An odd PCM16 byte count would misalign every following sample.
+
+    The transport treats it as a framing/desync signal (``SocketHandshakeError``),
+    not as audio to coerce — guarding speaker-attribution integrity downstream.
+    """
+    transport = _make_transport(path)
+    # 3 bytes is not a multiple of width*channels (2*1) for PCM16 mono.
+    with pytest.raises(SocketHandshakeError):
+        transport._decode_frame(make_frame(1, b"\x01\x00\x02")[4:])
+
+
 # ---------------------------------------------------------------------------
 # Integration: frames surface through the base with correct format
 # ---------------------------------------------------------------------------

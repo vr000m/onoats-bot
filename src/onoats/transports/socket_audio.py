@@ -247,6 +247,9 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         self._expected_nonce = expected_nonce
 
         self._expected_rate = params.audio_in_sample_rate or DEFAULT_SAMPLE_RATE
+        # Width is pinned to PCM16: the handshake validates width == 2 and refuses
+        # to start otherwise, so there is no TransportParams field that can make
+        # this diverge from the wire format today.
         self._expected_width = DEFAULT_SAMPLE_WIDTH
         self._expected_channels = params.audio_in_channels
 
@@ -462,6 +465,16 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         ) as exc:
             raise SocketHandshakeError(f"malformed frame payload: {exc}") from exc
 
+        # A PCM payload must be a whole number of samples for every channel;
+        # an odd byte count (PCM16) would silently misalign every following
+        # sample. Treat it as a framing/desync signal, not as audio to coerce.
+        bytes_per_sample_frame = self._expected_width * self._expected_channels
+        if bytes_per_sample_frame and len(pcm) % bytes_per_sample_frame != 0:
+            raise SocketHandshakeError(
+                f"PCM payload {len(pcm)} bytes is not a multiple of "
+                f"width*channels ({bytes_per_sample_frame}); stream is desynced"
+            )
+
         audio_frame = InputAudioRawFrame(
             audio=pcm,
             sample_rate=self._expected_rate,
@@ -569,7 +582,11 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         if self._writer is not None:
             try:
                 self._writer.close()
-            except OSError:
+                # Drain the close so the event loop fully releases the socket;
+                # skipping this can emit "transport not closed" warnings at
+                # shutdown on some loops. Best-effort and bounded.
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
+            except (OSError, asyncio.TimeoutError):
                 pass
             self._writer = None
         self._reader = None
