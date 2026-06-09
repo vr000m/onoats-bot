@@ -662,7 +662,7 @@ frozen queue-contract value koda's classifier keys on).
 ## Progress
 
 Milestone A (Phases 1–3) implemented via `/skein:conduct` on branch
-`feat/socket-audio-transport-milestone-a` (2026-06-08). Full suite 128 passed,
+`feat/socket-audio-transport-milestone-a` (2026-06-08). Full suite 144 passed,
 ruff clean. Phases 4–6 (native macOS) deliberately not started — they can't run
 in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 
@@ -686,7 +686,11 @@ env vars in `finally`, mirror `dual.main`'s `--interactive` warning), `4911eb2` 
 with a non-zero exit when the recorder ends on a fatal ErrorFrame), and a second
 Codex pass (CLI `--help` resolves before the socket supervisor is entered; the
 generation nonce is now threaded supervisor → `cfg.capturer_nonce` → transport
-`expected_nonce` and enforced end-to-end).
+`expected_nonce` and enforced end-to-end). A third Codex pass hardened the
+failure paths: `0df1aa6` (transport failures are now fatal so the recorder
+actually ends), `9f848d5` (controlled recorder-launch failures map to a clean
+`rc=1`), and `f4ca89e` (`~` is expanded in socket paths before they reach the
+transport).
 
 ## Findings
 
