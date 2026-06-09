@@ -533,6 +533,49 @@ async def test_start_refuses_on_bad_handshake(path, header_kwargs):
 
 
 @pytest.mark.anyio
+async def test_start_refuses_on_silent_handshake(path):
+    """A capturer that connects but never sends the handshake must not hang start().
+
+    The socket-exists check has already passed and the child is alive, so neither
+    the read-idle ErrorFrame path nor a capturer-death path can fire — without a
+    bounded handshake read, ``start()`` would block forever. The read-idle
+    watchdog must bound the handshake read too: ``start()`` raises
+    ``SocketHandshakeError`` (refuse-to-start) within roughly the idle timeout,
+    and no reader is spawned.
+    """
+    idle = 0.3
+
+    async def feed(writer: asyncio.StreamWriter):
+        # Connect, then stay silent forever — never write the handshake line.
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    server = _SocketWriterServer(path, feed)
+    await server.start()
+    harness = _ManualHarness(_make_transport(path, read_idle_timeout=idle))
+    await harness.setup()
+    raised = False
+    try:
+        try:
+            # Bound by WAIT_TIMEOUT so a regression (unbounded handshake read)
+            # fails the test instead of hanging CI; the fix should trip the
+            # idle timeout (idle) well before that.
+            await asyncio.wait_for(harness.start(), timeout=WAIT_TIMEOUT)
+        except SocketHandshakeError:
+            raised = True
+        await asyncio.sleep(0.05)
+    finally:
+        await server.aclose()
+
+    surfaced_error = bool(harness.sink.error_frames())
+    assert raised or surfaced_error, (
+        "a connected-but-silent capturer must refuse to start (bounded handshake "
+        "read), not hang"
+    )
+    assert not harness.sink.audio_frames()
+    assert harness.transport._read_task is None
+
+
+@pytest.mark.anyio
 async def test_start_accepts_valid_handshake(path):
     """The happy path: a valid header starts the branch and audio flows."""
     pcm = pcm_from_samples([9, 9, 9])

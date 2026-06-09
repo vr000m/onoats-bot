@@ -318,8 +318,24 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                 f"could not connect to capturer socket {self._socket_path!r}: {exc}"
             ) from exc
 
+        # Bound the handshake read by the same idle watchdog as the frame loop:
+        # a capturer that accepts the connection but never writes the header
+        # would otherwise hang start() forever — the socket-exists check has
+        # already passed and the child is still alive, so neither the read-idle
+        # ErrorFrame path nor the capturer-death path can fire here.
         try:
-            header_line = await self._reader.readline()
+            if self._read_idle_timeout and self._read_idle_timeout > 0:
+                header_line = await asyncio.wait_for(
+                    self._reader.readline(), timeout=self._read_idle_timeout
+                )
+            else:
+                header_line = await self._reader.readline()
+        except asyncio.TimeoutError as exc:
+            raise SocketHandshakeError(
+                f"timed out after {self._read_idle_timeout}s waiting for the "
+                f"capturer handshake on {self._socket_path!r} "
+                "(connected but silent)"
+            ) from exc
         except (OSError, asyncio.IncompleteReadError) as exc:
             raise SocketHandshakeError(
                 f"failed reading handshake from {self._socket_path!r}: {exc}"
