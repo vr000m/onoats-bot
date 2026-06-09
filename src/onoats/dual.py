@@ -204,24 +204,24 @@ def _build_dual_pipeline(
     return Pipeline(processors)
 
 
-async def run_onoats_dual(
-    *, live_terminal: bool = False, locked_category: str | None = None
-) -> None:
-    from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.processors.audio.vad_processor import VADProcessor
-    from pipecat.pipeline.runner import PipelineRunner
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
+def _build_portaudio_transports(cfg):
+    """Build the two ``LocalAudioTransport`` branches (today's default path).
+
+    This is the ONLY site that resolves PortAudio devices: it calls
+    ``select_dual_input_devices`` (which enumerates PyAudio devices) and
+    constructs ``LocalAudioTransport``. The ``socket`` branch never reaches
+    here, so socket mode never imports or invokes the PyAudio path.
+
+    Returns ``(mic_transport, system_transport, mic_dev, system_dev)`` where
+    ``mic_dev`` / ``system_dev`` are the resolved device indices (logged in the
+    startup banner).
+    """
     from pipecat.transports.local.audio import (
         LocalAudioTransport,
         LocalAudioTransportParams,
     )
 
-    from onoats._vendor.store import onoats_data_dir
     from onoats.config.audio_devices import select_dual_input_devices
-    from onoats.processors.dual_silence_detector import DualSilenceDetector
-    from onoats.processors.transcript_buffer import TranscriptBuffer
-
-    data_dir = onoats_data_dir()
 
     if os.getenv("INPUT_DEVICE", "").strip():
         logger.info(
@@ -232,9 +232,6 @@ async def run_onoats_dual(
     # SYSTEM_INPUT_DEVICE) wins, else config.toml [devices] mic/system written
     # by `onoats init`. Without this the recorder ignored the saved config and
     # re-prompted on every launch.
-    from onoats.config import load_config
-
-    cfg = load_config()
     mic_input = cfg.mic_device or None
     system_input = cfg.system_device or None
     mic_dev, system_dev = select_dual_input_devices(
@@ -243,6 +240,135 @@ async def run_onoats_dual(
         mic_source=cfg.mic_device_source,
         system_source=cfg.system_device_source,
     )
+
+    mic_transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            input_device_index=mic_dev,
+        )
+    )
+    system_transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            input_device_index=system_dev,
+        )
+    )
+    return mic_transport, system_transport, mic_dev, system_dev
+
+
+def _build_socket_transports(cfg):
+    """Build the two ``UnixSocketAudioTransport`` branches (``AUDIO_SOURCE=socket``).
+
+    Reads the per-branch socket paths from the config loader (``ONOATS_MIC_SOCKET``
+    / ``ONOATS_SYSTEM_SOCKET`` env, else ``[audio] mic_socket/system_socket``).
+    Imports no PortAudio code and never enumerates PyAudio devices — that is the
+    "no PortAudio on the socket path" invariant.
+
+    Never-mix guard: refuses to start if the two sockets resolve to the same
+    path. The comparison is on ``Path.expanduser().resolve()``, not raw strings,
+    so a symlink or relative-path alias cannot collapse both branches onto one
+    socket (which would silently destroy ``me``/``them`` speaker attribution).
+
+    Returns ``(mic_transport, system_transport, mic_label, system_label)`` where
+    the labels are the socket paths (logged in the startup banner).
+    """
+    from pathlib import Path
+
+    from onoats.transports.socket_audio import UnixSocketAudioTransport
+
+    mic_socket = cfg.mic_socket
+    system_socket = cfg.system_socket
+    if not mic_socket or not system_socket:
+        raise ValueError(
+            "AUDIO_SOURCE=socket requires both mic and system socket paths "
+            "(ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET, or [audio] "
+            "mic_socket/system_socket in config.toml); "
+            f"got mic_socket={mic_socket!r} system_socket={system_socket!r}"
+        )
+
+    # Expand ~ once: asyncio.open_unix_connection does NOT expand ~, so a config
+    # path like ~/onoats/mic.sock must be expanded before it reaches the
+    # transport or it silently fails to connect. (Supervisor paths are already
+    # absolute, so this is a no-op there.)
+    mic_path = Path(mic_socket).expanduser()
+    system_path = Path(system_socket).expanduser()
+
+    # Never-mix guard: compare RESOLVED paths so a symlink / relative-path alias
+    # can't slip two branches onto one socket. Refuse before the pipeline runs.
+    mic_resolved = mic_path.resolve()
+    system_resolved = system_path.resolve()
+    if mic_resolved == system_resolved:
+        raise ValueError(
+            "AUDIO_SOURCE=socket: mic and system sockets resolve to the SAME path "
+            f"({mic_resolved}) — the two branches must never share a socket or "
+            "`me`/`them` speaker attribution collapses. mic_socket="
+            f"{mic_socket!r}, system_socket={system_socket!r}."
+        )
+
+    # Generation nonce (Phase-3 supervisor mints one per launch and exports
+    # ONOATS_CAPTURER_NONCE). Threading it into the transports enforces the
+    # stale/foreign-generation handshake check: a capturer presenting a missing
+    # or wrong nonce on these supervisor-created paths is rejected. None when no
+    # supervisor set it (socket mode driven manually) — then no nonce gating.
+    expected_nonce = cfg.capturer_nonce
+
+    # Pass the EXPANDED paths to the transports (so ~ actually connects); the
+    # returned labels stay fully resolved for the startup banner.
+    mic_transport = UnixSocketAudioTransport(
+        str(mic_path), sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
+    )
+    system_transport = UnixSocketAudioTransport(
+        str(system_path),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+        expected_nonce=expected_nonce,
+    )
+    return mic_transport, system_transport, str(mic_resolved), str(system_resolved)
+
+
+async def run_onoats_dual(
+    *, live_terminal: bool = False, locked_category: str | None = None
+) -> int:
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+    from pipecat.processors.audio.vad_processor import VADProcessor
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+    from onoats._vendor.store import onoats_data_dir
+    from onoats.processors.dual_silence_detector import DualSilenceDetector
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    data_dir = onoats_data_dir()
+
+    from onoats.config import load_config
+
+    cfg = load_config()
+    audio_source = cfg.audio_source
+
+    # Build the two capture-branch transports. The branch is the AUDIO_SOURCE
+    # swap seam: `portaudio` keeps today's LocalAudioTransport path verbatim;
+    # `socket` reads framed PCM16 from per-branch unix sockets. The socket
+    # branch MUST short-circuit PortAudio device resolution entirely — it must
+    # neither import nor invoke the PyAudio device-enumeration path
+    # (select_dual_input_devices), or socket mode would still touch PortAudio.
+    # The last two tuple elements are the source-appropriate input identifier
+    # for the startup banner: a PortAudio device index in portaudio mode, a
+    # resolved socket path in socket mode. Name them source-neutrally here.
+    if audio_source == "socket":
+        mic_transport, system_transport, mic_input_label, system_input_label = (
+            _build_socket_transports(cfg)
+        )
+    elif audio_source == "portaudio":
+        mic_transport, system_transport, mic_input_label, system_input_label = (
+            _build_portaudio_transports(cfg)
+        )
+    else:
+        raise ValueError(
+            f"Unknown AUDIO_SOURCE {audio_source!r}: expected 'portaudio' or 'socket'"
+        )
 
     # Zero SQLite: the recorder opens no database. It emits files only —
     # a downstream consumer drains the pending/ queue.
@@ -297,23 +423,6 @@ async def run_onoats_dual(
     silence_detector = DualSilenceDetector(
         on_silence_timeout=on_silence_timeout,
         silence_timeout=silence_timeout_sec,
-    )
-
-    mic_transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=False,
-            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-            input_device_index=mic_dev,
-        )
-    )
-    system_transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=False,
-            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-            input_device_index=system_dev,
-        )
     )
 
     mic_vad = VADProcessor(
@@ -454,8 +563,8 @@ async def run_onoats_dual(
     logger.info(f"  Data dir:         {data_dir}")
     logger.info(f"  STT:              {stt_banner()}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
-    logger.info(f"  Mic input:        {mic_dev}")
-    logger.info(f"  System input:     {system_dev}")
+    logger.info(f"  Mic input:        {mic_input_label}")
+    logger.info(f"  System input:     {system_input_label}")
     if live_terminal:
         logger.info("  Live terminal:    enabled")
 
@@ -468,10 +577,40 @@ async def run_onoats_dual(
         f"{BOT_NAME} dual-input is listening. "
         "Ctrl+T = flush transcript. Ctrl+C = quit. Ctrl+C twice = force quit."
     )
+    ended_by_error = False
     try:
         await runner.run(task)
+        # runner.run returned. runner.run returns on ANY terminal state: a
+        # graceful EndFrame, a StopFrame, or a CancelFrame (the fatal-error path).
+        # We report a failure when the task ended WITHOUT a shutdown request,
+        # which is keyed on the load-bearing invariant that — for this recorder's
+        # pipeline composition — the only such self-end is a fatal ErrorFrame
+        # cancelling the task (a capture branch hit EOF / read-idle / a framing or
+        # pump failure and surfaced one). The invariant rests on three concrete
+        # guarantees, all of which must hold:
+        #   1. the ONLY EndFrame queued into this task is task.stop_when_done() in
+        #      runtime.stop_pipeline_for_shutdown, which runs only from
+        #      _shutdown_watcher (gated on shutdown_event) — so an EndFrame end
+        #      always has shutdown_event set;
+        #   2. idle_timeout_secs=None (above) disables the idle self-end;
+        #   3. no processor in the dual pipeline emits an EndFrame/StopFrame, and a
+        #      socket failure surfaces a CancelFrame (fatal ErrorFrame), not an
+        #      EndFrame.
+        # If a future processor pushes its own EndFrame/StopFrame outside the
+        # shutdown path, this inference breaks — revisit it then. pipecat 1.3.0
+        # exposes no on_pipeline_error event or PipelineTask observer hook to read
+        # the fatal ErrorFrame directly; if a future version adds one, switch to
+        # observing the frame and drop this inference.
+        if not shutdown_event.is_set():
+            ended_by_error = True
+            logger.error(
+                "Dual pipeline ended without a shutdown request — a capture "
+                "branch surfaced a fatal ErrorFrame (e.g. capturer EOF / "
+                "read-idle). Reporting non-zero exit."
+            )
     finally:
         await _on_shutdown()
+    return 1 if ended_by_error else 0
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -509,9 +648,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Console entrypoint for the dual-input recorder (``onoats bot``)."""
-    args = _parse_args(argv)
+def _apply_recorder_args(args: argparse.Namespace) -> int | None:
+    """Apply the shared post-parse handling for the dual recorder.
+
+    Emits the interactive-mode warning and validates/normalizes ``--category``
+    in place. Returns an error rc to abort (non-``None``) or ``None`` to proceed.
+    Shared by :func:`main` and the socket supervisor
+    (``cli._run_recorder_with_capturer``) so the two launch paths can never drift
+    on argument handling.
+    """
     if args.interactive:
         logger.warning(
             "Interactive mode is not implemented for the dual-input recorder. "
@@ -523,10 +668,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             args.category = validate_category(args.category)
         except InvalidCategoryError as exc:
-            print(f"Error: {exc}")
+            print(f"Error: {exc}", file=sys.stderr)
             return 1
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for the dual-input recorder (``onoats bot``)."""
+    args = _parse_args(argv)
+    rc = _apply_recorder_args(args)
+    if rc is not None:
+        return rc
     try:
-        asyncio.run(
+        rc = asyncio.run(
             run_onoats_dual(
                 live_terminal=args.live_terminal, locked_category=args.category
             )
@@ -534,7 +688,7 @@ def main(argv: list[str] | None = None) -> int:
     except SttPreflightError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

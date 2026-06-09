@@ -61,6 +61,28 @@ def test_bot_routes_to_dual(monkeypatch):
     assert called["argv"] == ["--live-terminal"]
 
 
+def test_bot_help_under_socket_does_not_enter_supervisor(monkeypatch, capsys):
+    """`onoats bot --help` must print bot help even under AUDIO_SOURCE=socket.
+
+    The bot's own parser resolves --help (and arg errors) BEFORE _cmd_bot picks
+    a backend, so a help request never enters the socket supervisor — which
+    would otherwise require/spawn ONOATS_CAPTURER_BIN just to answer --help,
+    regressing the "subcommand help resolves without booting services" contract.
+    """
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    monkeypatch.delenv("ONOATS_CAPTURER_BIN", raising=False)
+
+    def _boom(rest):
+        raise AssertionError("socket supervisor entered for a --help request")
+
+    monkeypatch.setattr(cli, "_run_socket_supervisor", _boom)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["bot", "--help"])
+    assert exc.value.code == 0
+    assert "usage" in capsys.readouterr().out.lower()
+
+
 def _recorder(called):
     def fake_main(argv=None):
         called["argv"] = argv

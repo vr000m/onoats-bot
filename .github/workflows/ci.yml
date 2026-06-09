@@ -11,6 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Cheap, dependency-free gate (stdlib + git only) — fail fast before the
+      # heavy portaudio/uv install if a dev-plan's reviewed contract section was
+      # edited without refreshing its review marker.
+      - name: Dev-plan review-marker check
+        run: python3 scripts/check_review_markers.py
+
       # pyaudio (via pipecat-ai[local]) builds a C extension against PortAudio,
       # whose dev headers ship with macOS/Homebrew but not ubuntu-latest. This
       # is the off-mac system dep the cross-platform baseline assumes.
