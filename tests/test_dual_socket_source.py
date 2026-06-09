@@ -488,6 +488,34 @@ def test_socket_transports_no_nonce_gating_when_unset(two_paths):
     assert sys_t.input()._expected_nonce is None
 
 
+def test_socket_paths_are_expanduser_expanded():
+    """``~`` in a config socket path must reach the transport EXPANDED.
+
+    ``asyncio.open_unix_connection`` does not expand ``~``, so a config value
+    like ``~/onoats/mic.sock`` would silently fail to connect if the raw string
+    were handed to the transport. The builder must pass the expanduser'd path.
+    """
+    import os
+
+    from onoats.config import OnoatsConfig
+
+    cfg = OnoatsConfig(
+        raw={
+            "audio": {
+                "source": "socket",
+                "mic_socket": "~/oa-test-mic.sock",
+                "system_socket": "~/oa-test-sys.sock",
+            }
+        }
+    )
+    mic_t, sys_t, _a, _b = _socket_builder()(cfg)
+    home = os.path.expanduser("~")
+    assert "~" not in mic_t.input()._socket_path
+    assert "~" not in sys_t.input()._socket_path
+    assert mic_t.input()._socket_path == os.path.join(home, "oa-test-mic.sock")
+    assert sys_t.input()._socket_path == os.path.join(home, "oa-test-sys.sock")
+
+
 # ---------------------------------------------------------------------------
 # (c) No-PortAudio assertion: socket mode skips device enumeration entirely
 # ---------------------------------------------------------------------------

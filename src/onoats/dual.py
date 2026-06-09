@@ -290,10 +290,17 @@ def _build_socket_transports(cfg):
             f"got mic_socket={mic_socket!r} system_socket={system_socket!r}"
         )
 
+    # Expand ~ once: asyncio.open_unix_connection does NOT expand ~, so a config
+    # path like ~/onoats/mic.sock must be expanded before it reaches the
+    # transport or it silently fails to connect. (Supervisor paths are already
+    # absolute, so this is a no-op there.)
+    mic_path = Path(mic_socket).expanduser()
+    system_path = Path(system_socket).expanduser()
+
     # Never-mix guard: compare RESOLVED paths so a symlink / relative-path alias
     # can't slip two branches onto one socket. Refuse before the pipeline runs.
-    mic_resolved = Path(mic_socket).expanduser().resolve()
-    system_resolved = Path(system_socket).expanduser().resolve()
+    mic_resolved = mic_path.resolve()
+    system_resolved = system_path.resolve()
     if mic_resolved == system_resolved:
         raise ValueError(
             "AUDIO_SOURCE=socket: mic and system sockets resolve to the SAME path "
@@ -309,11 +316,15 @@ def _build_socket_transports(cfg):
     # supervisor set it (socket mode driven manually) — then no nonce gating.
     expected_nonce = cfg.capturer_nonce
 
+    # Pass the EXPANDED paths to the transports (so ~ actually connects); the
+    # returned labels stay fully resolved for the startup banner.
     mic_transport = UnixSocketAudioTransport(
-        mic_socket, sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
+        str(mic_path), sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
     )
     system_transport = UnixSocketAudioTransport(
-        system_socket, sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
+        str(system_path),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+        expected_nonce=expected_nonce,
     )
     return mic_transport, system_transport, str(mic_resolved), str(system_resolved)
 
