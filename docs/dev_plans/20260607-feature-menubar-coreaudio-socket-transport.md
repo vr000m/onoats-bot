@@ -1,12 +1,12 @@
 # Task: macOS Menu-bar Launcher + CoreAudio Socket Audio Transport (retire BlackHole)
 
-**Status**: Proposed (draft — `/review-plan` findings incorporated 2026-06-08)
+**Status**: Milestone A (Phases 1–3) implemented — in review; Milestone B (Phases 4–6) not started
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
-**Branch**: _(none yet — author on a feature branch when picked up)_
+**Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); Milestone B TBD
 **Created**: 2026-06-07
-**Completed**: (fill when done)
+**Completed**: Milestone A 2026-06-08 (Phases 1–3); Milestone B pending (native, macOS-only)
 
 > **Provenance.** This work was scoped out of koda's recorder-extraction plan
 > (`koda-pipecat: docs/dev_plans/20260606-refactor-extract-onoats-recorder.md`,
@@ -657,4 +657,43 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ aa76f29d23b0a4133925d787e462ced0c25f4027 -->
+<!-- reviewed: 2026-06-08 @ 2d84b130fb24d8d3beded40aeac5b2711880a66f -->
+
+## Progress
+
+Milestone A (Phases 1–3) implemented via `/skein:conduct` on branch
+`feat/socket-audio-transport-milestone-a` (2026-06-08). Full suite 128 passed,
+ruff clean. Phases 4–6 (native macOS) deliberately not started — they can't run
+in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
+
+- [x] **Phase 1** — `UnixSocketAudioInputTransport` + wire framing — `108ba9e`
+  (25 tests). Length-prefixed PCM16-LE frames, JSON handshake header, start-order
+  guard, owned reader-task teardown, read-idle watchdog, configurable backpressure.
+- [x] **Phase 2** — `UnixSocketAudioTransport` wrapper + `AUDIO_SOURCE` wiring — `a60ebb7`
+  (9 tests incl. the mutation-verified keystone never-mix test). Socket branch
+  short-circuits all PortAudio device resolution; resolved-path never-mix guard.
+- [x] **Phase 3** — CLI supervisor + `docs/audio-socket-contract.md` — `4ccbb0c`
+  (11 tests). Per-generation 0700 private socket dir, generation nonce, capturer
+  spawn (`ONOATS_CAPTURER_BIN`), bounded socket-wait, fail-loud teardown.
+- [ ] **Phase 4** — Swift CoreAudio / ScreenCaptureKit capturer *(macOS native)*
+- [ ] **Phase 5** — macOS menu-bar launcher *(macOS native)*
+- [ ] **Phase 6** — Retire BlackHole from the default macOS story + docs/packaging
+
+Reviewer-finding fixes folded in: `dc31ff9` (Phase 1–2: PCM-length desync guard,
+writer drain, source-neutral banner naming) and `a78ae8b` (Phase 3: restore
+socket env vars in `finally`, mirror `dual.main`'s `--interactive` warning).
+
+## Findings
+
+- **`AUDIO_SOURCE=socket` is seam-complete but NOT user-runnable until Phase 4.**
+  The supervisor spawns `ONOATS_CAPTURER_BIN`, which does not exist until the Swift
+  capturer lands. The default `portaudio` path is unchanged; keep `socket` undocumented
+  as the default until Phase 6.
+- **Follow-up — end-to-end nonce gating.** `expected_nonce` is plumbed into the
+  transport (Phase 1) but not threaded supervisor → `dual._build_socket_transports`
+  → transport. Stale-socket defense currently rests on the fresh per-generation
+  private dir (structural); the capturer still presents the nonce per the contract.
+- **Test scope honesty.** The Phase-3 crash / hung-but-alive tests substitute a fake
+  recorder for `run_onoats_dual` (the real one needs the MLX STT stack, not CI-viable).
+  They prove the *supervisor* contract (exit code, rotation, fresh dir, nonce reject);
+  the `ErrorFrame`-on-EOF/idle behaviour itself is covered at the transport layer (Phase 1).
