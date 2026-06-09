@@ -21,7 +21,7 @@ def test_top_level_modules_exist():
 
 
 def test_subpackage_dirs_exist():
-    for name in ("agents", "frames", "processors", "stt"):
+    for name in ("agents", "frames", "processors", "stt", "transports"):
         assert (PKG / name).is_dir(), f"missing dir {name}"
 
 
