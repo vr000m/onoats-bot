@@ -75,7 +75,7 @@ from loguru import logger
 from pipecat.frames.frames import ErrorFrame, InputAudioRawFrame, StartFrame
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.transports.base_input import BaseInputTransport
-from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 # ---------------------------------------------------------------------------
 # Wire-format constants. These are the Phase-1 starting point; the canonical
@@ -573,6 +573,82 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                 pass
             self._writer = None
         self._reader = None
+
+
+class UnixSocketAudioTransport(BaseTransport):
+    """Input-only transport wrapping a :class:`UnixSocketAudioInputTransport`.
+
+    This is the ``dual.py`` swap seam: it exposes ``.input()`` (what
+    ``_build_dual_pipeline`` calls) returning a socket input transport, so it
+    drops in where ``LocalAudioTransport`` was with no pipeline change. One
+    instance == one branch == one socket; nothing here fans a socket to two
+    branches, preserving the never-mix invariant.
+
+    The transport is built with
+    ``TransportParams(audio_in_enabled=True, audio_in_sample_rate=16000)`` —
+    ``audio_in_enabled=True`` is required or the base never drains pushed
+    frames. There is no output side: ``.output()`` raises ``NotImplementedError``.
+    """
+
+    def __init__(
+        self,
+        socket_path: str,
+        *,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        params: TransportParams | None = None,
+        read_idle_timeout: float = 10.0,
+        max_buffered_frames: int = 200,
+        backpressure_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST,
+        expected_nonce: str | None = None,
+        name: str | None = None,
+        input_name: str | None = None,
+        **kwargs,
+    ):
+        """Initialize the input-only socket transport.
+
+        Args:
+            socket_path: Filesystem path of the unix socket to connect to.
+            sample_rate: Audio-in sample rate; used to build the default
+                ``TransportParams`` when ``params`` is not supplied.
+            params: Optional pre-built transport params. Defaults to
+                ``TransportParams(audio_in_enabled=True,
+                audio_in_sample_rate=sample_rate)``.
+            read_idle_timeout: Forwarded to the input transport's idle watchdog.
+            max_buffered_frames: Forwarded to the input transport's staging buffer.
+            backpressure_policy: Forwarded to the input transport.
+            expected_nonce: Forwarded to the input transport (Phase-3 generation
+                token; ``None`` in Phase 1/2).
+            name: Optional transport instance name.
+            input_name: Optional name for the input frame processor.
+        """
+        super().__init__(name=name, input_name=input_name)
+
+        if params is None:
+            params = TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=False,
+                audio_in_sample_rate=sample_rate,
+            )
+
+        self._socket_path = socket_path
+        self._input: UnixSocketAudioInputTransport = UnixSocketAudioInputTransport(
+            socket_path,
+            params,
+            read_idle_timeout=read_idle_timeout,
+            max_buffered_frames=max_buffered_frames,
+            backpressure_policy=backpressure_policy,
+            expected_nonce=expected_nonce,
+            name=input_name,
+            **kwargs,
+        )
+
+    def input(self) -> UnixSocketAudioInputTransport:
+        """Return the socket input transport (the frame processor ``dual.py`` uses)."""
+        return self._input
+
+    def output(self):
+        """Input-only transport: there is no output side."""
+        raise NotImplementedError("UnixSocketAudioTransport is input-only")
 
 
 class _ReadIdleTimeout(Exception):

@@ -204,24 +204,24 @@ def _build_dual_pipeline(
     return Pipeline(processors)
 
 
-async def run_onoats_dual(
-    *, live_terminal: bool = False, locked_category: str | None = None
-) -> None:
-    from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.processors.audio.vad_processor import VADProcessor
-    from pipecat.pipeline.runner import PipelineRunner
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
+def _build_portaudio_transports(cfg):
+    """Build the two ``LocalAudioTransport`` branches (today's default path).
+
+    This is the ONLY site that resolves PortAudio devices: it calls
+    ``select_dual_input_devices`` (which enumerates PyAudio devices) and
+    constructs ``LocalAudioTransport``. The ``socket`` branch never reaches
+    here, so socket mode never imports or invokes the PyAudio path.
+
+    Returns ``(mic_transport, system_transport, mic_dev, system_dev)`` where
+    ``mic_dev`` / ``system_dev`` are the resolved device indices (logged in the
+    startup banner).
+    """
     from pipecat.transports.local.audio import (
         LocalAudioTransport,
         LocalAudioTransportParams,
     )
 
-    from onoats._vendor.store import onoats_data_dir
     from onoats.config.audio_devices import select_dual_input_devices
-    from onoats.processors.dual_silence_detector import DualSilenceDetector
-    from onoats.processors.transcript_buffer import TranscriptBuffer
-
-    data_dir = onoats_data_dir()
 
     if os.getenv("INPUT_DEVICE", "").strip():
         logger.info(
@@ -232,9 +232,6 @@ async def run_onoats_dual(
     # SYSTEM_INPUT_DEVICE) wins, else config.toml [devices] mic/system written
     # by `onoats init`. Without this the recorder ignored the saved config and
     # re-prompted on every launch.
-    from onoats.config import load_config
-
-    cfg = load_config()
     mic_input = cfg.mic_device or None
     system_input = cfg.system_device or None
     mic_dev, system_dev = select_dual_input_devices(
@@ -243,6 +240,114 @@ async def run_onoats_dual(
         mic_source=cfg.mic_device_source,
         system_source=cfg.system_device_source,
     )
+
+    mic_transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            input_device_index=mic_dev,
+        )
+    )
+    system_transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+            input_device_index=system_dev,
+        )
+    )
+    return mic_transport, system_transport, mic_dev, system_dev
+
+
+def _build_socket_transports(cfg):
+    """Build the two ``UnixSocketAudioTransport`` branches (``AUDIO_SOURCE=socket``).
+
+    Reads the per-branch socket paths from the config loader (``ONOATS_MIC_SOCKET``
+    / ``ONOATS_SYSTEM_SOCKET`` env, else ``[audio] mic_socket/system_socket``).
+    Imports no PortAudio code and never enumerates PyAudio devices — that is the
+    "no PortAudio on the socket path" invariant.
+
+    Never-mix guard: refuses to start if the two sockets resolve to the same
+    path. The comparison is on ``Path.expanduser().resolve()``, not raw strings,
+    so a symlink or relative-path alias cannot collapse both branches onto one
+    socket (which would silently destroy ``me``/``them`` speaker attribution).
+
+    Returns ``(mic_transport, system_transport, mic_label, system_label)`` where
+    the labels are the socket paths (logged in the startup banner).
+    """
+    from pathlib import Path
+
+    from onoats.transports.socket_audio import UnixSocketAudioTransport
+
+    mic_socket = cfg.mic_socket
+    system_socket = cfg.system_socket
+    if not mic_socket or not system_socket:
+        raise ValueError(
+            "AUDIO_SOURCE=socket requires both mic and system socket paths "
+            "(ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET, or [audio] "
+            "mic_socket/system_socket in config.toml); "
+            f"got mic_socket={mic_socket!r} system_socket={system_socket!r}"
+        )
+
+    # Never-mix guard: compare RESOLVED paths so a symlink / relative-path alias
+    # can't slip two branches onto one socket. Refuse before the pipeline runs.
+    mic_resolved = Path(mic_socket).expanduser().resolve()
+    system_resolved = Path(system_socket).expanduser().resolve()
+    if mic_resolved == system_resolved:
+        raise ValueError(
+            "AUDIO_SOURCE=socket: mic and system sockets resolve to the SAME path "
+            f"({mic_resolved}) — the two branches must never share a socket or "
+            "`me`/`them` speaker attribution collapses. mic_socket="
+            f"{mic_socket!r}, system_socket={system_socket!r}."
+        )
+
+    mic_transport = UnixSocketAudioTransport(
+        mic_socket, sample_rate=PIPELINE_SAMPLE_RATE
+    )
+    system_transport = UnixSocketAudioTransport(
+        system_socket, sample_rate=PIPELINE_SAMPLE_RATE
+    )
+    return mic_transport, system_transport, str(mic_resolved), str(system_resolved)
+
+
+async def run_onoats_dual(
+    *, live_terminal: bool = False, locked_category: str | None = None
+) -> None:
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+    from pipecat.processors.audio.vad_processor import VADProcessor
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+    from onoats._vendor.store import onoats_data_dir
+    from onoats.processors.dual_silence_detector import DualSilenceDetector
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    data_dir = onoats_data_dir()
+
+    from onoats.config import load_config
+
+    cfg = load_config()
+    audio_source = cfg.audio_source
+
+    # Build the two capture-branch transports. The branch is the AUDIO_SOURCE
+    # swap seam: `portaudio` keeps today's LocalAudioTransport path verbatim;
+    # `socket` reads framed PCM16 from per-branch unix sockets. The socket
+    # branch MUST short-circuit PortAudio device resolution entirely — it must
+    # neither import nor invoke the PyAudio device-enumeration path
+    # (select_dual_input_devices), or socket mode would still touch PortAudio.
+    if audio_source == "socket":
+        mic_transport, system_transport, mic_dev, system_dev = _build_socket_transports(
+            cfg
+        )
+    elif audio_source == "portaudio":
+        mic_transport, system_transport, mic_dev, system_dev = (
+            _build_portaudio_transports(cfg)
+        )
+    else:
+        raise ValueError(
+            f"Unknown AUDIO_SOURCE {audio_source!r}: expected 'portaudio' or 'socket'"
+        )
 
     # Zero SQLite: the recorder opens no database. It emits files only —
     # a downstream consumer drains the pending/ queue.
@@ -297,23 +402,6 @@ async def run_onoats_dual(
     silence_detector = DualSilenceDetector(
         on_silence_timeout=on_silence_timeout,
         silence_timeout=silence_timeout_sec,
-    )
-
-    mic_transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=False,
-            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-            input_device_index=mic_dev,
-        )
-    )
-    system_transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=False,
-            audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-            input_device_index=system_dev,
-        )
     )
 
     mic_vad = VADProcessor(

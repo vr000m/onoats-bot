@@ -1,9 +1,11 @@
 """onoats transport implementations.
 
-Phase 1 ships :class:`UnixSocketAudioInputTransport`, a pipecat input transport
-that reads framed PCM16 LE / 16 kHz / mono audio from a unix domain socket
-(``AUDIO_SOURCE=socket``). The ``UnixSocketAudioTransport`` wrapper and the
-``dual.py`` wiring land in Phase 2.
+:class:`UnixSocketAudioInputTransport` is a pipecat input transport that reads
+framed PCM16 LE / 16 kHz / mono audio from a unix domain socket
+(``AUDIO_SOURCE=socket``). :class:`UnixSocketAudioTransport` is the input-only
+``BaseTransport`` wrapper exposing ``.input()`` so it drops into
+``_build_dual_pipeline`` in place of ``LocalAudioTransport`` with no pipeline
+change.
 
 This package is pure-Python (stdlib sockets + pipecat) and imports with no
 native binary present, keeping the baseline / CI path native-free.
@@ -16,6 +18,7 @@ from onoats.transports.socket_audio import (
     HandshakeHeader,
     SocketHandshakeError,
     UnixSocketAudioInputTransport,
+    UnixSocketAudioTransport,
     WIRE_VERSION,
     frame_size_bytes,
     parse_handshake,
@@ -26,6 +29,7 @@ __all__ = [
     "HandshakeHeader",
     "SocketHandshakeError",
     "UnixSocketAudioInputTransport",
+    "UnixSocketAudioTransport",
     "WIRE_VERSION",
     "frame_size_bytes",
     "parse_handshake",

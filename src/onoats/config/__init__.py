@@ -69,6 +69,7 @@ def secrets_env_path() -> Path:
 # ---------------------------------------------------------------------------
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
+    "audio": {"source": "portaudio"},
     "stt": {"service": "whisper", "model": ""},
     "speakers": {"me": "Me", "them": "Them"},
     "categories": {"set": ["uncategorized"]},
@@ -133,6 +134,45 @@ class OnoatsConfig:
         """Where ``system_device`` resolved from: "from env" / "from config" / "default"."""
         return _source_of(
             "SYSTEM_INPUT_DEVICE", self.raw.get("devices", {}).get("system")
+        )
+
+    # ---- audio source ----
+    @property
+    def audio_source(self) -> str:
+        """Capture backend: ``portaudio`` (default) or ``socket``.
+
+        env ``AUDIO_SOURCE`` > config.toml ``[audio].source`` > default
+        ``portaudio``. ``socket`` reads framed PCM16 from the per-branch unix
+        sockets (``mic_socket`` / ``system_socket``) instead of PortAudio
+        devices; the default keeps today's PortAudio path unchanged.
+        """
+        return (
+            str(
+                _env_or("AUDIO_SOURCE", self.raw.get("audio", {}).get("source"))
+                or _DEFAULTS["audio"]["source"]
+            )
+            .lower()
+            .strip()
+        )
+
+    @property
+    def mic_socket(self) -> str | None:
+        """Unix socket path for the ``me`` / mic branch under ``AUDIO_SOURCE=socket``.
+
+        env ``ONOATS_MIC_SOCKET`` > config.toml ``[audio].mic_socket``. ``None``
+        when neither set — socket mode then refuses to start without a path.
+        """
+        return _env_or("ONOATS_MIC_SOCKET", self.raw.get("audio", {}).get("mic_socket"))
+
+    @property
+    def system_socket(self) -> str | None:
+        """Unix socket path for the ``them`` / system branch under ``AUDIO_SOURCE=socket``.
+
+        env ``ONOATS_SYSTEM_SOCKET`` > config.toml ``[audio].system_socket``.
+        ``None`` when neither set — socket mode then refuses to start.
+        """
+        return _env_or(
+            "ONOATS_SYSTEM_SOCKET", self.raw.get("audio", {}).get("system_socket")
         )
 
     # ---- storage ----
