@@ -10,6 +10,15 @@ non-obvious parts; the code and `docs/` cover the rest.
   **and** `uv run ruff check` (a PostToolUse hook formats on edit, but verify).
 - Prefer the **pipecat-context-hub MCP** tools for Pipecat framework questions
   over reading `.venv` source.
+- **Dev-plan review markers are CI-gated.** `python3 scripts/check_review_markers.py`
+  (a CI step, stdlib + git only) fails if a reviewed plan's contract section —
+  everything above its `<!-- reviewed: YYYY-MM-DD @ <sha1> -->` marker — was edited
+  without refreshing the hash. The marker hashes only the above-marker bytes
+  (same convention as the skein `/review-plan` + `/conduct` tooling), so editing
+  the `## Progress` / `## Findings` workspace below it is free. Enable the same
+  check locally with `git config core.hooksPath .githooks`. To clear a failure:
+  re-run `/review-plan`, or recompute the hash for a purely administrative
+  above-marker edit (`head -n <marker_line-1> plan.md | git hash-object --stdin`).
 
 ## Audio capture: PortAudio vs socket (`AUDIO_SOURCE`)
 
@@ -70,6 +79,40 @@ pin them (`tests/test_dual_socket_source.py`, `tests/test_socket_audio_transport
 - Shared recorder arg handling lives in `dual._apply_recorder_args` — both
   `dual.main` and the supervisor route through it, so interactive/category
   handling can't drift.
+
+## Reviewing a subprocess / process-boundary change
+
+When a change spawns a child process (`create_subprocess_*` / `Popen` / `exec`)
+or otherwise crosses an OS boundary, the general review lenses tend to stay on
+the in-process logic and miss the boundary itself. The capturer supervisor's
+three post-review findings (one `[high]` no-ship) all came from this blind spot —
+the heavyweight gate stack passed; a single adversarial pass caught them. Run this
+checklist explicitly for any new spawn:
+
+- **Signals / session.** Does the child inherit the parent's controlling-terminal
+  signals (Ctrl+C / SIGTERM via the foreground process group)? If it must not,
+  spawn with `start_new_session=True`. (Without it, a graceful shutdown can be
+  mis-read as the child dying — the capturer's `[high]` finding.)
+- **Environment / secrets.** Never pass `dict(os.environ)` to a child. Build a
+  deny-by-default allowlist (see `cli._CAPTURER_ENV_POLICY`) so STT/application
+  secrets — and dylib-**injection** vars like `DYLD_INSERT_LIBRARIES` — never reach
+  a child that does not need them.
+- **Teardown reaches the whole group.** A session-leader child may spawn its own
+  helpers; signal the **process group** (`os.killpg(os.getpgid(pid), …)`), not just
+  the leader PID, on **both** the graceful and crash (leader-already-reaped) paths,
+  so nothing outlives the session holding a resource (e.g. the audio device).
+- **File descriptors.** Does the child inherit fds it should not (sockets, pipes,
+  log handles)? Pass only what is intended.
+- **Working dir + argv.** cwd is inherited; spawn via argv (no shell) so there is
+  no shell-injection surface — but verify `argv[0]` resolves to a trusted path.
+- **Failure is loud + bounded.** Spawn failure, child death, and a silent/hung
+  child each yield a non-zero exit + a WARNING/ERROR log + a bounded wait (no
+  hang) — see the fail-loud contract above.
+
+Each item should map to a regression test that fails against the pre-fix code
+(signal: spawn-kwarg + `rc`; env: a planted secret stripped from the child env;
+teardown: a spawned child PID is gone after stop). The supervisor's tests in
+`tests/test_socket_supervisor.py` are the worked example.
 
 ## Wire-format contract
 

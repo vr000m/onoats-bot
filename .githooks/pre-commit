@@ -1,0 +1,14 @@
+#!/bin/sh
+# onoats pre-commit hook. Enable once per clone with:
+#     git config core.hooksPath .githooks
+#
+# Validates that any staged dev-plan's reviewed contract section still matches
+# its review-marker hash (the same check CI runs on every PR). Catches an
+# above-marker edit that forgot to refresh the marker before it lands.
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep '^docs/dev_plans/.*\.md$' || true)
+if [ -n "$staged" ]; then
+    # Pass the staged paths explicitly; stdlib + git only, no uv/venv needed.
+    python3 scripts/check_review_markers.py $staged
+fi
