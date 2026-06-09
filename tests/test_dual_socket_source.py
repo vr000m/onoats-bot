@@ -444,6 +444,51 @@ def test_guard_accepts_distinct_paths(two_paths):
 
 
 # ---------------------------------------------------------------------------
+# Generation nonce: cfg.capturer_nonce must reach the transport handshake gate
+# ---------------------------------------------------------------------------
+
+
+def test_socket_transports_thread_capturer_nonce(two_paths):
+    """The supervisor's generation nonce must reach BOTH branch transports.
+
+    The Phase-3 supervisor mints a per-launch nonce and exports
+    ONOATS_CAPTURER_NONCE; the recorder resolves it via cfg.capturer_nonce. It
+    must be threaded into each transport as ``expected_nonce`` so a capturer that
+    handshakes with a missing/stale nonce is rejected — otherwise the supervisor
+    mints a nonce nobody enforces (the stale/foreign-generation check is dead).
+    """
+    from onoats.config import OnoatsConfig
+
+    _base, mic, system = two_paths
+    nonce = "gen-deadbeef00"
+    cfg = OnoatsConfig(
+        raw={
+            "audio": {
+                "source": "socket",
+                "mic_socket": mic,
+                "system_socket": system,
+                "capturer_nonce": nonce,
+            }
+        }
+    )
+    mic_t, sys_t, _mic_label, _system_label = _socket_builder()(cfg)
+    assert mic_t.input()._expected_nonce == nonce
+    assert sys_t.input()._expected_nonce == nonce
+
+
+def test_socket_transports_no_nonce_gating_when_unset(two_paths):
+    """Manual socket mode (no supervisor → no nonce) must NOT gate on a nonce.
+
+    ``expected_nonce`` is ``None`` so any handshake is accepted — backward
+    compatible with running socket mode without the supervisor.
+    """
+    _base, mic, system = two_paths
+    mic_t, sys_t, _a, _b = _socket_builder()(_cfg(mic, system))
+    assert mic_t.input()._expected_nonce is None
+    assert sys_t.input()._expected_nonce is None
+
+
+# ---------------------------------------------------------------------------
 # (c) No-PortAudio assertion: socket mode skips device enumeration entirely
 # ---------------------------------------------------------------------------
 

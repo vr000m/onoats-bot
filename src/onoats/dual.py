@@ -302,11 +302,18 @@ def _build_socket_transports(cfg):
             f"{mic_socket!r}, system_socket={system_socket!r}."
         )
 
+    # Generation nonce (Phase-3 supervisor mints one per launch and exports
+    # ONOATS_CAPTURER_NONCE). Threading it into the transports enforces the
+    # stale/foreign-generation handshake check: a capturer presenting a missing
+    # or wrong nonce on these supervisor-created paths is rejected. None when no
+    # supervisor set it (socket mode driven manually) — then no nonce gating.
+    expected_nonce = cfg.capturer_nonce
+
     mic_transport = UnixSocketAudioTransport(
-        mic_socket, sample_rate=PIPELINE_SAMPLE_RATE
+        mic_socket, sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
     )
     system_transport = UnixSocketAudioTransport(
-        system_socket, sample_rate=PIPELINE_SAMPLE_RATE
+        system_socket, sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
     )
     return mic_transport, system_transport, str(mic_resolved), str(system_resolved)
 

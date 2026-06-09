@@ -110,6 +110,15 @@ def _cmd_bot(rest: list[str]) -> int:
     or touches the supervisor / socket machinery.
     """
     from onoats.config import load_config
+    from onoats.dual import _parse_args
+
+    # Resolve --help and argument errors via the bot's own parser BEFORE
+    # choosing a backend. argparse prints help / usage and raises SystemExit
+    # here, so `onoats bot --help` (or a bad flag) never enters the socket
+    # supervisor — it must not require or spawn ONOATS_CAPTURER_BIN just to
+    # answer a help request. (dual.py's module top is import-light — no pipecat
+    # / pyaudio / MLX — so this preserves the no-boot-on-help guarantee.)
+    _parse_args(rest)
 
     if load_config().audio_source == "socket":
         return _run_socket_supervisor(rest)
@@ -228,17 +237,22 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # handshake; combined with the fresh dir this invalidates stale fds.
     nonce = secrets.token_hex(16)
 
-    # 3. Point the recorder at the private-dir sockets. The recorder resolves
-    # these through OnoatsConfig (ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET env >
-    # [audio] toml), so exporting them here is all dual._build_socket_transports
-    # needs. Capture any prior values so the `finally` can restore them — these
-    # are process-global, and leaving them set would leak our private-dir paths
-    # into any in-process caller (e.g. tests) that runs after us.
+    # 3. Point the recorder at the private-dir sockets AND the generation nonce.
+    # The recorder resolves these through OnoatsConfig (ONOATS_MIC_SOCKET /
+    # ONOATS_SYSTEM_SOCKET / ONOATS_CAPTURER_NONCE env > [audio] toml), so
+    # exporting them here is all dual._build_socket_transports needs to (a)
+    # connect to the right sockets and (b) gate on the nonce — rejecting a
+    # capturer that handshakes with a missing/stale nonce. Capture any prior
+    # values so the `finally` can restore them — these are process-global, and
+    # leaving them set would leak our private-dir paths / nonce into any
+    # in-process caller (e.g. tests) that runs after us.
     _prior_socket_env = {
-        k: os.environ.get(k) for k in ("ONOATS_MIC_SOCKET", "ONOATS_SYSTEM_SOCKET")
+        k: os.environ.get(k)
+        for k in ("ONOATS_MIC_SOCKET", "ONOATS_SYSTEM_SOCKET", "ONOATS_CAPTURER_NONCE")
     }
     os.environ["ONOATS_MIC_SOCKET"] = mic_sock
     os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
+    os.environ["ONOATS_CAPTURER_NONCE"] = nonce
 
     capturer_proc: asyncio.subprocess.Process | None = None
     rc = 0

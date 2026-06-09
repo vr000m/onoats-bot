@@ -81,15 +81,19 @@ mismatch, or a non-string `nonce`. Nothing is silently coerced.
 Each supervisor launch mints a fresh nonce (`secrets.token_hex(16)`) and passes it
 to the capturer. The capturer MUST echo it in the handshake's `nonce`.
 
-The supervisor's **primary** stale-socket defense is structural, not the nonce: it
-mints a **fresh private 0700 socket directory per generation**, so a leftover
-socket from a previous generation lives at a path the new recorder never
-references and is unreachable. The transport additionally supports an
-`expected_nonce` gate (`SocketHandshakeError` on mismatch) for end-to-end
-rejection of a stale/foreign capturer; in Phase 3 the supervisor relies on the
-fresh-dir mechanism and does **not** thread `expected_nonce` through the recorder
-(that would require editing `dual.py` / `socket_audio.py`, outside Phase 3 scope —
-tracked as a follow-up).
+The supervisor's **primary** stale-socket defense is structural: it mints a
+**fresh private 0700 socket directory per generation**, so a leftover socket from
+a previous generation lives at a path the new recorder never references and is
+unreachable.
+
+The nonce is the **end-to-end** belt-and-suspenders check on top of that. The
+supervisor exports `ONOATS_CAPTURER_NONCE` into the recorder's environment; the
+recorder resolves it via `OnoatsConfig.capturer_nonce` and threads it into both
+branch transports as `expected_nonce`. A capturer whose handshake omits the nonce
+or presents the wrong one is rejected with `SocketHandshakeError` (refuse-to-start
+on the affected branch). When socket mode is driven **without** the supervisor
+(no `ONOATS_CAPTURER_NONCE`), `expected_nonce` is `None` and the nonce is not
+gated — only the wire-format fields are validated.
 
 ## Framing (length-prefixed)
 

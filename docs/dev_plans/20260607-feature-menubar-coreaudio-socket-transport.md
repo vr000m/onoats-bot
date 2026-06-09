@@ -680,8 +680,13 @@ in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 - [ ] **Phase 6** — Retire BlackHole from the default macOS story + docs/packaging
 
 Reviewer-finding fixes folded in: `dc31ff9` (Phase 1–2: PCM-length desync guard,
-writer drain, source-neutral banner naming) and `a78ae8b` (Phase 3: restore
-socket env vars in `finally`, mirror `dual.main`'s `--interactive` warning).
+writer drain, source-neutral banner naming), `a78ae8b` (Phase 3: restore socket
+env vars in `finally`, mirror `dual.main`'s `--interactive` warning), `4911eb2` +
+`36eee67` (Codex P1/P2: bound the handshake read by the idle watchdog; fail loud
+with a non-zero exit when the recorder ends on a fatal ErrorFrame), and a second
+Codex pass (CLI `--help` resolves before the socket supervisor is entered; the
+generation nonce is now threaded supervisor → `cfg.capturer_nonce` → transport
+`expected_nonce` and enforced end-to-end).
 
 ## Findings
 
@@ -689,10 +694,13 @@ socket env vars in `finally`, mirror `dual.main`'s `--interactive` warning).
   The supervisor spawns `ONOATS_CAPTURER_BIN`, which does not exist until the Swift
   capturer lands. The default `portaudio` path is unchanged; keep `socket` undocumented
   as the default until Phase 6.
-- **Follow-up — end-to-end nonce gating.** `expected_nonce` is plumbed into the
-  transport (Phase 1) but not threaded supervisor → `dual._build_socket_transports`
-  → transport. Stale-socket defense currently rests on the fresh per-generation
-  private dir (structural); the capturer still presents the nonce per the contract.
+- **End-to-end nonce gating — done.** The supervisor exports `ONOATS_CAPTURER_NONCE`,
+  the recorder resolves it via `OnoatsConfig.capturer_nonce`, and
+  `_build_socket_transports` threads it into both transports as `expected_nonce`, so
+  a capturer handshaking with a missing/stale nonce is rejected end-to-end. The fresh
+  per-generation private dir remains the primary (structural) stale-socket defense;
+  the nonce is the belt-and-suspenders check. Manual socket mode without the
+  supervisor leaves `expected_nonce` `None` (no gating, backward compatible).
 - **Test scope honesty.** The Phase-3 crash / hung-but-alive tests substitute a fake
   recorder for `run_onoats_dual` (the real one needs the MLX STT stack, not CI-viable).
   They prove the *supervisor* contract (exit code, rotation, fresh dir, nonce reject);

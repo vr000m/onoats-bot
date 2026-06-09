@@ -175,6 +175,20 @@ class OnoatsConfig:
             "ONOATS_SYSTEM_SOCKET", self.raw.get("audio", {}).get("system_socket")
         )
 
+    @property
+    def capturer_nonce(self) -> str | None:
+        """Generation nonce the capturer must echo in its handshake (socket mode).
+
+        env ``ONOATS_CAPTURER_NONCE`` (set by the Phase-3 supervisor per launch)
+        > config.toml ``[audio].capturer_nonce``. ``None`` when unset — the
+        transport then does not gate on the nonce (e.g. socket mode driven
+        without the supervisor). When the supervisor exports it, a capturer that
+        handshakes with a missing or stale nonce is rejected.
+        """
+        return _env_or(
+            "ONOATS_CAPTURER_NONCE", self.raw.get("audio", {}).get("capturer_nonce")
+        )
+
     # ---- storage ----
     @property
     def data_dir(self) -> str | None:
