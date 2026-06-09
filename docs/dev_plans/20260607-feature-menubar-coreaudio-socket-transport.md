@@ -621,8 +621,44 @@ frozen queue-contract value koda's classifier keys on).
    process-tap (14.4+). Picks the system-audio API and the supported-OS floor.
 2. **Native binary distribution** — how does a `pip`/`uv`-installed Python package
    ship a notarized Swift capturer + menu-bar app? (Homebrew formula? `onoats
-   capturer install` downloader? build-from-source under `[macos]`?) **Biggest
-   unknown; likely a small sub-plan of its own.**
+   capturer install` downloader? build-from-source under `[macos]`?)
+   **RESOLVED 2026-06-09 — split into a free-path-now / notarized-path-later
+   answer; Milestone B is NOT blocked.**
+
+   The real constraints are **notarization** and **TCC permission stability**, not
+   packaging. Screen Recording / audio-capture TCC grants are keyed to the code
+   signature + bundle ID, so an unstable signature forces a re-grant on every
+   install/update.
+
+   - **Now (free Apple ID, author as sole user):** build the Swift capturer +
+     menu-bar app **from source locally** (a `make`/`xcodebuild` target under
+     `native/`). Sign with a **stable self-signed code-signing certificate** in
+     the login keychain (Keychain Access → Certificate Assistant → "Code Signing"),
+     *not* ad-hoc — this keeps a stable cdhash so the Screen Recording grant
+     survives rebuilds, at $0 and with no Apple Developer Program membership. No
+     notarization is needed for the author's own machine. The Python package stays
+     pure-Python and discovers the locally-built binary via the existing
+     `ONOATS_CAPTURER_BIN` (or a `native/build/` path). **This fully unblocks
+     Milestone B Phases 4–6 today.** (Note: a free account only issues local
+     "Apple Development" / self-signed certs — it CANNOT produce a `Developer ID
+     Application` cert or notarize; the user has a free account, not a paid one.)
+   - **Later (paid $99/yr membership, for shipping to others):** swap the
+     self-signed cert for a real `Developer ID Application` cert, add `xcrun
+     notarytool` + `stapler` to a release pipeline, and add a **Homebrew cask**
+     (prebuilt notarized `.app`, *not* a formula — a formula builds from source and
+     reintroduces the unstable-signature problem) or an `onoats capturer install`
+     downloader as the public channel. Both consume the same notarized artifact.
+   - **Architecture (applies to both phases):** one notarized `.app` bundle is the
+     native artifact (the menu-bar app with the capturer helper embedded at
+     `Onoats.app/Contents/MacOS/onoats-capturer` → one bundle ID, one TCC identity,
+     one signing pipeline); the pip wheel **never** bundles it. Decoupled
+     distribution means the recorder and capturer can version-drift, so add a
+     **protocol-version field to the existing Phase-1 JSON handshake header** and
+     have the supervisor reject a mismatched capturer loudly. Worth adding now
+     regardless of channel.
+
+   The public-distribution layer (notarize + cask) is additive and deferred — it
+   does not gate Milestone B work on the free path.
 3. **Capturer lifecycle owner** — CLI supervisor vs menu-bar app vs a launchd
    agent (mirrors the stt_server LaunchAgent pattern). Affects restart/crash
    semantics. **Partially resolved:** whichever layer is the supervisor *owns the
@@ -657,7 +693,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ 6354758fa66863c876fc29606eca82fbda4bb6e5 -->
+<!-- reviewed: 2026-06-09 @ 3428358c7c10b4b6ef9a06f79b66ac886338b850 -->
 
 ## Progress
 
