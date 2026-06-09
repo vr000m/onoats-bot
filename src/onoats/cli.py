@@ -231,7 +231,12 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # 3. Point the recorder at the private-dir sockets. The recorder resolves
     # these through OnoatsConfig (ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET env >
     # [audio] toml), so exporting them here is all dual._build_socket_transports
-    # needs.
+    # needs. Capture any prior values so the `finally` can restore them — these
+    # are process-global, and leaving them set would leak our private-dir paths
+    # into any in-process caller (e.g. tests) that runs after us.
+    _prior_socket_env = {
+        k: os.environ.get(k) for k in ("ONOATS_MIC_SOCKET", "ONOATS_SYSTEM_SOCKET")
+    }
     os.environ["ONOATS_MIC_SOCKET"] = mic_sock
     os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
 
@@ -291,6 +296,13 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             shutil.rmtree(sock_dir, ignore_errors=True)
         except OSError:
             pass
+        # Restore the socket env vars to their prior state so we don't leak our
+        # private-dir paths into a subsequent in-process caller.
+        for key, prior in _prior_socket_env.items():
+            if prior is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prior
 
     return rc
 
@@ -353,6 +365,13 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     # Parse the same args dual.main would, so `onoats bot --live-terminal
     # --category X` behaves identically in socket mode.
     args = _parse_args(rest)
+    if args.interactive:
+        # Mirror dual.main: interactive mode is unimplemented for the dual-input
+        # recorder. Warn rather than silently ignore so socket mode has parity.
+        logger.warning(
+            "Interactive mode is not implemented for the dual-input recorder. "
+            "Running in silent mode."
+        )
     if args.category:
         from onoats.categories import InvalidCategoryError, validate_category
 
