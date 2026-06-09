@@ -721,6 +721,23 @@ assumption is unreachable given the handshake-parse guarantee). Logic + security
 lenses independently confirmed the byte-accounting, lost-wakeup ordering, and
 eviction-termination are correct with no new attack surface.
 
+Adversarial-review continuation (Codex, full branch vs `main`): one **[high]**
+finding — the bounded staging cap did **not** bound the audio that actually
+reaches pipecat. `_pump_loop` drained the staging buffer into `push_audio_frame`
+unconditionally, and pipecat-1.3.0's `_audio_in_queue` is an unbounded
+`asyncio.Queue` (verified via the hub: `base_input.py:223-227` / `:170-177` /
+`:152-159`), so a *stalled* downstream consumer grew the base queue without limit
+while staging stayed empty and the drop/BLOCK policy never engaged — the existing
+backpressure tests drove `_stage_frame` directly with no pump, missing this path.
+**Fix:** the pump now gates on the base queue's depth (`_await_downstream_room`,
+high-water = `max_buffered_frames`) before each handoff, so the frame cap bounds
+both queues end-to-end (~2× worst case; base-queue bytes bounded by count × the
+1 MiB per-frame ceiling). Two integrated reader+pump regression tests added
+(`test_pump_gates_on_downstream_queue_under_consumer_stall`,
+`test_block_policy_surfaces_stall_through_real_pump`) — both confirmed to fail
+without the gate and pass with it (DROP keeps both queues ≤ cap; BLOCK surfaces the
+fatal consumer-stall through the real pump). Contract doc + `AGENTS.md` updated.
+
 ## Findings
 
 - **`AUDIO_SOURCE=socket` is seam-complete but NOT user-runnable until Phase 4.**

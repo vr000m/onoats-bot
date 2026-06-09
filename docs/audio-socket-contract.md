@@ -145,6 +145,18 @@ The recorder maintains a **bounded staging buffer** between the socket reader an
 pipecat's (unbounded) audio queue. Bounding it caps memory under a
 faster-than-consumer writer.
 
+**The staging cap alone is not sufficient** — pipecat's `_audio_in_queue` is an
+unbounded `asyncio.Queue`, so a pump that drained staging into it eagerly would let
+a *stalled downstream consumer* (slow/blocked VAD/STT) grow the base queue without
+limit while the staging buffer stays empty and the drop policy never fires. The pump
+therefore **gates on the base queue's depth**: it only forwards a staged frame when
+`_audio_in_queue` holds fewer than `max_buffered_frames`. Under a stall the pump
+parks, the staging buffer fills, and the drop/`block` policy engages — so the frame
+cap bounds **both** queues end-to-end. Consequence: worst-case buffered audio under a
+sustained stall is ~2× `max_buffered_frames` (staging + base), and — since the base
+queue exposes no per-byte hook — its bytes are bounded only by frame count × the
+1 MiB per-frame ceiling (the `max_buffered_bytes` cap below governs staging only).
+
 - **Default policy: `drop-oldest`** (`BackpressurePolicy.DROP_OLDEST`). On overflow
   the oldest staged frame is dropped and a **WARNING** is logged that includes the
   buffer depth and the dropped `seq` and a running total — so drops are observable.

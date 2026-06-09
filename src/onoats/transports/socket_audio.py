@@ -108,6 +108,16 @@ total staged bytes as well caps that footprint regardless of frame size. At the
 engages for pathologically large frames.
 """
 
+DOWNSTREAM_POLL_INTERVAL_S = 0.005
+"""How often the pump rechecks the base queue's depth while it is at the cap.
+
+The base ``_audio_in_queue`` is an unbounded ``asyncio.Queue`` with no
+"space-available" signal to await, so the pump polls ``qsize()`` to decide when
+there is room. Audio frames are tens of ms apart, so a 5 ms recheck adds
+negligible latency/CPU — and this poll is only reached when the downstream
+consumer has stalled (the healthy path never blocks here).
+"""
+
 
 def frame_size_bytes(sample_rate: int) -> int:
     """Return the 20 ms PCM16-mono frame size in bytes for ``sample_rate``.
@@ -236,7 +246,14 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                 declaring the (alive-but-silent) capturer dead and surfacing an
                 ``ErrorFrame``. ``<= 0`` disables the watchdog.
             max_buffered_frames: Frame-count bound on the internal staging buffer
-                between the socket reader and the base audio queue.
+                between the socket reader and the base audio queue. Also the
+                high-water mark the pump enforces on the *base* (Pipecat-facing)
+                queue (see :meth:`_await_downstream_room`), so this caps both
+                queues end-to-end. Worst case under a sustained downstream stall
+                the footprint is ~2× this many frames (staging + base), and —
+                given the 1 MiB per-frame ceiling — base-queue bytes can reach
+                ~``max_buffered_frames`` MiB (the byte cap below bounds staging
+                only; the base queue exposes no per-byte hook to gate on).
             max_buffered_bytes: Total-byte bound on the staging buffer, enforced
                 alongside ``max_buffered_frames`` so a few maximal frames cannot
                 blow the footprint past the count cap × the 1 MiB per-frame ceiling.
@@ -653,13 +670,39 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
 
         self._put_staged(frame, frame_bytes)
 
+    async def _await_downstream_room(self) -> None:
+        """Block while the base ``_audio_in_queue`` is at/over the frame cap.
+
+        ``push_audio_frame`` puts onto an *unbounded* ``asyncio.Queue`` (pipecat
+        ``BaseInputTransport`` creates it with no ``maxsize``), so draining the
+        staging buffer into it eagerly would let a stalled consumer grow the base
+        queue without limit while ``_stage`` stays near-empty — the drop/BLOCK
+        policy would never see the pressure. Gating the pump on the base queue's
+        depth makes ``max_buffered_frames`` cap *both* queues: when downstream
+        backs up, the pump parks here, ``_stage`` fills, and the existing staging
+        policy engages (drop, or — for BLOCK — the reader's ``_block_until_room``
+        timeout surfaces a fatal consumer-stall, since the parked pump no longer
+        sets ``_room_freed``).
+
+        There is no "space-available" event on an unbounded queue, so this polls
+        ``qsize()``; the wait is only reached under a stalled/slow consumer.
+        ``asyncio.sleep`` keeps it cancellable on teardown.
+        """
+        while True:
+            queue = self._audio_in_queue
+            if queue is None or queue.qsize() < self._max_buffered_frames:
+                return
+            await asyncio.sleep(DOWNSTREAM_POLL_INTERVAL_S)
+
     async def _pump_loop(self) -> None:
         """Forward staged frames into the base audio queue.
 
         Decoupling the socket reader from ``push_audio_frame`` via the bounded
-        staging buffer is what makes the drop policy effective: the base queue is
-        unbounded, so without this buffer a faster-than-consumer writer would
-        grow it without limit.
+        staging buffer, plus gating each handoff on the base queue's depth
+        (:meth:`_await_downstream_room`), is what bounds memory end-to-end: the
+        base queue is unbounded, so without both the staging cap *and* the
+        downstream gate a faster-than-consumer writer would grow the base queue
+        without limit. ``max_buffered_frames`` therefore caps both queues.
 
         Fail-loud: an unexpected exception from ``push_audio_frame`` surfaces a
         fatal ``ErrorFrame`` and ends the branch, mirroring ``_read_loop``. If the
@@ -668,6 +711,7 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         """
         try:
             while True:
+                await self._await_downstream_room()
                 frame = await self._stage.get()
                 self._staged_bytes -= len(frame.audio)
                 self._room_freed.set()

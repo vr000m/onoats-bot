@@ -37,10 +37,16 @@ pin them (`tests/test_dual_socket_source.py`, `tests/test_socket_audio_transport
   that's what cancels the pipeline) on EOF, a framing error, a read-idle timeout,
   a BLOCK consumer-stall, or a staging-pump failure. The supervisor owns restart;
   the transport never reconnects itself.
-- **Bounded staging.** The reader stages into a buffer bounded by **both** a frame
-  count (`max_buffered_frames`) and total bytes (`max_buffered_bytes`); the drop
-  policy (default `drop-oldest`, with a WARNING) keeps memory capped under a
-  faster-than-consumer writer.
+- **Bounded staging + downstream gate.** The reader stages into a buffer bounded by
+  **both** a frame count (`max_buffered_frames`) and total bytes
+  (`max_buffered_bytes`); the drop policy (default `drop-oldest`, with a WARNING)
+  keeps memory capped under a faster-than-consumer writer. Because pipecat's
+  `_audio_in_queue` is unbounded, the pump also **gates on the base queue's depth**
+  (`_await_downstream_room`, high-water = `max_buffered_frames`) so a *stalled
+  consumer* can't grow it without limit — the frame cap bounds both queues (~2×
+  worst case). Don't reintroduce an unconditional `push_audio_frame` drain in the
+  pump; that's the bug Codex caught (re-verified via the integrated reader+pump
+  regression tests in `tests/test_socket_audio_transport.py`).
 
 ## Supervisor ↔ capturer lifecycle (`cli._run_socket_supervisor`)
 

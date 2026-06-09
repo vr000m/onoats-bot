@@ -795,6 +795,146 @@ async def test_pump_failure_surfaces_fatal_error(path):
         await server.aclose()
 
 
+@pytest.mark.anyio
+async def test_pump_gates_on_downstream_queue_under_consumer_stall(path):
+    """Integrated reader+pump regression for the bounded-memory invariant.
+
+    The earlier backpressure tests drive ``_stage_frame`` directly with no pump,
+    so they never exercise the production path: the pump used to drain the bounded
+    staging buffer into Pipecat's *unbounded* ``_audio_in_queue`` unconditionally,
+    so a stalled consumer grew the base queue without limit while ``_stage`` stayed
+    near-empty and the drop policy never engaged.
+
+    Here the real reader AND pump run while the base audio consumer is stalled
+    (its task cancelled, so nothing drains ``_audio_in_queue``). BOTH queues must
+    stay within ``max_buffered_frames``, and the drop policy must engage via the
+    pump path (``_dropped_frames > 0``), not just a direct ``_stage_frame`` call.
+
+    Frames are fed at a measured pace (not one instant burst): the bug is the pump
+    moving frames into the *unbounded* base queue faster than the consumer drains.
+    A burst would instead let the reader out-race the pump and drop at the staging
+    layer regardless of the gate, masking the regression — so we space arrivals so
+    the pump keeps ``_stage`` empty and (without the gate) would pile every frame
+    into ``_audio_in_queue``.
+    """
+    cap = 4
+    n_frames = 40
+    pcm = pcm_from_samples([1, 2, 3])
+
+    async def feed(writer: asyncio.StreamWriter):
+        writer.write(make_header())
+        await writer.drain()
+        for seq in range(n_frames):
+            writer.write(make_frame(seq, pcm))
+            await writer.drain()
+            # Pace arrivals so the pump drains each frame downstream before the
+            # next one is read — this is what surfaces unbounded base-queue growth.
+            await asyncio.sleep(0.003)
+        # Stay alive so EOF/idle don't race the assertions.
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    server = _SocketWriterServer(path, feed)
+    await server.start()
+    harness = _ManualHarness(
+        _make_transport(
+            path,
+            max_buffered_frames=cap,
+            backpressure_policy=BackpressurePolicy.DROP_OLDEST,
+            read_idle_timeout=WAIT_TIMEOUT * 2,
+        )
+    )
+    await harness.setup()
+    try:
+        await asyncio.wait_for(harness.start(), timeout=WAIT_TIMEOUT)
+        transport = harness.transport
+        # Simulate a fully stalled downstream consumer: cancel the base audio
+        # task so nothing ever drains _audio_in_queue. The pump must then gate on
+        # the base queue's depth instead of draining the staging buffer into it.
+        # Yield once first so the just-scheduled task starts (and parks on get())
+        # before we cancel it — avoids a "coroutine never awaited" warning.
+        assert transport._audio_task is not None
+        await asyncio.sleep(0)
+        await transport.cancel_task(transport._audio_task)
+
+        # Wait until essentially every fed frame has flowed through the reader —
+        # i.e. been dropped, left staged, or pushed into the (stalled) base queue.
+        # Only at this steady state does the bug show: without the gate the base
+        # queue would now hold ~all n_frames; with it, both queues stay <= cap.
+        # (The base consumer may have drained a frame or two before we cancelled
+        # it, so allow a small margin rather than requiring the full count.)
+        def _accounted() -> int:
+            q = transport._audio_in_queue.qsize() if transport._audio_in_queue else 0
+            return transport._dropped_frames + transport._stage.qsize() + q
+
+        await _wait_until(lambda: _accounted() >= n_frames - cap, timeout=WAIT_TIMEOUT)
+
+        # Invariant: max_buffered_frames caps BOTH queues end-to-end. This is the
+        # discriminating assertion — without the downstream gate the base queue
+        # grows to ~n_frames here.
+        assert transport._audio_in_queue is not None
+        assert transport._audio_in_queue.qsize() <= cap
+        assert transport._stage.qsize() <= cap
+        # Drop policy engaged via the real pump path (most frames shed).
+        assert transport._dropped_frames > 0
+        # No fatal error under a drop policy — it sheds load, it does not abort.
+        assert not harness.error_frames()
+    finally:
+        await asyncio.wait_for(harness.send(CancelFrame()), timeout=WAIT_TIMEOUT)
+        await server.aclose()
+
+
+@pytest.mark.anyio
+async def test_block_policy_surfaces_stall_through_real_pump(path):
+    """Under BLOCK, a stalled downstream consumer must abort via the real pump.
+
+    Companion to the direct ``_stage_frame`` BLOCK test: with the base consumer
+    stalled, the pump gates on the full base queue and stops draining ``_stage``;
+    the reader then blocks in ``_block_until_room`` and, finding no room within
+    ``read_idle_timeout`` (the parked pump never signals ``_room_freed``), surfaces
+    a fatal ``ErrorFrame`` rather than buffering without bound.
+    """
+    cap = 2
+    pcm = pcm_from_samples([1, 2, 3])
+
+    async def feed(writer: asyncio.StreamWriter):
+        writer.write(make_header())
+        for seq in range(20):
+            writer.write(make_frame(seq, pcm))
+        await writer.drain()
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    server = _SocketWriterServer(path, feed)
+    await server.start()
+    harness = _ManualHarness(
+        _make_transport(
+            path,
+            max_buffered_frames=cap,
+            backpressure_policy=BackpressurePolicy.BLOCK,
+            read_idle_timeout=0.2,
+        )
+    )
+    await harness.setup()
+    try:
+        await asyncio.wait_for(harness.start(), timeout=WAIT_TIMEOUT)
+        transport = harness.transport
+        assert transport._audio_task is not None
+        await asyncio.sleep(0)
+        await transport.cancel_task(transport._audio_task)
+
+        await _wait_until(lambda: bool(harness.error_frames()), timeout=WAIT_TIMEOUT)
+        errs = harness.error_frames()
+        assert errs
+        assert errs[0].fatal is True
+        assert "not draining" in errs[0].error.lower()
+        # Memory stayed bounded even on the way to aborting.
+        assert transport._audio_in_queue is not None
+        assert transport._audio_in_queue.qsize() <= cap
+        assert transport._stage.qsize() <= cap
+    finally:
+        await asyncio.wait_for(harness.send(CancelFrame()), timeout=WAIT_TIMEOUT)
+        await server.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Read-idle watchdog: connected-but-silent capturer surfaces an ErrorFrame
 # ---------------------------------------------------------------------------
