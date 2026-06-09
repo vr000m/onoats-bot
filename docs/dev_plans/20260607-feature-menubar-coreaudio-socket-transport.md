@@ -705,7 +705,21 @@ documents `AUDIO_SOURCE` (README "Audio source (experimental)" section, marked
 `portaudio` and BlackHole is untouched), adds `AGENTS.md`, pins the Phase-4
 capturer device-change + capturer-exit-before-recorder contract in
 `docs/audio-socket-contract.md`, and adds a parity test asserting the contract
-constants table mirrors `socket_audio.py`.
+constants table mirrors `socket_audio.py`. Deep-review continuation: `a4aceaa`
+cites the concrete pipecat-1.3.0 guarantees behind the fail-loud "ended without
+shutdown ⇒ fatal ErrorFrame" inference in `dual.py`; `bd38100` closes
+the continuation findings — documents `DEFAULT_MAX_BUFFERED_BYTES` (16 MiB) in
+the contract's Backpressure section + Constants table, exports it from
+`onoats.transports`, and **fixes a parity-test over-claim**: the "parity is
+enforced / fails CI" callout was only true for the 6 uppercase constants, so the
+test now reads `read_idle_timeout`, `max_buffered_frames`, and the 640 frame-size
+rows from the doc table too (drifting the `200` row to `201` now fails CI). Three
+findings recorded as won't-fix/analysis-error in `AGENTS.md` with reasons
+(underscore-prefixed cross-module helpers match repo convention; inner-only
+`max_buffered_bytes` clamp mirrors `max_buffered_frames`; `nonce[:8]` str
+assumption is unreachable given the handshake-parse guarantee). Logic + security
+lenses independently confirmed the byte-accounting, lost-wakeup ordering, and
+eviction-termination are correct with no new attack surface.
 
 ## Findings
 
