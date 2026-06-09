@@ -227,6 +227,26 @@ event (rc=0) rather than a spurious *capturer-died-mid-session* event (rc=1): th
 recorder always wins the shutdown race because the OS cannot kill the capturer
 out from under it.
 
+**Environment (deny-by-default allowlist).** The capturer is launched with an
+**explicit, allowlisted** environment — **not** a copy of the recorder's full
+env. It receives ONLY:
+
+- the socket paths + generation nonce
+  (`ONOATS_MIC_SOCKET` / `ONOATS_SYSTEM_SOCKET` / `ONOATS_CAPTURER_NONCE`, always
+  set); and
+- a fixed runtime/OS allowlist needed to launch a native macOS/Linux process:
+  `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `USER`, `LOGNAME`, `LANG`, `SHELL`,
+  plus any present `LC_*` (locale) and `DYLD_*` / `__CF*` (macOS dynamic-loader)
+  vars.
+
+STT / application **secrets are never forwarded** to the capturer — anything not
+on the allowlist (e.g. `DEEPGRAM_API_KEY`, any `*_API_KEY` / `*_TOKEN` /
+`*_SECRET`, `STT_*`) is excluded **by construction**. The allowlist is the
+auditable module-level constant `onoats.cli._CAPTURER_ENV_PASSTHROUGH`; because
+the policy is deny-by-default, a newly added secret can't leak by omission. This
+keeps a buggy / replaced / crash-reporting capturer from ever seeing credentials
+it doesn't need.
+
 The capturer (Phase 4, not yet built) MUST: create both sockets, accept one
 connection each, write the v1 handshake (echoing the nonce), then stream
 length-prefixed v1 frames per branch.

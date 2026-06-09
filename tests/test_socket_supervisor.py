@@ -146,8 +146,23 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
     MIC = _arg(["ONOATS_MIC_SOCKET", "MIC_SOCKET"], "--mic-socket")
     SYSTEM = _arg(["ONOATS_SYSTEM_SOCKET", "SYSTEM_SOCKET"], "--system-socket")
     NONCE = _arg(["ONOATS_CAPTURER_NONCE", "ONOATS_NONCE"], "--nonce")
-    BEHAVIOUR = os.environ.get("ONOATS_FAKE_BEHAVIOUR", "stream")
-    N_FRAMES = int(os.environ.get("ONOATS_FAKE_NFRAMES", "5"))
+
+    # Behaviour control. The supervisor builds the capturer env from a strict
+    # deny-by-default allowlist (Phase 2, invariant I2), which intentionally
+    # strips ONOATS_FAKE_* — so we CANNOT rely on env to steer the fake. Read a
+    # sidecar control file written next to this script ("<script>.control",
+    # JSON) which survives the allowlist; fall back to env (for any direct,
+    # non-supervisor invocation) then defaults.
+    _control = {}
+    try:
+        with open(__file__ + ".control") as _cf:
+            _control = json.load(_cf)
+    except (OSError, ValueError):
+        _control = {}
+    BEHAVIOUR = _control.get("behaviour") or os.environ.get(
+        "ONOATS_FAKE_BEHAVIOUR", "stream"
+    )
+    N_FRAMES = int(_control.get("nframes") or os.environ.get("ONOATS_FAKE_NFRAMES", "5"))
 
     if not MIC or not SYSTEM:
         sys.stderr.write(
@@ -222,6 +237,27 @@ def fake_capturer(short_root):
     p.write_text(_FAKE_CAPTURER_SRC)
     p.chmod(0o755)
     return p
+
+
+@pytest.fixture
+def set_capturer_behaviour(fake_capturer):
+    """Steer the fake capturer's behaviour via its sidecar control file.
+
+    The supervisor builds the capturer env from a strict deny-by-default
+    allowlist (invariant I2), so ``ONOATS_FAKE_*`` env vars do NOT reach the
+    capturer. The capturer instead reads ``<script>.control`` (JSON), which this
+    helper writes — keeping the behaviour switch independent of the env contract
+    under test.
+    """
+    import json
+
+    def _set(behaviour: str, *, nframes: int | None = None) -> None:
+        control: dict = {"behaviour": behaviour}
+        if nframes is not None:
+            control["nframes"] = nframes
+        Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
+
+    return _set
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +539,9 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-def test_crash_fails_loud_and_rotates_partial_session(sup_env, log_sink, monkeypatch):
+def test_crash_fails_loud_and_rotates_partial_session(
+    sup_env, log_sink, monkeypatch, set_capturer_behaviour
+):
     """CRASH path, asserting every fail-loud observable the supervisor exposes.
 
     The fake capturer writes 5 frames then exits (process death + socket EOF).
@@ -516,8 +554,7 @@ def test_crash_fails_loud_and_rotates_partial_session(sup_env, log_sink, monkeyp
       * NOT hang (bounded by the worker-thread join).
     """
     _data_dir, pending_dir = sup_env
-    monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "crash")
-    monkeypatch.setenv("ONOATS_FAKE_NFRAMES", "5")
+    set_capturer_behaviour("crash", nframes=5)
     # The capturer sleeps ~0.5s after closing sockets before its process exits;
     # the recorder's drain must outlast that so the supervisor observes capturer
     # PROCESS death first and takes its non-zero crash branch (real ordering).
@@ -543,7 +580,9 @@ def test_crash_fails_loud_and_rotates_partial_session(sup_env, log_sink, monkeyp
 # ---------------------------------------------------------------------------
 
 
-def test_hung_but_alive_does_not_hang_and_rotates(sup_env, log_sink, monkeypatch):
+def test_hung_but_alive_does_not_hang_and_rotates(
+    sup_env, log_sink, monkeypatch, set_capturer_behaviour
+):
     """HUNG-BUT-ALIVE path: a connected-but-silent capturer must not hang.
 
     The fake capturer handshakes then stays silent forever (no EOF). The fake
@@ -557,7 +596,7 @@ def test_hung_but_alive_does_not_hang_and_rotates(sup_env, log_sink, monkeypatch
     succeeds, even though the capturer process is still alive.
     """
     _data_dir, pending_dir = sup_env
-    monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "silent")
+    set_capturer_behaviour("silent")
     # Short read-idle in the fake recorder so the watchdog-equivalent fires well
     # within the bounded join.
     state = _install_fake_recorder(monkeypatch, idle_end=0.4)
@@ -588,7 +627,9 @@ def test_hung_but_alive_does_not_hang_and_rotates(sup_env, log_sink, monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def test_clean_recorder_exit_returns_zero_and_stops_capturer(sup_env, monkeypatch):
+def test_clean_recorder_exit_returns_zero_and_stops_capturer(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
     """Negative control: a healthy streaming capturer + a recorder that returns
     cleanly yields rc=0, and the supervisor stops the (still-alive) capturer.
 
@@ -597,7 +638,7 @@ def test_clean_recorder_exit_returns_zero_and_stops_capturer(sup_env, monkeypatc
     voluntarily (emulating an EndFrame shutdown).
     """
     _data_dir, pending_dir = sup_env
-    monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "stream")
+    set_capturer_behaviour("stream")
 
     state: dict = {"frames_read": 0}
 
@@ -631,7 +672,7 @@ def test_clean_recorder_exit_returns_zero_and_stops_capturer(sup_env, monkeypatc
 
 
 def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
-    sup_env, monkeypatch
+    sup_env, monkeypatch, set_capturer_behaviour
 ):
     """Regression for invariant I1 (signal isolation).
 
@@ -651,7 +692,7 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
        the fail-loud branch.
     """
     _data_dir, _pending = sup_env
-    monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "stream")
+    set_capturer_behaviour("stream")
 
     spawn_kwargs: dict = {}
     real_exec = asyncio.create_subprocess_exec
@@ -701,11 +742,118 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
 
 
 # ---------------------------------------------------------------------------
+# I2 ENV ALLOWLIST: the capturer is spawned with a deny-by-default env — ONLY
+# the socket paths, nonce, and a fixed runtime/OS allowlist (PATH/HOME/…). STT /
+# application secrets in the recorder env (DEEPGRAM_API_KEY, *_TOKEN, …) must
+# NOT leak into the native child.
+# ---------------------------------------------------------------------------
+
+
+def test_capturer_env_is_allowlisted_and_excludes_secrets(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """Regression for invariant I2 (capturer env allowlist).
+
+    A sentinel STT secret is planted in the recorder env. We spy on
+    ``asyncio.create_subprocess_exec`` to capture the ``env=`` kwarg the capturer
+    is launched with, then assert:
+
+      * the three socket/nonce vars + PATH ARE present (the allowlist isn't
+        over-aggressive — the capturer can still launch);
+      * the planted secrets (DEEPGRAM_API_KEY / STT_WS_TOKEN) are ABSENT (the
+        deny-by-default allowlist holds — secrets are never forwarded).
+    """
+    _data_dir, _pending = sup_env
+    set_capturer_behaviour("stream")
+    # Plant sentinel secrets that the supervisor's old dict(os.environ) copy
+    # would have leaked into the capturer.
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "should-not-leak")
+    monkeypatch.setenv("STT_WS_TOKEN", "should-not-leak-either")
+
+    spawn_kwargs: dict = {}
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _spy_exec(*args, **kwargs):
+        spawn_kwargs.update(kwargs)
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spy_exec)
+
+    # The recorder reads a few frames then returns cleanly so the supervisor runs
+    # to a normal completion (we only need the captured spawn env).
+    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)  # handshake
+            for _ in range(3):
+                chunk = await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT)
+                if not chunk:
+                    break
+        finally:
+            writer.close()
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
+
+    rc = _run_supervisor_bounded()
+    assert rc == 0, f"a clean recorder exit must yield rc=0, got {rc}"
+
+    env = spawn_kwargs.get("env")
+    assert env is not None, "the capturer must be spawned with an explicit env="
+
+    # Required: socket paths + nonce are always present.
+    for required in (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    ):
+        assert required in env, f"capturer env is missing required var {required!r}"
+    # The allowlist isn't over-aggressive — PATH survives so the native child can
+    # actually launch.
+    assert "PATH" in env, (
+        "PATH must be passed through to the capturer (allowlist must not break "
+        "the native launch)"
+    )
+
+    # I2: the planted STT secrets must NOT be forwarded into the capturer env.
+    assert "DEEPGRAM_API_KEY" not in env, (
+        "DEEPGRAM_API_KEY leaked into the capturer env — the deny-by-default "
+        "allowlist must exclude STT/application secrets"
+    )
+    assert "STT_WS_TOKEN" not in env, (
+        "STT_WS_TOKEN leaked into the capturer env — secrets must never be "
+        "forwarded to the native capturer"
+    )
+    # The recorder env itself still HAD the secrets (proving exclusion happened
+    # at the allowlist boundary, not because they were never set).
+    assert os.environ.get("DEEPGRAM_API_KEY") == "should-not-leak"
+
+
+def test_capturer_env_allowlist_constant_excludes_secret_families():
+    """The auditable allowlist constant must not name any secret-bearing var.
+
+    Importing the module-level allowlist keeps the policy testable: a future edit
+    that adds a secret to the passthrough set fails here even without a spawn.
+    """
+    secret_markers = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "DEEPGRAM", "STT_")
+    for name in cli._CAPTURER_ENV_PASSTHROUGH:
+        upper = name.upper()
+        assert not any(marker in upper for marker in secret_markers), (
+            f"allowlisted passthrough var {name!r} looks secret-bearing"
+        )
+    # Socket paths + nonce are set explicitly by the builder, not via the
+    # passthrough tuple.
+    assert "PATH" in cli._CAPTURER_ENV_PASSTHROUGH
+
+
+# ---------------------------------------------------------------------------
 # Private 0700 socket dir: minted under the system temp root, owner-only
 # ---------------------------------------------------------------------------
 
 
-def test_supervisor_mints_private_0700_socket_dir(sup_env, monkeypatch):
+def test_supervisor_mints_private_0700_socket_dir(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
     """The supervisor must mint a PRIVATE 0700 socket dir and export both socket
 
     paths into it (ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET), foreclosing symlink
@@ -714,7 +862,7 @@ def test_supervisor_mints_private_0700_socket_dir(sup_env, monkeypatch):
     distinct files in that dir.
     """
     _data_dir, _pending = sup_env
-    monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "stream")
+    set_capturer_behaviour("stream")
 
     captured: dict = {}
 

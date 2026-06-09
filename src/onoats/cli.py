@@ -173,6 +173,58 @@ _CAPTURER_TERM_GRACE_SEC = 5.0
 MIC_SOCKET_NAME = "mic.sock"
 SYSTEM_SOCKET_NAME = "system.sock"
 
+# Deny-by-default allowlist for the capturer's environment. The capturer is a
+# native macOS/Linux child process that needs ONLY the socket paths + nonce (set
+# explicitly) plus a minimal runtime/OS environment to launch. We build its env
+# from THIS allowlist instead of copying os.environ wholesale, so STT /
+# application secrets in the recorder env (DEEPGRAM_API_KEY, any *_API_KEY /
+# *_TOKEN / *_SECRET, STT_*) are NEVER forwarded. New secrets can't leak by
+# omission: anything not listed here is excluded by construction.
+#
+# Exact names pulled individually; prefix families (LC_*, DYLD_*, __CF*) matched
+# by iterating os.environ so locale + macOS dynamic-loader vars pass through only
+# when actually present.
+_CAPTURER_ENV_PASSTHROUGH = (
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "SHELL",
+)
+_CAPTURER_ENV_PREFIXES = ("LC_", "DYLD_", "__CF")
+
+
+def _build_capturer_env(
+    base_env: "os._Environ[str] | dict[str, str]",
+    *,
+    mic_sock: str,
+    system_sock: str,
+    nonce: str,
+) -> dict[str, str]:
+    """Build the capturer's env from the deny-by-default allowlist + the three
+    socket/nonce vars (which must always be present).
+
+    Only allowlisted keys actually present in ``base_env`` are forwarded; the
+    socket paths + nonce are then set explicitly so they're guaranteed present
+    regardless of the inbound env.
+    """
+    env: dict[str, str] = {}
+    for key in _CAPTURER_ENV_PASSTHROUGH:
+        value = base_env.get(key)
+        if value is not None:
+            env[key] = value
+    for key, value in base_env.items():
+        if key.startswith(_CAPTURER_ENV_PREFIXES):
+            env[key] = value
+    env["ONOATS_MIC_SOCKET"] = mic_sock
+    env["ONOATS_SYSTEM_SOCKET"] = system_sock
+    env["ONOATS_CAPTURER_NONCE"] = nonce
+    return env
+
 
 def _run_socket_supervisor(rest: list[str]) -> int:
     """Synchronous entry: drive the async socket session, mirror dual.main's rc.
@@ -273,10 +325,14 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         # 3b. Spawn the capturer pointed at both sockets. Pass the socket paths +
         # nonce via BOTH env and argv (documented in the contract doc) so a
         # capturer can read whichever it prefers.
-        capturer_env = dict(os.environ)
-        capturer_env["ONOATS_MIC_SOCKET"] = mic_sock
-        capturer_env["ONOATS_SYSTEM_SOCKET"] = system_sock
-        capturer_env["ONOATS_CAPTURER_NONCE"] = nonce
+        # Deny-by-default: the capturer gets ONLY the allowlisted runtime/OS vars
+        # plus the socket paths + nonce — NOT the full recorder env. This keeps
+        # STT/application secrets (DEEPGRAM_API_KEY, *_API_KEY/*_TOKEN/*_SECRET,
+        # STT_*) out of a native child that never needs them. See
+        # _CAPTURER_ENV_PASSTHROUGH and docs/audio-socket-contract.md.
+        capturer_env = _build_capturer_env(
+            os.environ, mic_sock=mic_sock, system_sock=system_sock, nonce=nonce
+        )
         logger.info(
             f"Socket supervisor: spawning capturer {capturer_bin!r} "
             f"(mic={mic_sock}, system={system_sock}, nonce={nonce[:8]}…)"
