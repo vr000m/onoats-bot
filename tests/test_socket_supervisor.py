@@ -623,6 +623,84 @@ def test_clean_recorder_exit_returns_zero_and_stops_capturer(sup_env, monkeypatc
 
 
 # ---------------------------------------------------------------------------
+# I1 SIGNAL ISOLATION: the capturer must be spawned in its OWN session so a
+# terminal Ctrl+C/SIGTERM is NOT delivered to it by the OS (process-group
+# membership). A graceful recorder shutdown (recorder finishes first, capturer
+# still alive) must yield rc=0 — NOT be mis-classified as capturer-death (rc=1).
+# ---------------------------------------------------------------------------
+
+
+def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
+    sup_env, monkeypatch
+):
+    """Regression for invariant I1 (signal isolation).
+
+    Two assertions, structural + behavioural:
+
+    1. The capturer is spawned via ``asyncio.create_subprocess_exec`` with
+       ``start_new_session=True`` — the portable spelling of ``setsid``. This is
+       what stops a terminal Ctrl+C/SIGTERM from reaching the capturer as a side
+       effect of foreground process-group membership; the supervisor stops the
+       capturer explicitly via ``_stop_capturer`` after the recorder finishes.
+       We spy on the spawn rather than deliver a real OS signal in CI.
+
+    2. A recorder that finishes first while the capturer is still streaming
+       (the graceful-shutdown shape) yields rc=0 — proving a clean shutdown is
+       NOT mis-classified as capturer-death (rc=1). Without isolation, an
+       inherited terminal signal could kill the capturer first and flip this to
+       the fail-loud branch.
+    """
+    _data_dir, _pending = sup_env
+    monkeypatch.setenv("ONOATS_FAKE_BEHAVIOUR", "stream")
+
+    spawn_kwargs: dict = {}
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _spy_exec(*args, **kwargs):
+        spawn_kwargs.update(kwargs)
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spy_exec)
+
+    state: dict = {"frames_read": 0}
+
+    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+        # Healthy streaming capturer; the recorder reads a few frames then
+        # returns cleanly (EndFrame-equivalent) while the capturer is STILL
+        # alive — the graceful-shutdown shape a terminal Ctrl+C would produce
+        # once signal isolation keeps the capturer out of the foreground group.
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)  # handshake
+            for _ in range(3):
+                chunk = await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT)
+                if not chunk:
+                    break
+                state["frames_read"] += len(chunk)
+        finally:
+            writer.close()
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
+
+    rc = _run_supervisor_bounded()
+
+    # Structural: the OS will never relay a terminal signal to the capturer.
+    assert spawn_kwargs.get("start_new_session") is True, (
+        "the capturer must be spawned with start_new_session=True so a terminal "
+        "Ctrl+C/SIGTERM is not delivered to it by the OS; the supervisor owns "
+        "capturer teardown explicitly via _stop_capturer"
+    )
+    # Behavioural: a recorder-first completion with a still-alive capturer is a
+    # GRACEFUL shutdown — rc=0, not the capturer-death fail-loud branch (rc=1).
+    assert rc == 0, (
+        "a graceful recorder shutdown (recorder finishes first, capturer still "
+        f"alive) must yield rc=0, not be mis-classified as capturer-death; got {rc}"
+    )
+    assert state["frames_read"] > 0, "recorder read no frames from a streaming capturer"
+
+
+# ---------------------------------------------------------------------------
 # Private 0700 socket dir: minted under the system temp root, owner-only
 # ---------------------------------------------------------------------------
 

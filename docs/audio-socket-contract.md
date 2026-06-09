@@ -204,8 +204,9 @@ When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor
 2. mints a fresh generation **nonce**;
 3. exports `ONOATS_MIC_SOCKET` / `ONOATS_SYSTEM_SOCKET` (pointing at those
    sockets) for the recorder;
-4. **spawns the binary named by `ONOATS_CAPTURER_BIN`**, passing the socket paths
-   and nonce **both** ways (read whichever you prefer):
+4. **spawns the binary named by `ONOATS_CAPTURER_BIN`** **in its own
+   session/process group** (`start_new_session=True`, the portable `setsid`),
+   passing the socket paths and nonce **both** ways (read whichever you prefer):
 
    - **argv:** `--mic-socket <path> --system-socket <path> --nonce <hex>`
    - **env:** `ONOATS_MIC_SOCKET`, `ONOATS_SYSTEM_SOCKET`, `ONOATS_CAPTURER_NONCE`
@@ -214,6 +215,17 @@ When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor
    the recorder;
 6. on shutdown stops the recorder, then the capturer (SIGTERM → bounded wait →
    SIGKILL); on capturer death tears down cleanly.
+
+**Signal isolation.** Because the capturer is spawned in its **own
+session/process group**, a terminal `Ctrl+C`/`SIGTERM` (delivered by the OS to
+the whole foreground process group) is **NOT relayed to the capturer**. The
+supervisor owns the capturer's lifecycle end to end: it stops the capturer
+**explicitly** (SIGTERM → bounded wait → SIGKILL on the pid, via
+`_stop_capturer`) **after the recorder finishes**, never via an inherited
+terminal signal. This is what makes a graceful Ctrl+C a *recorder-finishes-first*
+event (rc=0) rather than a spurious *capturer-died-mid-session* event (rc=1): the
+recorder always wins the shutdown race because the OS cannot kill the capturer
+out from under it.
 
 The capturer (Phase 4, not yet built) MUST: create both sockets, accept one
 connection each, write the v1 handshake (echoing the nonce), then stream

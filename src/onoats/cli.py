@@ -291,6 +291,19 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 "--nonce",
                 nonce,
                 env=capturer_env,
+                # Spawn the capturer in its OWN session/process group
+                # (start_new_session=True is the portable subprocess spelling of
+                # setsid). On POSIX a terminal Ctrl+C/SIGTERM is delivered to the
+                # whole foreground process group, so without this it would hit
+                # BOTH onoats and the capturer. Terminal signals must NOT reach
+                # the capturer: the supervisor owns capturer teardown explicitly
+                # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the pid)
+                # AFTER the recorder finishes. This isolation is what makes the
+                # recorder-finishes-first branch in _run_recorder_with_capturer
+                # correct under Ctrl+C — without it, the capturer could win the
+                # race and a graceful shutdown would be mis-classified as
+                # capturer-death (rc=1).
+                start_new_session=True,
             )
         except OSError as exc:
             # Missing binary / permission denied launching it — fail loud.
