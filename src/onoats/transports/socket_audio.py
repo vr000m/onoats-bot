@@ -57,8 +57,9 @@ buffer between the socket reader and the base queue, with a configurable policy
 *not* frozen — see Open Question 4 in the plan.
 
 No self-reconnect: EOF, a broken handshake, a version mismatch, or a read-idle
-timeout each surface an ``ErrorFrame`` downstream and end the branch. The
-supervisor (Phase 3) owns capturer restart.
+timeout each surface a **fatal** ``ErrorFrame`` (pushed upstream via
+``push_error(..., fatal=True)``) that cancels the pipeline and ends the branch
+*and* the recorder. The supervisor (Phase 3) owns capturer restart.
 """
 
 from __future__ import annotations
@@ -72,8 +73,7 @@ from enum import Enum
 
 from loguru import logger
 
-from pipecat.frames.frames import ErrorFrame, InputAudioRawFrame, StartFrame
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.frames.frames import InputAudioRawFrame, StartFrame
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
@@ -374,7 +374,7 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         """Read length-prefixed frames and stage them for the pump.
 
         Ends the branch on EOF, a malformed frame, or a read-idle timeout by
-        surfacing an ``ErrorFrame`` downstream. Never self-reconnects.
+        surfacing a fatal ``ErrorFrame`` (upstream). Never self-reconnects.
         """
         assert self._reader is not None
         try:
@@ -575,9 +575,18 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
     # -- teardown / errors --------------------------------------------------
 
     async def _surface_error(self, message: str) -> None:
-        """Log and push an ``ErrorFrame`` downstream to end the branch."""
+        """Push a FATAL ``ErrorFrame`` upstream to terminate the recorder.
+
+        Uses the framework's ``push_error(..., fatal=True)`` helper, which pushes
+        the error **upstream**. The pipeline worker only cancels the pipeline for
+        a *fatal* error arriving upstream (``worker.py``: ``frame.fatal`` →
+        queue ``CancelFrame``). A plain/downstream ``ErrorFrame`` would log but
+        leave the recorder running — so a silent-but-alive capturer would hang
+        the session instead of failing loud. ``fatal=True`` is what makes the
+        EOF / read-idle / framing failures end the branch AND the recorder.
+        """
         logger.error(f"Socket transport: {message}")
-        await self.push_frame(ErrorFrame(error=message), FrameDirection.DOWNSTREAM)
+        await self.push_error(message, fatal=True)
 
     async def _teardown(self) -> None:
         """Close the socket and cancel-and-await the reader/pump tasks.

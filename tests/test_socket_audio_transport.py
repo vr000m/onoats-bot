@@ -225,15 +225,27 @@ class _ManualHarness:
     def __init__(self, transport: UnixSocketAudioInputTransport):
         self.transport = transport
         self.sink = _CapturingSink()
+        # The transport surfaces failures via push_error(..., fatal=True), which
+        # pushes UPSTREAM (that is what the pipeline worker watches to cancel on
+        # a fatal error). Capture the transport's upstream neighbour so tests can
+        # assert the fatal ErrorFrame, not just the downstream audio flow.
+        self.upstream = _CapturingSink()
         self._tm: TaskManager | None = None
 
     async def setup(self) -> None:
         tm = TaskManager()
         tm.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
         self._tm = tm
+        await _setup_processor(self.upstream, tm)
         await _setup_processor(self.transport, tm)
         await _setup_processor(self.sink, tm)
+        # upstream -> transport -> sink
+        self.upstream.link(self.transport)
         self.transport.link(self.sink)
+
+    def error_frames(self) -> list[ErrorFrame]:
+        """Fatal errors surface upstream; downstream is checked too for safety."""
+        return self.upstream.error_frames() + self.sink.error_frames()
 
     async def start(self) -> None:
         await self.transport.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
@@ -525,7 +537,7 @@ async def test_start_refuses_on_bad_handshake(path, header_kwargs):
     finally:
         await server.aclose()
 
-    surfaced_error = bool(harness.sink.error_frames())
+    surfaced_error = bool(harness.error_frames())
     assert raised or surfaced_error, "bad handshake was not rejected loudly"
     # No audio coerced through, reader never started.
     assert not harness.sink.audio_frames()
@@ -566,7 +578,7 @@ async def test_start_refuses_on_silent_handshake(path):
     finally:
         await server.aclose()
 
-    surfaced_error = bool(harness.sink.error_frames())
+    surfaced_error = bool(harness.error_frames())
     assert raised or surfaced_error, (
         "a connected-but-silent capturer must refuse to start (bounded handshake "
         "read), not hang"
@@ -675,12 +687,12 @@ async def test_read_idle_watchdog_surfaces_error(path):
     await harness.setup()
     try:
         await asyncio.wait_for(harness.start(), timeout=WAIT_TIMEOUT)
-        await _wait_until(
-            lambda: bool(harness.sink.error_frames()), timeout=WAIT_TIMEOUT
-        )
-        errs = harness.sink.error_frames()
+        await _wait_until(lambda: bool(harness.error_frames()), timeout=WAIT_TIMEOUT)
+        errs = harness.error_frames()
         assert errs
         assert "idle" in errs[0].error.lower()
+        # FATAL so the pipeline worker cancels the recorder (not just logs).
+        assert errs[0].fatal is True
         # No audio was fabricated.
         assert not harness.sink.audio_frames()
     finally:
@@ -714,12 +726,12 @@ async def test_clean_eof_surfaces_error_and_ends_branch(path):
     await harness.setup()
     try:
         await asyncio.wait_for(harness.start(), timeout=WAIT_TIMEOUT)
-        await _wait_until(
-            lambda: bool(harness.sink.error_frames()), timeout=WAIT_TIMEOUT
-        )
-        errs = harness.sink.error_frames()
+        await _wait_until(lambda: bool(harness.error_frames()), timeout=WAIT_TIMEOUT)
+        errs = harness.error_frames()
         assert errs
         assert "eof" in errs[0].error.lower() or "closed" in errs[0].error.lower()
+        # FATAL so the pipeline worker cancels the recorder (not just logs).
+        assert errs[0].fatal is True
         # The read loop returned (no self-reconnect): the reader task is done.
         read_task = harness.transport._read_task
         assert read_task is not None
