@@ -478,6 +478,26 @@ def test_unspawnable_capturer_bin_fails_loud(sup_env, log_sink, monkeypatch):
     assert log_sink.warned()
 
 
+def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch):
+    """A controlled recorder launch failure must be rc=1, not a traceback.
+
+    E.g. a capturer that creates the sockets but handshakes with a bad/stale
+    nonce raises SocketHandshakeError out of the recorder; only SttPreflightError
+    was caught at the CLI boundary before, so this used to escape as a traceback
+    (and an ugly non-zero exit) instead of the documented clean fail-loud rc=1.
+    """
+    from onoats.transports.socket_audio import SocketHandshakeError
+
+    async def _raise_handshake(rest):
+        raise SocketHandshakeError("stale/foreign capturer: handshake nonce mismatch")
+
+    monkeypatch.setattr(cli, "_supervise_socket_session", _raise_handshake)
+
+    rc = cli._run_socket_supervisor([])
+    assert rc == 1, "a SocketHandshakeError must map to a clean non-zero exit"
+    assert log_sink.warned()
+
+
 # ---------------------------------------------------------------------------
 # CRASH: capturer writes N frames then dies -> fail loud + rotate partial
 # ---------------------------------------------------------------------------

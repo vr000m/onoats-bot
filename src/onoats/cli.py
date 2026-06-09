@@ -183,13 +183,26 @@ def _run_socket_supervisor(rest: list[str]) -> int:
     """
     import asyncio as _asyncio
 
+    from loguru import logger
+
     from onoats.runtime import SttPreflightError
+    from onoats.transports.socket_audio import SocketHandshakeError
 
     try:
         return _asyncio.run(_supervise_socket_session(rest))
     except SttPreflightError as exc:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
+        return 1
+    except (SocketHandshakeError, OSError, ValueError) as exc:
+        # A controlled socket-mode launch failure (bad/stale capturer handshake,
+        # socket connect error, or a same-socket / config guard rejection) must
+        # be a clean non-zero exit per the fail-loud contract — not a traceback.
+        # Unexpected errors (programming bugs) still propagate so they are not
+        # silently swallowed.
+        logger.error(
+            f"Socket supervisor: recorder failed to start ({exc!r}); exiting non-zero."
+        )
         return 1
 
 
