@@ -35,7 +35,7 @@ plan covers Phases 4–6:
 the parent plan's Open Questions §2, resolved 2026-06-09): build the native
 artifacts **from source locally** and sign with a **stable self-signed
 code-signing certificate** (login-keychain "Code Signing" cert, *not* ad-hoc) so
-the Screen Recording / audio-capture TCC grant survives rebuilds — $0, free Apple
+the mic + system-audio TCC grants survive rebuilds — $0, free Apple
 ID, **no notarization**. Public distribution (Developer ID notarize + Homebrew
 cask) is deferred until a paid ($99/yr) membership and is **out of scope here**.
 
@@ -77,7 +77,7 @@ cask) is deferred until a paid ($99/yr) membership and is **out of scope here**.
   capturer (local build) version independently, the capturer **must** emit the
   handshake version the recorder expects, and the recorder **must** reject a
   mismatch loudly (the guard already exists — see Technical Specifications).
-- **Fail loud, leave state consistent.** Denied Screen Recording, no system-audio
+- **Fail loud, leave state consistent.** Denied mic or system-audio grant, no system-audio
   device, or a capturer crash mid-session must fail loud and still rotate a partial
   session — never hang (mirrors Milestone A's supervisor teardown).
 - **Status file is single-source-of-truth for liveness display.** The recorder
@@ -125,14 +125,25 @@ works on the target OS. Resolve **both** before Phase 4, gated:
    by the supervisor may be attributed to a different TCC identity than the GUI-launched
    app — test the path you ship. (Cite Apple TN2206 on designated-requirement stability.)
 4. **Core Audio tap recipe spike — blocking, executable.** Prove the exact capture
-   primitive with a throwaway executable **before** Phase 4 coding: create the
-   process tap (empty process list + `isExclusive`), build the **private aggregate
-   device**, install an IOProc, and confirm a real system-audio stream arrives. Prove
-   **teardown leaves no residue**: `AudioDeviceStop` → destroy IOProc → destroy
-   aggregate → destroy tap on exit, then a **start/kill/start ×3** loop with no stale
-   aggregate/tap surviving and no exclusive-tap contention on relaunch. If the recipe
-   is wrong on this OS, Phase 4 must be built around a different primitive — find that
-   out now, not mid-implementation.
+   primitive with a throwaway executable **before** Phase 4 coding:
+   - Create the global process tap. **Semantics note:** `CATapDescription`'s process
+     list is an *exclusion* list when the exclude/`isExclusive`-style initializer is
+     used, so an **empty exclusion list = tap all processes = system output** (the
+     AudioCap `stereoGlobalTapButExcludeProcesses: []` pattern). Confirm the exact
+     initializer/flag on the target OS — do not assume `isExclusive` means "exclusive
+     ownership."
+   - Build the **private aggregate device**, install an IOProc, and confirm a real
+     **system-output** stream arrives **from multiple unrelated apps**, and that those
+     apps **keep playing normally** (the tap must not starve/mute other audio).
+   - **Concurrent mic + system capture** in the same spike (not just smoke): run the
+     mic input device alongside the system-audio aggregate under the two-socket
+     topology and confirm both stream together with no aggregate/clock-domain conflict.
+   - Prove **teardown leaves no residue**: `AudioDeviceStop` → destroy IOProc →
+     destroy aggregate → destroy tap on exit, then a **start/kill/start ×3** loop with
+     no stale aggregate/tap object surviving and no leaked-tap-object contention on
+     relaunch.
+   - If the recipe is wrong on this OS, Phase 4 must be built around a different
+     primitive (and Open Question 1 reopens) — find that out now, not mid-implementation.
 5. **If grant cannot be obtained/persisted under self-signed (spike 3):** STOP — the
    "no notarization / $0" conclusion (Open Question 2) is reopened and needs the paid
    Developer ID path. **If the tap recipe fails (spike 4):** revisit Open Question 1.
@@ -162,8 +173,10 @@ works on the target OS. Resolve **both** before Phase 4, gated:
   domains**; resampling alone does not align them. Derive **one capturer-wide
   monotonic mapping** (host-time → ns) and stamp `captured_monotonic_ns` from it for
   both streams — not from unrelated per-callback times — so `me`/`them` drift is
-  measurable and bounded. Specify the host-time conversion and a resampler drift
-  budget; a long-running soak (OQ4 smoke) must bound drift over a realistic session.
+  measurable and bounded. Use the IOProc `AudioTimeStamp.mHostTime` converted via
+  `mach_timebase_info` (equivalently `clock_gettime(CLOCK_UPTIME_RAW)`) as the single
+  source; set a resampler drift budget (e.g. ≤1 audio frame / minute) and a
+  long-running soak (OQ4 smoke) that must hold drift within it over a realistic session.
 - **Wire format — emit JSON-object frames, NOT raw PCM** (per
   `docs/audio-socket-contract.md`): after the handshake line, each frame is a
   **4-byte big-endian length prefix** followed by a JSON object
@@ -252,7 +265,10 @@ it; pid file kept as backstop), `src/onoats/status.py` (new — schema + read/wr
 - Define a JSON status-file schema (under the state dir): a **`schema`/`v` integer**
   (so the Swift menu-bar consumer can't silently drift — same independent-versioning
   argument as the audio handshake), recorder pid, start time, audio source, STT
-  config label, last-rotation time, running flag.
+  config label, last-rotation time, running flag, **and a failure state** —
+  `last_error` / `exit_reason` / `supervisor_rc` (e.g. mic-denied, system-audio-denied,
+  capturer-crash) so the menu bar can show *why* a start failed, not just liveness.
+  The recorder writes the failure state on a fail-loud exit.
 - **Producer:** `runtime.py`/`dual.py` write the file on startup and on
   shutdown/rotation. This is the load-bearing slice — the schema round-trip test
   alone does not deliver it. **Writes MUST be atomic (temp file + `os.replace`)** so
@@ -269,7 +285,9 @@ it; pid file kept as backstop), `src/onoats/status.py` (new — schema + read/wr
   (b) **producer test** — drive the start path, assert file exists with
   `running=true`; drive shutdown/rotation, assert `running=false` + last-rotation
   updated (this fills the load-bearing gap the round-trip test does not); (c) the
-  4-cell backstop truth table; (d) atomic-write (no half-JSON observable).
+  4-cell backstop truth table; (d) atomic-write (no half-JSON observable);
+  (e) **failure-state propagation** — a fail-loud exit writes `last_error`/
+  `exit_reason`/`supervisor_rc` and `onoats status` surfaces it.
 
 ### Phase 5b: SwiftUI menu-bar launcher  *(macOS native; NOT conduct-runnable)*
 
@@ -443,12 +461,13 @@ _(to be filled during implementation)_
 
 ## Open Questions
 
-1. **Minimum macOS target / system-audio API** — **RESOLVED 2026-06-09: Core Audio
-   process-tap, macOS 14.4+ floor** (Apple guidance: audio-only ⇒ Core Audio tap,
-   not ScreenCaptureKit). ScreenCaptureKit (13+) deferred — "if we ever need it, we
-   can get that later." *Still requires the trivial `sw_vers ≥ 14.4` machine check
-   in the Phase 4 Pre-req before locking.*
-2. **Self-signed cert grants + persists the Screen Recording TCC grant** *(NEW —
+1. **Minimum macOS target / system-audio API** — **API SELECTED 2026-06-09: Core
+   Audio process-tap, macOS 14.4+ floor** (Apple guidance: audio-only ⇒ Core Audio
+   tap, not ScreenCaptureKit). ScreenCaptureKit (13+) deferred — "if we ever need it,
+   we can get that later." **Not fully resolved until Pre-req spike 4 proves the
+   recipe** (and the `sw_vers ≥ 14.4` check passes); if the spike fails, this
+   reopens.
+2. **Self-signed cert grants + persists the mic + system-audio TCC grants** *(NEW —
    from assumptions lens)* — the load-bearing premise of the $0 path is an
    unverified Apple-platform behavior. **Must be confirmed by the Phase 4 Pre-req
    spike**; if it fails, the paid Developer ID path is reopened.
