@@ -213,16 +213,23 @@ When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor
 
 5. waits (bounded, default 10 s) for **both** socket files to appear, then runs
    the recorder;
-6. on shutdown stops the recorder, then the capturer (SIGTERM → bounded wait →
-   SIGKILL); on capturer death tears down cleanly.
+6. on shutdown stops the recorder, then the capturer's **entire process group**
+   (SIGTERM → bounded wait → SIGKILL); on capturer death tears down cleanly.
 
 **Signal isolation.** Because the capturer is spawned in its **own
 session/process group**, a terminal `Ctrl+C`/`SIGTERM` (delivered by the OS to
 the whole foreground process group) is **NOT relayed to the capturer**. The
 supervisor owns the capturer's lifecycle end to end: it stops the capturer
-**explicitly** (SIGTERM → bounded wait → SIGKILL on the pid, via
-`_stop_capturer`) **after the recorder finishes**, never via an inherited
-terminal signal. This is what makes a graceful Ctrl+C a *recorder-finishes-first*
+**explicitly** (SIGTERM → bounded wait → SIGKILL, via `_stop_capturer`) **after
+the recorder finishes**, never via an inherited terminal signal.
+
+**Process-group teardown.** Because the capturer is a process-group leader
+(`start_new_session=True`), `_stop_capturer` signals the **whole process group**
+(`os.killpg`), not just the leader PID — so any helper/child the capturer
+spawned (a wrapper script, a CoreAudio helper) is torn down with it. Signalling
+only the leader would orphan such a descendant, leaving it holding the audio
+device after the supervisor reports success and removes the socket dir. On
+platforms without process groups the teardown falls back to a single-PID signal. This is what makes a graceful Ctrl+C a *recorder-finishes-first*
 event (rc=0) rather than a spurious *capturer-died-mid-session* event (rc=1): the
 recorder always wins the shutdown race because the OS cannot kill the capturer
 out from under it.

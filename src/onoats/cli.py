@@ -547,26 +547,70 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     return 1
 
 
+def _signal_capturer_group(capturer_proc, sig, logger) -> bool:
+    """Send ``sig`` to the capturer's entire process group.
+
+    The capturer is spawned with ``start_new_session=True`` (see
+    ``_supervise_socket_session``), so it is a session/process-group leader and
+    its PGID equals its PID. Signalling the group via ``os.killpg`` reaches any
+    helper/child the capturer spawned (a wrapper script, a CoreAudio helper) —
+    signalling only the parent PID would orphan those descendants while they
+    still hold the audio device, even though the supervisor reports success and
+    removes the socket dir.
+
+    Returns True if a signal was delivered, False if the group/process was
+    already gone. Falls back to a single-PID signal on platforms without
+    process groups (``os.getpgid``/``os.killpg`` unavailable, e.g. Windows).
+    """
+    pid = capturer_proc.pid
+    pgid = None
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return False
+    except (AttributeError, OSError):
+        # No process-group support — fall through to the per-PID path.
+        pgid = None
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except (AttributeError, OSError) as exc:
+            logger.warning(
+                f"Socket supervisor: killpg({pgid}, {sig}) failed ({exc}); "
+                "falling back to single-process signal."
+            )
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+
+
 async def _stop_capturer(capturer_proc, logger) -> None:
-    """Stop the capturer: SIGTERM, bounded wait, then SIGKILL. Idempotent."""
+    """Stop the capturer's whole process group: SIGTERM, bounded wait, then
+    SIGKILL. Idempotent.
+
+    Signals the process group rather than the lone capturer PID, so a
+    helper/child subprocess the capturer spawned cannot survive teardown while
+    still holding the audio device (see ``_signal_capturer_group``).
+    """
     import asyncio
 
     if capturer_proc.returncode is not None:
         return
-    try:
-        capturer_proc.terminate()
-    except ProcessLookupError:
+    if not _signal_capturer_group(capturer_proc, signal.SIGTERM, logger):
         return
     try:
         await asyncio.wait_for(capturer_proc.wait(), timeout=_CAPTURER_TERM_GRACE_SEC)
     except asyncio.TimeoutError:
         logger.warning(
             "Socket supervisor: capturer did not exit on SIGTERM within "
-            f"{_CAPTURER_TERM_GRACE_SEC}s — sending SIGKILL."
+            f"{_CAPTURER_TERM_GRACE_SEC}s — sending SIGKILL to the process group."
         )
-        try:
-            capturer_proc.kill()
-        except ProcessLookupError:
+        if not _signal_capturer_group(capturer_proc, signal.SIGKILL, logger):
             return
         try:
             await capturer_proc.wait()

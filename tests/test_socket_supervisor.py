@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import stat
 import textwrap
 from pathlib import Path
@@ -163,12 +164,28 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
         "ONOATS_FAKE_BEHAVIOUR", "stream"
     )
     N_FRAMES = int(_control.get("nframes") or os.environ.get("ONOATS_FAKE_NFRAMES", "5"))
+    SPAWN_CHILD = bool(_control.get("spawn_child"))
 
     if not MIC or not SYSTEM:
         sys.stderr.write(
             "fake-capturer: missing socket paths (mic=%r system=%r)\\n" % (MIC, SYSTEM)
         )
         sys.exit(3)
+
+    if SPAWN_CHILD:
+        # Spawn a long-lived child that INHERITS our process group (no
+        # start_new_session), then record its PID next to this script. We are a
+        # process-group leader (the supervisor spawned us with
+        # start_new_session=True), so a teardown that signals only OUR pid would
+        # orphan this child while it keeps running. The test reads the recorded
+        # PID and asserts it is gone after the supervisor stops us — proving the
+        # supervisor tore down the whole process group, not just the leader.
+        import subprocess
+
+        _child = subprocess.Popen(["sleep", "3600"])
+        with open(__file__ + ".child_pid", "w") as _pf:
+            _pf.write(str(_child.pid))
+            _pf.flush()
 
 
     def header():
@@ -251,10 +268,14 @@ def set_capturer_behaviour(fake_capturer):
     """
     import json
 
-    def _set(behaviour: str, *, nframes: int | None = None) -> None:
+    def _set(
+        behaviour: str, *, nframes: int | None = None, spawn_child: bool = False
+    ) -> None:
         control: dict = {"behaviour": behaviour}
         if nframes is not None:
             control["nframes"] = nframes
+        if spawn_child:
+            control["spawn_child"] = True
         Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
 
     return _set
@@ -739,6 +760,97 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
         f"alive) must yield rc=0, not be mis-classified as capturer-death; got {rc}"
     )
     assert state["frames_read"] > 0, "recorder read no frames from a streaming capturer"
+
+
+# ---------------------------------------------------------------------------
+# I3 PROCESS-GROUP TEARDOWN: the capturer is a process-group leader
+# (start_new_session=True), so the supervisor must tear down the WHOLE group on
+# shutdown — not just the leader PID. A helper/child the capturer spawned must
+# not survive teardown holding the audio device while the supervisor reports
+# success and removes the socket dir.
+# ---------------------------------------------------------------------------
+
+
+def test_capturer_teardown_reaps_whole_process_group(
+    sup_env, monkeypatch, set_capturer_behaviour, fake_capturer
+):
+    """Regression for invariant I3 (process-group teardown).
+
+    The fake capturer spawns a long-lived child (``sleep 3600``) that inherits
+    the capturer's process group, and records the child PID. After a clean
+    recorder shutdown (recorder finishes first, capturer still streaming), the
+    supervisor stops the capturer via ``_stop_capturer``. We then assert the
+    recorded child PID is GONE — proving the teardown signalled the whole group,
+    not just the leader.
+
+    Without the fix (single-PID terminate/kill), the leader dies but the
+    orphaned ``sleep`` child keeps running and this assertion fails.
+    """
+    _data_dir, _pending = sup_env
+    set_capturer_behaviour("stream", spawn_child=True)
+
+    state: dict = {"frames_read": 0}
+
+    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+        # Healthy streaming capturer; read a few frames then return cleanly while
+        # the capturer (and its child) are still alive — the graceful-shutdown
+        # shape that drives the supervisor's _stop_capturer teardown.
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)  # handshake
+            for _ in range(3):
+                chunk = await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT)
+                if not chunk:
+                    break
+                state["frames_read"] += len(chunk)
+        finally:
+            writer.close()
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
+
+    child_pid_file = Path(str(fake_capturer) + ".child_pid")
+    child_pid: int | None = None
+    try:
+        rc = _run_supervisor_bounded()
+
+        assert rc == 0, f"a graceful recorder shutdown must yield rc=0, got {rc}"
+        assert state["frames_read"] > 0, "recorder read no frames from the capturer"
+        assert child_pid_file.exists(), (
+            "fake capturer did not record its child PID — spawn_child wiring broke"
+        )
+        child_pid = int(child_pid_file.read_text().strip())
+
+        # I3: the child (in the capturer's process group) must be gone. The
+        # supervisor's _stop_capturer awaits the leader's exit but the group
+        # children are reaped by init, so poll briefly for the PID to clear.
+        import time
+
+        deadline = time.monotonic() + SUP_TIMEOUT
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            except PermissionError:
+                # Exists but not ours to signal — still "alive" for our purpose.
+                pass
+            time.sleep(0.05)
+        assert not alive, (
+            f"capturer child PID {child_pid} survived supervisor teardown — the "
+            "supervisor signalled only the leader PID, not the whole process "
+            "group; an orphaned capture path can outlive shutdown"
+        )
+    finally:
+        # Best-effort cleanup so a regression (child survives) does not leak a
+        # stray `sleep` process across the test session.
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
 
 # ---------------------------------------------------------------------------
