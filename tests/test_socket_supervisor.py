@@ -278,7 +278,11 @@ def set_capturer_behaviour(fake_capturer):
             control["spawn_child"] = True
         Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
 
-    return _set
+    yield _set
+    # Defensive cleanup: the sidecar lives next to the per-test fake-capturer
+    # script (function-scoped tmp dir, so it can't leak across tests already),
+    # but remove it explicitly so no test ever depends on ordering or scope.
+    Path(str(fake_capturer) + ".control").unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -948,14 +952,50 @@ def test_capturer_env_allowlist_constant_excludes_secret_families():
     that adds a secret to the passthrough set fails here even without a spawn.
     """
     secret_markers = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "DEEPGRAM", "STT_")
-    for name in cli._CAPTURER_ENV_PASSTHROUGH:
+    for name in cli._CAPTURER_ENV_POLICY.exact:
         upper = name.upper()
         assert not any(marker in upper for marker in secret_markers), (
             f"allowlisted passthrough var {name!r} looks secret-bearing"
         )
     # Socket paths + nonce are set explicitly by the builder, not via the
     # passthrough tuple.
-    assert "PATH" in cli._CAPTURER_ENV_PASSTHROUGH
+    assert "PATH" in cli._CAPTURER_ENV_POLICY.exact
+    # The dylib-injection DYLD members are explicitly denied even though the
+    # DYLD_* prefix family is otherwise forwarded for framework resolution.
+    assert "DYLD_INSERT_LIBRARIES" in cli._CAPTURER_ENV_POLICY.deny
+    assert "DYLD_FORCE_FLAT_NAMESPACE" in cli._CAPTURER_ENV_POLICY.deny
+
+
+def test_build_capturer_env_unit_allowlist_deny_and_overrides():
+    """Pure-function unit test for `_build_capturer_env` (no spawn).
+
+    Exercises the allowlist directly against a synthetic env: allowlisted exact +
+    prefix vars pass through, secrets and the DYLD-injection denylist are dropped,
+    and the three socket/nonce vars are always set (overriding any inbound value).
+    """
+    base = {
+        "PATH": "/usr/bin",
+        "LANG": "en_US.UTF-8",
+        "LC_CTYPE": "UTF-8",  # prefix family
+        "DYLD_FRAMEWORK_PATH": "/Frameworks",  # DYLD_* resolution → forwarded
+        "DYLD_INSERT_LIBRARIES": "/evil.dylib",  # injection → denied
+        "DEEPGRAM_API_KEY": "secret",  # not allowlisted → dropped
+        "ONOATS_MIC_SOCKET": "/stale/mic.sock",  # must be overridden
+    }
+    env = cli._build_capturer_env(
+        base, mic_sock="/run/mic.sock", system_sock="/run/sys.sock", nonce="n0"
+    )
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert env["LC_CTYPE"] == "UTF-8"
+    assert env["DYLD_FRAMEWORK_PATH"] == "/Frameworks"
+    assert "DYLD_INSERT_LIBRARIES" not in env, "dylib-injection var must be denied"
+    assert "DEEPGRAM_API_KEY" not in env, "non-allowlisted secret must be dropped"
+    # Socket/nonce always set explicitly, overriding any inbound value.
+    assert env["ONOATS_MIC_SOCKET"] == "/run/mic.sock"
+    assert env["ONOATS_SYSTEM_SOCKET"] == "/run/sys.sock"
+    assert env["ONOATS_CAPTURER_NONCE"] == "n0"
 
 
 # ---------------------------------------------------------------------------

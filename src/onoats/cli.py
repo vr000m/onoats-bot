@@ -24,6 +24,7 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 PID_FILENAME = "onoats.pid"
 
@@ -173,6 +174,7 @@ _CAPTURER_TERM_GRACE_SEC = 5.0
 MIC_SOCKET_NAME = "mic.sock"
 SYSTEM_SOCKET_NAME = "system.sock"
 
+
 # Deny-by-default allowlist for the capturer's environment. The capturer is a
 # native macOS/Linux child process that needs ONLY the socket paths + nonce (set
 # explicitly) plus a minimal runtime/OS environment to launch. We build its env
@@ -183,19 +185,33 @@ SYSTEM_SOCKET_NAME = "system.sock"
 #
 # Exact names pulled individually; prefix families (LC_*, DYLD_*, __CF*) matched
 # by iterating os.environ so locale + macOS dynamic-loader vars pass through only
-# when actually present.
-_CAPTURER_ENV_PASSTHROUGH = (
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "USER",
-    "LOGNAME",
-    "LANG",
-    "SHELL",
+# when actually present. `exact`, `prefixes`, and `deny` are ONE policy — kept in
+# a single object so a future edit can't add a rule to the wrong tuple and
+# silently change what reaches the capturer.
+class _CapturerEnvPolicy(NamedTuple):
+    exact: tuple[str, ...]  # forwarded verbatim when present in the recorder env
+    prefixes: tuple[str, ...]  # var-name prefixes whose whole family is forwarded
+    deny: frozenset[str]  # names NEVER forwarded, even if a prefix would match
+
+
+_CAPTURER_ENV_POLICY = _CapturerEnvPolicy(
+    exact=(
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "SHELL",
+    ),
+    prefixes=("LC_", "DYLD_", "__CF"),
+    # DYLD_* is forwarded for framework/dylib RESOLUTION, but the dylib-INJECTION
+    # members are denied: forwarding them into a native child would reintroduce an
+    # injection channel in the very path whose job is to NOT forward sensitive env.
+    deny=frozenset({"DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE"}),
 )
-_CAPTURER_ENV_PREFIXES = ("LC_", "DYLD_", "__CF")
 
 
 def _build_capturer_env(
@@ -208,17 +224,22 @@ def _build_capturer_env(
     """Build the capturer's env from the deny-by-default allowlist + the three
     socket/nonce vars (which must always be present).
 
-    Only allowlisted keys actually present in ``base_env`` are forwarded; the
-    socket paths + nonce are then set explicitly so they're guaranteed present
-    regardless of the inbound env.
+    Only allowlisted keys actually present in ``base_env`` are forwarded (minus
+    the ``deny`` set); the socket paths + nonce are then set explicitly so they're
+    guaranteed present regardless of the inbound env.
     """
+    policy = _CAPTURER_ENV_POLICY
     env: dict[str, str] = {}
-    for key in _CAPTURER_ENV_PASSTHROUGH:
+    for key in policy.exact:
+        if key in policy.deny:
+            continue
         value = base_env.get(key)
         if value is not None:
             env[key] = value
     for key, value in base_env.items():
-        if key.startswith(_CAPTURER_ENV_PREFIXES):
+        if key in policy.deny:
+            continue
+        if key.startswith(policy.prefixes):
             env[key] = value
     env["ONOATS_MIC_SOCKET"] = mic_sock
     env["ONOATS_SYSTEM_SOCKET"] = system_sock
@@ -329,7 +350,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         # plus the socket paths + nonce — NOT the full recorder env. This keeps
         # STT/application secrets (DEEPGRAM_API_KEY, *_API_KEY/*_TOKEN/*_SECRET,
         # STT_*) out of a native child that never needs them. See
-        # _CAPTURER_ENV_PASSTHROUGH and docs/audio-socket-contract.md.
+        # _CAPTURER_ENV_POLICY and docs/audio-socket-contract.md.
         capturer_env = _build_capturer_env(
             os.environ, mic_sock=mic_sock, system_sock=system_sock, nonce=nonce
         )

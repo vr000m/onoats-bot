@@ -244,15 +244,26 @@ env. It receives ONLY:
 - a fixed runtime/OS allowlist needed to launch a native macOS/Linux process:
   `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `USER`, `LOGNAME`, `LANG`, `SHELL`,
   plus any present `LC_*` (locale) and `DYLD_*` / `__CF*` (macOS dynamic-loader)
-  vars.
+  vars — **except** the dylib-**injection** members `DYLD_INSERT_LIBRARIES` and
+  `DYLD_FORCE_FLAT_NAMESPACE`, which are denied even though the rest of the
+  `DYLD_*` family (framework/dylib resolution) is forwarded.
 
 STT / application **secrets are never forwarded** to the capturer — anything not
 on the allowlist (e.g. `DEEPGRAM_API_KEY`, any `*_API_KEY` / `*_TOKEN` /
 `*_SECRET`, `STT_*`) is excluded **by construction**. The allowlist is the
-auditable module-level constant `onoats.cli._CAPTURER_ENV_PASSTHROUGH`; because
-the policy is deny-by-default, a newly added secret can't leak by omission. This
-keeps a buggy / replaced / crash-reporting capturer from ever seeing credentials
-it doesn't need.
+auditable module-level constant `onoats.cli._CAPTURER_ENV_POLICY` (an
+`exact` / `prefixes` / `deny` policy object); because the policy is
+deny-by-default, a newly added secret can't leak by omission. This keeps a buggy
+/ replaced / crash-reporting capturer from ever seeing credentials it doesn't
+need.
+
+> **Limitation (Phase 4).** If a real capturer ever needs a non-secret env var
+> outside this allowlist (e.g. a device index or a non-credential license token),
+> it must be added to `_CAPTURER_ENV_POLICY` in source — there is no runtime
+> override today. A blessed pass-through mechanism (e.g. an
+> `ONOATS_CAPTURER_ENV_EXTRA` allowlist-extension var) is **deferred to Phase 4**,
+> when the native capturer exists to define the actual requirement; adding it now
+> would be speculative.
 
 The capturer (Phase 4, not yet built) MUST: create both sockets, accept one
 connection each, write the v1 handshake (echoing the nonce), then stream
