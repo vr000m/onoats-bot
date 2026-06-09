@@ -581,11 +581,18 @@ async def run_onoats_dual(
     try:
         await runner.run(task)
         # runner.run returned. If nobody requested shutdown (no Ctrl+C / SIGINT
-        # set shutdown_event), the pipeline ended on its own — for this recorder
-        # the only such path is a fatal ErrorFrame cancelling the task (e.g. a
-        # socket branch hit EOF / read-idle and surfaced an ErrorFrame). Report
-        # that as a failure so a supervisor can honour the fail-loud contract,
-        # even when the capturer process is still alive.
+        # set shutdown_event), the pipeline ended on its own. This is keyed on the
+        # load-bearing invariant that **the only self-end path for this recorder
+        # is a fatal ErrorFrame** cancelling the task (a capture branch hit EOF /
+        # read-idle / a framing or pump failure and surfaced one): there is no
+        # EndFrame source other than shutdown, so "ended without a shutdown
+        # request" is exactly "ended on a fatal error". Report it as a failure so
+        # a supervisor can honour the fail-loud contract, even when the capturer
+        # process is still alive.
+        #
+        # (pipecat 1.3.0 exposes no on_pipeline_error event or PipelineTask
+        # observer hook to read the ErrorFrame directly; if a future version adds
+        # one, switch to observing the fatal frame and drop this inference.)
         if not shutdown_event.is_set():
             ended_by_error = True
             logger.error(
@@ -633,9 +640,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Console entrypoint for the dual-input recorder (``onoats bot``)."""
-    args = _parse_args(argv)
+def _apply_recorder_args(args: argparse.Namespace) -> int | None:
+    """Apply the shared post-parse handling for the dual recorder.
+
+    Emits the interactive-mode warning and validates/normalizes ``--category``
+    in place. Returns an error rc to abort (non-``None``) or ``None`` to proceed.
+    Shared by :func:`main` and the socket supervisor
+    (``cli._run_recorder_with_capturer``) so the two launch paths can never drift
+    on argument handling.
+    """
     if args.interactive:
         logger.warning(
             "Interactive mode is not implemented for the dual-input recorder. "
@@ -647,8 +660,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             args.category = validate_category(args.category)
         except InvalidCategoryError as exc:
-            print(f"Error: {exc}")
+            print(f"Error: {exc}", file=sys.stderr)
             return 1
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for the dual-input recorder (``onoats bot``)."""
+    args = _parse_args(argv)
+    rc = _apply_recorder_args(args)
+    if rc is not None:
+        return rc
     try:
         rc = asyncio.run(
             run_onoats_dual(

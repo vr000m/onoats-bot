@@ -578,3 +578,62 @@ def test_socket_mode_skips_portaudio_device_enumeration(two_paths, monkeypatch):
 
     # Two independent branch transports (one socket each).
     assert mic_t.input() is not sys_t.input()
+
+
+# ---------------------------------------------------------------------------
+# Shared recorder arg handling (dual.main + the socket supervisor route through
+# _apply_recorder_args so interactive/category handling can never drift).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_recorder_args_normalizes_valid_category(tmp_path, monkeypatch):
+    import argparse
+
+    import onoats.dual as dual_mod
+
+    # Configure a real category set (uncategorized is deliberately unlockable).
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("ONOATS_CATEGORIES", "work,personal")
+
+    ns = argparse.Namespace(interactive=False, category="Work", live_terminal=False)
+    assert dual_mod._apply_recorder_args(ns) is None
+    assert ns.category == "work"  # normalized in place
+
+
+def test_apply_recorder_args_rejects_invalid_category_on_stderr(
+    tmp_path, monkeypatch, capsys
+):
+    import argparse
+
+    import onoats.dual as dual_mod
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.delenv("ONOATS_CATEGORIES", raising=False)
+
+    ns = argparse.Namespace(
+        interactive=False, category="definitely-not-a-category", live_terminal=False
+    )
+    rc = dual_mod._apply_recorder_args(ns)
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "Error:" in captured.err  # stderr, not stdout
+    assert captured.out == ""
+
+
+def test_dual_main_invalid_category_short_circuits_before_run(
+    tmp_path, monkeypatch, capsys
+):
+    """dual.main routes through _apply_recorder_args: an invalid category returns
+    rc=1 without ever entering run_onoats_dual."""
+    import onoats.dual as dual_mod
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.delenv("ONOATS_CATEGORIES", raising=False)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("run_onoats_dual must not run on an invalid category")
+
+    monkeypatch.setattr(dual_mod.asyncio, "run", _boom)
+    rc = dual_mod.main(["--category", "definitely-not-a-category"])
+    assert rc == 1
+    assert "Error:" in capsys.readouterr().err

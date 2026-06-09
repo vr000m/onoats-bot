@@ -665,6 +665,136 @@ async def test_backpressure_bounded_and_drops_oldest_with_warning(path):
     assert survivors == [total - bound, total - bound + 1, total - 1]
 
 
+@pytest.mark.anyio
+async def test_staging_byte_cap_bounds_memory_with_large_frames(path):
+    """The byte cap bounds memory even when the frame-count cap is never reached.
+
+    With a large ``max_buffered_frames`` but a small ``max_buffered_bytes``, big
+    frames must be dropped-oldest so total staged bytes stay under the byte cap —
+    the fix for the ~200 MiB (200 frames x 1 MiB) worst case.
+    """
+    transport = _make_transport(
+        path,
+        max_buffered_frames=1000,  # count cap will never bite
+        max_buffered_bytes=4096,  # bytes cap is what bounds memory
+        backpressure_policy=BackpressurePolicy.DROP_OLDEST,
+    )
+    big = pcm_from_samples([0] * 1024)  # 2048 bytes/frame -> 2 fit under 4096
+
+    def mkframe(seq: int) -> InputAudioRawFrame:
+        f = InputAudioRawFrame(audio=big, sample_rate=16000, num_channels=1)
+        f.metadata["socket_seq"] = seq
+        return f
+
+    warnings: list[str] = []
+    sink_id = logger.add(lambda m: warnings.append(str(m)), level="WARNING")
+    try:
+        for i in range(10):
+            await asyncio.wait_for(
+                transport._stage_frame(mkframe(i)), timeout=WAIT_TIMEOUT
+            )
+    finally:
+        logger.remove(sink_id)
+
+    assert transport._staged_bytes <= 4096
+    assert transport._stage.qsize() <= 2
+    assert transport._dropped_frames >= 8
+    assert any("buffer full" in w for w in warnings)
+    # Drop-OLDEST: the newest frames survive.
+    survivors = []
+    while not transport._stage.empty():
+        survivors.append(transport._stage.get_nowait().metadata["socket_seq"])
+    assert survivors == [8, 9]
+
+
+@pytest.mark.anyio
+async def test_frame_larger_than_byte_cap_is_dropped_not_spun(path):
+    """A single frame bigger than the entire byte cap is dropped loudly, never
+    spinning the drop-oldest eviction loop forever on an empty queue."""
+    transport = _make_transport(
+        path,
+        max_buffered_bytes=64,
+        backpressure_policy=BackpressurePolicy.DROP_OLDEST,
+    )
+    huge = pcm_from_samples([0] * 1024)  # 2048 bytes > 64-byte cap
+    frame = InputAudioRawFrame(audio=huge, sample_rate=16000, num_channels=1)
+    frame.metadata["socket_seq"] = 0
+
+    await asyncio.wait_for(transport._stage_frame(frame), timeout=WAIT_TIMEOUT)
+
+    assert transport._stage.empty()
+    assert transport._staged_bytes == 0
+    assert transport._dropped_frames == 1
+
+
+@pytest.mark.anyio
+async def test_block_backpressure_bounded_put_raises_on_consumer_stall(path):
+    """BLOCK must not park the reader forever on a stalled consumer.
+
+    With no pump draining the buffer, a BLOCK put that cannot place its frame
+    within ``read_idle_timeout`` raises ``_ConsumerStallTimeout`` (which
+    ``_read_loop`` turns into a fatal ErrorFrame) rather than blocking forever —
+    the idle watchdog cannot fire while the reader is parked in ``put``.
+    """
+    from onoats.transports.socket_audio import _ConsumerStallTimeout
+
+    transport = _make_transport(
+        path,
+        max_buffered_frames=1,
+        backpressure_policy=BackpressurePolicy.BLOCK,
+        read_idle_timeout=0.2,
+    )
+
+    def mkframe(seq: int) -> InputAudioRawFrame:
+        f = InputAudioRawFrame(
+            audio=pcm_from_samples([seq]), sample_rate=16000, num_channels=1
+        )
+        f.metadata["socket_seq"] = seq
+        return f
+
+    # Fill the single slot; nothing drains it.
+    await asyncio.wait_for(transport._stage_frame(mkframe(0)), timeout=WAIT_TIMEOUT)
+    # The next put has nowhere to go and must time out loudly.
+    with pytest.raises(_ConsumerStallTimeout):
+        await asyncio.wait_for(transport._stage_frame(mkframe(1)), timeout=WAIT_TIMEOUT)
+
+
+@pytest.mark.anyio
+async def test_pump_failure_surfaces_fatal_error(path):
+    """If ``push_audio_frame`` raises, the staging pump surfaces a fatal
+    ErrorFrame and ends the branch instead of dying silently and starving the
+    pipeline (after which the reader would drop every staged frame)."""
+    pcm = pcm_from_samples([1, 2, 3])
+
+    async def feed(writer: asyncio.StreamWriter):
+        writer.write(make_header())
+        writer.write(make_frame(0, pcm))
+        await writer.drain()
+        # Stay alive so EOF/idle don't race the pump failure.
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    server = _SocketWriterServer(path, feed)
+    await server.start()
+    harness = _ManualHarness(_make_transport(path, read_idle_timeout=WAIT_TIMEOUT * 2))
+    await harness.setup()
+
+    async def _boom(_frame):
+        raise RuntimeError("downstream blew up")
+
+    # Replace the bound method so the pump's push raises.
+    harness.transport.push_audio_frame = _boom  # type: ignore[method-assign]
+    try:
+        await asyncio.wait_for(harness.start(), timeout=WAIT_TIMEOUT)
+        await _wait_until(lambda: bool(harness.error_frames()), timeout=WAIT_TIMEOUT)
+        errs = harness.error_frames()
+        assert errs
+        assert errs[0].fatal is True
+        assert "pump" in errs[0].error.lower()
+    finally:
+        await asyncio.wait_for(harness.send(EndFrame()), timeout=WAIT_TIMEOUT)
+        await server.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Read-idle watchdog: connected-but-silent capturer surfaces an ErrorFrame
 # ---------------------------------------------------------------------------

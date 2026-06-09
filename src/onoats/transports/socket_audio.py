@@ -97,18 +97,29 @@ MAX_FRAME_PAYLOAD_BYTES = (
     1 << 20
 )  # 1 MiB ceiling guards against a runaway length prefix
 
+DEFAULT_MAX_BUFFERED_BYTES = 16 << 20
+"""Byte ceiling for the staging buffer, independent of the frame-count cap.
+
+The per-frame ceiling (``MAX_FRAME_PAYLOAD_BYTES``, 1 MiB) times the frame-count
+cap (``max_buffered_frames``, default 200) would otherwise allow ~200 MiB of
+transient staging under a misbehaving capturer sending maximal frames. Bounding
+total staged bytes as well caps that footprint regardless of frame size. At the
+640-byte 20 ms reference frame the count cap always bites first, so this only
+engages for pathologically large frames.
+"""
+
 
 def frame_size_bytes(sample_rate: int) -> int:
     """Return the 20 ms PCM16-mono frame size in bytes for ``sample_rate``.
 
-    Mirrors ``LocalAudioInputTransport``'s chunking: its
-    ``num_frames = int(sample_rate / 100) * 2`` is a *sample* count (20 ms @
-    16 kHz = 320 samples). At 2 bytes/sample, mono, one 20 ms chunk is
+    Mirrors ``LocalAudioInputTransport``'s chunking: pipecat's
+    ``num_frames = int(sample_rate / 100) * 2`` is the PyAudio frames-per-buffer
+    count (20 ms @ 16 kHz = 320). At 2 bytes/sample, mono, one 20 ms chunk is
     320 * 2 = 640 bytes @ 16 kHz. Exposed so tests and the contract doc can
     assert the framing matches the reference.
     """
-    samples_per_20ms = int(sample_rate / 100) * 2
-    return samples_per_20ms * DEFAULT_SAMPLE_WIDTH
+    num_frames = int(sample_rate / 100) * 2
+    return num_frames * DEFAULT_SAMPLE_WIDTH
 
 
 class BackpressurePolicy(str, Enum):
@@ -210,6 +221,7 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         *,
         read_idle_timeout: float = 10.0,
         max_buffered_frames: int = 200,
+        max_buffered_bytes: int = DEFAULT_MAX_BUFFERED_BYTES,
         backpressure_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST,
         expected_nonce: str | None = None,
         **kwargs,
@@ -223,8 +235,11 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
             read_idle_timeout: Seconds to wait for the next frame before
                 declaring the (alive-but-silent) capturer dead and surfacing an
                 ``ErrorFrame``. ``<= 0`` disables the watchdog.
-            max_buffered_frames: Bound on the internal staging buffer between the
-                socket reader and the base audio queue.
+            max_buffered_frames: Frame-count bound on the internal staging buffer
+                between the socket reader and the base audio queue.
+            max_buffered_bytes: Total-byte bound on the staging buffer, enforced
+                alongside ``max_buffered_frames`` so a few maximal frames cannot
+                blow the footprint past the count cap × the 1 MiB per-frame ceiling.
             backpressure_policy: What the staging buffer does when full
                 (configurable — see Open Question 4).
             expected_nonce: If set, the handshake nonce must equal this value or
@@ -243,6 +258,7 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         self._socket_path = socket_path
         self._read_idle_timeout = read_idle_timeout
         self._max_buffered_frames = max_buffered_frames
+        self._max_buffered_bytes = max(1, max_buffered_bytes)
         self._backpressure_policy = backpressure_policy
         self._expected_nonce = expected_nonce
 
@@ -260,11 +276,16 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         self._pump_task: asyncio.Task | None = None
 
         # Bounded staging buffer: the socket reader puts frames here; a pump task
-        # forwards them to the base queue. Bounding it (plus the drop policy)
-        # caps memory under a faster-than-consumer writer.
+        # forwards them to the base queue. Bounding it by BOTH frame count and
+        # total bytes (plus the drop policy) caps memory under a
+        # faster-than-consumer writer regardless of frame size.
         self._stage: asyncio.Queue[InputAudioRawFrame] = asyncio.Queue(
             maxsize=max(1, max_buffered_frames)
         )
+        self._staged_bytes = 0
+        # Set by the pump after each ``get`` so a BLOCK-policy producer waiting on
+        # the byte cap (which the count-based Queue cannot express) is woken.
+        self._room_freed = asyncio.Event()
         self._dropped_frames = 0
         self._tearing_down = False
 
@@ -362,10 +383,13 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                 f"{self._handshake.nonce!r} != expected {self._expected_nonce!r}"
             )
 
+        # Truncate the nonce in logs (it is a generation token; same-user logs,
+        # but keep it consistent with cli.py's nonce[:8] truncation).
+        nonce_log = f"{self._handshake.nonce[:8]}…" if self._handshake.nonce else None
         logger.info(
             f"Socket transport connected: path={self._socket_path} "
             f"rate={self._handshake.rate} width={self._handshake.width} "
-            f"channels={self._handshake.channels} nonce={self._handshake.nonce}"
+            f"channels={self._handshake.channels} nonce={nonce_log}"
         )
 
     # -- read loop ----------------------------------------------------------
@@ -393,6 +417,12 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
             await self._surface_error(
                 f"read-idle timeout ({self._read_idle_timeout}s) on "
                 f"{self._socket_path!r}: capturer alive but silent; ending branch"
+            )
+        except _ConsumerStallTimeout:
+            await self._surface_error(
+                f"backpressure BLOCK stalled (> {self._read_idle_timeout}s) on "
+                f"{self._socket_path!r}: downstream consumer is not draining; "
+                "ending branch"
             )
         except SocketHandshakeError as exc:
             await self._surface_error(
@@ -505,57 +535,114 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
 
     # -- staging buffer / backpressure -------------------------------------
 
+    def _has_room_for(self, frame_bytes: int) -> bool:
+        """Whether a frame of ``frame_bytes`` fits within BOTH staging caps."""
+        return (
+            not self._stage.full()
+            and self._staged_bytes + frame_bytes <= self._max_buffered_bytes
+        )
+
+    def _put_staged(self, frame: InputAudioRawFrame, frame_bytes: int) -> None:
+        """Put a frame on the staging queue and account its bytes.
+
+        Caller MUST have checked :meth:`_has_room_for` first (no ``await`` runs
+        between the check and here, so the room cannot vanish under us)."""
+        self._stage.put_nowait(frame)
+        self._staged_bytes += frame_bytes
+
     async def _stage_frame(self, frame: InputAudioRawFrame) -> None:
         """Enqueue a frame into the bounded staging buffer per the drop policy.
 
-        The fast path is a non-blocking put. Only when the buffer is full does
-        the configured backpressure policy kick in. ``BLOCK`` awaits free space
-        (applying socket-level flow control back to the capturer); the drop
-        policies never block the reader.
+        The buffer is bounded by BOTH a frame count and a total-byte ceiling; it
+        is "full" when adding this frame would breach either. The fast path is a
+        non-blocking put. Only when full does the backpressure policy kick in:
+        ``BLOCK`` awaits free space (applying flow control back to the capturer),
+        bounded by the read-idle timeout so a stalled *consumer* surfaces a fatal
+        error rather than parking the reader forever; the drop policies never
+        block the reader.
         """
-        try:
-            self._stage.put_nowait(frame)
+        frame_bytes = len(frame.audio)
+
+        if self._has_room_for(frame_bytes):
+            self._put_staged(frame, frame_bytes)
             return
-        except asyncio.QueueFull:
-            pass
 
         policy = self._backpressure_policy
 
         if policy is BackpressurePolicy.BLOCK:
-            # Bounded-block: stall the reader until the pump frees a slot. Since
-            # the reader stops reading, the OS socket buffer fills and the
-            # capturer's writes block — natural flow control, no frame loss.
-            await self._stage.put(frame)
+            await self._block_until_room(frame, frame_bytes)
             return
 
         if policy is BackpressurePolicy.DROP_NEWEST:
             self._dropped_frames += 1
             logger.warning(
                 f"Socket transport {self._socket_path!r} buffer full "
-                f"(depth={self._stage.qsize()}/{self._max_buffered_frames}); "
+                f"(depth={self._stage.qsize()}/{self._max_buffered_frames} "
+                f"frames, {self._staged_bytes}/{self._max_buffered_bytes} bytes); "
                 f"dropping NEWEST frame seq={frame.metadata.get('socket_seq')} "
                 f"(total dropped={self._dropped_frames})"
             )
             return
 
-        # Default: DROP_OLDEST.
-        try:
-            dropped = self._stage.get_nowait()
+        # Default: DROP_OLDEST. Evict oldest frames until this one fits within
+        # both caps (one eviction suffices when only the count cap is breached;
+        # a large frame against the byte cap may evict several).
+        while not self._has_room_for(frame_bytes) and not self._stage.empty():
+            try:
+                dropped = self._stage.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._staged_bytes -= len(dropped.audio)
             self._dropped_frames += 1
             logger.warning(
                 f"Socket transport {self._socket_path!r} buffer full "
-                f"(depth={self._stage.qsize() + 1}/{self._max_buffered_frames}); "
-                f"dropping OLDEST frame seq={dropped.metadata.get('socket_seq')} "
+                f"(depth={self._stage.qsize() + 1}/{self._max_buffered_frames} "
+                f"frames, bytes cap {self._max_buffered_bytes}); dropping OLDEST "
+                f"frame seq={dropped.metadata.get('socket_seq')} "
                 f"(total dropped={self._dropped_frames})"
             )
-        except asyncio.QueueEmpty:
-            pass
-        # Now there is room — but the pump may have raced us to it. If still
-        # full, drop this frame rather than block the reader.
-        try:
-            self._stage.put_nowait(frame)
-        except asyncio.QueueFull:
+
+        if self._has_room_for(frame_bytes):
+            self._put_staged(frame, frame_bytes)
+        else:
+            # The queue is empty yet the frame still doesn't fit: it alone
+            # exceeds the byte cap. Drop it loudly rather than spin forever.
             self._dropped_frames += 1
+            logger.warning(
+                f"Socket transport {self._socket_path!r}: frame "
+                f"seq={frame.metadata.get('socket_seq')} is {frame_bytes} bytes, "
+                f"larger than the entire staging cap ({self._max_buffered_bytes}); "
+                f"dropping it (total dropped={self._dropped_frames})"
+            )
+
+    async def _block_until_room(
+        self, frame: InputAudioRawFrame, frame_bytes: int
+    ) -> None:
+        """BLOCK policy: wait until both caps admit the frame, then stage it.
+
+        Bounded by the read-idle timeout: a downstream pipeline that stops
+        draining must surface a fatal error (via ``_ConsumerStallTimeout``)
+        instead of parking the reader — the socket-read watchdog cannot fire
+        while we are blocked here, so this is the only stall guard on this path.
+        """
+        bounded = self._read_idle_timeout and self._read_idle_timeout > 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._read_idle_timeout if bounded else None
+
+        while not self._has_room_for(frame_bytes):
+            self._room_freed.clear()
+            if bounded:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise _ConsumerStallTimeout()
+                try:
+                    await asyncio.wait_for(self._room_freed.wait(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise _ConsumerStallTimeout() from exc
+            else:
+                await self._room_freed.wait()
+
+        self._put_staged(frame, frame_bytes)
 
     async def _pump_loop(self) -> None:
         """Forward staged frames into the base audio queue.
@@ -564,13 +651,24 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         staging buffer is what makes the drop policy effective: the base queue is
         unbounded, so without this buffer a faster-than-consumer writer would
         grow it without limit.
+
+        Fail-loud: an unexpected exception from ``push_audio_frame`` surfaces a
+        fatal ``ErrorFrame`` and ends the branch, mirroring ``_read_loop``. If the
+        pump died silently the reader would keep staging into a full buffer and
+        drop every frame with no audio reaching the pipeline — a silent failure.
         """
         try:
             while True:
                 frame = await self._stage.get()
+                self._staged_bytes -= len(frame.audio)
+                self._room_freed.set()
                 await self.push_audio_frame(frame)
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            await self._surface_error(
+                f"staging pump failed on {self._socket_path!r}: {exc}; ending branch"
+            )
 
     # -- teardown / errors --------------------------------------------------
 
@@ -640,6 +738,7 @@ class UnixSocketAudioTransport(BaseTransport):
         params: TransportParams | None = None,
         read_idle_timeout: float = 10.0,
         max_buffered_frames: int = 200,
+        max_buffered_bytes: int = DEFAULT_MAX_BUFFERED_BYTES,
         backpressure_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST,
         expected_nonce: str | None = None,
         name: str | None = None,
@@ -657,11 +756,20 @@ class UnixSocketAudioTransport(BaseTransport):
                 audio_in_sample_rate=sample_rate)``.
             read_idle_timeout: Forwarded to the input transport's idle watchdog.
             max_buffered_frames: Forwarded to the input transport's staging buffer.
+            max_buffered_bytes: Forwarded to the input transport's staging buffer.
             backpressure_policy: Forwarded to the input transport.
             expected_nonce: Forwarded to the input transport (Phase-3 generation
                 token; ``None`` in Phase 1/2).
             name: Optional transport instance name.
             input_name: Optional name for the input frame processor.
+
+        Any extra ``**kwargs`` are forwarded verbatim to
+        :class:`UnixSocketAudioInputTransport` (and on to ``BaseInputTransport``).
+        They MUST NOT duplicate the keys this wrapper already forwards explicitly
+        (``name``/``input_name``, ``params``, ``read_idle_timeout``,
+        ``max_buffered_frames``, ``max_buffered_bytes``, ``backpressure_policy``,
+        ``expected_nonce``) or the input transport raises a duplicate-keyword
+        ``TypeError``.
         """
         super().__init__(name=name, input_name=input_name)
 
@@ -678,6 +786,7 @@ class UnixSocketAudioTransport(BaseTransport):
             params,
             read_idle_timeout=read_idle_timeout,
             max_buffered_frames=max_buffered_frames,
+            max_buffered_bytes=max_buffered_bytes,
             backpressure_policy=backpressure_policy,
             expected_nonce=expected_nonce,
             name=input_name,
@@ -695,3 +804,8 @@ class UnixSocketAudioTransport(BaseTransport):
 
 class _ReadIdleTimeout(Exception):
     """Internal: no frame arrived within the read-idle watchdog window."""
+
+
+class _ConsumerStallTimeout(Exception):
+    """Internal: BLOCK backpressure could not stage a frame within the watchdog
+    window because the downstream consumer stopped draining."""

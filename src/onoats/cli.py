@@ -186,7 +186,7 @@ def _run_socket_supervisor(rest: list[str]) -> int:
     from loguru import logger
 
     from onoats.runtime import SttPreflightError
-    from onoats.transports.socket_audio import SocketHandshakeError
+    from onoats.transports import SocketHandshakeError
 
     try:
         return _asyncio.run(_supervise_socket_session(rest))
@@ -387,26 +387,15 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     """
     import asyncio
 
-    from onoats.dual import _parse_args, run_onoats_dual
+    from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
 
-    # Parse the same args dual.main would, so `onoats bot --live-terminal
-    # --category X` behaves identically in socket mode.
+    # Parse + validate the same args dual.main would, through the shared helper,
+    # so `onoats bot --live-terminal --category X` behaves identically in socket
+    # mode (interactive-mode warning + category validation can never drift).
     args = _parse_args(rest)
-    if args.interactive:
-        # Mirror dual.main: interactive mode is unimplemented for the dual-input
-        # recorder. Warn rather than silently ignore so socket mode has parity.
-        logger.warning(
-            "Interactive mode is not implemented for the dual-input recorder. "
-            "Running in silent mode."
-        )
-    if args.category:
-        from onoats.categories import InvalidCategoryError, validate_category
-
-        try:
-            args.category = validate_category(args.category)
-        except InvalidCategoryError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
+    rc = _apply_recorder_args(args)
+    if rc is not None:
+        return rc
 
     recorder_task = asyncio.create_task(
         run_onoats_dual(
@@ -451,11 +440,22 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     # Capturer finished first → it died mid-session. The recorder's own
     # ErrorFrame path is draining (flush + rotate). Give it a bounded grace, then
     # force-cancel so the supervisor never hangs.
+    #
+    # Contract (Interpretation A): a capturer that exits BEFORE the recorder is
+    # ALWAYS a fail-loud event, even on a clean rc=0. The supervisor outlives the
+    # capturer by design — it stops the capturer when the recorder ends, never the
+    # reverse — so any capturer-initiated exit means the audio stream ended
+    # mid-session and the recording is truncated regardless of exit code. We do
+    # not branch on rc==0 here. A future, deliberate "clean stop" signal and its
+    # supervisor semantics are reserved for the Phase-4 capturer exit-code
+    # contract (see docs/audio-socket-contract.md); honouring it would also mean
+    # redefining the transport's EOF-is-fatal rule, which is out of scope.
     rc = capturer_task.result()
     logger.error(
         f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
         "branch surfaced an ErrorFrame and is rotating the partial session. "
-        "Supervisor will exit non-zero."
+        "Supervisor will exit non-zero (capturer-exit-before-recorder is always "
+        "fail-loud, even on rc=0)."
     )
     try:
         await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
