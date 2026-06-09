@@ -107,9 +107,26 @@ wrong: the reference does **not** use that hook.
   `UnixSocketAudioTransport.input()` returns a `UnixSocketAudioInputTransport`.
 
 So the Python seam is **verified**: subclass `BaseInputTransport`, override
-`start(frame)` to connect the socket and spawn an async read loop that
-`push_audio_frame`s PCM16/16 kHz/mono, call `set_transport_ready(frame)`, and pass
-`TransportParams(audio_in_enabled=True, …)`. One instance per branch.
+`start(frame)` to connect the socket, **call `set_transport_ready(frame)` first,
+then** spawn an async read loop that `push_audio_frame`s PCM16/16 kHz/mono, and
+pass `TransportParams(audio_in_enabled=True, …)`. One instance per branch.
+
+> **Ordering matters — set ready BEFORE spawning the reader (queue-init race).**
+> `push_audio_frame()` does `self._audio_in_queue.put(frame)` (`base_input.py:170`),
+> but `_audio_in_queue` is created only inside `set_transport_ready()` →
+> `_create_audio_task()` (`base_input.py:152`). If the reader task starts and
+> pushes a frame before `set_transport_ready(frame)` has run, it hits a `None`
+> queue. Connect + validate the handshake, call `set_transport_ready(frame)`,
+> *then* start the reader (or gate the reader on an `asyncio.Event` set after
+> readiness). Keep `push_audio_frame()` as the public call — do not reach for
+> `_push_audio_frame`.
+>
+> **The subclass must tear down its own reader task.** `BaseInputTransport.stop()`
+> / `cancel()` only cancel the framework's internal drain task via
+> `_cancel_audio_task()` (`base_input.py:116,140`) — they do **not** touch a task
+> the subclass spawned. Store `_read_task`, and in `stop()` / `cancel()` /
+> `cleanup()` close the socket and cancel-and-await `_read_task`, or it leaks past
+> `EndFrame` / `CancelFrame`.
 
 ### Why retire BlackHole
 
@@ -145,6 +162,11 @@ audio **without** a virtual device, removing that setup step and failure class.
     precedence rules.
   - **Never-mix guarantee preserved**: exactly one socket per branch; the
     transport refuses to start if both branches resolve to the same socket path.
+    **Compare resolved paths, not raw strings** —
+    `Path(mic_socket).expanduser().resolve() != Path(system_socket).expanduser().resolve()`
+    — so a symlink or relative-path alias can't slip two branches onto one socket.
+    The supervisor should also place the two sockets in a **private, supervisor-owned
+    directory** (not a world-writable `/tmp` path) to foreclose symlink aliasing.
   - Clean teardown on socket loss: if the capturer dies / the socket closes, the
     branch surfaces an `ErrorFrame` and the session tears down cleanly (still
     flushes + rotates). **Specify this on the socket transport's own terms** — do
@@ -153,6 +175,16 @@ audio **without** a virtual device, removing that setup step and failure class.
     ~15.5s retry, `runtime.py:340-356`), is not a transport-level helper, and a
     unix-socket reader has a different failure model (EOF / broken pipe / process
     death). There is no reusable reconnect routine in `runtime.py` to inherit.
+  - **Read-idle watchdog (EOF is not the only failure).** A capturer that is alive
+    but produces no data never closes the socket, so EOF never fires and the branch
+    hangs silently (the base audio task just waits — `base_input.py:237`). Add a
+    configurable read-idle timeout: if no frame arrives within it, surface an
+    `ErrorFrame` and tear the session down the same way as EOF.
+  - **Generation token / handshake nonce** so a supervisor restart invalidates
+    stale socket fds: a restarted capturer presents a new nonce in its handshake,
+    and the transport rejects (or refuses to bind to) a stale socket file left by
+    the previous generation — preventing a new transport from latching onto an old
+    half-open socket.
   - **Single lifecycle owner (resolve the Phase 1 ⇄ Phase 3 overlap).** Exactly
     one layer owns recovery so the two don't race (supervisor respawning the
     capturer → a new socket while the transport is mid-reconnect on the old path).
@@ -246,33 +278,65 @@ audio **without** a virtual device, removing that setup step and failure class.
 - **Create the `src/onoats/transports/` package** (new `__init__.py`) and check
   `tests/test_package_layout.py` doesn't need updating in the same commit (it
   enumerates packages) so the Phase-1 boundary stays green.
+- **Create the `src/onoats/transports/` package** (above) before the transport.
 - Subclass `BaseInputTransport`. **Override `async start(self, frame)`** (the
   verified reference hook — see "The pipecat transport seam" above, *not*
-  `start_audio_in_streaming`): `await super().start(frame)`, connect the unix
-  socket, spawn an async read-loop task that reads framed PCM16 and
-  `push_audio_frame(InputAudioRawFrame(...))`, then `await
-  self.set_transport_ready(frame)`. Construct the base with
-  `TransportParams(audio_in_enabled=True, audio_in_sample_rate=…)` — without
-  `audio_in_enabled=True` the base never drains pushed frames. Mirror
-  `LocalAudioInputTransport`'s 20 ms (`sample_rate/100 * 2`) frame sizing.
-- Define the wire framing (start with raw length-prefixed PCM16 LE mono @ 16 kHz;
-  a 1-line JSON handshake header `{"rate":16000,"width":2,"channels":1,"v":1}` for
-  format negotiation is the forward-compatible option — decide in review, then
-  pin it in the Phase-3 contract doc).
-- **Backpressure policy (implement + test):** bounded read buffer; on overflow
-  drop oldest with a logged WARNING (realtime audio > completeness). This is a
-  Review-Focus invariant, not optional.
+  `start_audio_in_streaming`), in this **order** (the order is load-bearing):
+  1. `await super().start(frame)`;
+  2. connect the unix socket and validate the handshake;
+  3. `await self.set_transport_ready(frame)` — this is what creates
+     `_audio_in_queue` (`base_input.py:152`);
+  4. **only then** spawn the async read-loop task (store it as `self._read_task`)
+     that reads framed PCM16 and `push_audio_frame(InputAudioRawFrame(...))`.
+
+  Spawning the reader before step 3 races the queue creation —
+  `push_audio_frame` does `_audio_in_queue.put(frame)` (`base_input.py:170`) and
+  would hit a `None` queue. (Equivalently, gate the reader on an `asyncio.Event`
+  set after readiness.) Keep `push_audio_frame()` — do not call `_push_audio_frame`.
+- **Own the reader-task teardown.** `BaseInputTransport.stop()` / `cancel()` only
+  cancel the framework's drain task (`_cancel_audio_task`, `base_input.py:116,140`),
+  not `self._read_task`. Override `stop(frame)` / `cancel(frame)` / `cleanup()` to
+  close the socket and cancel-and-await `self._read_task`, so it doesn't leak past
+  `EndFrame` / `CancelFrame`.
+- Construct the base with `TransportParams(audio_in_enabled=True,
+  audio_in_sample_rate=…)` — without `audio_in_enabled=True` the base never drains
+  pushed frames. Mirror `LocalAudioInputTransport`'s 20 ms (`sample_rate/100 * 2`)
+  frame sizing.
+- Define the wire framing. **Prefer length-prefixed frames** over fixed-size: a
+  unix *stream* socket gives no message boundaries, so a fixed-size reader must
+  `readexactly(N)` and the writer must handle partial writes — length-prefixing
+  makes desync-on-partial-write impossible to ignore. If fixed-size is chosen
+  anyway, `N = 640` bytes (20 ms PCM16/16 kHz mono) and the reader MUST use
+  `readexactly(640)`. A 1-line JSON handshake header
+  `{"rate":16000,"width":2,"channels":1,"v":1,"nonce":…}` for format negotiation +
+  generation token is the forward-compatible option — decide in review, then pin
+  it in the Phase-3 contract doc.
+- **Read-idle watchdog:** a configurable timeout so a capturer that is alive but
+  silent (no EOF ever fires — `base_input.py:237`) surfaces an `ErrorFrame` and
+  ends the branch rather than hanging.
+- **Backpressure policy (implement + test, but keep it configurable — see Open
+  Question 4):** bounded read buffer; default policy drop-oldest with a logged
+  WARNING that includes the queue depth (realtime audio > completeness). Stamp each
+  frame with the capturer's monotonic sequence number so a drop is observable and
+  `me`/`them` drift is measurable. Do **not** treat drop-oldest as a frozen
+  invariant until the drift comparison in OQ4 is run.
 - Tests feed the socket from a pure-Python writer (a recorded PCM fixture) — **no
   native code** — and assert:
   - the transport emits `InputAudioRawFrame`s with the right rate/width/channels,
     and that frames actually **surface through the base** (guards the silent
     `audio_in_enabled=False` no-op);
+  - **start ordering**: a reader that pushes immediately after connect does not
+    observe a `None` queue (readiness precedes the first `push_audio_frame`);
+  - **teardown**: `EndFrame` *and* `CancelFrame` each cancel `self._read_task` and
+    close the socket (no leaked task);
   - **endianness**: PCM16 **LE** bytes round-trip to the expected samples;
   - **handshake validation** (once the header is adopted): a valid header is
     accepted; a header with a mismatched rate/width/channels or unknown version is
     rejected loudly (`ErrorFrame` / refuse-to-start), not silently coerced;
   - **backpressure**: a writer faster than the consumer (or a stalled consumer)
     caps memory and drops-oldest with the WARNING, rather than growing unbounded;
+  - **read-idle**: a connected-but-silent writer trips the idle watchdog and
+    surfaces an `ErrorFrame` rather than hanging;
   - clean EOF handling: socket close surfaces an `ErrorFrame` and ends the branch
     (no self-reconnect — the supervisor owns restart; see Requirements).
 
@@ -294,13 +358,16 @@ audio **without** a virtual device, removing that setup step and failure class.
     that PyAudio enumeration must be skipped entirely, or socket mode still
     imports/invokes PortAudio — violating the Review-Focus "no PortAudio on the
     socket path" mirror of the no-native assertion.
-- **Never-mix guard:** refuse to start if `mic_socket == system_socket`.
+- **Never-mix guard:** refuse to start if the two sockets resolve to the same
+  path — compare `Path(mic_socket).expanduser().resolve()` against
+  `Path(system_socket).expanduser().resolve()`, not the raw strings, so a symlink
+  or relative-path alias can't collapse both branches onto one socket.
 - Tests: (a) drive `_build_dual_pipeline` with two socket transports fed by two
   fixtures; assert mic-socket audio only ever exits tagged `me`, system-socket
-  only `them` (the keystone invariant); (b) assert the negative guard —
-  constructing with `mic_socket == system_socket` refuses to start *before* the
-  pipeline runs; (c) assert `AUDIO_SOURCE=socket` neither imports nor calls the
-  PortAudio device-enumeration path.
+  only `them` (the keystone invariant); (b) assert the negative guard — both
+  identical paths **and** a symlink/relative alias of one onto the other refuse to
+  start *before* the pipeline runs; (c) assert `AUDIO_SOURCE=socket` neither
+  imports nor calls the PortAudio device-enumeration path.
 
 ### Phase 3: Capturer↔recorder lifecycle (CLI supervisor) + wire-contract doc
 
@@ -308,12 +375,15 @@ audio **without** a virtual device, removing that setup step and failure class.
 **Test files:** `tests/test_socket_supervisor.py`
 **Test command:** `uv run pytest tests/test_socket_supervisor.py -v`
 
-- A supervisor (used when `onoats bot` runs with `AUDIO_SOURCE=socket`): spawn the
-  capturer (path via `ONOATS_CAPTURER_BIN`), wait for both sockets to appear,
-  start the recorder; on shutdown, stop the recorder then the capturer; on
-  capturer death, tear down cleanly (session still flushes + rotates). The
-  supervisor owns the capturer lifecycle; the transport does not self-reconnect
-  (see Requirements).
+- A supervisor (used when `onoats bot` runs with `AUDIO_SOURCE=socket`): create a
+  **private, supervisor-owned socket directory** (0700, not a shared `/tmp` path —
+  forecloses symlink aliasing of the two branch sockets), spawn the capturer (path
+  via `ONOATS_CAPTURER_BIN`) with a fresh **generation nonce**, wait for both
+  sockets to appear, start the recorder; on shutdown, stop the recorder then the
+  capturer; on capturer death, tear down cleanly (session still flushes + rotates).
+  The supervisor owns the capturer lifecycle; the transport does not self-reconnect
+  (see Requirements). On restart, a new nonce + fresh socket files invalidate any
+  stale fd from the previous generation.
 - **Define "fail loud" as a testable observable** so the acceptance criteria are
   checkable: for each failure path (capturer crash, permission denied, slow
   reader) the recorder MUST surface an `ErrorFrame` on the affected branch **AND**
@@ -324,12 +394,17 @@ audio **without** a virtual device, removing that setup step and failure class.
   policy, version) in `docs/audio-socket-contract.md` the way the queue contract
   is documented.
 - Test the supervisor against a **fake capturer** (a Python script that writes the
-  fixtures to the sockets) — still no Swift needed. **Explicitly test the crash
-  path:** fake capturer writes N frames then dies / abruptly closes the socket →
-  assert (per the "fail loud" definition) the branch surfaces an `ErrorFrame`, the
-  recorder rotates the partial session into `pending/` (the existing
-  `flush_and_rotate` path), the supervisor exits non-zero, and the process does
-  not hang.
+  fixtures to the sockets) — still no Swift needed. Test paths:
+  - **crash:** fake capturer writes N frames then dies / abruptly closes the socket
+    → assert (per the "fail loud" definition) the branch surfaces an `ErrorFrame`,
+    the recorder rotates the partial session into `pending/` (the existing
+    `flush_and_rotate` path), the supervisor exits non-zero, and the process does
+    not hang;
+  - **hung-but-alive:** fake capturer connects but writes nothing → the read-idle
+    watchdog fires, surfaces an `ErrorFrame`, and the session rotates (does not
+    hang waiting for EOF that never comes);
+  - **stale socket / restart:** a leftover socket file from a prior generation does
+    not let a new transport latch onto it — the nonce mismatch is rejected.
 
 ### Phase 4: Swift CoreAudio / ScreenCaptureKit capturer  *(macOS native)*
 
@@ -404,10 +479,34 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
     # triggers the base's audio drain task, and only when audio_in_enabled=True.
     async def start(self, frame: StartFrame):
         await super().start(frame)
-        # connect self._socket_path; spawn an async read-loop task that does:
+        await self._connect_and_handshake(frame)   # 1. connect + validate header
+        await self.set_transport_ready(frame)       # 2. creates _audio_in_queue
+        self._read_task = self.create_task(         # 3. ONLY THEN spawn the reader
+            self._read_loop())                      #    (else push_audio_frame hits
+                                                    #     a None queue, base_input.py:170)
+
+    async def _read_loop(self):
+        # read framed PCM16; on each frame:
         #   await self.push_audio_frame(
-        #       InputAudioRawFrame(audio=pcm_bytes, sample_rate=16000, num_channels=1))
-        await self.set_transport_ready(frame)
+        #       InputAudioRawFrame(audio=pcm, sample_rate=16000, num_channels=1))
+        # EOF or read-idle timeout -> push ErrorFrame, end the branch.
+        ...
+
+    async def stop(self, frame):    # framework cancels only ITS drain task,
+        await self._teardown()      # not self._read_task -> we must do it
+        await super().stop(frame)
+
+    async def cancel(self, frame):
+        await self._teardown()
+        await super().cancel(frame)
+
+    async def cleanup(self):
+        await self._teardown()
+        await super().cleanup()
+
+    async def _teardown(self):
+        # close the socket; cancel-and-await self._read_task if set.
+        ...
 
 class UnixSocketAudioTransport(BaseTransport):
     # built with TransportParams(audio_in_enabled=True, audio_in_sample_rate=16000)
@@ -424,15 +523,24 @@ input_device_index=…))`): branch on `AUDIO_SOURCE`, construct two
 ### Wire format (Phase 1 starting point — finalize in review)
 
 - PCM16 LE, 16 kHz, **mono**, one socket per branch.
-- Framing: fixed-size frames OR length-prefixed. If fixed-size, match the
+- Framing: **prefer length-prefixed** over fixed-size. A unix *stream* socket has
+  no message boundaries, so a fixed-size reader must `readexactly(N)` and the
+  writer must handle partial writes; length-prefixing makes a partial-write desync
+  impossible to silently ignore. If fixed-size is chosen anyway, match the
   reference's chunking — `LocalAudioInputTransport` uses `int(sample_rate/100)*2`
-  samples ≈ **20 ms** (`audio.py:68-93`); read the actual value from pipecat
-  rather than assuming, since it gates frame size. A leading 1-line JSON handshake
-  (`{"rate":16000,"width":2,"channels":1,"v":1}`) lets the transport
-  validate/negotiate before the stream — recommended for forward-compat, decide in
-  review.
-- Backpressure: bounded buffer; on overflow drop oldest with a logged WARNING
-  (audio realtime > completeness) — confirm policy in review.
+  samples = **640 bytes** for 20 ms PCM16/16 kHz mono (`audio.py:68-93`; read the
+  actual value from pipecat rather than assuming) and the reader MUST use
+  `readexactly(640)`.
+- Handshake: a leading 1-line JSON header
+  `{"rate":16000,"width":2,"channels":1,"v":1,"nonce":…}` lets the transport
+  validate/negotiate format and carry the generation nonce before the stream —
+  recommended for forward-compat, decide in review.
+- Each frame carries the capturer's **monotonic sequence number** so drops are
+  observable and `me`/`them` drift is measurable.
+- Backpressure: bounded buffer; **default** policy drop-oldest with a logged
+  WARNING that includes queue depth (audio realtime > completeness). **Keep the
+  policy configurable, not frozen** — drop-oldest vs drop-newest vs bounded-block
+  is decided by the OQ4 drift comparison, not pinned here.
 
 ### Invariant (do not violate)
 
@@ -474,7 +582,13 @@ frozen queue-contract value koda's classifier keys on).
       (LE), handshake validation, and version-mismatch rejection** — not just a
       happy-path rate/width/channels round-trip.
 - [ ] **Backpressure proven by test**: a faster-than-consumer writer caps memory
-      and drops-oldest with a WARNING (no unbounded growth).
+      under the configured policy (default drop-oldest) with a queue-depth WARNING
+      (no unbounded growth); frames carry a monotonic sequence number.
+- [ ] **Reader lifecycle proven by test**: readiness precedes the first
+      `push_audio_frame` (no `None`-queue race), and `EndFrame`/`CancelFrame` each
+      cancel the reader task and close the socket (no leak).
+- [ ] **Hung-but-alive proven by test**: a connected-but-silent capturer trips the
+      read-idle watchdog and rotates the session rather than hanging.
 - [ ] Capturer crash / permission-denied / slow-reader paths **fail loud** —
       defined as `ErrorFrame` on the branch AND non-zero supervisor exit AND a
       WARNING/ERROR log line — and leave the queue consistent (partial session
@@ -499,10 +613,13 @@ frozen queue-contract value koda's classifier keys on).
    terminal-for-this-session (no self-reconnect) — so the two never race (see
    Requirements). Still open: which layer is the supervisor in CLI vs GUI mode.
 4. **Backpressure policy** — drop-oldest vs bounded-block vs adaptive, and how to
-   keep `me`/`them` timestamps from drifting under load. **Tentatively resolved:**
-   bounded buffer, **drop-oldest with a WARNING** (realtime > completeness),
-   implemented and tested in Phase 1; confirm the cap size and drift handling in
-   review.
+   keep `me`/`them` timestamps from drifting under load. **Default, not frozen:**
+   Phase 1 ships a bounded buffer with a *configurable* policy defaulting to
+   drop-oldest + WARNING (queue depth logged), and frames carry a monotonic
+   sequence number so drift is measurable. **Decide the final policy (drop-oldest
+   vs drop-newest vs bounded-block) after a short STT-artifact + drift comparison
+   test — do not treat drop-oldest as a frozen invariant** (it would otherwise
+   contradict the "keep timestamps from drifting" goal of this very question).
 5. **Echo/duplication** — when capturing system output, does the user's own voice
    (played back through speakers + re-captured) leak into `them`? May need the
    process-tap to exclude onoats's own output, or AEC. Validate during Phase 4
@@ -523,4 +640,4 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ 0e68b039bd0aede42d1b1d6e043fd1b1e20801b7 -->
+<!-- reviewed: 2026-06-08 @ 92bfac4ad2c25b1b6119680350bbda9b2d1216bd -->
