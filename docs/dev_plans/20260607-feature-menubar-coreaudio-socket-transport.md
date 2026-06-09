@@ -246,6 +246,20 @@ audio **without** a virtual device, removing that setup step and failure class.
 
 ## Implementation Checklist
 
+> **⛔ AUTONOMOUS-RUN SCOPE (e.g. `/conduct`): implement Phases 1–3 ONLY, then
+> STOP and report.** Do **not** begin Phase 4 (Swift/native capturer), Phase 5
+> (menu bar), or Phase 6 (BlackHole retirement) in an unattended run: those are
+> macOS-native, can't be verified in headless/Python CI, and Phase 4 is gated on
+> the unresolved distribution unknown (Open Question 2). Two further guardrails
+> for the autonomous run:
+> - **Do not resolve Open Question 4** (final backpressure policy). Ship the
+>   configurable default (drop-oldest + WARNING + monotonic seq); the *final*
+>   drop-oldest vs drop-newest vs bounded-block choice is deferred to a drift
+>   test and is out of scope here.
+> - After Phase 2, surface the **keystone never-mix test** (mic-socket ⇒ only
+>   `me`, system-socket ⇒ only `them`) for human review before continuing — it
+>   protects downstream speaker attribution and warrants eyes even when green.
+>
 > **Two milestones, two PRs — do not bundle.** The plan covers two
 > independently-shippable features; keep them in separate PRs so the CI-testable
 > core is not held hostage by the hardest native unknown (Open Question 2,
@@ -643,4 +657,4 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ 15005517662fe083487a212b2c9846767b5ac4b5 -->
+<!-- reviewed: 2026-06-08 @ aa76f29d23b0a4133925d787e462ced0c25f4027 -->
