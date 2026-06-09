@@ -1,0 +1,226 @@
+# onoats audio-socket wire contract (v1)
+
+Status: **versioned contract — pinned**. This is the capturer↔recorder framing for
+`AUDIO_SOURCE=socket`. Changing any value here is a wire-version bump (`v` in the
+handshake) — bump `WIRE_VERSION` in `src/onoats/transports/socket_audio.py` and
+this doc together. The transport refuses to start on a version it does not speak,
+so a mismatched capturer fails loud rather than emitting silently-misframed audio.
+
+This is the third versioned contract in the system, alongside the JSONL queue
+contract (the `me`/`them` `source` enum — see `processors/source_tagger.py`) and
+the status-file schema (Phase 5, not yet built). The constants below are read
+from `src/onoats/transports/socket_audio.py`; that module is the source of truth
+and this doc mirrors it.
+
+## Topology / invariant
+
+Dual-stream, **two** STT sessions, `me` and `them` **never mixed**:
+
+```
+one capturer source → one unix socket → one transport instance → one branch
+                    → one STT session → one SourceTagger
+```
+
+- `me` (mic) → `mic.sock` → `UnixSocketAudioInputTransport` → STT #1 → `source="me"`
+- `them` (system) → `system.sock` → `UnixSocketAudioInputTransport` → STT #2 → `source="them"`
+
+Exactly **one socket per branch**. The capturer MUST NOT interleave the two
+streams onto one socket, and the recorder fans no socket to both branches.
+Collapsing the two onto one socket silently destroys downstream speaker
+attribution (the classifier keys on the canonical `me`/`them` enum).
+
+## Transport (socket type)
+
+- **Unix domain `SOCK_STREAM`** socket, one path per branch.
+- The **capturer is the server** (it `bind()` + `listen()`s and creates the socket
+  file); the **recorder transport is the client** (`asyncio.open_unix_connection`).
+  The recorder waits for the socket file to appear, then connects.
+- The recorder reads only; it never writes audio back. There is no output side.
+
+## Format (PCM)
+
+| Field         | Value        | Source constant                     |
+|---------------|--------------|-------------------------------------|
+| Encoding      | PCM signed   | —                                   |
+| Sample width  | **2 bytes** (16-bit) | `DEFAULT_SAMPLE_WIDTH = 2`   |
+| Endianness    | **little-endian (LE)** | (PCM16 LE)                |
+| Sample rate   | **16000 Hz** | `DEFAULT_SAMPLE_RATE = 16000`       |
+| Channels      | **1 (mono)** | `DEFAULT_CHANNELS = 1`              |
+
+The transport validates `rate`/`width`/`channels` from the handshake against
+these and refuses to start on a mismatch — never coerces.
+
+A PCM payload MUST be a whole number of samples (`len(pcm) % (width*channels) == 0`).
+An odd byte count is treated as a desync/framing error (loud `ErrorFrame`), not
+coerced.
+
+## Handshake (1-line JSON header)
+
+Before any frames, the capturer writes **exactly one line** of UTF-8 JSON
+terminated by `\n`:
+
+```json
+{"rate":16000,"width":2,"channels":1,"v":1,"nonce":"<hex>"}
+```
+
+| Key        | Type   | Meaning                                                        |
+|------------|--------|---------------------------------------------------------------|
+| `rate`     | int    | Sample rate; MUST equal the transport's expected rate (16000).|
+| `width`    | int    | Sample width in bytes; MUST equal 2.                          |
+| `channels` | int    | Channel count; MUST equal 1.                                  |
+| `v`        | int    | Wire version; MUST equal `WIRE_VERSION` (currently **1**).    |
+| `nonce`    | string | Generation token (see below). May be absent/`null` in v1.     |
+
+The transport (`parse_handshake`) **refuses to start loudly** — raises
+`SocketHandshakeError`, surfaced as refuse-to-start / `ErrorFrame` — on:
+malformed/non-UTF-8 JSON, a non-object, an unknown `v`, a `rate`/`width`/`channels`
+mismatch, or a non-string `nonce`. Nothing is silently coerced.
+
+### Generation nonce (stale-socket defense)
+
+Each supervisor launch mints a fresh nonce (`secrets.token_hex(16)`) and passes it
+to the capturer. The capturer MUST echo it in the handshake's `nonce`.
+
+The supervisor's **primary** stale-socket defense is structural, not the nonce: it
+mints a **fresh private 0700 socket directory per generation**, so a leftover
+socket from a previous generation lives at a path the new recorder never
+references and is unreachable. The transport additionally supports an
+`expected_nonce` gate (`SocketHandshakeError` on mismatch) for end-to-end
+rejection of a stale/foreign capturer; in Phase 3 the supervisor relies on the
+fresh-dir mechanism and does **not** thread `expected_nonce` through the recorder
+(that would require editing `dual.py` / `socket_audio.py`, outside Phase 3 scope —
+tracked as a follow-up).
+
+## Framing (length-prefixed)
+
+After the handshake line, each frame is:
+
+```
+[ 4-byte big-endian unsigned length N ][ N bytes of JSON payload ]
+```
+
+- **Length prefix:** `LENGTH_PREFIX_BYTES = 4`, **big-endian**, unsigned. (Note the
+  length prefix is big-endian / network order; the PCM *samples* inside the
+  payload are little-endian — these are independent and intentional.)
+- Length-prefixing (not fixed-size frames) is deliberate: a unix *stream* socket
+  has no message boundaries, so a fixed-size reader silently desyncs on a partial
+  write. The prefix makes a partial-write desync impossible to ignore.
+- `N` MUST be in `1..MAX_FRAME_PAYLOAD_BYTES` (`MAX_FRAME_PAYLOAD_BYTES = 1 MiB`,
+  `1 << 20`). A length of 0, negative, or over the ceiling is a desync → loud
+  `ErrorFrame`. A guard against a runaway prefix.
+
+### Frame payload (JSON object)
+
+```json
+{"seq": 0, "captured_monotonic_ns": 123456789, "pcm_b64": "<base64 PCM16 LE>"}
+```
+
+| Key                     | Type   | Meaning                                                    |
+|-------------------------|--------|------------------------------------------------------------|
+| `seq`                   | int    | Monotonic per-stream sequence number. Lets a drop be observed and `me`/`them` drift be measured. |
+| `captured_monotonic_ns` | int    | Capture timestamp (capturer's monotonic clock, ns).        |
+| `pcm_b64`               | string | base64 of the raw PCM16 LE mono samples for this frame.     |
+
+The transport copies `seq` → `metadata["socket_seq"]`,
+`captured_monotonic_ns` → `metadata["captured_monotonic_ns"]`, and sets the
+Pipecat frame `pts = captured_monotonic_ns`, then pushes an
+`InputAudioRawFrame(audio=pcm, sample_rate=16000, num_channels=1)`.
+
+### Frame size
+
+The reference chunking is **640 bytes** of PCM per 20 ms frame at 16 kHz
+(`frame_size_bytes(16000) == int(16000/100)*2 samples * 2 bytes = 640`), mirroring
+pipecat's `LocalAudioInputTransport`. The capturer SHOULD emit ~20 ms frames;
+the transport does not hard-require 640 — any whole-sample payload within the
+1 MiB ceiling is accepted — but matching the reference keeps VAD/STT cadence
+identical to the PortAudio path.
+
+## Backpressure policy
+
+The recorder maintains a **bounded staging buffer** between the socket reader and
+pipecat's (unbounded) audio queue. Bounding it caps memory under a
+faster-than-consumer writer.
+
+- **Default policy: `drop-oldest`** (`BackpressurePolicy.DROP_OLDEST`). On overflow
+  the oldest staged frame is dropped and a **WARNING** is logged that includes the
+  buffer depth and the dropped `seq` and a running total — so drops are observable.
+  Realtime audio favours freshness over completeness.
+- **Configurable, not frozen.** `drop-newest` and bounded-`block` are also
+  implemented. The *final* choice (drop-oldest vs drop-newest vs bounded-block) is
+  deferred to the OQ4 STT-artifact + drift comparison; do not treat drop-oldest as
+  a frozen invariant.
+- Default bound: `max_buffered_frames = 200` frames (~4 s at 20 ms/frame).
+- The monotonic `seq` is what makes a drop and any `me`/`them` drift measurable.
+
+## Read-idle watchdog
+
+EOF is not the only failure: a capturer that is alive but silent never closes the
+socket, so EOF never fires. The transport applies a **read-idle timeout** (default
+`read_idle_timeout = 10.0 s`; `<= 0` disables it). If no frame arrives within the
+window, the transport surfaces an `ErrorFrame` and ends the branch — the same
+terminal-for-session outcome as EOF, so the session rotates instead of hanging.
+
+## Termination semantics (terminal-for-session; no self-reconnect)
+
+Any of: clean EOF (capturer closed the socket), a truncated/desynced frame, a
+malformed payload, a handshake/version mismatch, or a read-idle timeout — is
+**terminal for the session**. The transport surfaces an `ErrorFrame` downstream
+(which is fatal → the pipeline is cancelled) and **does not self-reconnect**.
+
+**The supervisor owns restart.** A fresh capturer + transport pair (a new
+generation: new private dir, new nonce, new sockets) is what a restart
+establishes. The transport never latches a live branch back onto a respawned
+capturer — this is the single-lifecycle-owner rule that keeps the two layers from
+racing.
+
+## Capturer launch contract (supervisor → capturer)
+
+When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor
+(`cli._run_socket_supervisor`). The supervisor:
+
+1. mints a **private 0700 socket directory** under the system temp root (short
+   path to stay under the macOS ~104-byte `AF_UNIX` limit) containing
+   `mic.sock` and `system.sock`;
+2. mints a fresh generation **nonce**;
+3. exports `ONOATS_MIC_SOCKET` / `ONOATS_SYSTEM_SOCKET` (pointing at those
+   sockets) for the recorder;
+4. **spawns the binary named by `ONOATS_CAPTURER_BIN`**, passing the socket paths
+   and nonce **both** ways (read whichever you prefer):
+
+   - **argv:** `--mic-socket <path> --system-socket <path> --nonce <hex>`
+   - **env:** `ONOATS_MIC_SOCKET`, `ONOATS_SYSTEM_SOCKET`, `ONOATS_CAPTURER_NONCE`
+
+5. waits (bounded, default 10 s) for **both** socket files to appear, then runs
+   the recorder;
+6. on shutdown stops the recorder, then the capturer (SIGTERM → bounded wait →
+   SIGKILL); on capturer death tears down cleanly.
+
+The capturer (Phase 4, not yet built) MUST: create both sockets, accept one
+connection each, write the v1 handshake (echoing the nonce), then stream
+length-prefixed v1 frames per branch.
+
+## Fail-loud observable (acceptance shape)
+
+For every failure path — capturer crash, permission denied, slow/silent reader —
+the contract requires all of:
+
+1. an **`ErrorFrame`** on the affected branch (the transport emits it),
+2. a **non-zero supervisor exit code**,
+3. a **WARNING/ERROR log line**, and
+4. the **partial session still rotates** into `pending/` (via the recorder's
+   existing `flush_and_rotate` shutdown path) — **no hang**.
+
+## Constants (mirror of `socket_audio.py`)
+
+| Constant                  | Value     |
+|---------------------------|-----------|
+| `WIRE_VERSION`            | `1`       |
+| `DEFAULT_SAMPLE_RATE`     | `16000`   |
+| `DEFAULT_SAMPLE_WIDTH`    | `2`       |
+| `DEFAULT_CHANNELS`        | `1`       |
+| `LENGTH_PREFIX_BYTES`     | `4` (big-endian) |
+| `MAX_FRAME_PAYLOAD_BYTES` | `1048576` (1 MiB) |
+| 20 ms frame @ 16 kHz      | `640` bytes PCM (`frame_size_bytes(16000)`) |
+| default `read_idle_timeout` | `10.0` s |
+| default `max_buffered_frames` | `200` |
+| default backpressure      | `drop-oldest` + WARNING (configurable) |
