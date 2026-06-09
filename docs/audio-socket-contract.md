@@ -154,6 +154,10 @@ faster-than-consumer writer.
   deferred to the OQ4 STT-artifact + drift comparison; do not treat drop-oldest as
   a frozen invariant.
 - Default bound: `max_buffered_frames = 200` frames (~4 s at 20 ms/frame).
+- Second bound: `DEFAULT_MAX_BUFFERED_BYTES = 16 MiB` total staged bytes, enforced
+  *alongside* the frame count. Without it, 200 frames at the 1 MiB per-frame
+  ceiling could stage ~200 MiB; the byte cap keeps the footprint bounded for any
+  frame size (at the 640-byte reference frame the count cap always bites first).
 - The monotonic `seq` is what makes a drop and any `me`/`them` drift measurable.
 
 ## Read-idle watchdog
@@ -250,6 +254,7 @@ the contract requires all of:
 | `DEFAULT_CHANNELS`        | `1`       |
 | `LENGTH_PREFIX_BYTES`     | `4` (big-endian) |
 | `MAX_FRAME_PAYLOAD_BYTES` | `1048576` (1 MiB) |
+| `DEFAULT_MAX_BUFFERED_BYTES` | `16777216` (16 MiB) |
 | 20 ms frame @ 16 kHz      | `640` bytes PCM (`frame_size_bytes(16000)`) |
 | default `read_idle_timeout` | `10.0` s |
 | default `max_buffered_frames` | `200` |

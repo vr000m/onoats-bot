@@ -28,7 +28,20 @@ _REQUIRED = {
     "DEFAULT_CHANNELS",
     "LENGTH_PREFIX_BYTES",
     "MAX_FRAME_PAYLOAD_BYTES",
+    "DEFAULT_MAX_BUFFERED_BYTES",
 }
+
+
+def _doc_value_for(rows: list[list[str]], name_substr: str) -> str:
+    """First backticked token in the value cell of the row whose name cell
+    contains ``name_substr``. Lets the lowercase/prose rows (which the uppercase
+    name regex in ``test_contract_constants_mirror_module`` skips) be checked."""
+    for name_cell, value_cell, *_ in rows:
+        if name_substr in name_cell:
+            m = re.search(r"`([^`]+)`", value_cell)
+            assert m, f"no backticked value for row {name_substr!r}"
+            return m.group(1)
+    raise AssertionError(f"no Constants row matching {name_substr!r}")
 
 
 def _constants_table_rows() -> list[list[str]]:
@@ -71,9 +84,19 @@ def test_contract_constants_mirror_module() -> None:
 
 
 def test_contract_frame_size_and_defaults_match() -> None:
-    # 20 ms frame @ 16 kHz row.
-    assert mod.frame_size_bytes(16000) == 640
-    # default read_idle_timeout / max_buffered_frames rows.
+    # These rows use lowercase/prose names the uppercase-name parser skips, so
+    # read their values straight from the doc table and compare to the live
+    # module — a doc-only edit to any of them must fail this test (honouring the
+    # contract's 'change both together / fails CI' parity callout).
+    rows = _constants_table_rows()
     sig = inspect.signature(mod.UnixSocketAudioInputTransport.__init__)
-    assert sig.parameters["read_idle_timeout"].default == 10.0
-    assert sig.parameters["max_buffered_frames"].default == 200
+
+    assert (
+        int(_doc_value_for(rows, "20 ms frame")) == mod.frame_size_bytes(16000) == 640
+    )
+    assert float(_doc_value_for(rows, "read_idle_timeout")) == (
+        sig.parameters["read_idle_timeout"].default
+    )
+    assert int(_doc_value_for(rows, "max_buffered_frames")) == (
+        sig.parameters["max_buffered_frames"].default
+    )

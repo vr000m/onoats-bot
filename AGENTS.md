@@ -80,4 +80,16 @@ should NOT re-flag go here, one per line:
 
 `- **[Category] disposition**: description (YYYY-MM-DD)`
 
-_None recorded yet._
+- **[Architecture] won't-fix**: `dual._apply_recorder_args` (and `_parse_args`)
+  keep their leading underscore despite being imported cross-module by `cli.py` —
+  this matches the established in-repo convention for shared-but-internal helpers
+  (`_parse_args`, `_build_socket_transports`); they are intentionally cross-module,
+  not a public API. (2026-06-09)
+- **[Architecture] won't-fix**: `max_buffered_bytes` is clamped to `max(1, …)`
+  only inside `UnixSocketAudioInputTransport`, not at the `UnixSocketAudioTransport`
+  facade — the inner clamp is the single point of use and mirrors how
+  `max_buffered_frames` is handled (`Queue(maxsize=max(1, …))`); forwarding the
+  raw value through the facade is intentional. (2026-06-09)
+- **[Logic] analysis-error**: `nonce[:8]` in the handshake log assumes a `str` —
+  unreachable: `parse_handshake` validates `nonce` is `str | None` and the log
+  guards on truthiness, so a non-string nonce can never reach the slice. (2026-06-09)

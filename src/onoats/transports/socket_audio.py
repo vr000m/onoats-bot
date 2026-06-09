@@ -285,6 +285,11 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         self._staged_bytes = 0
         # Set by the pump after each ``get`` so a BLOCK-policy producer waiting on
         # the byte cap (which the count-based Queue cannot express) is woken.
+        # Single-reader / single-pump invariant: exactly one task waits on this
+        # Event (the reader in _block_until_room) and exactly one sets it (the
+        # pump). If a future refactor adds a second reader or pump, replace this
+        # Event with an asyncio.Condition — two concurrent BLOCK waiters would
+        # otherwise race past _has_room_for on one set().
         self._room_freed = asyncio.Event()
         self._dropped_frames = 0
         self._tearing_down = False
@@ -640,6 +645,10 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                 except asyncio.TimeoutError as exc:
                     raise _ConsumerStallTimeout() from exc
             else:
+                # Watchdog disabled (read_idle_timeout <= 0): wait unbounded.
+                # Liveness here rests on external cancellation — if the pump dies
+                # (its own _surface_error), its fatal ErrorFrame cancels the
+                # pipeline and this reader task, so the wait cannot hang forever.
                 await self._room_freed.wait()
 
         self._put_staged(frame, frame_bytes)

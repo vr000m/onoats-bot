@@ -14,6 +14,7 @@ native binary present, keeping the baseline / CI path native-free.
 from __future__ import annotations
 
 from onoats.transports.socket_audio import (
+    DEFAULT_MAX_BUFFERED_BYTES,
     BackpressurePolicy,
     HandshakeHeader,
     SocketHandshakeError,
@@ -25,6 +26,7 @@ from onoats.transports.socket_audio import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_BUFFERED_BYTES",
     "BackpressurePolicy",
     "HandshakeHeader",
     "SocketHandshakeError",
