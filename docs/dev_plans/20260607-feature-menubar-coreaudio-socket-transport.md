@@ -1,6 +1,6 @@
 # Task: macOS Menu-bar Launcher + CoreAudio Socket Audio Transport (retire BlackHole)
 
-**Status**: Milestone A (Phases 1–3) implemented — in review; Milestone B (Phases 4–6) not started
+**Status**: Milestone A (Phases 1–3) shipped (PR #4 merged); Milestone B (Phases 4–6) not started
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
