@@ -643,4 +643,4 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-08 @ eeb13fe39cab08b25f10e4e3bb83569661e48393 -->
+<!-- reviewed: 2026-06-08 @ 15005517662fe083487a212b2c9846767b5ac4b5 -->
