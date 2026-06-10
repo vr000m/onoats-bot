@@ -72,8 +72,6 @@ func defaultInputDeviceDescription() -> String {
 final class MicCapture {
     private var deviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
-    private var resampler: Resampler16k?
-    private var inputFormat: AVAudioFormat?
     private let chunker: FrameChunker
     private let rebindQueue = DispatchQueue(label: "onoats.mic.rebind")
     private var running = false
@@ -82,8 +80,19 @@ final class MicCapture {
 
     // IOProc → worker handoff (same realtime constraint as SystemCapture:
     // the IO callback only memcpys; the worker resamples/chunks).
+    //
+    // Each chunk carries the format + resampler of the device GENERATION it was
+    // captured under (both captured by that generation's IOProc closure). A
+    // rebind swaps devices on rebindQueue while the worker may still be
+    // draining old-device chunks — decoding those with the new device's
+    // format/converter would corrupt them, so the worker must never read a
+    // shared "current format"; it uses what travelled with the chunk.
     private let lock = NSCondition()
-    private var queue: [(bytes: Data, frames: AVAudioFrameCount, endNs: UInt64)] = []
+    private var queue:
+        [(
+            bytes: Data, frames: AVAudioFrameCount, endNs: UInt64,
+            format: AVAudioFormat, resampler: Resampler16k
+        )] = []
     private var workerClosed = false
     private var worker: Thread?
     private var droppedChunks: UInt64 = 0
@@ -144,8 +153,11 @@ final class MicCapture {
         guard let format = AVAudioFormat(streamDescription: &asbd) else {
             throw CapturerError("input format not representable as AVAudioFormat")
         }
-        inputFormat = format
-        resampler = try Resampler16k(inputFormat: format)
+        // One resampler per bind generation, owned by this generation's IOProc
+        // closure and travelling with each chunk it enqueues — never stored on
+        // the instance, so a rebind cannot retroactively change how chunks
+        // already in the queue are decoded.
+        let resampler = try Resampler16k(inputFormat: format)
 
         let sampleRate = format.sampleRate
         let bytesPerFrame = asbd.mBytesPerFrame
@@ -164,7 +176,9 @@ final class MicCapture {
                 ts.mFlags.contains(.hostTimeValid)
                 ? MonotonicClock.nanos(fromHostTime: ts.mHostTime) : MonotonicClock.nowNanos()
             let endNs = startNs + UInt64(Double(frames) / sampleRate * 1e9)
-            self.enqueueChunk(bytes: bytes, frames: frames, endNs: endNs)
+            self.enqueueChunk(
+                bytes: bytes, frames: frames, endNs: endNs,
+                format: format, resampler: resampler)
         }
         guard procErr == noErr, let proc = newProcID else {
             throw CapturerError(
@@ -212,7 +226,10 @@ final class MicCapture {
         }
     }
 
-    private func enqueueChunk(bytes: Data, frames: AVAudioFrameCount, endNs: UInt64) {
+    private func enqueueChunk(
+        bytes: Data, frames: AVAudioFrameCount, endNs: UInt64,
+        format: AVAudioFormat, resampler: Resampler16k
+    ) {
         lock.lock()
         defer { lock.unlock() }
         if workerClosed { return }
@@ -225,7 +242,7 @@ final class MicCapture {
                         + "(total dropped \(droppedChunks))")
             }
         }
-        queue.append((bytes, frames, endNs))
+        queue.append((bytes, frames, endNs, format, resampler))
         lock.signal()
     }
 
@@ -240,9 +257,8 @@ final class MicCapture {
             let item = queue.removeFirst()
             lock.unlock()
 
-            guard let format = inputFormat, let resampler else { continue }
             guard item.frames > 0,
-                let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: item.frames)
+                let buffer = AVAudioPCMBuffer(pcmFormat: item.format, frameCapacity: item.frames)
             else { continue }
             buffer.frameLength = item.frames
             item.bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
@@ -251,7 +267,7 @@ final class MicCapture {
                     memcpy(dstData, src, min(Int(dst.mDataByteSize), raw.count))
                 }
             }
-            guard let out = resampler.convert(buffer) else { continue }
+            guard let out = item.resampler.convert(buffer) else { continue }
             chunker.append(out, endNs: item.endNs)
         }
     }
