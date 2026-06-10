@@ -483,7 +483,7 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: YYYY-MM-DD @ <hash> -->
+<!-- reviewed: 2026-06-09 @ ac9e748a405b8fbd412a06c842645727642a0d7d -->
 
 ## Progress
 
