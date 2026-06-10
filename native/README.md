@@ -114,36 +114,44 @@ needs the paid Developer ID path. Record the failure in the plan's `## Findings`
 
 ### Spike 4 — Core Audio tap recipe + residue
 
+> **ALWAYS test the SIGNED app (`open Onoats.app --args …`), not the unsigned
+> `./onoats-capturer`.** The unsigned standalone blocks **~3.9 s** inside
+> `AudioHardwareCreateProcessTap` (per-call security verification) and is
+> intermittently flaky; the **signed** bundle creates the tap in **~200 ms** with no
+> audible dropout. Results land in `/tmp/onoats-spike-result.txt`. Use `--mute
+> unmuted` (the default) — other apps stay audible. (Residue/leak checks below run
+> the standalone deliberately, because signing is irrelevant to object lifecycle.)
+
 ```sh
-# Real system-output stream from other apps, without muting them:
-uv run python supervisor-exec.py tap --seconds 10
-#   While it runs, play music / a video in another app and KEEP LISTENING — the
-#   other app must keep playing (tap is .unmuted). Expect: TAP frames=… peak>0 PASS.
+make sign
+: > /tmp/onoats-spike-result.txt
 
-# Concurrent mic + system capture (no clock-domain conflict):
-uv run python supervisor-exec.py concurrent --seconds 10
-#   Speak into the mic AND play system audio. Expect: CONCURRENT mic=PASS system=PASS.
+# Real system-output stream, other apps stay audible (signed → ~200ms, no stutter):
+open Onoats.app --args tap --seconds 10        # play music in another app; KEEP LISTENING
+# Concurrent mic + system (no clock-domain conflict):
+open Onoats.app --args concurrent --seconds 10 # speak AND play audio
+sleep 12; cat /tmp/onoats-spike-result.txt
+#   expect: TAP … peak>0 PASS  and  CONCURRENT mic=PASS system=PASS
 
-# Residue: start/kill/start ×3 must leave no stale aggregate/tap.
+# Residue: start/kill -9 ×3 must leave no stale aggregate OR tap.
 for i in 1 2 3; do
-  uv run python supervisor-exec.py tap --seconds 3 &
-  pid=$!; sleep 1; kill -9 $pid; wait $pid 2>/dev/null
+  ./onoats-capturer tap --seconds 30 & pid=$!; sleep 2; kill -9 $pid; wait $pid 2>/dev/null
 done
-uv run python supervisor-exec.py list-aggregates   # expect: RESIDUE: none
+./onoats-capturer list-aggregates   # expect: RESIDUE: none
+./onoats-capturer list-taps         # expect: TAPS: none   (clean-taps to force-sweep)
 ```
 
 **PASS:** `tap` yields a real stream (peak > 0) while other apps keep playing,
-`concurrent` streams both, and after start/kill/start ×3 `list-aggregates` reports
-`RESIDUE: none`.
+`concurrent` streams both, and after start/kill/start ×3 both `list-aggregates` and
+`list-taps` report none.
 **FAIL → STOP:** Open Question 1 (system-audio API) reopens; Phase 4 must be built
 on a different primitive. Record it in `## Findings`.
 
-> **Note on the two TCC services.** The plan declares both
-> `NSMicrophoneUsageDescription` and `NSAudioCaptureUsageDescription`. It is not
-> certain Core Audio taps consult the latter (tap authorization has historically
-> ridden on the mic/"Audio Recording" grant). Watch which prompt(s) actually fire
-> during the first `tcc` run and record it — if only one appears, that's a finding,
-> not a bug.
+> **Two TCC services — CONFIRMED.** Both `NSMicrophoneUsageDescription` and
+> `NSAudioCaptureUsageDescription` are real, separate services: macOS lists
+> **Microphone** and **System Audio Recording Only** as distinct panes and the tap
+> added "Onoats" to the latter. Only the **mic** prompt is interactive; the
+> system-audio grant is recorded without a visible separate prompt yet capture works.
 
 ## After the spikes
 

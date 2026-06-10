@@ -180,6 +180,47 @@ func aggregateUID(_ devID: AudioObjectID) -> String? {
     return s as String
 }
 
+/// Enumerate live process taps via kAudioHardwarePropertyTapList. Unlike private
+/// aggregate devices (auto-reclaimed on process death), process taps appear to
+/// SURVIVE a SIGKILL — so a force-killed capturer leaks its tap, and enough leaks
+/// make AudioHardwareCreateProcessTap return noErr with kAudioObjectUnknown.
+func tapList() -> [AudioObjectID] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyTapList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard ck(AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size),
+        "get tap-list size") else { return [] }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    if count == 0 { return [] }
+    var taps = [AudioObjectID](repeating: 0, count: count)
+    guard ck(AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &taps),
+        "get tap list") else { return [] }
+    return taps
+}
+
+func listTaps() {
+    let taps = tapList()
+    log("  process taps present: \(taps.count) \(taps)")
+    print(taps.isEmpty ? "TAPS: none" : "TAPS: \(taps.count) leaked \(taps)")
+}
+
+/// Destroy ALL live process taps. On this machine nothing but our spike creates
+/// taps, so a blanket sweep is the cleanup. (Phase 4 will instead sweep only taps
+/// matching our name on capturer startup, and rely on SIGTERM-graceful teardown.)
+func cleanTaps() {
+    let taps = tapList()
+    var destroyed = 0
+    for t in taps {
+        if AudioHardwareDestroyProcessTap(t) == noErr { destroyed += 1 }
+    }
+    log("  destroyed \(destroyed)/\(taps.count) process taps")
+    print("CLEANED \(destroyed)/\(taps.count) taps")
+}
+
 func listAggregates() {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
@@ -403,8 +444,12 @@ case "tcc": rc = modeTCC()
 case "tap": rc = modeTap(seconds: secs, mute: mute)
 case "concurrent": rc = modeConcurrent(seconds: secs, mute: mute)
 case "list-aggregates": listAggregates(); rc = 0
+case "list-taps": listTaps(); rc = 0
+case "clean-taps": cleanTaps(); rc = 0
 default:
-    log("usage: onoats-capturer [tcc|tap|concurrent|list-aggregates] [--seconds N]")
+    log("usage: onoats-capturer "
+        + "[tcc|tap|concurrent|list-aggregates|list-taps|clean-taps] "
+        + "[--seconds N] [--mute unmuted|muted|mutedWhenTapped]")
     rc = 2
 }
 exit(rc)

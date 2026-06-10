@@ -487,7 +487,7 @@ _(to be filled on completion)_
 
 ## Progress
 
-- [ ] Phase 4 — Swift capturer (manual smoke) — *Pre-req **spike 3 (TCC) PASSED** 2026-06-09 (see Findings); spike 4 (tap residue/concurrent) in progress*
+- [ ] Phase 4 — Swift capturer (manual smoke) — *Pre-req **spikes 3 (TCC) + 4 (Core Audio tap) BOTH PASSED** 2026-06-09 (see Findings). Ready to build.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
@@ -528,6 +528,35 @@ _(to be filled on completion)_
   prompt, yet real capture works (`peak=0.44`) — so the system-audio authorization
   is more permissive for a signed app creating a tap. Both denials must still be
   handled in Phase 4 (a user can revoke either pane).
+
+- **Pre-req spike 4 (Core Audio tap recipe) PASSED — 2026-06-09.** Global process
+  tap (`CATapDescription(stereoGlobalTapButExcludeProcesses: [])`, empty exclusion =
+  tap all = system output) → private aggregate device → IOProc captures a **real
+  system-output stream** (peak 0.5–0.8 over ~575k frames at 48 kHz/2ch float).
+  - **Concurrent mic + system**: AVAudioEngine mic alongside the Core Audio
+    aggregate streamed together (mic peak 0.18 / system peak 0.29), no clock-domain
+    conflict.
+  - **Mute behavior**: `CATapMuteBehavior.unmuted` (raw 0) keeps other apps
+    **audible** while capturing — this is the one to use. `.mutedWhenTapped` (raw 2)
+    mutes the tapped apps for the whole capture (ruled out).
+  - **Startup dropout is a SIGNING artifact, not the API.** The **unsigned**
+    standalone binary blocked **~3.9 s inside `AudioHardwareCreateProcessTap`**
+    (TCC/security verification per call) → audible 4 s dropout. The **signed**
+    `Onoats.app` creates the tap in **~200 ms, no audible stutter** (3 back-to-back
+    runs: 204/184/195 ms). **Implication: the capturer MUST be signed** (it is — it
+    ships inside `Onoats.app`); never benchmark/ship the unsigned build. The unsigned
+    binary was also intermittently flaky (one `AudioHardwareCreateProcessTap`
+    returned `noErr` + `kAudioObjectUnknown`).
+  - **Residue / teardown**: `kill -9 ×3` then `list-aggregates` → **none** (macOS
+    auto-reclaims *private* aggregate devices on process death) and `list-taps` →
+    **none** (no tap leak even on SIGKILL — an earlier "taps leak" hunch was wrong).
+    Graceful exit (our `defer` chain) also leaves none.
+  - **Phase 4 design notes:** create the tap **once per session** and start the
+    IOProc immediately (signed ⇒ ~200 ms, fine); use `.unmuted`; tear down on
+    SIGTERM-graceful (`AudioDeviceStop`→destroy IOProc→destroy aggregate→destroy
+    tap); a startup tap-sweep (`kAudioHardwarePropertyTapList`) is cheap optional
+    insurance though no leak was observed. Touching the tap subsystem
+    (even `list-taps`) glitches audio briefly — avoid needless tap ops mid-session.
 
 - **Phase 5a (status file) — shipped 2026-06-09.** `src/onoats/status.py` (new):
   `STATUS_SCHEMA_VERSION = 1`, frozen `StatusRecord`, atomic `write_status`
