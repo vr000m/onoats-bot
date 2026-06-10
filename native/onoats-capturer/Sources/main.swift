@@ -114,6 +114,97 @@ if cliArgs.contains("--selftest-tap") {
     exit(frames > Int(seconds * 40) ? 0 : 1)  // expect ~50/s; allow slack
 }
 
+// Hidden debug mode: raw AVAudioEngine mic probe — no resampler, no chunker,
+// no silence pacer. Reports the actual default input device, raw tap-callback
+// count, and peak, so "engine bound to the wrong/dead device" is unambiguous.
+if cliArgs.contains("--selftest-mic") {
+    let seconds = Double(argValue("--seconds") ?? "") ?? 8.0
+    logLine("default input device: \(defaultInputDeviceDescription())")
+    guard requestMicGrantBlocking() else {
+        logLine("mic permission DENIED")
+        exit(1)
+    }
+    let engine = AVAudioEngine()
+    let input = engine.inputNode
+    let hwFormat = input.inputFormat(forBus: 0)
+    let outFormat = input.outputFormat(forBus: 0)
+    logLine(
+        "inputNode hw=\(hwFormat.sampleRate) Hz/\(hwFormat.channelCount) ch  "
+            + "out=\(outFormat.sampleRate) Hz/\(outFormat.channelCount) ch")
+    let format = hwFormat
+    var callbacks = 0
+    var frames = 0
+    var peak: Float = 0
+    let probeLock = NSLock()
+    input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        probeLock.lock()
+        callbacks += 1
+        frames += Int(buffer.frameLength)
+        if let ch = buffer.floatChannelData?[0] {
+            for i in 0..<Int(buffer.frameLength) { peak = max(peak, abs(ch[i])) }
+        }
+        probeLock.unlock()
+    }
+    do { try engine.start() } catch {
+        logLine("engine.start failed: \(error)")
+        exit(1)
+    }
+    logLine("engine running=\(engine.isRunning) — SPEAK for \(seconds)s…")
+    Thread.sleep(forTimeInterval: seconds)
+    engine.stop()
+    probeLock.lock()
+    logLine(
+        "selftest-mic (AVAudioEngine): callbacks=\(callbacks) frames=\(frames) "
+            + "peak=\(String(format: "%.4f", peak))")
+    probeLock.unlock()
+
+    // Second probe: direct HAL IOProc on the default input device (the same
+    // primitive PortAudio uses, and that our system branch uses).
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard
+        AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID) == noErr
+    else { exit(1) }
+    var halCallbacks = 0
+    var halFrames = 0
+    var halPeak: Float = 0
+    var procID: AudioDeviceIOProcID?
+    let err = AudioDeviceCreateIOProcIDWithBlock(&procID, deviceID, nil) {
+        _, inInputData, _, _, _ in
+        let abl = inInputData.pointee
+        probeLock.lock()
+        halCallbacks += 1
+        let buf = abl.mBuffers
+        if let data = buf.mData, buf.mDataByteSize > 0 {
+            let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
+            let p = data.bindMemory(to: Float.self, capacity: n)
+            for i in 0..<n { halPeak = max(halPeak, abs(p[i])) }
+            halFrames += n
+        }
+        probeLock.unlock()
+    }
+    guard err == noErr, let proc = procID else {
+        logLine("HAL probe: create IOProc failed \(fourCC(err))")
+        exit(1)
+    }
+    let startErr = AudioDeviceStart(deviceID, proc)
+    logLine("HAL probe on device \(deviceID): start=\(fourCC(startErr)) — SPEAK for \(seconds)s…")
+    Thread.sleep(forTimeInterval: seconds)
+    AudioDeviceStop(deviceID, proc)
+    AudioDeviceDestroyIOProcID(deviceID, proc)
+    probeLock.lock()
+    logLine(
+        "selftest-mic (HAL IOProc): callbacks=\(halCallbacks) frames=\(halFrames) "
+            + "peak=\(String(format: "%.4f", halPeak))")
+    probeLock.unlock()
+    exit((callbacks > 0 || halCallbacks > 0) ? 0 : 1)
+}
+
 // Hidden debug mode: system tap + mic engine together, no sockets.
 if cliArgs.contains("--selftest-concurrent") {
     let seconds = Double(argValue("--seconds") ?? "") ?? 6.0

@@ -1,13 +1,21 @@
-// Mic ("me") branch: AVAudioEngine input tap → resample → 20 ms frames.
+// Mic ("me") branch: direct HAL IOProc on the default input device →
+// resample → 20 ms frames.
 //
-// Device-change survival (contract MUST): AVAudioEngine stops itself when the
-// default input device changes (AirPods disconnect etc.) and posts
-// AVAudioEngineConfigurationChange. We rebuild the tap + converter against the
-// new input format and restart — never exit on a recoverable change. If the
-// restart fails (e.g. no input device at all for a moment), retry on a timer
-// AND on the next configuration-change notification.
+// Deliberately NOT AVAudioEngine: on this machine AVAudioEngine's inputNode
+// reports running=true yet delivers ZERO tap callbacks from a Focusrite
+// Scarlett Solo (verified with --selftest-mic: engine callbacks=0 while a raw
+// HAL IOProc on the same device streams fine). PortAudio — the Milestone A
+// path that works daily — also uses raw HAL. So the mic branch uses the same
+// copy-only IOProc + worker-thread pattern as SystemCapture.
+//
+// Device-change survival (contract MUST): a listener on
+// kAudioHardwarePropertyDefaultInputDevice rebinds the IOProc to the new
+// default device (AirPods disconnect etc.) and keeps streaming to the same
+// socket. The chunker's silence pacer covers the rebind gap so the timeline
+// stays continuous.
 
 import AVFoundation
+import CoreAudio
 import Foundation
 
 func requestMicGrantBlocking() -> Bool {
@@ -24,85 +32,251 @@ func requestMicGrantBlocking() -> Bool {
     return granted
 }
 
+func defaultInputDeviceID() -> AudioObjectID {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let err = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID)
+    return err == noErr ? deviceID : AudioObjectID(kAudioObjectUnknown)
+}
+
+/// Name + UID of the system default INPUT device — logged at mic start so a
+/// wrong default (e.g. a leftover virtual loopback device) is diagnosable at
+/// a glance.
+func defaultInputDeviceDescription() -> String {
+    let deviceID = defaultInputDeviceID()
+    guard deviceID != kAudioObjectUnknown else { return "<no default input device>" }
+
+    func stringProp(_ selector: AudioObjectPropertySelector) -> String {
+        var propAddr = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cfStr: CFString?
+        var strSize = UInt32(MemoryLayout<CFString?>.size)
+        let err = withUnsafeMutablePointer(to: &cfStr) {
+            AudioObjectGetPropertyData(deviceID, &propAddr, 0, nil, &strSize, $0)
+        }
+        guard err == noErr, let s = cfStr else { return "?" }
+        return s as String
+    }
+    let name = stringProp(kAudioObjectPropertyName)
+    let uid = stringProp(kAudioDevicePropertyDeviceUID)
+    return "\"\(name)\" (uid=\(uid), id=\(deviceID))"
+}
+
 final class MicCapture {
-    private let engine = AVAudioEngine()
+    private var deviceID = AudioObjectID(kAudioObjectUnknown)
+    private var ioProcID: AudioDeviceIOProcID?
     private var resampler: Resampler16k?
+    private var inputFormat: AVAudioFormat?
     private let chunker: FrameChunker
-    private let restartQueue = DispatchQueue(label: "onoats.mic.restart")
+    private let rebindQueue = DispatchQueue(label: "onoats.mic.rebind")
     private var running = false
-    private var observer: NSObjectProtocol?
+    private var listenerInstalled = false
     private var retryTimer: DispatchSourceTimer?
+
+    // IOProc → worker handoff (same realtime constraint as SystemCapture:
+    // the IO callback only memcpys; the worker resamples/chunks).
+    private let lock = NSCondition()
+    private var queue: [(bytes: Data, frames: AVAudioFrameCount, endNs: UInt64)] = []
+    private var workerClosed = false
+    private var worker: Thread?
+    private var droppedChunks: UInt64 = 0
+    private let maxQueuedChunks = 128
+
+    private lazy var deviceListener: AudioObjectPropertyListenerBlock = {
+        [weak self] _, _ in
+        guard let self else { return }
+        self.rebindQueue.async { self.rebind(reason: "default input device changed") }
+    }
 
     init(emit: @escaping (Data, UInt64) -> Void) {
         chunker = FrameChunker(label: "mic", emit: emit)
     }
 
     func start() throws {
-        observer = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.restartQueue.async { self.restart(reason: "configuration change") }
+        let workerThread = Thread { [weak self] in self?.runWorker() }
+        workerThread.name = "mic-capture-worker"
+        worker = workerThread
+        workerThread.start()
+
+        try bind()
+
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let err = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, rebindQueue, deviceListener)
+        if err == noErr {
+            listenerInstalled = true
+        } else {
+            logLine("WARNING mic: could not install device-change listener (\(fourCC(err)))")
         }
-        try attachAndStart()
+
         chunker.activate()
         running = true
     }
 
+    /// Bind an IOProc to the CURRENT default input device.
+    private func bind() throws {
+        let device = defaultInputDeviceID()
+        guard device != kAudioObjectUnknown else {
+            throw CapturerError("no default input device")
+        }
+
+        // The device's input-side stream format (what the IOProc will deliver).
+        var fmtAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let fmtErr = AudioObjectGetPropertyData(device, &fmtAddr, 0, nil, &size, &asbd)
+        guard fmtErr == noErr else {
+            throw CapturerError("get input stream format failed (OSStatus \(fourCC(fmtErr)))")
+        }
+        guard let format = AVAudioFormat(streamDescription: &asbd) else {
+            throw CapturerError("input format not representable as AVAudioFormat")
+        }
+        inputFormat = format
+        resampler = try Resampler16k(inputFormat: format)
+
+        let sampleRate = format.sampleRate
+        let bytesPerFrame = asbd.mBytesPerFrame
+        var newProcID: AudioDeviceIOProcID?
+        let procErr = AudioDeviceCreateIOProcIDWithBlock(&newProcID, device, nil) {
+            [weak self] _, inInputData, inInputTime, _, _ in
+            guard let self else { return }
+            let abl = inInputData.pointee
+            guard abl.mNumberBuffers >= 1 else { return }
+            let buf = abl.mBuffers
+            guard let src = buf.mData, buf.mDataByteSize > 0, bytesPerFrame > 0 else { return }
+            let bytes = Data(bytes: src, count: Int(buf.mDataByteSize))
+            let frames = AVAudioFrameCount(Int(buf.mDataByteSize) / Int(bytesPerFrame))
+            let ts = inInputTime.pointee
+            let startNs =
+                ts.mFlags.contains(.hostTimeValid)
+                ? MonotonicClock.nanos(fromHostTime: ts.mHostTime) : MonotonicClock.nowNanos()
+            let endNs = startNs + UInt64(Double(frames) / sampleRate * 1e9)
+            self.enqueueChunk(bytes: bytes, frames: frames, endNs: endNs)
+        }
+        guard procErr == noErr, let proc = newProcID else {
+            throw CapturerError(
+                "mic AudioDeviceCreateIOProcIDWithBlock failed (OSStatus \(fourCC(procErr)))")
+        }
+        let startErr = AudioDeviceStart(device, proc)
+        guard startErr == noErr else {
+            AudioDeviceDestroyIOProcID(device, proc)
+            throw CapturerError("mic AudioDeviceStart failed (OSStatus \(fourCC(startErr)))")
+        }
+        deviceID = device
+        ioProcID = proc
+        logLine(
+            "mic: capturing from \(defaultInputDeviceDescription()) at "
+                + "\(Int(format.sampleRate)) Hz / \(format.channelCount) ch")
+    }
+
+    private func unbind() {
+        if deviceID != kAudioObjectUnknown, let proc = ioProcID {
+            AudioDeviceStop(deviceID, proc)
+            AudioDeviceDestroyIOProcID(deviceID, proc)
+        }
+        deviceID = AudioObjectID(kAudioObjectUnknown)
+        ioProcID = nil
+    }
+
+    /// Runs on rebindQueue only. MUST NOT exit on a recoverable device change —
+    /// on failure (e.g. no input device for a moment) retry in 2 s; the silence
+    /// pacer keeps the branch alive meanwhile.
+    private func rebind(reason: String) {
+        guard running else { return }
+        retryTimer?.cancel()
+        retryTimer = nil
+        unbind()
+        do {
+            try bind()
+            logLine("mic: rebound after \(reason)")
+        } catch {
+            logLine("mic: rebind after \(reason) failed (\(error)); retrying in 2s")
+            let timer = DispatchSource.makeTimerSource(queue: rebindQueue)
+            timer.schedule(deadline: .now() + 2)
+            timer.setEventHandler { [weak self] in self?.rebind(reason: "retry") }
+            timer.resume()
+            retryTimer = timer
+        }
+    }
+
+    private func enqueueChunk(bytes: Data, frames: AVAudioFrameCount, endNs: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        if workerClosed { return }
+        if queue.count >= maxQueuedChunks {
+            queue.removeFirst()
+            droppedChunks += 1
+            if droppedChunks == 1 || droppedChunks % 100 == 0 {
+                logLine(
+                    "WARNING mic: capture queue full; dropped oldest chunk "
+                        + "(total dropped \(droppedChunks))")
+            }
+        }
+        queue.append((bytes, frames, endNs))
+        lock.signal()
+    }
+
+    private func runWorker() {
+        while true {
+            lock.lock()
+            while queue.isEmpty && !workerClosed { lock.wait() }
+            if workerClosed {
+                lock.unlock()
+                return
+            }
+            let item = queue.removeFirst()
+            lock.unlock()
+
+            guard let format = inputFormat, let resampler else { continue }
+            guard item.frames > 0,
+                let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: item.frames)
+            else { continue }
+            buffer.frameLength = item.frames
+            item.bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                let dst = buffer.audioBufferList.pointee.mBuffers
+                if let dstData = dst.mData, let src = raw.baseAddress {
+                    memcpy(dstData, src, min(Int(dst.mDataByteSize), raw.count))
+                }
+            }
+            guard let out = resampler.convert(buffer) else { continue }
+            chunker.append(out, endNs: item.endNs)
+        }
+    }
+
     func stop() {
-        restartQueue.sync {
+        rebindQueue.sync {
             running = false
             retryTimer?.cancel()
             retryTimer = nil
         }
+        if listenerInstalled {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, rebindQueue, deviceListener)
+            listenerInstalled = false
+        }
         chunker.stop()
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-    }
-
-    private func attachAndStart() throws {
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw CapturerError("mic input has no usable format (no input device?)")
-        }
-        let resampler = try Resampler16k(inputFormat: format)
-        self.resampler = resampler
-        // ~20 ms at the device rate keeps emission cadence close to the wire's.
-        let bufferSize = AVAudioFrameCount(max(256, Int(format.sampleRate / 50)))
-        input.installTap(onBus: 0, bufferSize: bufferSize, format: format) {
-            [weak self] buffer, when in
-            guard let self else { return }
-            // hostTime stamps the START of the buffer; the chunker wants its end.
-            let startNs =
-                when.isHostTimeValid
-                ? MonotonicClock.nanos(fromHostTime: when.hostTime) : MonotonicClock.nowNanos()
-            let durNs = UInt64(Double(buffer.frameLength) / format.sampleRate * 1e9)
-            guard let out = self.resampler?.convert(buffer) else { return }
-            self.chunker.append(out, endNs: startNs + durNs)
-        }
-        try engine.start()
-        logLine("mic: capturing at \(Int(format.sampleRate)) Hz / \(format.channelCount) ch")
-    }
-
-    /// Runs on restartQueue only.
-    private func restart(reason: String) {
-        guard running else { return }
-        retryTimer?.cancel()
-        retryTimer = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        do {
-            try attachAndStart()
-            logLine("mic: restarted after \(reason)")
-        } catch {
-            logLine("mic: restart after \(reason) failed (\(error)); retrying in 2s")
-            let timer = DispatchSource.makeTimerSource(queue: restartQueue)
-            timer.schedule(deadline: .now() + 2)
-            timer.setEventHandler { [weak self] in self?.restart(reason: "retry") }
-            timer.resume()
-            retryTimer = timer
-        }
+        unbind()
+        lock.lock()
+        workerClosed = true
+        queue.removeAll()
+        lock.signal()
+        lock.unlock()
     }
 }
