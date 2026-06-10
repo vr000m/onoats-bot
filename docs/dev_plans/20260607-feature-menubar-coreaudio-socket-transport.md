@@ -282,6 +282,15 @@ audio **without** a virtual device, removing that setup step and failure class.
 > If this file grows unwieldy as Milestone B is fleshed out, split B into its own
 > dev-plan file at that point; for now the two-milestone framing keeps the shared
 > macOS context in one place.
+>
+> **Update 2026-06-10:** Milestone B lives in its own plan
+> (`20260609-feature-milestone-b-macos-capture-menubar.md`); see its Phase 5b
+> "Decisions" block. Notably, "BlackHole retirement" is now a *demotion*, not a
+> removal: the PortAudio/BlackHole backend stays a supported CLI option
+> (`onoats bot --source portaudio|socket`, required below macOS 14.4); only the
+> menu-bar app is socket/CoreAudio-only. GUI→CLI discovery is via the
+> `uv tool install --editable` shim at `~/.local/bin/onoats`, installed/updated
+> through `make -C native install`.
 
 ### Phase 1: `UnixSocketAudioInputTransport` + wire framing  *(Python)*
 
@@ -693,7 +702,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-09 @ 3428358c7c10b4b6ef9a06f79b66ac886338b850 -->
+<!-- reviewed: 2026-06-09 @ abea83a08f6309149d0dc336a96148458cd1227d -->
 
 ## Progress
 

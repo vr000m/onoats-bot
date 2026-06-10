@@ -311,6 +311,30 @@ embeds the Phase-4 capturer at `Contents/MacOS/onoats-capturer`
 - **Manual smoke:** launch from menu bar, start/stop a session, confirm indicator
   tracks the status file, confirm Flush works.
 
+**Decisions (2026-06-10) — CLI discovery, install/update, backend split:**
+
+- **CLI discovery:** the GUI invokes the stable shim `~/.local/bin/onoats`
+  created by `uv tool install --editable '<repo>[macos]'` (isolated uv tool venv,
+  decoupled from the repo's `.venv`; editable, so Python edits apply on next
+  Start with no reinstall). Optional absolute-path override in the app's config;
+  the menu shows the resolved path + version so a stale install is visible. No
+  login-shell shell-out — a LaunchServices app never inherits shell PATH, and
+  config is already CWD-independent (`~/.config/onoats/`, data `~/koda-data`).
+- **Install/update:** extend `native/Makefile` (not a justfile — `make` ships
+  with Xcode CLT; no new prerequisite): `cert` (scripted self-signed identity
+  creation; README GUI steps stay as fallback), `install-cli` (idempotent
+  `uv tool install --editable` — re-run *is* the update), `install` (sign +
+  install-cli + `ditto` to `~/Applications/Onoats.app`; `ditto` preserves
+  signatures, and TCC grants key to the DR not the path, so reinstall keeps
+  grants). Full story: create cert once, `make -C native install`; update =
+  `git pull && make -C native install`.
+- **Backend split:** the PortAudio/BlackHole path stays fully supported and
+  CLI-invokable — it is already the default (`audio_source` = `portaudio`) and
+  the required path below macOS 14.4. Add an explicit `onoats bot
+  --source portaudio|socket` flag for ergonomics. The menu-bar app hardcodes
+  `AUDIO_SOURCE=socket` only: the GUI exists for the TCC responsible-process
+  topology, which is meaningless for the PortAudio path.
+
 ### Phase 6: Retire BlackHole from the default macOS story + docs
 
 > **⛔ GATE: do not start Phase 6 until Phase 4 acceptance (asymmetric keystone
@@ -495,7 +519,7 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: 2026-06-09 @ a1fd19b18803fbf1d6467e938fc5dc4d8c2c1d30 -->
+<!-- reviewed: 2026-06-09 @ c5f90d8b6319890db3598f4b34d215ee8c6a7c2d -->
 ## Progress
 
 - [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
