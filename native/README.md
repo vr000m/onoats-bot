@@ -88,6 +88,19 @@ python3 wire_check.py --mic-socket $S/mic.sock --system-socket $S/system.sock \
 The binary also has socket-less debug modes: `--selftest-tap` and
 `--selftest-concurrent` (`--seconds N`).
 
+### Residue check (manual-smoke step 8)
+
+`residue_check.sh` automates the start → `kill -9` → ×3 loop against the
+**production** binary with live socket clients (the tap + aggregate only exist
+once a client connects), then asserts via the spike's enumeration commands that
+no `onoats-*` aggregate or process tap survived:
+
+```sh
+./residue_check.sh        # default 3 rounds; expect "residue check PASS"
+```
+
+(PASSED 2026-06-10 — see the dev plan's manual-smoke checklist.)
+
 ## Phase-4 Pre-req spikes (BLOCKING — run before any production Swift)
 
 Two unverified Apple-platform premises gate Phase 4. Resolve **both** here.

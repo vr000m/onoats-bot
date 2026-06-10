@@ -73,6 +73,11 @@ func ck(_ status: OSStatus, _ label: String) -> Bool {
 }
 
 let AGG_UID_PREFIX = "onoats-spike-agg-"
+// Residue scan matches ANY onoats aggregate — the spike's own
+// ("onoats-spike-agg-") AND the production capturer's ("onoats-capturer-agg-",
+// see onoats-capturer/Sources/SystemCapture.swift) — so `list-aggregates`
+// works as the leak check for both binaries.
+let RESIDUE_UID_PREFIX = "onoats-"
 
 // MARK: - microphone grant (TCC: NSMicrophoneUsageDescription)
 
@@ -237,13 +242,13 @@ func listAggregates() {
         "get device list") else { return }
     var found = 0
     for dev in devices {
-        if let uid = aggregateUID(dev), uid.hasPrefix(AGG_UID_PREFIX) {
+        if let uid = aggregateUID(dev), uid.hasPrefix(RESIDUE_UID_PREFIX) {
             log("  RESIDUE: leftover aggregate id=\(dev) uid=\(uid)")
             found += 1
         }
     }
     if found == 0 {
-        log("  clean: no \(AGG_UID_PREFIX)* aggregate devices present")
+        log("  clean: no \(RESIDUE_UID_PREFIX)* aggregate devices present")
     }
     print(found == 0 ? "RESIDUE: none" : "RESIDUE: \(found) leftover")
 }
