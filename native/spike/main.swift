@@ -33,6 +33,24 @@ func log(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
 }
 
+// GUI launches (`open Onoats.app`) are detached — stderr/stdout go nowhere. Append
+// every result line to a fixed file so a GUI-rooted run (the only faithful TCC test
+// for the menu-bar topology) is observable. `cat /tmp/onoats-spike-result.txt`.
+let RESULT_FILE = "/tmp/onoats-spike-result.txt"
+
+func result(_ s: String) {
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(stamp)] pid=\(getpid()) \(s)\n"
+    log(s)
+    if let fh = FileHandle(forWritingAtPath: RESULT_FILE) {
+        fh.seekToEndOfFile()
+        fh.write(line.data(using: .utf8)!)
+        fh.closeFile()
+    } else {
+        try? line.data(using: .utf8)!.write(to: URL(fileURLWithPath: RESULT_FILE))
+    }
+}
+
 func fourCC(_ s: OSStatus) -> String {
     // Many CoreAudio OSStatus values are packed 4-char codes; show both forms.
     let n = UInt32(bitPattern: s)
@@ -253,6 +271,11 @@ func runTap(aggID: AudioObjectID, format: AudioStreamBasicDescription,
 
 func modeTCC() -> Int32 {
     log("== TCC spike (mic + system-audio grants) ==")
+    // Record the PRE status: for a freshly-attributed bundle id that has never been
+    // granted, this is 0 (notDetermined) and a prompt fires. A non-zero pre-status
+    // on a brand-new bundle means TCC attributed the request to a DIFFERENT identity
+    // (e.g. the launching terminal) — the false-pass confound to watch for.
+    let preMic = AVCaptureDevice.authorizationStatus(for: .audio).rawValue
     let mic = requestMicGrant()
     log("  triggering system-audio grant via process-tap creation…")
     var sysGrant = false
@@ -260,9 +283,12 @@ func modeTCC() -> Int32 {
         sysGrant = true
         destroyTap(tapID)
     }
-    log("")
-    log("  RESULT mic=\(mic ? "PASS" : "FAIL") system-audio=\(sysGrant ? "PASS" : "FAIL")")
-    print("TCC mic=\(mic ? "PASS" : "FAIL") system=\(sysGrant ? "PASS" : "FAIL")")
+    // GUI-launched system-audio prompts can be async — hold the process so the
+    // prompt can be answered before we exit.
+    Thread.sleep(forTimeInterval: 3)
+    result(
+        "TCC mic_pre=\(preMic) mic=\(mic ? "PASS" : "FAIL") "
+            + "system=\(sysGrant ? "PASS" : "FAIL")")
     return (mic && sysGrant) ? 0 : 1
 }
 

@@ -34,8 +34,13 @@ app: build
 	cp $(PLIST) $(APP)/Contents/Info.plist
 	@echo "✓ assembled $(APP)"
 
+# NOTE: deliberately NOT `-v`. A self-signed root fails the *trust* evaluation
+# (it is not in the system trust store), so `find-identity -v` hides it — but
+# codesign can still sign with it, and TCC keys on the cert IDENTITY (the
+# designated requirement), not on keychain trust. So we only require the identity
+# to EXIST for the codesigning policy; `make sign`'s codesign call is the real test.
 check-identity:
-	@security find-identity -v -p codesigning | grep -q "$(IDENTITY)" || { \
+	@security find-identity -p codesigning | grep -q "$(IDENTITY)" || { \
 	  echo "✗ No code-signing identity named '$(IDENTITY)' in the keychain."; \
 	  echo "  Create the self-signed 'Code Signing' cert first — see native/README.md."; \
 	  exit 1; }

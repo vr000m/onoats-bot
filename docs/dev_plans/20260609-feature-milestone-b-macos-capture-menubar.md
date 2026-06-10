@@ -494,6 +494,31 @@ _(to be filled on completion)_
 
 ## Findings
 
+- **TCC attribution is rooted at the launching GUI app, not the capturer's bundle
+  identity (spike 3, 2026-06-09).** Running `supervisor-exec.py tcc` from Ghostty
+  reported `mic (pre)=authorized` and a silent system-audio tap success on a
+  **brand-new bundle id** (`net.varunsingh.onoats`) that had never been granted
+  anything — and System Settings lists **Ghostty** (not "Onoats") under both
+  Microphone and Screen & System Audio Recording. Conclusion: a binary
+  `posix_spawn`'d from a terminal (`shell → uv → python → capturer`) is attributed
+  by TCC to the **responsible GUI process at the session root = the terminal**, and
+  inherits *its* grants; the capturer's own self-signed identity is never consulted.
+  - **Consequence:** the self-signed-cert TCC-persistence premise (OQ2) can ONLY be
+    tested with `Onoats.app` as the responsible process (a LaunchServices/`open`
+    launch, or a GUI menu-bar app at the chain root) — the terminal path is a
+    confound and any "PASS" from it is a false pass.
+  - **Two viable production topologies fall out:** (1) **terminal-launched** — the
+    recorder runs from a terminal that already holds the grants (today's koda/onoats
+    workflow); the capturer inherits them; **no self-signed cert / no `.app` needed**
+    for TCC (ad-hoc signing is fine). (2) **menu-bar-app-launched** — `Onoats.app`
+    (GUI, LaunchServices) is its own responsible process, so grants are keyed to its
+    bundle identity and the **self-signed stable cert is required** to persist them
+    across rebuilds; this is the path the plan's Phase 5b assumes.
+  - DR captured and is the stable shape we want (no cdhash):
+    `identifier "net.varunsingh.onoats" and certificate leaf = H"aac7e2b9…"`.
+  - `make build` compiled the Core Audio process-tap Swift clean on macOS 26.3.1
+    (no API iteration needed); `make sign` succeeded with the self-signed cert.
+
 - **Phase 5a (status file) — shipped 2026-06-09.** `src/onoats/status.py` (new):
   `STATUS_SCHEMA_VERSION = 1`, frozen `StatusRecord`, atomic `write_status`
   (tempfile + `os.replace` + `fsync`), tolerant `read_status` (malformed/half-JSON

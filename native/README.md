@@ -23,11 +23,18 @@ identity every build and re-prompts forever — so we use a stable self-signed c
    - **Certificate Type:** **Code Signing**
    - (optional) tick *Let me override defaults* and extend validity to a few years.
 3. Create it; it lands in the **login** keychain.
-4. Verify the tool can see it:
+4. On the override pages, set **Certificate Type / Extended Key Usage = Code
+   Signing** (the assistant defaults to *SSL Server* — if you leave it, the cert is
+   not a codesigning identity). A long validity (e.g. 3650 days) saves re-doing it.
+5. Verify the tool can see it — **without `-v`**:
    ```sh
-   security find-identity -v -p codesigning
+   security find-identity -p codesigning
    ```
-   You should see one line containing `"Code Signing"`.
+   You should see one line containing `"Code Signing"`. Note: `find-identity -v`
+   (valid-only) will report `0 valid identities` for a self-signed cert because it
+   is not in the system trust store — **that is expected and fine**. codesign signs
+   with it regardless, and TCC keys on the cert *identity* (the designated
+   requirement), not on keychain trust.
 
 You only do this once. The same cert signs the capturer and the menu-bar `.app`.
 
@@ -50,33 +57,45 @@ make build                       # compile-only; catches API errors before perms
 
 ### Spike 3 — TCC persistence (mic + system audio, across 3 rebuilds)
 
-The persistence test must run on the **real launch topology**: the Python
-supervisor exec-ing the embedded helper (not double-clicking the `.app`). The
-`supervisor-exec.py` harness reuses the real `_build_capturer_env` +
-`start_new_session=True` exec from `cli.py`.
+> **Attribution gotcha (learned the hard way, 2026-06-09).** TCC attributes a
+> grant to the **responsible GUI process at the session root**. A helper
+> `posix_spawn`'d from a **terminal** (`shell → uv → python → capturer`) is
+> attributed to the **terminal**, and inherits *its* grants — so running this from
+> a terminal is a **false-pass confound** (you'd be testing your terminal's grants,
+> not the bundle's). The menu-bar topology's responsible process is `Onoats.app`
+> itself, so the faithful test **GUI-launches the app** via `open` (LaunchServices),
+> making `Onoats.app` its own responsible process. The tell: a **brand-new** bundle
+> id must report `mic_pre=0` (notDetermined) and **prompt**, attributed to "Onoats".
+> A non-zero `mic_pre` on first run means attribution went elsewhere.
+
+The helper writes results to `/tmp/onoats-spike-result.txt` (a GUI launch has no
+stdout). Run 1 — obtain the grants against the bundle identity:
 
 ```sh
-make sign                        # assemble Onoats.app + codesign + print the DR
+make sign                        # rebuild + codesign + print the DR
 make dr  > /tmp/onoats-dr-1.txt  # capture the designated requirement (run 1)
 make cdhash                      # note the cdhash (it WILL change — that's fine)
+: > /tmp/onoats-spike-result.txt # clear the result log
 
-# Launch via the supervisor exec path. First run prompts for BOTH grants — accept.
-uv run python ../../native/spike/supervisor-exec.py tcc
-#   → expect: TCC mic=PASS system=PASS
+open Onoats.app                  # GUI launch → responsible process = Onoats.app
+#   Expect TWO prompts attributed to "Onoats" (mic + system audio) — ACCEPT both.
+cat /tmp/onoats-spike-result.txt #   → expect: mic_pre=0 mic=PASS system=PASS
 ```
 
-Then **rebuild + re-sign 3×** and confirm macOS does **not** re-prompt and both
-grants persist:
+Confirm **"Onoats"** now appears in System Settings ▸ Privacy & Security ▸
+**Microphone** and ▸ **Screen & System Audio Recording**. Then **rebuild + re-sign
+3×** and confirm macOS does **not** re-prompt and both grants persist (now
+`mic_pre=3`, no prompt):
 
 ```sh
 make rebuild && make dr > /tmp/onoats-dr-2.txt
-uv run python supervisor-exec.py tcc        # must NOT re-prompt; still PASS/PASS
+open Onoats.app && sleep 6 && cat /tmp/onoats-spike-result.txt  # mic_pre=3, no prompt
 
 make rebuild && make dr > /tmp/onoats-dr-3.txt
-uv run python supervisor-exec.py tcc        # must NOT re-prompt; still PASS/PASS
+open Onoats.app && sleep 6 && cat /tmp/onoats-spike-result.txt  # mic_pre=3, no prompt
 
 make rebuild && make dr > /tmp/onoats-dr-4.txt
-uv run python supervisor-exec.py tcc        # must NOT re-prompt; still PASS/PASS
+open Onoats.app && sleep 6 && cat /tmp/onoats-spike-result.txt  # mic_pre=3, no prompt
 
 # The designated requirement MUST be byte-identical across rebuilds:
 diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-2.txt && \
@@ -84,9 +103,13 @@ diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-3.txt && \
 diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-4.txt && echo "DR STABLE ✓"
 ```
 
-**PASS:** all four `tcc` runs report `mic=PASS system=PASS`, no re-prompt after the
-first, and the four DR files are byte-identical (the cdhash differing is expected).
-**FAIL → STOP:** the `$0` / no-notarization conclusion (Open Question 2) reopens and
+**PASS:** run 1 shows `mic_pre=0` + two "Onoats" prompts → `mic=PASS system=PASS`;
+runs 2–4 show `mic_pre=3` with **no** re-prompt; the four DR files are byte-identical
+(the cdhash differing is expected). The end-to-end menu-bar→supervisor→capturer path
+is verified later in Phase 5b (the embedded capturer shares the bundle id, so this
+grant covers it).
+**FAIL → STOP:** if run 1 re-shows `mic_pre≠0` (attribution still wrong) or grants
+don't persist, the `$0` / no-notarization conclusion (Open Question 2) reopens and
 needs the paid Developer ID path. Record the failure in the plan's `## Findings`.
 
 ### Spike 4 — Core Audio tap recipe + residue
