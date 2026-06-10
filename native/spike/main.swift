@@ -96,11 +96,12 @@ func requestMicGrant() -> Bool {
 /// Create a global stereo process tap with an EMPTY exclusion list — i.e. tap all
 /// processes = system output. `.unmuted` so other apps keep playing through it.
 /// Returns the tap AudioObjectID and its UUID string (for the aggregate's taplist).
-func createGlobalTap() -> (AudioObjectID, String)? {
+func createGlobalTap(mute: CATapMuteBehavior = .unmuted) -> (AudioObjectID, String)? {
     let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
     desc.name = "onoats-spike-tap"
     desc.isPrivate = true
-    desc.muteBehavior = .unmuted
+    desc.muteBehavior = mute
+    log("  tap muteBehavior set to .\(mute) (raw=\(mute.rawValue))")
     var tapID = AudioObjectID(kAudioObjectUnknown)
     let err = AudioHardwareCreateProcessTap(desc, &tapID)
     guard err == noErr, tapID != kAudioObjectUnknown else {
@@ -211,8 +212,8 @@ func listAggregates() {
 /// Install an IOProc on the aggregate, run for `seconds`, and report frames seen
 /// and peak level so we can prove a real system-output stream (not silence).
 /// Returns (framesSeen, peak).
-func runTap(aggID: AudioObjectID, format: AudioStreamBasicDescription,
-            seconds: Double) -> (Int, Float) {
+func runTapTimed(aggID: AudioObjectID, format: AudioStreamBasicDescription,
+                 seconds: Double) -> (Int, Float, Date) {
     var frames = 0
     var peak: Float = 0
     let isFloat = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0
@@ -252,19 +253,20 @@ func runTap(aggID: AudioObjectID, format: AudioStreamBasicDescription,
     }
     guard createErr == noErr, let proc = procID else {
         log("  ✗ AudioDeviceCreateIOProcIDWithBlock: \(fourCC(createErr))")
-        return (0, 0)
+        return (0, 0, Date())
     }
     guard ck(AudioDeviceStart(aggID, proc), "AudioDeviceStart") else {
         AudioDeviceDestroyIOProcID(aggID, proc)
-        return (0, 0)
+        return (0, 0, Date())
     }
+    let tStart = Date()  // IOProc is now draining the tap → output resumes here
     log("  ▶ capturing system output for \(seconds)s — PLAY AUDIO NOW (music, a " +
         "video, anything) so we can prove a real stream arrives…")
     Thread.sleep(forTimeInterval: seconds)
     ck(AudioDeviceStop(aggID, proc), "AudioDeviceStop")
     ck(AudioDeviceDestroyIOProcID(aggID, proc), "AudioDeviceDestroyIOProcID")
     lock.lock(); let f = frames; let pk = peak; lock.unlock()
-    return (f, pk)
+    return (f, pk, tStart)
 }
 
 // MARK: - modes
@@ -292,26 +294,41 @@ func modeTCC() -> Int32 {
     return (mic && sysGrant) ? 0 : 1
 }
 
-func modeTap(seconds: Double) -> Int32 {
+func modeTap(seconds: Double, mute: CATapMuteBehavior) -> Int32 {
     log("== Core Audio tap recipe spike ==")
-    guard let (tapID, tapUUID) = createGlobalTap() else { return 1 }
+    // Measure the "output undrained" window = from tap creation (output diverted
+    // into the tap) until AudioDeviceStart (IOProc begins draining). This is the
+    // audible-dropout the user hears at record-start. AudioHardwareCreateAggregate
+    // Device is the slow step inside it.
+    let t0 = Date()
+    guard let (tapID, tapUUID) = createGlobalTap(mute: mute) else { return 1 }
     defer { destroyTap(tapID); log("  ✓ tap destroyed") }
+    let tTap = Date()
     guard let fmt = tapFormat(tapID) else { return 1 }
-    log("  tap format: \(fmt.mSampleRate) Hz, \(fmt.mChannelsPerFrame) ch, " +
-        "flags=0x\(String(fmt.mFormatFlags, radix: 16)) " +
-        "(\((fmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0 ? "float" : "int"))")
+    let tFmt = Date()
     guard let (aggID, uid) = createAggregate(tapUUID: tapUUID) else { return 1 }
+    let tAgg = Date()
     defer { destroyAggregate(aggID); log("  ✓ aggregate destroyed (uid=\(uid))") }
-    let (frames, peak) = runTap(aggID: aggID, format: fmt, seconds: seconds)
-    log("")
+    let (frames, peak, tStart) = runTapTimed(aggID: aggID, format: fmt, seconds: seconds)
+    let window = tStart.timeIntervalSince(t0) * 1000
+    log("  tap format: \(fmt.mSampleRate) Hz, \(fmt.mChannelsPerFrame) ch")
+    log(String(
+        format: "  TIMING createTap=%.0fms format=%.0fms createAggregate=%.0fms "
+            + "IOProc+start=%.0fms | UNDRAINED WINDOW=%.0fms",
+        tTap.timeIntervalSince(t0) * 1000,
+        tFmt.timeIntervalSince(tTap) * 1000,
+        tAgg.timeIntervalSince(tFmt) * 1000,
+        tStart.timeIntervalSince(tAgg) * 1000,
+        window))
     let ok = frames > 0 && peak > 0.0001
     result(
-        "TAP frames=\(frames) peak=\(String(format: "%.4f", peak)) "
+        "TAP mute=\(mute) frames=\(frames) peak=\(String(format: "%.4f", peak)) "
+            + "undrained_window=\(String(format: "%.0f", window))ms "
             + "\(ok ? "PASS (real stream)" : "FAIL (silence/no frames)")")
     return ok ? 0 : 1
 }
 
-func modeConcurrent(seconds: Double) -> Int32 {
+func modeConcurrent(seconds: Double, mute: CATapMuteBehavior) -> Int32 {
     log("== Concurrent mic + system-audio spike ==")
     // Mic via AVAudioEngine input tap; system via Core Audio aggregate. Prove both
     // stream together with no aggregate/clock-domain conflict.
@@ -331,7 +348,7 @@ func modeConcurrent(seconds: Double) -> Int32 {
         micLock.lock(); micFrames += Int(buf.frameLength); micPeak = max(micPeak, p); micLock.unlock()
     }
 
-    guard let (tapID, tapUUID) = createGlobalTap() else { return 1 }
+    guard let (tapID, tapUUID) = createGlobalTap(mute: mute) else { return 1 }
     defer { destroyTap(tapID) }
     guard let fmt = tapFormat(tapID),
           let (aggID, _) = createAggregate(tapUUID: tapUUID) else { return 1 }
@@ -343,7 +360,7 @@ func modeConcurrent(seconds: Double) -> Int32 {
     } catch {
         log("  ✗ engine.start: \(error)"); return 1
     }
-    let (sysFrames, sysPeak) = runTap(aggID: aggID, format: fmt, seconds: seconds)
+    let (sysFrames, sysPeak, _) = runTapTimed(aggID: aggID, format: fmt, seconds: seconds)
     engine.stop()
     input.removeTap(onBus: 0)
     micLock.lock(); let mf = micFrames; let mp = micPeak; micLock.unlock()
@@ -369,11 +386,22 @@ let secs: Double = {
     return 8
 }()
 
+// --mute <unmuted|muted|mutedWhenTapped> (default unmuted). Lets us A/B which mute
+// behavior actually keeps other apps audible while the tap captures.
+let mute: CATapMuteBehavior = {
+    guard let i = args.firstIndex(of: "--mute"), i + 1 < args.count else { return .unmuted }
+    switch args[i + 1] {
+    case "muted": return .muted
+    case "mutedWhenTapped": return .mutedWhenTapped
+    default: return .unmuted
+    }
+}()
+
 let rc: Int32
 switch mode {
 case "tcc": rc = modeTCC()
-case "tap": rc = modeTap(seconds: secs)
-case "concurrent": rc = modeConcurrent(seconds: secs)
+case "tap": rc = modeTap(seconds: secs, mute: mute)
+case "concurrent": rc = modeConcurrent(seconds: secs, mute: mute)
 case "list-aggregates": listAggregates(); rc = 0
 default:
     log("usage: onoats-capturer [tcc|tap|concurrent|list-aggregates] [--seconds N]")
