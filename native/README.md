@@ -15,6 +15,22 @@ TCC persistence is keyed to the bundle's **designated requirement**, which deriv
 from the signing certificate. An **ad-hoc** signature (`codesign -s -`) gets a new
 identity every build and re-prompts forever — so we use a stable self-signed cert.
 
+**Scripted (recommended):**
+
+```sh
+make -C native cert     # idempotent; no-op if the identity already exists
+```
+
+This runs `make_cert.sh`: openssl generates a self-signed cert with the
+code-signing EKU and imports it into your login keychain with codesign
+pre-authorized — no password prompts (verified: codesign needs neither keychain
+trust nor a partition-list fix). **Do not regenerate the cert once you have TCC
+grants** — a new cert means a new designated requirement and macOS re-prompts
+for everything; the script refuses to overwrite an existing identity for this
+reason.
+
+**Manual fallback (Keychain Access GUI):**
+
 1. Open **Keychain Access** → menu **Keychain Access ▸ Certificate Assistant ▸
    Create a Certificate…**
 2. Set:
@@ -37,6 +53,30 @@ identity every build and re-prompts forever — so we use a stable self-signed c
    requirement), not on keychain trust.
 
 You only do this once. The same cert signs the capturer and the menu-bar `.app`.
+
+## Install / update (the whole story)
+
+```sh
+make -C native cert      # once, ever (see Step 0 above)
+make -C native install   # build + sign Onoats.app → ~/Applications,
+                         # and uv-tool-install the CLI → ~/.local/bin/onoats
+```
+
+Updating after a `git pull` is the same single command — `make -C native
+install`. What each kind of change needs:
+
+| Change                     | Needed action                                  |
+|----------------------------|------------------------------------------------|
+| Python source edits        | nothing (editable install picks them up)       |
+| Python dependency changes  | `make -C native install-cli` (or full install) |
+| Swift / bundle changes     | `make -C native install`                       |
+
+The CLI is installed with `uv tool install --editable`, giving an isolated venv
+under `~/.local/share/uv/tools/onoats/` and a stable shim at
+`~/.local/bin/onoats` — this fixed path is what the menu-bar app invokes (a
+LaunchServices-launched GUI app inherits no shell PATH). Reinstalling the app
+bundle does **not** re-prompt TCC: grants key on the designated requirement
+(bundle id + cert), not the filesystem path or cdhash.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

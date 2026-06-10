@@ -8,6 +8,7 @@
 # AudioHardwareCreateProcessTap call blocks ~4 s in security verification.
 #
 # Targets:
+#   make cert     create the self-signed "Code Signing" identity (once; scripted)
 #   make build    compile build/onoats-capturer (unsigned; compile smoke only)
 #   make app      assemble Onoats.app with the capturer at Contents/MacOS/
 #   make sign     codesign Onoats.app + print the designated requirement
@@ -15,6 +16,12 @@
 #   make cdhash   print the cdhash (expected to change every rebuild)
 #   make rebuild  build + app + sign + dr in one go
 #   make print-bin  print the signed capturer path (for ONOATS_CAPTURER_BIN)
+#   make install-cli  uv tool install --editable the repo → ~/.local/bin/onoats
+#                     (idempotent; re-run after dependency changes = the update)
+#   make install  sign + install-cli + copy Onoats.app → ~/Applications
+#                 (full story: `make cert` once, then `make install`; update =
+#                  `git pull && make install`. TCC grants survive: they key on
+#                  the DR — bundle id + cert — not the path or cdhash.)
 #   make clean
 #
 # The throwaway spike kit lives in spike/ with its own Makefile.
@@ -35,7 +42,11 @@ BIN   := $(APP)/Contents/MacOS/onoats-capturer
 SWIFTC_FLAGS := -O -target $(ARCH)-apple-macos$(DEPLOY) \
 	-framework AVFoundation -framework CoreAudio -framework AudioToolbox
 
-.PHONY: build app sign dr cdhash rebuild print-bin clean check-identity
+REPO        := $(abspath ..)
+INSTALL_DIR := $(HOME)/Applications
+
+.PHONY: build app sign dr cdhash rebuild print-bin clean check-identity \
+	cert install-cli install
 
 build: $(BUILD)/onoats-capturer
 
@@ -74,6 +85,23 @@ rebuild: sign dr
 
 print-bin:
 	@echo "$(CURDIR)/$(BIN)"
+
+cert:
+	sh make_cert.sh
+
+install-cli:
+	uv tool install --editable '$(REPO)[macos]'
+	@echo "✓ CLI shim: $$HOME/.local/bin/onoats (editable — Python edits apply"
+	@echo "  on next run; re-run this target after dependency changes)"
+
+# rm before ditto: ditto MERGES into an existing tree, which would leave stale
+# files behind across bundle-layout changes. TCC grants key on the DR, not the
+# path, so replacing the installed app preserves them.
+install: sign install-cli
+	mkdir -p $(INSTALL_DIR)
+	rm -rf $(INSTALL_DIR)/$(APP)
+	ditto $(APP) $(INSTALL_DIR)/$(APP)
+	@echo "✓ installed $(INSTALL_DIR)/$(APP)"
 
 clean:
 	rm -rf $(BUILD) $(APP)
