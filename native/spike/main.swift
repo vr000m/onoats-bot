@@ -305,8 +305,9 @@ func modeTap(seconds: Double) -> Int32 {
     let (frames, peak) = runTap(aggID: aggID, format: fmt, seconds: seconds)
     log("")
     let ok = frames > 0 && peak > 0.0001
-    log("  RESULT frames=\(frames) peak=\(peak) → \(ok ? "PASS (real stream)" : "FAIL (silence/no frames)")")
-    print("TAP frames=\(frames) peak=\(String(format: "%.4f", peak)) \(ok ? "PASS" : "FAIL")")
+    result(
+        "TAP frames=\(frames) peak=\(String(format: "%.4f", peak)) "
+            + "\(ok ? "PASS (real stream)" : "FAIL (silence/no frames)")")
     return ok ? 0 : 1
 }
 
@@ -348,9 +349,10 @@ func modeConcurrent(seconds: Double) -> Int32 {
     micLock.lock(); let mf = micFrames; let mp = micPeak; micLock.unlock()
     log("")
     let ok = mf > 0 && sysFrames > 0
-    log("  RESULT mic frames=\(mf) peak=\(mp) | system frames=\(sysFrames) peak=\(sysPeak)")
-    log("  → \(ok ? "PASS (both streamed concurrently)" : "FAIL")")
-    print("CONCURRENT mic=\(mf > 0 ? "PASS" : "FAIL") system=\(sysFrames > 0 ? "PASS" : "FAIL")")
+    result(
+        "CONCURRENT mic frames=\(mf) peak=\(String(format: "%.4f", mp)) "
+            + "system frames=\(sysFrames) peak=\(String(format: "%.4f", sysPeak)) "
+            + "\(ok ? "PASS" : "FAIL")")
     return ok ? 0 : 1
 }
 

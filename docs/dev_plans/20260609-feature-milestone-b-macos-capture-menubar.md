@@ -487,7 +487,7 @@ _(to be filled on completion)_
 
 ## Progress
 
-- [ ] Phase 4 — Swift capturer (manual smoke) — *Pre-req spike kit built (`native/spike/`); blocked on interactive spike PASS*
+- [ ] Phase 4 — Swift capturer (manual smoke) — *Pre-req **spike 3 (TCC) PASSED** 2026-06-09 (see Findings); spike 4 (tap residue/concurrent) in progress*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
@@ -518,6 +518,16 @@ _(to be filled on completion)_
     `identifier "net.varunsingh.onoats" and certificate leaf = H"aac7e2b9…"`.
   - `make build` compiled the Core Audio process-tap Swift clean on macOS 26.3.1
     (no API iteration needed); `make sign` succeeded with the self-signed cert.
+
+- **System audio is a SEPARATE TCC service from mic — confirmed (2026-06-09).**
+  macOS 26 lists a distinct **"System Audio Recording Only"** pane; the Core Audio
+  process tap added "Onoats" there independently of the `Microphone` pane. So the
+  plan's "two distinct grants" requirement and the `NSAudioCaptureUsageDescription`
+  key are both correct/necessary. **Notable:** only the **mic** prompt was
+  interactive; the system-audio grant was recorded without a visible separate
+  prompt, yet real capture works (`peak=0.44`) — so the system-audio authorization
+  is more permissive for a signed app creating a tap. Both denials must still be
+  handled in Phase 4 (a user can revoke either pane).
 
 - **Phase 5a (status file) — shipped 2026-06-09.** `src/onoats/status.py` (new):
   `STATUS_SCHEMA_VERSION = 1`, frozen `StatusRecord`, atomic `write_status`
