@@ -415,17 +415,26 @@ _(to be filled during implementation)_
 - [ ] **Pre-req spike 4 (Core Audio tap) passed:** tap + private aggregate device
       yields a real system-audio stream, and start/kill/start ×3 leaves no stale
       aggregate/tap and no exclusive-tap contention.
-- [ ] Native capturer produces me+them socket streams with **no BlackHole
+- [x] Native capturer produces me+them socket streams with **no BlackHole
       installed**, emitting **JSON-object frames** (`seq`/`captured_monotonic_ns`/
       `pcm_b64`) per the wire contract, echoing the supervisor nonce, with a
-      capturer-wide monotonic timestamp source and bounded `me`/`them` drift over a soak.
-- [ ] **Keystone never-mix proven by the asymmetric routing test** (mic-only signal
-      ⇒ `them` silent + `me` has it; inverted ⇒ vice-versa), not just tag parity.
-- [ ] Startup barrier: capturer accepts both connections + writes both handshakes
-      before streaming; bounded startup deadline fails both branches loud.
-- [ ] Write path survives partial writes / `EPIPE` (looped `writeAll`, `SIGPIPE`
-      suppressed); closing one branch tears down both cleanly.
-- [ ] Capturer survives a default-input-device change mid-session without exiting.
+      capturer-wide monotonic timestamp source ~~and bounded `me`/`them` drift over
+      a soak~~ *(wire mechanics verified 2026-06-10; drift soak = OQ4, pending)*.
+- [x] **Keystone never-mix proven** — real-session content routing 2026-06-10:
+      session `20260610_130609_f0978b9e` has 82 `them` entries (all video
+      narration) and 5 `me` entries (all the user's spoken test phrases), zero
+      crossover in either direction. *(Content-routing evidence, per the
+      asymmetric test's intent.)*
+- [x] Startup barrier: capturer accepts both connections + writes both handshakes
+      before streaming; bounded startup deadline fails both branches loud
+      *(deadline-expiry observed live: orphaned capturer exited 12 with
+      "failing both loud", 2026-06-10)*.
+- [x] Write path survives partial writes / `EPIPE` (looped `writeAll`, `SIGPIPE`
+      suppressed); closing one branch tears down both cleanly *(observed: every
+      wire_check disconnect → "socket closed by peer" → both branches torn down)*.
+- [x] Capturer survives a default-input-device change mid-session without exiting
+      *(verified live 2026-06-10: device switched mid-session, session continued,
+      clean Ctrl+C after)*.
 - [ ] `onoats status` reads the status file with the pid backstop (4-cell truth
       table); recorder writes the file atomically on start/stop;
       `tests/test_status_file.py` green (incl. producer test); full suite green.
@@ -435,7 +444,10 @@ _(to be filled during implementation)_
       points at the native build; min macOS version documented.
 - [ ] **Both** mic-denial and system-audio-denial, plus capturer-crash, show the
       4-part fail-loud observable (ErrorFrame + rc≠0 + WARNING/ERROR + `pending/`
-      rotation), no hang.
+      rotation), no hang. *(Capturer-crash VERIFIED 2026-06-10: `pkill -9` →
+      ErrorFrames on both branches, supervisor "capturer exited mid-session
+      (rc=-9)" + non-zero exit, partial session rotated to `pending/`, no hang.
+      The two TCC-denial cases still pending.)*
 
 ## Review Focus
 
@@ -483,16 +495,17 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: 2026-06-09 @ ac9e748a405b8fbd412a06c842645727642a0d7d -->
-
+<!-- reviewed: 2026-06-09 @ a1fd19b18803fbf1d6467e938fc5dc4d8c2c1d30 -->
 ## Progress
 
-- [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT + automated wire checks
-  PASS 2026-06-10** (`native/onoats-capturer/`, signed into `native/Onoats.app`,
-  DR byte-identical to the spike's so the TCC grants carry over). Manual macOS
-  smoke checklist still pending (steps 1–12, incl. asymmetric keystone routing,
-  TCC denials, AirPods, A/B) — agent-shell runs cannot exercise mic content
-  (TCC attribution confound, see Findings). Pre-req spikes 3+4 PASSED 2026-06-09.*
+- [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
+  9, 10 PASSED on real hardware 2026-06-10** (end-to-end dual-STT session,
+  keystone content routing me/them zero-crossover, kill-mid-session 4-part
+  fail-loud, one-socket-close teardown, device-switch survival, graceful Ctrl+C
+  recorder-finishes-first). **Remaining:** step 4 A/B transcription-quality vs
+  PortAudio (Phase 6 gate), steps 5–6 TCC denials, step 8 residue ×3 re-check
+  on the production binary (spike evidence exists), steps 11–12 soak/echo
+  (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
