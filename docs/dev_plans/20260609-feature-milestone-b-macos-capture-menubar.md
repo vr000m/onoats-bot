@@ -487,11 +487,30 @@ _(to be filled on completion)_
 
 ## Progress
 
-- [ ] Phase 4 — Swift capturer (manual smoke)
-- [ ] Phase 5a — Python status file (`tests/test_status_file.py`)
+- [ ] Phase 4 — Swift capturer (manual smoke) — *Pre-req spike kit built (`native/spike/`); blocked on interactive spike PASS*
+- [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
-- [ ] Phase 6 — retire BlackHole + docs
+- [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
 
 ## Findings
 
-_(durable findings recorded here during implementation)_
+- **Phase 5a (status file) — shipped 2026-06-09.** `src/onoats/status.py` (new):
+  `STATUS_SCHEMA_VERSION = 1`, frozen `StatusRecord`, atomic `write_status`
+  (tempfile + `os.replace` + `fsync`), tolerant `read_status` (malformed/half-JSON
+  → `None`), producer helpers, and `resolve_liveness` (the pid-authoritative 4-cell
+  truth table). Producers wired in `runtime.py` (`_write_status_running` /
+  `_mark_status_rotation` / `_write_status_stopped`, best-effort) and called from
+  `dual.py` at start (after pid write), every rotation, and stop (before pid
+  removal). `onoats status` (`cli.py`) now reads the status file with the pid file
+  as the liveness backstop and surfaces `exit_reason`/`last_error`/`supervisor_rc`;
+  the socket supervisor stamps the specific `capturer-crash` vs `fatal_error_frame`
+  cause + final rc via `stamp_supervisor_failure`. 26 new tests in
+  `tests/test_status_file.py`; full suite green (187).
+- **Phase 4 Pre-req spike kit built (`native/spike/`).** One signed bundle
+  (`Onoats.app` + helper at `Contents/MacOS/onoats-capturer`) with `tcc` / `tap` /
+  `concurrent` / `list-aggregates` modes, a faithful `supervisor-exec.py` harness
+  (reuses the real `_build_capturer_env` — verified no `DYLD_*`, nonce wired, no
+  secrets leaked), Makefile, and `native/README.md` (cert step + run sequence).
+  `sw_vers` = 26.3.1 (≥ 14.4 ✓). **Spikes 3 & 4 are interactive and BLOCKING — not
+  yet run.** Open uncertainty to resolve in spike 3: whether Core Audio taps
+  actually consult `NSAudioCaptureUsageDescription` (both keys declared).

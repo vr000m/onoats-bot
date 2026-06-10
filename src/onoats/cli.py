@@ -484,7 +484,11 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     """
     import asyncio
 
+    from onoats import status as status_file
+    from onoats._vendor.store import onoats_data_dir
     from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
+
+    data_dir = onoats_data_dir()
 
     # Parse + validate the same args dual.main would, through the shared helper,
     # so `onoats bot --live-terminal --category X` behaves identically in socket
@@ -530,6 +534,12 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
                 "capture branch surfaced a fatal ErrorFrame (silent/failed "
                 "capturer); stopping capturer and exiting non-zero."
             )
+            # The recorder already wrote running=false + a fatal_error_frame
+            # reason; enrich it with the supervisor's final rc so `onoats status`
+            # / the menu bar can show the exit code.
+            status_file.stamp_supervisor_failure(
+                data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
+            )
         else:
             logger.info("Socket supervisor: recorder exited; stopping capturer")
         return rc
@@ -572,6 +582,16 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
         # The recorder may surface its own teardown error; we already log + exit
         # non-zero for the capturer death, so just record it.
         logger.warning(f"Socket supervisor: recorder drain raised: {exc}")
+    # The supervisor alone knows this was a capturer-death (not the recorder's own
+    # ErrorFrame). Override the reason to capturer-crash + stamp the rc. If the
+    # recorder was force-cancelled before writing its stopped record, this also
+    # flips the lingering running=true start record to stopped.
+    status_file.stamp_supervisor_failure(
+        data_dir,
+        exit_reason="capturer-crash",
+        supervisor_rc=1,
+        last_error="capturer exited mid-session; partial recording rotated to pending/",
+    )
     return 1
 
 
@@ -785,16 +805,43 @@ def _cmd_status(rest: list[str]) -> int:
     args = parser.parse_args(rest)
     data_dir = Path(args.data_dir) if args.data_dir else _resolve_data_dir()
 
+    from onoats import status as status_file
+
     print(f"Data dir: {data_dir}")
     print(f"PID file: {_pid_path(data_dir)}")
-    pid = _read_pid(data_dir)
-    if pid is None:
-        print("Recorder: not running (no valid pid file)")
-        return 0
-    if _process_alive(pid):
-        print(f"Recorder: RUNNING (pid {pid})")
+    print(f"Status file: {status_file.status_path(data_dir)}")
+
+    # pid-authoritative verdict; the status file supplies the rich detail and the
+    # off-diagonal staleness note (see status.resolve_liveness — the 4-cell table).
+    live = status_file.resolve_liveness(
+        data_dir, read_pid=_read_pid, process_alive=_process_alive
+    )
+    st = live.status
+
+    if live.alive:
+        print(f"Recorder: RUNNING (pid {live.pid})")
+    elif live.pid is not None:
+        print(f"Recorder: stale pid file (pid {live.pid} not running)")
     else:
-        print(f"Recorder: stale pid file (pid {pid} not running)")
+        print("Recorder: not running (no valid pid file)")
+    if live.note:
+        print(f"  note: {live.note}")
+
+    if st is not None:
+        if st.audio_source:
+            print(f"  audio source: {st.audio_source}")
+        if st.stt_label:
+            print(f"  STT: {st.stt_label}")
+        if st.last_rotation_time is not None:
+            print(f"  last rotation: {st.last_rotation_time}")
+        # Surface WHY a start failed, not just liveness — the menu bar reads the
+        # same fields.
+        if st.exit_reason and st.exit_reason != "graceful":
+            print(f"  exit reason: {st.exit_reason}")
+        if st.last_error:
+            print(f"  last error: {st.last_error}")
+        if st.supervisor_rc is not None:
+            print(f"  supervisor rc: {st.supervisor_rc}")
     return 0
 
 

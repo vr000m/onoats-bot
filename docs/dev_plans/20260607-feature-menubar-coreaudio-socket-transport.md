@@ -715,6 +715,16 @@ in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 - [ ] **Phase 5** — macOS menu-bar launcher *(macOS native)*
 - [ ] **Phase 6** — Retire BlackHole from the default macOS story + docs/packaging
 
+> **Phases 4–6 superseded → split into Milestone B**
+> (`docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md`, branch
+> `feat/socket-audio-transport-milestone-b`). Status as of 2026-06-09: the Python
+> **status-file slice (Phase 5a) shipped** — `src/onoats/status.py` + producers in
+> `runtime.py`/`dual.py` + `onoats status` rewired with the pid backstop, tested in
+> `tests/test_status_file.py`. So the "there is no status file" notes in the Phase 5
+> contract above now describe the *pre-5a* state. The native capturer (Phase 4),
+> the SwiftUI menu bar (5b), and BlackHole retirement (6) live in the Milestone B
+> plan.
+
 Reviewer-finding fixes folded in: `dc31ff9` (Phase 1–2: PCM-length desync guard,
 writer drain, source-neutral banner naming), `a78ae8b` (Phase 3: restore socket
 env vars in `finally`, mirror `dual.main`'s `--interactive` warning), `4911eb2` +

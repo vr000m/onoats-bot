@@ -1035,6 +1035,67 @@ def _remove_pid_file(pid_path: Path) -> None:
         logger.warning(f"Could not remove PID file {pid_path}: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Status file (liveness + failure-state for ``onoats status`` / the menu bar)
+#
+# Thin recorder-process-only wrappers over ``onoats.status`` — mirror the pid
+# write/remove split (the schema + atomic I/O live in the standalone module; the
+# producer calls live here, alongside the pid producer, and are imported by
+# ``dual.py``). Status writes are best-effort: a status-file failure must never
+# take down a recording, so each wrapper swallows + logs and carries on.
+# ---------------------------------------------------------------------------
+
+
+def _write_status_running(data_dir: Path, *, audio_source: str, stt_label: str) -> None:
+    """Write the start-of-session status (``running=true``). Best-effort."""
+    from onoats import status as _status
+
+    try:
+        _status.write_running(
+            data_dir,
+            pid=os.getpid(),
+            audio_source=audio_source,
+            stt_label=stt_label,
+        )
+    except OSError as exc:
+        logger.warning(f"Could not write status file (start): {exc}")
+
+
+def _mark_status_rotation(data_dir: Path) -> None:
+    """Stamp ``last_rotation_time`` on the current status record. Best-effort."""
+    from onoats import status as _status
+
+    try:
+        _status.mark_rotation(data_dir)
+    except OSError as exc:
+        logger.warning(f"Could not update status file (rotation): {exc}")
+
+
+def _write_status_stopped(
+    data_dir: Path,
+    *,
+    exit_reason: str = "graceful",
+    last_error: str | None = None,
+    supervisor_rc: int | None = None,
+) -> None:
+    """Write the end-of-session status (``running=false``) + failure detail.
+
+    Called inside the single-writer shutdown path BEFORE the pid file is removed,
+    so the pid backstop and the status file never disagree about a live recorder.
+    """
+    from onoats import status as _status
+
+    try:
+        _status.write_stopped(
+            data_dir,
+            exit_reason=exit_reason,
+            last_error=last_error,
+            supervisor_rc=supervisor_rc,
+        )
+    except OSError as exc:
+        logger.warning(f"Could not write status file (stop): {exc}")
+
+
 def _install_signal_handlers(
     shutdown_event: asyncio.Event,
     force_exit_event: asyncio.Event,
