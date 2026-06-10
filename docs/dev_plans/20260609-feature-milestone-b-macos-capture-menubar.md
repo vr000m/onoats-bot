@@ -503,7 +503,10 @@ _(to be filled on completion)_
   keystone content routing me/them zero-crossover, kill-mid-session 4-part
   fail-loud, one-socket-close teardown, device-switch survival, graceful Ctrl+C
   recorder-finishes-first). **Step 4 A/B parity PASSED 2026-06-10 — both Phase 6
-  gate conditions met.** **Remaining:** steps 5–6 TCC denials, step 8 residue ×3
+  gate conditions met.** **Steps 5–6 TCC denials: attempted 2026-06-10,
+  INCONCLUSIVE in the terminal topology (Onoats toggles don't govern
+  terminal-launched sessions — Ghostty attribution); moved to Phase 5b where the
+  menu-bar topology makes them testable.** **Remaining:** step 8 residue ×3
   re-check on the production binary (spike evidence exists), steps 11–12
   soak/echo (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
@@ -549,6 +552,24 @@ _(to be filled on completion)_
     "stall" symptoms during debugging. Mic-content verification and the full
     manual smoke checklist (steps 1–12) must run from the user's interactive
     terminal.
+
+- **TCC-denial tests (smoke steps 5–6) INCONCLUSIVE in the terminal topology —
+  re-test in Phase 5b (2026-06-10).** Three denial tests were run by toggling
+  the **"Onoats"** entries in System Settings — but per the spike-3 attribution
+  finding, a terminal-launched capturer's effective TCC identity is the
+  **terminal (Ghostty)**, whose grants were never touched. Hence: mid-session
+  revocation "did nothing", a start with "mic off" still captured, and the tap
+  was still created with "system audio off" — all expected, none of it evidence
+  about real denial behavior. What today's runs DID establish: (a) the silence
+  pacer turns a starved branch into "alive but empty" (session rotates, no
+  hang, no watchdog kill) rather than a hard failure; (b) the capturer's
+  fail-loud denial path rests on the startup `AVCaptureDevice` authorization
+  check, which keys to the responsible process — correct for the 5b menu-bar
+  topology, vacuous for terminal launches where the terminal already holds the
+  grant. **Action:** run steps 5–6 against the menu-bar topology in Phase 5b
+  (where the "Onoats" toggles are the effective ones); also consider a 5b-era
+  heuristic warning for a persistently all-zero mic branch (macOS can deliver
+  zeroed buffers, not errors, to unauthorized audio clients).
 
 - **A/B parity check PASSED (2026-06-10) — Phase 6 gate satisfied.** Same source
   video recorded via the socket/native path (`session_20260610_133548_e010cfab`,
