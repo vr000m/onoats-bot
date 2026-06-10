@@ -83,6 +83,43 @@ def test_bot_help_under_socket_does_not_enter_supervisor(monkeypatch, capsys):
     assert "usage" in capsys.readouterr().out.lower()
 
 
+def test_bot_source_socket_flag_enters_supervisor(monkeypatch):
+    """`--source socket` selects the supervisor even when env/config say portaudio."""
+    monkeypatch.setenv("AUDIO_SOURCE", "portaudio")
+    called = {}
+
+    def fake_supervisor(rest):
+        called["rest"] = rest
+        return 0
+
+    monkeypatch.setattr(cli, "_run_socket_supervisor", fake_supervisor)
+    rc = cli.main(["bot", "--source", "socket"])
+    assert rc == 0
+    assert called["rest"] == ["--source", "socket"]
+
+
+def test_bot_source_portaudio_flag_overrides_socket_env(monkeypatch):
+    """`--source portaudio` wins over AUDIO_SOURCE=socket (flag > env > config)."""
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+
+    def _boom(rest):
+        raise AssertionError("supervisor entered despite --source portaudio")
+
+    monkeypatch.setattr(cli, "_run_socket_supervisor", _boom)
+    called = {}
+    monkeypatch.setattr("onoats.dual.main", _recorder(called))
+    rc = cli.main(["bot", "--source", "portaudio"])
+    assert rc == 0
+    assert called["argv"] == ["--source", "portaudio"]
+
+
+def test_bot_source_rejects_unknown_backend(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["bot", "--source", "alsa"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
 def _recorder(called):
     def fake_main(argv=None):
         called["argv"] = argv

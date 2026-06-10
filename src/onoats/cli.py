@@ -119,7 +119,13 @@ def _cmd_bot(rest: list[str]) -> int:
     # supervisor — it must not require or spawn ONOATS_CAPTURER_BIN just to
     # answer a help request. (dual.py's module top is import-light — no pipecat
     # / pyaudio / MLX — so this preserves the no-boot-on-help guarantee.)
-    _parse_args(rest)
+    args = _parse_args(rest)
+
+    # --source overrides via the env channel (top of the existing precedence:
+    # env > config.toml > default), so the supervisor, the spawned recorder,
+    # and the status file all see one consistent value with no new plumbing.
+    if args.source:
+        os.environ["AUDIO_SOURCE"] = args.source
 
     if load_config().audio_source == "socket":
         return _run_socket_supervisor(rest)

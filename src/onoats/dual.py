@@ -651,6 +651,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument(
+        "--source",
+        choices=("portaudio", "socket"),
+        default=None,
+        help=(
+            "Capture backend: 'portaudio' (PortAudio/BlackHole devices, the "
+            "default) or 'socket' (native capturer over unix sockets). "
+            "Overrides AUDIO_SOURCE / config.toml [audio].source for this run."
+        ),
+    )
+    parser.add_argument(
         "--interactive",
         action="store_true",
         default=False,
