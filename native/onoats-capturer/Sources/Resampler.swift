@@ -122,12 +122,19 @@ final class FrameChunker {
             // Clamp into the already-emitted timeline: after a silence-filled
             // gap the first real frame's capture time can land slightly before
             // the filler cursor; captured_monotonic_ns must never regress.
+            // Side effect: that first real frame is pinned to the trailing
+            // cursor, up to ~silenceAfterNs (100 ms) behind true capture time —
+            // a fixed, bounded offset to keep in mind when reading drift
+            // measurements (OQ4).
             let ts = max(endNs > backNs ? endNs - backNs : 0, lastEmittedEndNs)
             let frame = pending[0..<SAMPLES_PER_FRAME].withUnsafeBufferPointer {
                 Data(buffer: $0)  // Int16 native LE on all Apple targets
             }
             pending.removeFirst(SAMPLES_PER_FRAME)
             lastEmittedEndNs = ts + UInt64(SAMPLES_PER_FRAME) * NS_PER_SAMPLE
+            // emit under `lock`: the pacer thread emits under the same lock,
+            // so the two producers are serialized — this is what guarantees
+            // seq order == captured_monotonic_ns order into the writer.
             emit(frame, ts)
         }
     }
@@ -161,6 +168,8 @@ final class FrameChunker {
                     lastEmittedEndNs = ts + frameNs
                     silenceFramesTotal += 1
                     emitted += 1
+                    // emit under `lock`: serialized against the worker
+                    // thread's append() → emit path (see comment there).
                     emit(Self.silentFrame, ts)
                 }
                 if emitted > 0 && (silenceFramesTotal <= 1 || silenceFramesTotal % 500 == 0) {

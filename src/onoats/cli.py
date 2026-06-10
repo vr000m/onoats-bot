@@ -160,7 +160,11 @@ def _cmd_bot(rest: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 # How long to wait for BOTH branch sockets to be created by the capturer before
-# declaring the launch failed.
+# declaring the launch failed. Intentionally shorter than the capturer's
+# --accept-timeout-s default (30 s): the socket FILES appear almost immediately
+# once the capturer is listening, whereas the 30 s accept window covers the
+# slower step of the recorder actually connecting. The asymmetry is deliberate,
+# not a conflict.
 _SOCKET_WAIT_TIMEOUT_SEC = 10.0
 _SOCKET_WAIT_POLL_SEC = 0.05
 

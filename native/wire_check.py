@@ -97,6 +97,9 @@ def check_branch(path, label, nonce, seconds, result):
             if len(pcm) % 2 != 0:
                 result.errors.append(f"odd PCM byte count {len(pcm)} (seq={seq})")
                 return
+            # The transport contract says 640 bytes is SHOULD, not MUST. This
+            # is a stricter self-check of OUR capturer (which always emits
+            # 640) — do not mistake it for the wire-contract rule.
             if len(pcm) != 640:
                 result.errors.append(
                     f"frame size {len(pcm)} != 640 reference (seq={seq})"
