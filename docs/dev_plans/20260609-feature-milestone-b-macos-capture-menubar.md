@@ -506,8 +506,10 @@ _(to be filled on completion)_
   gate conditions met.** **Steps 5–6 TCC denials: attempted 2026-06-10,
   INCONCLUSIVE in the terminal topology (Onoats toggles don't govern
   terminal-launched sessions — Ghostty attribution); moved to Phase 5b where the
-  menu-bar topology makes them testable.** **Remaining:** step 8 residue ×3
-  re-check on the production binary (spike evidence exists), steps 11–12
+  menu-bar topology makes them testable.** **Step 8 residue ×3 PASSED 2026-06-10
+  on the production binary via `native/residue_check.sh` (3× kill -9 mid-capture
+  → `RESIDUE: none` + `TAPS: none`; spike scan widened to match `onoats-*` UIDs
+  so it sees production aggregates).** **Remaining:** steps 11–12
   soak/echo (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
