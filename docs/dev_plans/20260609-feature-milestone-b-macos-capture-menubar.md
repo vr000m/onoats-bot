@@ -502,10 +502,10 @@ _(to be filled on completion)_
   9, 10 PASSED on real hardware 2026-06-10** (end-to-end dual-STT session,
   keystone content routing me/them zero-crossover, kill-mid-session 4-part
   fail-loud, one-socket-close teardown, device-switch survival, graceful Ctrl+C
-  recorder-finishes-first). **Remaining:** step 4 A/B transcription-quality vs
-  PortAudio (Phase 6 gate), steps 5–6 TCC denials, step 8 residue ×3 re-check
-  on the production binary (spike evidence exists), steps 11–12 soak/echo
-  (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
+  recorder-finishes-first). **Step 4 A/B parity PASSED 2026-06-10 — both Phase 6
+  gate conditions met.** **Remaining:** steps 5–6 TCC denials, step 8 residue ×3
+  re-check on the production binary (spike evidence exists), steps 11–12
+  soak/echo (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
@@ -549,6 +549,21 @@ _(to be filled on completion)_
     "stall" symptoms during debugging. Mic-content verification and the full
     manual smoke checklist (steps 1–12) must run from the user's interactive
     terminal.
+
+- **A/B parity check PASSED (2026-06-10) — Phase 6 gate satisfied.** Same source
+  video recorded via the socket/native path (`session_20260610_133548_e010cfab`,
+  27 `them` utterances) and the PortAudio/BlackHole path
+  (`session_20260610_134058_a00d0a0d`, 28 `them` utterances): near-identical
+  segmentation and transcription quality, with minor STT errors in BOTH
+  directions (socket: "whatever"→"whenever"; PortAudio: "say from"→"say
+  Friend") — no systematic socket-path degradation, ruling out a resample bug.
+  Mic-content quality evidenced separately (earlier session's `me` entries
+  transcribed the spoken test phrases verbatim). Together with the keystone
+  content-routing result, **both Phase 6 gate conditions have PASSED on the
+  author's machine**. Caveat from the first A/B attempt: the PortAudio run
+  initially recorded 0 entries because the wrong devices were selected —
+  reinforcing the device-visibility follow-up (show chosen devices in CLI +
+  menu bar).
 
 - **Wire smoke PASSED on real hardware (user terminal, 2026-06-10):** both
   branches PASS via `smoke_wire_check.sh` with real content — mic peak 0.07–0.12
