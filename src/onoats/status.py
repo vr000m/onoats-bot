@@ -116,10 +116,11 @@ def write_status(data_dir: Path, record: StatusRecord) -> Path:
 
 
 def read_status(data_dir: Path) -> StatusRecord | None:
-    """Read the status file. Returns ``None`` if absent, half-written, or malformed.
+    """Read the status file. Returns ``None`` if absent, half-written, malformed,
+    or written under a different ``schema`` version.
 
-    Tolerant by design: a partial/corrupt file is "no status", never an exception —
-    the pid backstop still yields a correct liveness verdict on its own.
+    Tolerant by design: a partial/corrupt/drifted file is "no status", never an
+    exception — the pid backstop still yields a correct liveness verdict on its own.
     """
     path = status_path(data_dir)
     try:
@@ -135,6 +136,11 @@ def read_status(data_dir: Path) -> StatusRecord | None:
     if not isinstance(obj, dict):
         return None
     try:
+        # The whole point of the schema integer is rejecting drift: a file
+        # written under any other version must read as "no status", never be
+        # rendered as if it were ours.
+        if int(obj["schema"]) != STATUS_SCHEMA_VERSION:
+            return None
         return StatusRecord(
             schema=int(obj["schema"]),
             pid=int(obj["pid"]),

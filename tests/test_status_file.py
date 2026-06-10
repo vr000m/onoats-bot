@@ -97,6 +97,19 @@ def test_read_malformed_returns_none(tmp_path: Path, raw: str):
     assert read_status(tmp_path) is None
 
 
+@pytest.mark.parametrize("schema", [0, STATUS_SCHEMA_VERSION + 1])
+def test_read_unsupported_schema_returns_none(tmp_path: Path, schema: int):
+    """A drifted schema version must read as "no status", not as schema 1."""
+    p = status_path(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        f'{{"schema":{schema},"pid":1,"start_time":0,"audio_source":"s",'
+        '"stt_label":"l","running":true}',
+        encoding="utf-8",
+    )
+    assert read_status(tmp_path) is None
+
+
 # ---------------------------------------------------------------------------
 # (b) producer sequence + wiring guard
 # ---------------------------------------------------------------------------
