@@ -537,6 +537,31 @@ _(to be filled on completion)_
     manual smoke checklist (steps 1–12) must run from the user's interactive
     terminal.
 
+- **Wire smoke PASSED on real hardware (user terminal, 2026-06-10):** both
+  branches PASS via `smoke_wire_check.sh` with real content — mic peak 0.07–0.12
+  (Scarlett Solo), system peak 0.37 (music). Two fixes/findings from getting there:
+  - **AVAudioEngine inputNode delivers ZERO tap callbacks from the Scarlett Solo
+    USB** (engine `running=true`, formats agree, no error — and it misreports the
+    device at 44.1 kHz when HAL says 48 kHz). A raw HAL `AudioDeviceIOProcID` on
+    the same device streams fine (`--selftest-mic` shows both probes). MicCapture
+    was rewritten onto raw HAL (same copy-only IOProc + worker pattern as the
+    system branch) with a `kAudioHardwarePropertyDefaultInputDevice` listener for
+    the device-change contract. Lesson: **never use AVAudioEngine input for this
+    product; PortAudio worked all along because it is raw HAL.**
+  - **Terminal-launched tap creation is SLOW (~2–3 s, audible output dropout at
+    session start)** even signed — the spike's ~200 ms number was measured
+    GUI-launched (`open Onoats.app`); the TCC verification inside
+    `AudioHardwareCreateProcessTap` is evidently the slow path under terminal
+    attribution. Per-session impact only (tap is created once). Phase 5b's
+    GUI launch should restore ~200 ms; for the CLI topology, document "start
+    onoats before the meeting". The capturer's frame timeline stays gap-free
+    regardless (frames × 20 ms == ts_span, drops=0).
+  - **Follow-up (Phase 5b/6 scope):** surface the chosen capture devices in
+    `onoats status` / CLI output and the menu-bar UI (the capturer now logs the
+    input device name/UID at start), and decide whether the socket path should
+    honor explicit device selection like the PortAudio path instead of
+    default-input-only.
+
 - **TCC attribution is rooted at the launching GUI app, not the capturer's bundle
   identity (spike 3, 2026-06-09).** Running `supervisor-exec.py tcc` from Ghostty
   reported `mic (pre)=authorized` and a silent system-audio tap success on a
