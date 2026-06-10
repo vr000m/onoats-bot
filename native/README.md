@@ -38,6 +38,56 @@ identity every build and re-prompts forever — so we use a stable self-signed c
 
 You only do this once. The same cert signs the capturer and the menu-bar `.app`.
 
+## Phase 4: production capturer (`onoats-capturer/`)
+
+Build + sign from `native/` (NOT from `spike/` — that Makefile builds the
+throwaway spike):
+
+```sh
+cd native
+make sign        # build → assemble Onoats.app → codesign (stable cert) → print DR
+make print-bin   # the path to export as ONOATS_CAPTURER_BIN
+```
+
+Run the real session:
+
+```sh
+AUDIO_SOURCE=socket ONOATS_CAPTURER_BIN="$(make -s print-bin)" onoats bot
+```
+
+Design notes baked into the capturer (each learned the hard way — see the dev
+plan `## Findings` for the evidence):
+
+- **Startup order is load-bearing:** mic TCC grant → create both sockets →
+  accept both → write both handshakes → only then start captures (tap first,
+  then mic engine).
+- **Copy-only IOProc.** Doing AVAudioConverter work in the Core Audio realtime
+  callback makes the HAL silently stop calling it after ~5 cycles. The IOProc
+  memcpys into a bounded queue; a worker thread resamples and chunks.
+- **The tap delivers data only while something renders audio.** Each branch
+  runs a 20 ms silence pacer so a quiet system doesn't trip the recorder's
+  read-idle watchdog and the me/them timeline stays continuous.
+- **`AudioHardwareCreateProcessTap` is intermittently flaky** (instant
+  `noErr` + `kAudioObjectUnknown`) even signed — retried ×3, 500 ms apart.
+- Full teardown on every exit path: `AudioDeviceStop` → IOProc → aggregate →
+  tap; one socket closing (or `EPIPE`) tears down BOTH branches.
+
+### Wire-contract checker
+
+`wire_check.py` plays the recorder's role against a running capturer and
+asserts the v1 contract (handshake incl. nonce echo, BE length prefix, 640-byte
+whole-sample frames, monotonic `seq`/`captured_monotonic_ns`):
+
+```sh
+S=$(mktemp -d) && ./Onoats.app/Contents/MacOS/onoats-capturer \
+  --mic-socket $S/mic.sock --system-socket $S/system.sock --nonce cafef00d &
+python3 wire_check.py --mic-socket $S/mic.sock --system-socket $S/system.sock \
+  --nonce cafef00d --seconds 10   # play audio + speak during this
+```
+
+The binary also has socket-less debug modes: `--selftest-tap` and
+`--selftest-concurrent` (`--seconds N`).
+
 ## Phase-4 Pre-req spikes (BLOCKING — run before any production Swift)
 
 Two unverified Apple-platform premises gate Phase 4. Resolve **both** here.

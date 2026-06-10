@@ -487,12 +487,55 @@ _(to be filled on completion)_
 
 ## Progress
 
-- [ ] Phase 4 — Swift capturer (manual smoke) — *Pre-req **spikes 3 (TCC) + 4 (Core Audio tap) BOTH PASSED** 2026-06-09 (see Findings). Ready to build.*
+- [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT + automated wire checks
+  PASS 2026-06-10** (`native/onoats-capturer/`, signed into `native/Onoats.app`,
+  DR byte-identical to the spike's so the TCC grants carry over). Manual macOS
+  smoke checklist still pending (steps 1–12, incl. asymmetric keystone routing,
+  TCC denials, AirPods, A/B) — agent-shell runs cannot exercise mic content
+  (TCC attribution confound, see Findings). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
 - [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
 
 ## Findings
+
+- **Phase 4 capturer built + wire-contract verified end to end (2026-06-10).**
+  `native/onoats-capturer/` (plain swiftc, 7 sources), built/signed via
+  `native/Makefile` into `native/Onoats.app` — DR byte-identical to the spike's
+  (`identifier "net.varunsingh.onoats" and certificate leaf = H"aac7e2b9…"`), so
+  the existing TCC grants apply. Verified with `native/wire_check.py` (a
+  recorder-role contract checker): handshake (rate/width/channels/`v:1`, nonce
+  echoed verbatim), 4-byte BE length prefix, 640-byte whole-sample 20 ms frames,
+  `seq` contiguous from 0, `captured_monotonic_ns` non-decreasing, both branches
+  PASS rc=0; real system audio captured through the tap (peak 0.72–0.77 from a
+  `say` voice); SIGTERM and peer-close both produce full teardown (taps/aggregate
+  destroyed, socket files unlinked, both branches torn down together). 187-test
+  Python suite green. Engineering findings while building it:
+  - **Copy-only IOProc is mandatory.** Running AVAudioConverter inside the Core
+    Audio realtime callback made the HAL silently stop invoking the IOProc after
+    ~5 cycles (~50 ms). Fixed: IOProc memcpys buffer+timestamp into a bounded
+    queue; a worker thread does wrap→resample→chunk.
+  - **The global process tap delivers IO callbacks ONLY while some process is
+    rendering audio** — a quiet system produces no frames at all (every earlier
+    "continuous stream" spike observation had test audio covering the window).
+    Without filler this starves the `them` branch, trips the recorder's 10 s
+    read-idle watchdog, and breaks me/them timeline continuity. Fixed: per-branch
+    20 ms silence pacer (engages after 100 ms without real data, trails the live
+    edge by 100 ms, clamps resumed-real timestamps monotonic, gap-jumps if >2 s
+    behind). Also covers mic gaps during device changes.
+  - **`AudioHardwareCreateProcessTap` intermittently returns `noErr` +
+    `kAudioObjectUnknown` even for the signed bundle** (instant return, vs
+    ~200 ms legit) — bounded retry ×3 @ 500 ms recovers it (observed recovering
+    on attempt 2). The spike had seen this only unsigned.
+  - **Capture start order:** tap+aggregate first, mic engine second (creating
+    the tap while AVAudioEngine runs correlated with the flaky creation).
+  - **Agent-shell limitation:** mic capture delivers zero callbacks under the
+    Claude/sandboxed shell context regardless of code (the known TCC-attribution
+    confound — the spike's own `concurrent` mode also reports mic=0 there), and
+    background-niced processes get scheduler-throttled, which produced phantom
+    "stall" symptoms during debugging. Mic-content verification and the full
+    manual smoke checklist (steps 1–12) must run from the user's interactive
+    terminal.
 
 - **TCC attribution is rooted at the launching GUI app, not the capturer's bundle
   identity (spike 3, 2026-06-09).** Running `supervisor-exec.py tcc` from Ghostty
