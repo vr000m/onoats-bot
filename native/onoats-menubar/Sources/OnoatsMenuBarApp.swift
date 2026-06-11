@@ -3,6 +3,7 @@
 // is the entire reason this app exists (terminal launches attribute the mic +
 // system-audio grants to the terminal and cost ~2-3 s of tap-creation dropout).
 import AppKit
+import CoreAudio
 import SwiftUI
 
 @main
@@ -44,29 +45,6 @@ struct MenuContent: View {
 
         Divider()
 
-        // The capturer binds the system DEFAULT devices; surfacing them here is
-        // the guard against silent wrong-device capture (Findings, 2026-06-10).
-        // The picker sets the macOS default input (system-wide) — the only
-        // selection that actually applies on the socket path.
-        Menu("Mic (me): \(model.micDevice)") {
-            ForEach(model.inputDevices) { device in
-                Button(device.id == model.defaultInputID ? "✓ \(device.name)" : device.name) {
-                    model.setMicDevice(device)
-                }
-            }
-            Divider()
-            Text("Sets the macOS default input (system-wide)")
-            if case .running = model.state {
-                Text("Recording keeps its device — applies on next Start")
-            }
-        }
-        Text("System (them): \(model.outputDevice)")
-        if let stt = model.sttLabel {
-            Text("STT: \(stt)")
-        }
-
-        Divider()
-
         switch model.state {
         case .running(let ours):
             Button(ours ? "Stop" : "Stop (external session)") { model.stop() }
@@ -81,22 +59,41 @@ struct MenuContent: View {
 
         Divider()
 
-        Menu("Settings") {
-            // Writes config.toml — shared with the CLI. Applies on next Start.
-            Menu("STT service: \(model.sttService)") {
-                ForEach(RecorderModel.sttServices, id: \.self) { service in
-                    Button(service == model.sttService ? "✓ \(service)" : service) {
-                        model.setSTTService(service)
-                    }
-                }
+        // Flat inline pickers (no submenus — SwiftUI MenuBarExtra submenus
+        // lose hover focus and vanish; the Sound-menu pattern keeps every
+        // option visible in the main menu). The mic picker sets the macOS
+        // DEFAULT input device (system-wide) — the only selection that
+        // actually applies on the socket path, since the capturer binds the
+        // system default at start. A running session keeps its device.
+        Picker("Mic (me) — sets macOS default input", selection: micSelection) {
+            ForEach(model.inputDevices) { device in
+                Text(device.name).tag(device.id)
             }
-            Text("Data dir: \(model.dataDirDisplay)")
-            Button("Change data dir…") { model.chooseDataDir() }
-            Divider()
-            Button("Open config.toml…") { model.openConfig() }
-            if case .running = model.state {
-                Text("Changes apply on next Start")
+        }
+        .pickerStyle(.inline)
+
+        Text("System (them): \(model.outputDevice)")
+        if let stt = model.sttLabel {
+            Text("STT: \(stt)")
+        }
+
+        Divider()
+
+        // Writes config.toml — shared with the CLI. Applies on next Start.
+        Picker("STT service", selection: sttSelection) {
+            ForEach(RecorderModel.sttServices, id: \.self) { service in
+                Text(service).tag(service)
             }
+        }
+        .pickerStyle(.inline)
+
+        Divider()
+
+        Text("Data dir: \(model.dataDirDisplay)")
+        Button("Change data dir…") { model.chooseDataDir() }
+        Button("Open config.toml…") { model.openConfig() }
+        if case .running = model.state {
+            Text("Config changes apply on next Start")
         }
 
         Divider()
@@ -104,6 +101,22 @@ struct MenuContent: View {
         Text("CLI: \(model.cliPath)\(model.cliAvailable ? "" : "  ⚠ not found — run `make -C native install-cli`")")
             .font(.caption)
         Button("Quit Onoats") { NSApp.terminate(nil) }
+    }
+
+    private var micSelection: Binding<AudioObjectID> {
+        Binding(
+            get: { model.defaultInputID },
+            set: { id in
+                if let device = model.inputDevices.first(where: { $0.id == id }) {
+                    model.setMicDevice(device)
+                }
+            })
+    }
+
+    private var sttSelection: Binding<String> {
+        Binding(
+            get: { model.sttService },
+            set: { model.setSTTService($0) })
     }
 
     private var statusLine: String {
