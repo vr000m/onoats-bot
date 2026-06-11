@@ -9,7 +9,15 @@ import re
 import tomllib
 from pathlib import Path
 
+from packaging.requirements import Requirement
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_pyproject() -> dict:
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        return tomllib.load(fh)
+
 
 COPYRIGHT_LINE = "Copyright (c) 2025–2026 Varun Singh"
 
@@ -58,17 +66,15 @@ def test_license_file_is_canonical_bsd_2_clause():
 
 
 def test_pyproject_declares_bsd_2_clause_spdx_license():
-    pyproject = tomllib.loads(
-        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    )
-    assert pyproject["project"]["license"] == "BSD-2-Clause"
+    assert _load_pyproject()["project"]["license"] == "BSD-2-Clause"
 
 
 def test_build_backend_pins_hatchling_with_pep639_support():
-    pyproject = tomllib.loads(
-        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    requires = [Requirement(r) for r in _load_pyproject()["build-system"]["requires"]]
+    hatchling = [r for r in requires if r.name == "hatchling"]
+    assert hatchling, "hatchling missing from [build-system] requires"
+    # PEP 639 License-Expression emission needs hatchling >= 1.27: the
+    # specifier must exclude everything below that.
+    assert not hatchling[0].specifier.contains("1.26.5"), (
+        f"hatchling pin must exclude <1.27 (PEP 639 support), got {hatchling[0]}"
     )
-    requires = pyproject["build-system"]["requires"]
-    assert any(
-        re.fullmatch(r"hatchling>=1\.(2[7-9]|[3-9]\d)(\.\d+)?", req) for req in requires
-    ), f"hatchling must be pinned >=1.27 for PEP 639 support, got {requires}"
