@@ -39,9 +39,17 @@ struct MenuContent: View {
         Text(statusLine)
         // Live capture warning (schema-v2 `warning`): the branch-specific hint
         // from the capturer's all-zero-input detector. Cleared automatically
-        // when real audio re-arms the detector.
+        // when real audio re-arms the detector. Native menu items render one
+        // line and never wrap, and the full hint is ~200 chars — rendered as
+        // ONE item it stretches the whole menu to its width (observed live,
+        // 2026-06-11). Split on the hint's em-dash clause breaks into stacked
+        // caption lines instead; the unsplit text stays in `onoats status`
+        // and the log.
         if let warning = model.warning {
-            Text("⚠ \(warning)").font(.caption)
+            let lines = warning.components(separatedBy: " — ")
+            ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+                Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
+            }
         }
         if case .failed(let reason, let detail) = model.state {
             Text("Last session failed: \(reason)")
