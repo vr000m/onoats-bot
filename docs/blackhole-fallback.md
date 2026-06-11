@@ -50,9 +50,10 @@ the underlying device.)
 ## 3. Point onoats at the devices
 
 `onoats init` enumerates input devices and flags likely loopback candidates
-with `[loopback?]` (it matches names like *BlackHole*, *Loopback*,
-*Soundflower*, *VB-Cable*, monitor/aggregate devices). Pick your microphone as
-**Me** and the loopback device as **Them**. The choices land in
+with `[loopback?]` (it matches names containing *blackhole*, *loopback*,
+*soundflower*, *aggregate*, or *vb-cable* — Linux monitor sources aren't
+flagged, but work fine when selected). Pick your microphone as **Me** and the
+loopback device as **Them**. The choices land in
 `~/.config/onoats/config.toml`:
 
 ```toml
