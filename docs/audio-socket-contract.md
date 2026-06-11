@@ -8,7 +8,8 @@ so a mismatched capturer fails loud rather than emitting silently-misframed audi
 
 This is the third versioned contract in the system, alongside the JSONL queue
 contract (the `me`/`them` `source` enum — see `processors/source_tagger.py`) and
-the status-file schema (Phase 5, not yet built). The constants below are read
+the status-file schema (`src/onoats/status.py`, `STATUS_SCHEMA_VERSION` — shipped
+in Phase 5a). The constants below are read
 from `src/onoats/transports/socket_audio.py`; that module is the source of truth
 and this doc mirrors it.
 

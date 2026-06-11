@@ -142,3 +142,35 @@ should NOT re-flag go here, one per line:
 - **[Logic] analysis-error**: `nonce[:8]` in the handshake log assumes a `str` —
   unreachable: `parse_handshake` validates `nonce` is `str | None` and the log
   guards on truthiness, so a non-string nonce can never reach the slice. (2026-06-09)
+- **[Architecture] won't-fix**: `native/spike/Info.plist` shares the production
+  `CFBundleIdentifier` — intentional: Spike 3's entire purpose was validating
+  TCC persistence on the PRODUCTION designated requirement (bundle id + cert),
+  so a distinct spike identity would invalidate the spike evidence. The spike
+  tree is slated for deletion after Phase 5b/6. (2026-06-10)
+- **[Performance] won't-fix (scoped)**: the capturer IOProcs perform one bounded
+  heap copy (`Data(bytes:count:)`, ~10 ms chunk) and take an `NSCondition` lock
+  per callback (`MicCapture.enqueueChunk` / `SystemCapture.enqueueChunk`). A
+  textbook RT path would use a pre-allocated lock-free ring buffer; we keep the
+  copy+lock because (a) the worker holds the lock only for a queue pop —
+  microsecond contention window, (b) the pattern is hardware-verified across
+  the full Phase 4/5b smoke incl. hours-long real-call sessions with zero HAL
+  starvation, and (c) a ring-buffer rewrite would invalidate that evidence and
+  force a re-smoke for a latent, never-observed risk. What we DID fix
+  (2026-06-10): the drop-path `logLine` that ran on the realtime thread —
+  drops are now counted under the lock and reported from the worker thread.
+  Revisit only if a real session ever logs HAL silence/dropouts. (2026-06-10)
+- **[Logic] analysis-error**: `FrameChunker.append` back-extrapolating from the
+  total `pending.count` "over-counts leftover samples" — the math is exact while
+  capture is contiguous (leftovers are contiguous with the next buffer); only a
+  frame straddling a capture gap inherits a bounded <20 ms skew, governed by the
+  existing `lastEmittedEndNs` clamp. Comment added at the site. (2026-06-10)
+- **[Architecture] won't-fix**: `onoats bot --source` sets `AUDIO_SOURCE` in
+  `os.environ` rather than threading a parameter — deliberate: the env var is
+  the pre-existing public contract (config.toml/env already select the source),
+  the flag is a convenience alias onto that contract, and downstream re-parses
+  argv independently (documented at the site). Threading a parameter would
+  create a second, competing resolution path. (2026-06-11)
+- **[Security] won't-fix**: `make_cert.sh` passes the p12 transport password on
+  `security import -P` argv — `security import` has no file/stdin password
+  option. Residual is a one-shot random secret guarding a file that lives
+  seconds inside a 0700 tmpdir; documented at the site. (2026-06-11)

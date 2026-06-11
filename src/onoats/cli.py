@@ -119,7 +119,17 @@ def _cmd_bot(rest: list[str]) -> int:
     # supervisor — it must not require or spawn ONOATS_CAPTURER_BIN just to
     # answer a help request. (dual.py's module top is import-light — no pipecat
     # / pyaudio / MLX — so this preserves the no-boot-on-help guarantee.)
-    _parse_args(rest)
+    args = _parse_args(rest)
+
+    # --source overrides via the env channel (top of the existing precedence:
+    # env > config.toml > default), so the supervisor, the spawned recorder,
+    # and the status file all see one consistent value with no new plumbing.
+    # Note: `rest` still contains --source and dual.main/_parse_args will
+    # parse it again downstream — that re-parse is deliberately ignored (the
+    # env var set here is the single effective channel), kept so both launch
+    # paths share one parser.
+    if args.source:
+        os.environ["AUDIO_SOURCE"] = args.source
 
     if load_config().audio_source == "socket":
         return _run_socket_supervisor(rest)
@@ -160,9 +170,22 @@ def _cmd_bot(rest: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 # How long to wait for BOTH branch sockets to be created by the capturer before
-# declaring the launch failed.
+# declaring the launch failed. Intentionally shorter than the capturer's
+# --accept-timeout-s default (30 s): the socket FILES appear almost immediately
+# once the capturer is listening, whereas the 30 s accept window covers the
+# slower step of the recorder actually connecting. The asymmetry is deliberate,
+# not a conflict.
 _SOCKET_WAIT_TIMEOUT_SEC = 10.0
 _SOCKET_WAIT_POLL_SEC = 0.05
+
+# Map the capturer's exit-code contract (native/onoats-capturer/Sources/
+# Support.swift ``ExitCode``) to the ``exit_reason`` vocabulary documented in
+# status.py, so a TCC denial shows as itself in `onoats status` / the menu bar
+# instead of a generic "capturer-crash".
+_CAPTURER_RC_REASONS = {
+    10: "mic-denied",  # ExitCode.micDenied
+    11: "system-audio-denied",  # ExitCode.systemAudioFailed
+}
 
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +
 # rotate) after the capturer dies, before the supervisor force-cancels it.
@@ -305,6 +328,13 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
     from loguru import logger
 
+    # 0. One canonical data-dir resolution per session. Every status write in
+    # this supervisor — the early-failure records below AND the recorder's own
+    # stamps (passed down through _run_recorder_with_capturer → run_onoats_dual)
+    # — uses this single value, so an env-configured non-default dir can never
+    # land the early-exit status in a different place than the session records.
+    data_dir = _resolve_data_dir()
+
     capturer_bin = os.environ.get("ONOATS_CAPTURER_BIN", "").strip()
     if not capturer_bin:
         logger.error(
@@ -405,11 +435,32 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         if not ready:
             # _wait_for_sockets already logged the cause (capturer death / timeout).
             await _stop_capturer(capturer_proc, logger)
+            # The recorder never started, so nothing else will write the status
+            # file — without this, a stale record from the PREVIOUS session is
+            # what `onoats status` / the menu bar would read (observed live:
+            # a mic-denial start rendered as "failed: graceful").
+            from onoats import status as status_file
+
+            rc_cap = capturer_proc.returncode
+            if rc_cap is not None:
+                exit_reason = _CAPTURER_RC_REASONS.get(rc_cap, "capturer-start-failed")
+                last_error = (
+                    f"capturer exited (rc={rc_cap}) before creating its sockets"
+                )
+            else:
+                exit_reason = "capturer-start-timeout"
+                last_error = "capturer did not create its sockets in time"
+            status_file.write_prestart_failure(
+                data_dir,
+                audio_source="socket",
+                exit_reason=exit_reason,
+                last_error=last_error,
+            )
             return 1
 
         # 5. Run the recorder against the sockets, watching the capturer
         # concurrently so its death tears the session down.
-        rc = await _run_recorder_with_capturer(rest, capturer_proc, logger)
+        rc = await _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir)
     finally:
         if capturer_proc is not None:
             await _stop_capturer(capturer_proc, logger)
@@ -471,7 +522,7 @@ async def _wait_for_sockets(capturer_proc, socket_paths, logger) -> bool:
         await asyncio.sleep(_SOCKET_WAIT_POLL_SEC)
 
 
-async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
+async def _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
 
     The recorder (``run_onoats_dual``) installs its own signal handlers and runs
@@ -484,6 +535,7 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     """
     import asyncio
 
+    from onoats import status as status_file
     from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
 
     # Parse + validate the same args dual.main would, through the shared helper,
@@ -496,7 +548,11 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
 
     recorder_task = asyncio.create_task(
         run_onoats_dual(
-            live_terminal=args.live_terminal, locked_category=args.category
+            live_terminal=args.live_terminal,
+            locked_category=args.category,
+            # Same resolution the supervisor's own status stamps use — one
+            # canonical data dir per session (see run_onoats_dual).
+            data_dir=data_dir,
         ),
         name="socket_supervisor_recorder",
     )
@@ -529,6 +585,12 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
                 f"Socket supervisor: recorder exited non-zero (rc={rc}) — a "
                 "capture branch surfaced a fatal ErrorFrame (silent/failed "
                 "capturer); stopping capturer and exiting non-zero."
+            )
+            # The recorder already wrote running=false + a fatal_error_frame
+            # reason; enrich it with the supervisor's final rc so `onoats status`
+            # / the menu bar can show the exit code.
+            status_file.stamp_supervisor_failure(
+                data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
             )
         else:
             logger.info("Socket supervisor: recorder exited; stopping capturer")
@@ -572,6 +634,20 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
         # The recorder may surface its own teardown error; we already log + exit
         # non-zero for the capturer death, so just record it.
         logger.warning(f"Socket supervisor: recorder drain raised: {exc}")
+    # The supervisor alone knows this was a capturer-death (not the recorder's own
+    # ErrorFrame). Stamp the specific reason: the capturer's exit-code contract
+    # (Support.swift ExitCode: 10=mic denied, 11=system-audio failed) is the only
+    # way the menu bar / `onoats status` can show WHY a start failed, not just
+    # that it crashed. Anything else — including rc=0 — is "capturer-crash".
+    # If the recorder was force-cancelled before writing its stopped record,
+    # this also flips the lingering running=true start record to stopped.
+    exit_reason = _CAPTURER_RC_REASONS.get(rc, "capturer-crash")
+    status_file.stamp_supervisor_failure(
+        data_dir,
+        exit_reason=exit_reason,
+        supervisor_rc=1,
+        last_error="capturer exited mid-session; partial recording rotated to pending/",
+    )
     return 1
 
 
@@ -785,16 +861,53 @@ def _cmd_status(rest: list[str]) -> int:
     args = parser.parse_args(rest)
     data_dir = Path(args.data_dir) if args.data_dir else _resolve_data_dir()
 
+    from onoats import status as status_file
+
     print(f"Data dir: {data_dir}")
     print(f"PID file: {_pid_path(data_dir)}")
-    pid = _read_pid(data_dir)
-    if pid is None:
-        print("Recorder: not running (no valid pid file)")
-        return 0
-    if _process_alive(pid):
-        print(f"Recorder: RUNNING (pid {pid})")
+    print(f"Status file: {status_file.status_path(data_dir)}")
+
+    # pid-authoritative verdict; the status file supplies the rich detail and the
+    # off-diagonal staleness note (see status.resolve_liveness — the 4-cell table).
+    # The injected aliveness is identity-checked (cmdline fingerprint) so a
+    # recycled pid behind a stale pid file is never reported as RUNNING.
+    from onoats._vendor.pid import fingerprint_matches, read_pid_record
+
+    rec = read_pid_record(_pid_path(data_dir))
+    live = status_file.resolve_liveness(
+        data_dir,
+        read_pid=_read_pid,
+        process_alive=lambda pid: (
+            _process_alive(pid)
+            and (rec is None or rec.pid != pid or fingerprint_matches(rec))
+        ),
+    )
+    st = live.status
+
+    if live.alive:
+        print(f"Recorder: RUNNING (pid {live.pid})")
+    elif live.pid is not None:
+        print(f"Recorder: stale pid file (pid {live.pid} not running)")
     else:
-        print(f"Recorder: stale pid file (pid {pid} not running)")
+        print("Recorder: not running (no valid pid file)")
+    if live.note:
+        print(f"  note: {live.note}")
+
+    if st is not None:
+        if st.audio_source:
+            print(f"  audio source: {st.audio_source}")
+        if st.stt_label:
+            print(f"  STT: {st.stt_label}")
+        if st.last_rotation_time is not None:
+            print(f"  last rotation: {st.last_rotation_time}")
+        # Surface WHY a start failed, not just liveness — the menu bar reads the
+        # same fields.
+        if st.exit_reason and st.exit_reason != "graceful":
+            print(f"  exit reason: {st.exit_reason}")
+        if st.last_error:
+            print(f"  last error: {st.last_error}")
+        if st.supervisor_rc is not None:
+            print(f"  supervisor rc: {st.supervisor_rc}")
     return 0
 
 

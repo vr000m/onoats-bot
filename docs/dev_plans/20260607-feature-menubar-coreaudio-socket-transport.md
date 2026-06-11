@@ -1,10 +1,10 @@
 # Task: macOS Menu-bar Launcher + CoreAudio Socket Audio Transport (retire BlackHole)
 
-**Status**: Milestone A (Phases 1–3 + post-adversarial-review hardening) on **open** PR #4, pending merge; Milestone B (Phases 4–6) not started
+**Status**: Milestone A (Phases 1–3 + post-adversarial-review hardening) merged in PR #4 (2026-06-09); Milestone B (Phases 4–6) in progress on `feat/socket-audio-transport-milestone-b` — see the Milestone B plan
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
-**Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); Milestone B TBD
+**Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); `feat/socket-audio-transport-milestone-b` (Milestone B)
 **Created**: 2026-06-07
 **Completed**: Milestone A core 2026-06-08 (Phases 1–3); post-adversarial-review supervisor hardening 2026-06-09; Milestone B pending (native, macOS-only)
 
@@ -282,6 +282,15 @@ audio **without** a virtual device, removing that setup step and failure class.
 > If this file grows unwieldy as Milestone B is fleshed out, split B into its own
 > dev-plan file at that point; for now the two-milestone framing keeps the shared
 > macOS context in one place.
+>
+> **Update 2026-06-10:** Milestone B lives in its own plan
+> (`20260609-feature-milestone-b-macos-capture-menubar.md`); see its Phase 5b
+> "Decisions" block. Notably, "BlackHole retirement" is now a *demotion*, not a
+> removal: the PortAudio/BlackHole backend stays a supported CLI option
+> (`onoats bot --source portaudio|socket`, required below macOS 14.4); only the
+> menu-bar app is socket/CoreAudio-only. GUI→CLI discovery is via the
+> `uv tool install --editable` shim at `~/.local/bin/onoats`, installed/updated
+> through `make -C native install`.
 
 ### Phase 1: `UnixSocketAudioInputTransport` + wire framing  *(Python)*
 
@@ -693,7 +702,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-09 @ 3428358c7c10b4b6ef9a06f79b66ac886338b850 -->
+<!-- reviewed: 2026-06-11 @ 619c615f9866a3d5dfbac3de2f779f387a4688ef -->
 
 ## Progress
 
@@ -711,9 +720,23 @@ in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 - [x] **Phase 3** — CLI supervisor + `docs/audio-socket-contract.md` — `4ccbb0c`
   (11 tests). Per-generation 0700 private socket dir, generation nonce, capturer
   spawn (`ONOATS_CAPTURER_BIN`), bounded socket-wait, fail-loud teardown.
-- [ ] **Phase 4** — Swift CoreAudio / ScreenCaptureKit capturer *(macOS native)*
-- [ ] **Phase 5** — macOS menu-bar launcher *(macOS native)*
-- [ ] **Phase 6** — Retire BlackHole from the default macOS story + docs/packaging
+- **Phase 4** — Swift CoreAudio capturer → *delegated; status lives in the
+  Milestone B plan (built + smoke-passed 2026-06-10)*
+- **Phase 5** — macOS menu-bar launcher → *delegated; status lives in the
+  Milestone B plan (5a shipped; 5b built, full manual smoke incl. both TCC
+  denials done 2026-06-10)*
+- **Phase 6** — Retire BlackHole from the default macOS story → *delegated;
+  status lives in the Milestone B plan (done 2026-06-10 — demoted to fallback)*
+
+> **Phases 4–6 superseded → split into Milestone B**
+> (`docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md`, branch
+> `feat/socket-audio-transport-milestone-b`). Status as of 2026-06-09: the Python
+> **status-file slice (Phase 5a) shipped** — `src/onoats/status.py` + producers in
+> `runtime.py`/`dual.py` + `onoats status` rewired with the pid backstop, tested in
+> `tests/test_status_file.py`. So the "there is no status file" notes in the Phase 5
+> contract above now describe the *pre-5a* state. The native capturer (Phase 4),
+> the SwiftUI menu bar (5b), and BlackHole retirement (6) live in the Milestone B
+> plan.
 
 Reviewer-finding fixes folded in: `dc31ff9` (Phase 1–2: PCM-length desync guard,
 writer drain, source-neutral banner naming), `a78ae8b` (Phase 3: restore socket

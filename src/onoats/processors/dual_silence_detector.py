@@ -29,8 +29,8 @@ _SPEAKING_STALENESS_MULTIPLIER = 1.5
 
 # Heartbeat: warn when both branches stay silent during an active session.
 # Catches AirPods BT-profile-switch orphaned PortAudio streams and user-error
-# routing (e.g. call audio bypassing BlackHole) within ~2 min instead of
-# bleeding the entire call.
+# routing (e.g. call audio bypassing the loopback device on the PortAudio
+# path) within ~2 min instead of bleeding the entire call.
 _HEARTBEAT_THRESHOLD_DEFAULT = 120.0
 _HEARTBEAT_STARTUP_GRACE = 30.0
 

@@ -166,6 +166,11 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
     N_FRAMES = int(_control.get("nframes") or os.environ.get("ONOATS_FAKE_NFRAMES", "5"))
     SPAWN_CHILD = bool(_control.get("spawn_child"))
 
+    if BEHAVIOUR == "exit-early":
+        # Die BEFORE creating any socket — the shape of a TCC denial at
+        # startup (real capturer: ExitCode.micDenied=10 / systemAudioFailed=11).
+        sys.exit(int(_control.get("rc") or 10))
+
     if not MIC or not SYSTEM:
         sys.stderr.write(
             "fake-capturer: missing socket paths (mic=%r system=%r)\\n" % (MIC, SYSTEM)
@@ -269,13 +274,19 @@ def set_capturer_behaviour(fake_capturer):
     import json
 
     def _set(
-        behaviour: str, *, nframes: int | None = None, spawn_child: bool = False
+        behaviour: str,
+        *,
+        nframes: int | None = None,
+        spawn_child: bool = False,
+        rc: int | None = None,
     ) -> None:
         control: dict = {"behaviour": behaviour}
         if nframes is not None:
             control["nframes"] = nframes
         if spawn_child:
             control["spawn_child"] = True
+        if rc is not None:
+            control["rc"] = rc
         Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
 
     yield _set
@@ -318,7 +329,9 @@ def _install_fake_recorder(
     """
     state: dict = {"rotated_path": None, "frames_read": 0, "connected": 0}
 
-    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
         from onoats._vendor.store import onoats_data_dir
         from onoats._vendor import session_queue
 
@@ -559,6 +572,54 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
     assert log_sink.warned()
 
 
+@pytest.mark.parametrize(
+    ("cap_rc", "expected_reason"),
+    [(10, "mic-denied"), (11, "system-audio-denied"), (7, "capturer-start-failed")],
+)
+def test_prestart_capturer_death_writes_fresh_failure_status(
+    sup_env, log_sink, set_capturer_behaviour, cap_rc, expected_reason
+):
+    """A capturer dying BEFORE its sockets exist (the TCC-denial shape) must
+    leave a FRESH stopped status record naming the mapped reason.
+
+    Observed live (2026-06-10): this path wrote nothing, so the menu bar read
+    the PREVIOUS session's record and rendered a mic denial as
+    "failed: graceful". The record must be fresh (new start_time), not the
+    stale session's record enriched — the menu's staleness guard keys on it.
+    """
+    from onoats import status as status_file
+
+    data_dir, _ = sup_env
+    # Plant the stale "graceful" record of a previous successful session.
+    stale_start = 123.0
+    status_file.write_status(
+        data_dir,
+        status_file.StatusRecord(
+            schema=status_file.STATUS_SCHEMA_VERSION,
+            pid=1,
+            start_time=stale_start,
+            audio_source="socket",
+            stt_label="old-session",
+            running=False,
+            exit_reason="graceful",
+        ),
+    )
+    set_capturer_behaviour("exit-early", rc=cap_rc)
+
+    rc = _run_supervisor_bounded()
+
+    assert rc != 0, "pre-start capturer death must yield a NON-ZERO exit"
+    rec = status_file.read_status(data_dir)
+    assert rec is not None, "the pre-start failure must write a status record"
+    assert rec.exit_reason == expected_reason
+    assert rec.running is False
+    assert rec.supervisor_rc == 1
+    assert rec.last_error, "the record must carry a human-readable cause"
+    assert rec.start_time > stale_start, (
+        "must be a FRESH record, not the stale session's record enriched"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CRASH: capturer writes N frames then dies -> fail loud + rotate partial
 # ---------------------------------------------------------------------------
@@ -667,7 +728,9 @@ def test_clean_recorder_exit_returns_zero_and_stops_capturer(
 
     state: dict = {"frames_read": 0}
 
-    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
         try:
@@ -730,7 +793,9 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
 
     state: dict = {"frames_read": 0}
 
-    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
         # Healthy streaming capturer; the recorder reads a few frames then
         # returns cleanly (EndFrame-equivalent) while the capturer is STILL
         # alive — the graceful-shutdown shape a terminal Ctrl+C would produce
@@ -862,7 +927,9 @@ def test_capturer_teardown_reaps_group_on_clean_shutdown(
 
     state: dict = {"frames_read": 0}
 
-    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
         # Healthy streaming capturer; read a few frames then return cleanly while
         # the capturer (and its child) are still alive — the graceful-shutdown
         # shape that drives the supervisor's _stop_capturer teardown.
@@ -954,7 +1021,9 @@ def test_capturer_env_is_allowlisted_and_excludes_secrets(
 
     # The recorder reads a few frames then returns cleanly so the supervisor runs
     # to a normal completion (we only need the captured spawn env).
-    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
         try:
@@ -1083,7 +1152,9 @@ def test_supervisor_mints_private_0700_socket_dir(
 
     captured: dict = {}
 
-    async def _fake_run_onoats_dual(*, live_terminal=False, locked_category=None):
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
         captured["mic"] = os.environ.get("ONOATS_MIC_SOCKET")
         captured["system"] = os.environ.get("ONOATS_SYSTEM_SOCKET")
         # Return immediately (clean exit) — we only need the exported wiring.

@@ -44,12 +44,14 @@ onoats status       # recorder pid / running state + data dir
 | Local STT over TCP (stt_server)   | ✅ baseline                  | ✅ baseline        |
 | Local Whisper-MLX (on-device)     | —                           | ✅ `[macos]` extra |
 | Kokoro TTS                        | —                           | ✅ `[macos]` extra |
-| System loopback (BlackHole/etc.)  | driver-dependent            | BlackHole ⁺       |
+| System audio ("them") capture     | loopback driver-dependent   | ✅ native capturer ⁺ |
 
-⁺ A native socket-audio capture path (`AUDIO_SOURCE=socket`) is in development and
-will retire the BlackHole loopback story on macOS once the native capturer ships
-(see [Audio source](#audio-source-experimental) below and
-[`docs/audio-socket-contract.md`](docs/audio-socket-contract.md)).
+⁺ On **macOS 14.4+** the default system-audio story is the **native capturer**
+(`AUDIO_SOURCE=socket` — Core Audio process tap, no virtual-audio driver; built
+from source, see [`native/README.md`](native/README.md) and
+[Audio source](#audio-source) below). On macOS 13.x–14.3 (below the Core Audio
+tap API floor) and on other platforms, the fallback is a loopback driver
+(e.g. BlackHole) on the default PortAudio path.
 
 The baseline ships **MLX-free**: `mlx-whisper` is only in the `[macos]` extra
 and its imports are lazy, so `onoats bot` runs off-mac with PortAudio plus
@@ -75,13 +77,18 @@ key) — notably the shutdown timers: on Ctrl+C the recorder drains the pipeline
 transcript lands before the flush, then hard-cancels (capped at
 `SHUTDOWN_CANCEL_TIMEOUT_SEC`, default `2.0`) if the drain stalls.
 
-### Audio source (experimental)
+### Audio source
 
-By default onoats captures audio through **PortAudio** (`AUDIO_SOURCE=portaudio`).
-An experimental **socket** source (`AUDIO_SOURCE=socket`) reads framed PCM16 from
-two per-branch unix sockets (mic → `me`, system → `them`) written by an external
-native capturer, instead of enumerating PortAudio devices. Select it via env
-`AUDIO_SOURCE` or `config.toml`:
+Two capture backends:
+
+- **`socket`** — the recommended macOS (14.4+) path: framed PCM16 from two
+  per-branch unix sockets (mic → `me`, system → `them`) written by the native
+  capturer. No loopback driver, no PortAudio device enumeration.
+- **`portaudio`** (default) — PortAudio devices; system audio needs a loopback
+  driver (e.g. BlackHole). This is the path for other platforms and for macOS
+  below 14.4.
+
+Select via env `AUDIO_SOURCE` or `config.toml`:
 
 ```toml
 [audio]
@@ -97,11 +104,16 @@ socket directory + generation nonce and spawns the capturer named by
 endianness, backpressure, versioning) is pinned in
 [`docs/audio-socket-contract.md`](docs/audio-socket-contract.md).
 
-> **Status:** the Python transport, supervisor, and wire contract are in place,
-> but the native capturer (`ONOATS_CAPTURER_BIN`) is not yet shipped — so
-> `AUDIO_SOURCE=socket` is **not runnable end-to-end yet**. Leave the default
-> `portaudio` source unless you are wiring up your own capturer against the
-> contract.
+A one-off override is available on the command line — `onoats bot --source
+socket` (or `--source portaudio`) — which sits at the top of the usual
+precedence (CLI flag > env `AUDIO_SOURCE` > `config.toml` > default).
+
+> **Status:** runnable end-to-end on macOS 14.4+. The native capturer +
+> menu-bar app build from source — see [`native/README.md`](native/README.md)
+> for the one-time self-signed-cert setup and the `make -C native install`
+> flow (it also installs the CLI and wires `ONOATS_CAPTURER_BIN`). On other
+> platforms, or below macOS 14.4, keep the default `portaudio` source —
+> BlackHole remains the system-loopback fallback there.
 
 ### Data location
 

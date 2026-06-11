@@ -616,6 +616,13 @@ def _vocabulary_bias() -> list[str]:
         return []
 
 
+# Canonical set of STT_SERVICE values dispatched by _create_stt_service below
+# ("whisper" is the fall-through default branch). The menu bar's STT picker
+# (native/onoats-menubar/Sources/RecorderModel.swift `sttServices`) mirrors
+# this tuple; tests/test_native_contract_parity.py keeps the two in sync.
+VALID_STT_SERVICES = ("whisper", "websocket", "deepgram")
+
+
 async def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -640,6 +647,13 @@ async def _create_stt_service():
     service = cfg.stt_service
     model_name = cfg.stt_model
     vocabulary = _vocabulary_bias()
+    # Enforce the canonical set, not just document it: a typo'd STT_SERVICE
+    # used to silently fall through to the whisper branch — fail loud instead.
+    if service not in VALID_STT_SERVICES:
+        raise RuntimeError(
+            f"Unknown STT_SERVICE {service!r} — valid values: "
+            f"{', '.join(VALID_STT_SERVICES)}"
+        )
     if service == "websocket":
         try:
             from onoats.stt.websocket_stt_service import WebSocketSTTService
@@ -1033,6 +1047,67 @@ def _remove_pid_file(pid_path: Path) -> None:
         pass
     except OSError as exc:
         logger.warning(f"Could not remove PID file {pid_path}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Status file (liveness + failure-state for ``onoats status`` / the menu bar)
+#
+# Thin recorder-process-only wrappers over ``onoats.status`` — mirror the pid
+# write/remove split (the schema + atomic I/O live in the standalone module; the
+# producer calls live here, alongside the pid producer, and are imported by
+# ``dual.py``). Status writes are best-effort: a status-file failure must never
+# take down a recording, so each wrapper swallows + logs and carries on.
+# ---------------------------------------------------------------------------
+
+
+def _write_status_running(data_dir: Path, *, audio_source: str, stt_label: str) -> None:
+    """Write the start-of-session status (``running=true``). Best-effort."""
+    from onoats import status as _status
+
+    try:
+        _status.write_running(
+            data_dir,
+            pid=os.getpid(),
+            audio_source=audio_source,
+            stt_label=stt_label,
+        )
+    except OSError as exc:
+        logger.warning(f"Could not write status file (start): {exc}")
+
+
+def _mark_status_rotation(data_dir: Path) -> None:
+    """Stamp ``last_rotation_time`` on the current status record. Best-effort."""
+    from onoats import status as _status
+
+    try:
+        _status.mark_rotation(data_dir)
+    except OSError as exc:
+        logger.warning(f"Could not update status file (rotation): {exc}")
+
+
+def _write_status_stopped(
+    data_dir: Path,
+    *,
+    exit_reason: str = "graceful",
+    last_error: str | None = None,
+    supervisor_rc: int | None = None,
+) -> None:
+    """Write the end-of-session status (``running=false``) + failure detail.
+
+    Called inside the single-writer shutdown path BEFORE the pid file is removed,
+    so the pid backstop and the status file never disagree about a live recorder.
+    """
+    from onoats import status as _status
+
+    try:
+        _status.write_stopped(
+            data_dir,
+            exit_reason=exit_reason,
+            last_error=last_error,
+            supervisor_rc=supervisor_rc,
+        )
+    except OSError as exc:
+        logger.warning(f"Could not write status file (stop): {exc}")
 
 
 def _install_signal_handlers(

@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -49,10 +50,13 @@ from onoats.runtime import (  # noqa: E402
     _create_stt_service,
     log_stt_server_rss,
     _install_signal_handlers,
+    _mark_status_rotation,
     _restore_terminal,
     _start_keypress_reader,
     _topic_pipeline_tasks,
     _write_pid_file,
+    _write_status_running,
+    _write_status_stopped,
     flush_and_rotate,
     run_crash_recovery,
     stt_banner,
@@ -276,7 +280,6 @@ def _build_socket_transports(cfg):
     Returns ``(mic_transport, system_transport, mic_label, system_label)`` where
     the labels are the socket paths (logged in the startup banner).
     """
-    from pathlib import Path
 
     from onoats.transports.socket_audio import UnixSocketAudioTransport
 
@@ -330,7 +333,10 @@ def _build_socket_transports(cfg):
 
 
 async def run_onoats_dual(
-    *, live_terminal: bool = False, locked_category: str | None = None
+    *,
+    live_terminal: bool = False,
+    locked_category: str | None = None,
+    data_dir: Path | None = None,
 ) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
@@ -341,7 +347,11 @@ async def run_onoats_dual(
     from onoats.processors.dual_silence_detector import DualSilenceDetector
     from onoats.processors.transcript_buffer import TranscriptBuffer
 
-    data_dir = onoats_data_dir()
+    # One canonical derivation per session: the socket supervisor resolves the
+    # data dir once and passes it in, so its failure stamps and the recorder's
+    # own status/pid writes can never target different directories. Standalone
+    # callers (the PortAudio path) resolve here as before.
+    data_dir = data_dir if data_dir is not None else onoats_data_dir()
 
     from onoats.config import load_config
 
@@ -406,6 +416,10 @@ async def run_onoats_dual(
                 data_dir=data_dir,
                 locked_category=locked_category,
             )
+        # Stamp last-rotation on the status file after a successful rotation
+        # (terminal or continuation) so the menu bar / `onoats status` can show
+        # when the session last rolled over.
+        _mark_status_rotation(data_dir)
 
     async def _flush_continuation(reason: str) -> None:
         """Continuation-flush entry point for Ctrl+T / SIGUSR1 / silence.
@@ -476,6 +490,10 @@ async def run_onoats_dual(
         loop,
     )
     pid_path = _write_pid_file(data_dir)
+    # Write ordering (status-file contract): pid file FIRST, then status. So a
+    # reader that catches us mid-start sees pid-alive (backstop) before the rich
+    # status record exists, never the reverse.
+    _write_status_running(data_dir, audio_source=audio_source, stt_label=stt_banner())
 
     shutdown_started = False
     shutdown_complete = asyncio.Event()
@@ -540,6 +558,25 @@ async def run_onoats_dual(
         await _shutdown_stt_service(system_stt, "system")
         await log_stt_server_rss("shutdown")
 
+        # Status file: record stop + failure reason BEFORE removing the pid file.
+        # Write ordering (status-file contract): status-stopped FIRST, then the
+        # pid is removed — so `onoats status` (pid backstop) never observes
+        # pid-gone while the status file still claims running. ``ended_by_error``
+        # (set in the outer run body) distinguishes a fatal-ErrorFrame self-end
+        # from a graceful shutdown; the specific cause (capturer-crash vs the
+        # recorder's own ErrorFrame, mic/system-audio denial) is enriched by the
+        # socket supervisor, which alone knows the final rc.
+        if ended_by_error:
+            _write_status_stopped(
+                data_dir,
+                exit_reason="fatal_error_frame",
+                last_error=(
+                    "dual pipeline ended on a fatal ErrorFrame (capture branch "
+                    "EOF / read-idle / framing failure)"
+                ),
+            )
+        else:
+            _write_status_stopped(data_dir, exit_reason="graceful")
         # Restore terminal and remove PID file inside the single-writer
         # shutdown path so the two call sites (_shutdown_watcher and the
         # outer ``finally`` block) are truly idempotent regardless of ordering.
@@ -619,6 +656,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="onoats dual-input recorder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+    parser.add_argument(
+        "--source",
+        choices=("portaudio", "socket"),
+        default=None,
+        help=(
+            "Capture backend: 'portaudio' (PortAudio/BlackHole devices, the "
+            "default) or 'socket' (native capturer over unix sockets). "
+            "Overrides AUDIO_SOURCE / config.toml [audio].source for this run."
+        ),
     )
     parser.add_argument(
         "--interactive",
