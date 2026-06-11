@@ -9,7 +9,8 @@ so a mismatched capturer fails loud rather than emitting silently-misframed audi
 This is the third versioned contract in the system, alongside the JSONL queue
 contract (the `me`/`them` `source` enum — see `processors/source_tagger.py`) and
 the status-file schema (`src/onoats/status.py`, `STATUS_SCHEMA_VERSION` — shipped
-in Phase 5a). The constants below are read
+in Phase 5a; see [Status-file schema](#status-file-schema-v2) below). The
+constants below are read
 from `src/onoats/transports/socket_audio.py`; that module is the source of truth
 and this doc mirrors it.
 
@@ -291,6 +292,44 @@ MUST: create both sockets, accept one connection each, write the v1 handshake
 per connection as it is accepted (echoing the nonce), then stream
 length-prefixed v1 frames per branch.
 
+### Capturer event lines (`ONOATS-EVENT`, stderr)
+
+Since release-plan Phase 4 the supervisor spawns the capturer with
+**`stderr=PIPE`** and runs an **always-drain reader task** from spawn to pipe
+EOF. The reader:
+
+- **tees every line verbatim** to the supervisor's own stderr — the
+  pre-Phase-4 inherited-fd behaviour (and the menu bar's log redirect) is
+  preserved exactly;
+- **never blocks the capturer**: it drains continuously (including before the
+  sockets exist), and an overlong line (>64 KiB) is dropped rather than
+  stalling the pipe;
+- **parses machine-readable event lines** and reflects them into the status
+  file.
+
+Event-line format (emitted by `Support.swift emitEvent`; parsed by
+`cli._parse_capturer_event`; prefix parity-pinned by
+`tests/test_native_contract_parity.py`):
+
+```
+ONOATS-EVENT <type> k=v …
+```
+
+- The line **starts with** `ONOATS-EVENT ` (no `onoats-capturer:` prologue).
+- Field values are single space-delimited tokens, **except `hint=`**, which is
+  by contract the trailing field and consumes the rest of the line (free text).
+- One line per event; never multi-line. Unknown event types / extra fields are
+  ignored by the supervisor (forward-compatible).
+
+Defined events:
+
+| Event | Fields | Supervisor action |
+|---|---|---|
+| `zero-run-warning` | `branch=<mic\|system> hint=<text>` | sets the status-file `warning` (schema v2) to `"<branch>: <hint>"`; per-branch messages merge `; `-joined in branch order. Emitted once per zero-run (30 s of all-zero real input); re-armed by real audio. |
+| `zero-run-clear` | `branch=<mic\|system>` | removes that branch's message; clears `warning` to `null` when none remain. |
+| `device` | *(reserved — release-plan Phase 5)* | populates `mic_device` / `system_device`. |
+| `waiting-for-permission` | *(reserved — release-plan Phase 7)* | extends the socket-appearance wait while a TCC prompt is pending. |
+
 ### Default-device changes (capturer requirement, verified live)
 
 The capturer MUST survive a **default-input-device change** mid-session — e.g. the
@@ -311,6 +350,30 @@ the audio stream stopped mid-session and the recording is truncated. A deliberat
 success) is **reserved for a future capturer exit-code contract** — adopting it
 would also require redefining the transport's EOF-is-fatal rule, so it is out of
 scope for v1.
+
+## Status-file schema (v2)
+
+`src/onoats/status.py` (`StatusRecord` / `STATUS_SCHEMA_VERSION`) is the source
+of truth; the menu bar's `RecorderModel.swift` mirrors it (parity-pinned by
+`tests/test_native_contract_parity.py`). **Both readers hard-reject any other
+`schema` value** (Python returns "no status"; the menu bar shows schema drift)
+— so a schema bump requires reinstalling the app and the CLI **together**
+(`make -C native install`); the visible mixed-version symptom is schema drift,
+never mis-rendered data.
+
+Version history:
+
+- **v1** (Phase 5a): `schema`, `pid`, `start_time`, `audio_source`,
+  `stt_label`, `running`, `last_rotation_time`, `last_error`, `exit_reason`,
+  `supervisor_rc`.
+- **v2** (release-plan Phase 4): adds three **optional flat string** fields,
+  all default `null`:
+  - `warning` — live, non-fatal capture anomaly (today: the capturer's
+    all-zero-input detector). Set/cleared by the supervisor from
+    `ONOATS-EVENT` lines (above) while the session runs.
+  - `mic_device`, `system_device` — `"<name> (uid=<uid>)"` for the devices the
+    capturer actually bound. Defined in v2, populated from release-plan
+    Phase 5 onward (`null` until then).
 
 ## Fail-loud observable (acceptance shape)
 

@@ -35,7 +35,13 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 STATUS_FILENAME = "onoats.status.json"
-STATUS_SCHEMA_VERSION = 1
+# v2 (release-plan Phase 4): adds the OPTIONAL `warning`, `mic_device`, and
+# `system_device` fields (all flat string scalars, default None). One bump
+# defines all three; Phase 5 populates the device fields without another bump.
+# Both readers (this module and the menu bar's RecorderModel.swift) hard-reject
+# any other version, so app + CLI must be reinstalled together
+# (`make -C native install`) — a mixed-version window shows schema drift, not data.
+STATUS_SCHEMA_VERSION = 2
 
 # Active dir name mirrors the pid file's location (``<data_dir>/.active``).
 _ACTIVE_DIR = ".active"
@@ -64,6 +70,14 @@ class StatusRecord:
     # "system-audio-denied". Free-form but stable across producers.
     exit_reason: str | None = None
     supervisor_rc: int | None = None
+    # Schema v2. `warning` is a live, non-fatal capture anomaly (today: the
+    # capturer's all-zero-input detector) — set/cleared by the supervisor while
+    # the session runs, so the menu bar can surface it without tailing logs.
+    # `mic_device`/`system_device` are "<name> (uid=<uid>)" strings populated
+    # from the capturer's device events (release-plan Phase 5; None until then).
+    warning: str | None = None
+    mic_device: str | None = None
+    system_device: str | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +182,15 @@ def read_status(data_dir: Path) -> StatusRecord | None:
                 if obj.get("supervisor_rc") is not None
                 else None
             ),
+            warning=(str(obj["warning"]) if obj.get("warning") is not None else None),
+            mic_device=(
+                str(obj["mic_device"]) if obj.get("mic_device") is not None else None
+            ),
+            system_device=(
+                str(obj["system_device"])
+                if obj.get("system_device") is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError):
         # Missing/typewrong required field → treat as no status, not a crash.
@@ -214,6 +237,23 @@ def mark_rotation(data_dir: Path, *, when: float | None = None) -> Path | None:
         data_dir,
         replace(current, last_rotation_time=when if when is not None else time.time()),
     )
+
+
+def set_warning(data_dir: Path, warning: str | None) -> Path | None:
+    """Set (or clear, with ``None``) the live capture warning on the current record.
+
+    Called by the socket supervisor when the capturer reports a non-fatal
+    capture anomaly (the all-zero-input detector) and again when real audio
+    re-arms it. Best-effort like :func:`mark_rotation`: returns ``None`` when
+    there is no readable record to annotate (e.g. the event raced ahead of the
+    recorder's start write — the detector needs ~30 s of session, so in
+    practice the record exists). Same last-writer-wins concurrency contract as
+    :func:`stamp_supervisor_failure`.
+    """
+    current = read_status(data_dir)
+    if current is None:
+        return None
+    return write_status(data_dir, replace(current, warning=warning))
 
 
 def write_stopped(

@@ -20,7 +20,11 @@ struct OnoatsMenuBarApp: App {
 
     private var menuSymbol: String {
         switch model.state {
-        case .running: return "waveform.circle.fill"
+        // A live capture warning (all-zero input — likely a denied grant or a
+        // muted mic) changes the icon so the anomaly is visible without
+        // opening the menu. Warning, not failure: the session keeps running.
+        case .running: return model.warning == nil
+            ? "waveform.circle.fill" : "waveform.badge.exclamationmark"
         case .starting, .stopping: return "ellipsis.circle"
         case .failed: return "exclamationmark.triangle.fill"
         case .stopped: return "waveform.circle"
@@ -33,6 +37,20 @@ struct MenuContent: View {
 
     var body: some View {
         Text(statusLine)
+        // Live capture warning (schema-v2 `warning`): the branch-specific hint
+        // from the capturer's all-zero-input detector. Cleared automatically
+        // when real audio re-arms the detector. Native menu items render one
+        // line and never wrap, and the full hint is ~200 chars — rendered as
+        // ONE item it stretches the whole menu to its width (observed live,
+        // 2026-06-11). Split on the hint's em-dash clause breaks into stacked
+        // caption lines instead; the unsplit text stays in `onoats status`
+        // and the log.
+        if let warning = model.warning {
+            let lines = warning.components(separatedBy: " — ")
+            ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+                Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
+            }
+        }
         if case .failed(let reason, let detail) = model.state {
             Text("Last session failed: \(reason)")
             if let detail, !detail.isEmpty {

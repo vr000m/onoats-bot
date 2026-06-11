@@ -165,6 +165,28 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
     )
     N_FRAMES = int(_control.get("nframes") or os.environ.get("ONOATS_FAKE_NFRAMES", "5"))
     SPAWN_CHILD = bool(_control.get("spawn_child"))
+    # Phase-4 stderr-channel controls (see the supervisor's always-drain reader):
+    #   stderr_lines: lines written to stderr at STARTUP, before binding sockets
+    #       (tee coverage — they must surface verbatim on the supervisor's stderr).
+    #   stderr_flood: bytes of stderr noise written at STARTUP, before binding.
+    #       Far exceeds the 64 KiB pipe capacity: if nothing drains, the write
+    #       BLOCKS and the sockets never appear (start-timeout) — so a passing
+    #       run proves the always-drain property.
+    #   events: ONOATS-EVENT lines written to stderr when the MIC connection
+    #       arrives (after the fake recorder has written its running status
+    #       record, so set_warning has a record to annotate).
+    STDERR_LINES = _control.get("stderr_lines") or []
+    STDERR_FLOOD = int(_control.get("stderr_flood") or 0)
+    EVENTS = _control.get("events") or []
+
+    for _line in STDERR_LINES:
+        sys.stderr.write(_line + "\\n")
+    sys.stderr.flush()
+    if STDERR_FLOOD:
+        _noise = "x" * 1023 + "\\n"
+        for _ in range(max(1, STDERR_FLOOD // 1024)):
+            sys.stderr.write(_noise)
+        sys.stderr.flush()
 
     if BEHAVIOUR == "exit-early":
         # Die BEFORE creating any socket — the shape of a TCC denial at
@@ -214,6 +236,10 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
             try:
                 writer.write(header())
                 await writer.drain()
+                if EVENTS and path == MIC:
+                    for _line in EVENTS:
+                        sys.stderr.write(_line + "\\n")
+                    sys.stderr.flush()
                 if BEHAVIOUR == "silent":
                     while True:
                         await asyncio.sleep(3600)
@@ -279,6 +305,9 @@ def set_capturer_behaviour(fake_capturer):
         nframes: int | None = None,
         spawn_child: bool = False,
         rc: int | None = None,
+        stderr_lines: list[str] | None = None,
+        stderr_flood: int | None = None,
+        events: list[str] | None = None,
     ) -> None:
         control: dict = {"behaviour": behaviour}
         if nframes is not None:
@@ -287,6 +316,12 @@ def set_capturer_behaviour(fake_capturer):
             control["spawn_child"] = True
         if rc is not None:
             control["rc"] = rc
+        if stderr_lines is not None:
+            control["stderr_lines"] = stderr_lines
+        if stderr_flood is not None:
+            control["stderr_flood"] = stderr_flood
+        if events is not None:
+            control["events"] = events
         Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
 
     yield _set
@@ -310,7 +345,11 @@ def set_capturer_behaviour(fake_capturer):
 
 
 def _install_fake_recorder(
-    monkeypatch, *, idle_end: float = 0.6, post_eof_drain: float = 0.0
+    monkeypatch,
+    *,
+    idle_end: float = 0.6,
+    post_eof_drain: float = 0.0,
+    write_running: bool = False,
 ):
     """Patch ``onoats.dual.run_onoats_dual`` with a socket-reading fake recorder.
 
@@ -336,6 +375,16 @@ def _install_fake_recorder(
         from onoats._vendor import session_queue
 
         data_dir = onoats_data_dir()
+        if write_running:
+            # Mirror the real recorder's start-of-session status write, BEFORE
+            # connecting — the fake capturer emits its ONOATS-EVENT lines only
+            # once a connection arrives, so the supervisor's set_warning always
+            # finds a record (the ordering the warning tests rely on).
+            from onoats import status as status_file
+
+            status_file.write_running(
+                data_dir, pid=os.getpid(), audio_source="socket", stt_label="fake"
+            )
         mic = os.environ["ONOATS_MIC_SOCKET"]
         system = os.environ["ONOATS_SYSTEM_SOCKET"]
 
@@ -1364,3 +1413,230 @@ async def test_fresh_generation_nonce_is_accepted(short_root):
     finally:
         await asyncio.wait_for(harness.send(EndFrame()), timeout=WAIT_TIMEOUT)
         await server.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (release plan): the capturer stderr channel — always-drain reader,
+# verbatim tee, and ONOATS-EVENT parsing into the status-file `warning`.
+#
+# The no-hang property for the reader is pinned two ways: every E2E test here
+# runs under the same bounded worker-thread join as the rest of the suite (a
+# reader that extended any wait would trip it), and the flood test proves the
+# drain side (an undrained 512 KiB flood would block the capturer at the
+# ~64 KiB pipe capacity before its sockets ever appeared).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_capturer_event_unit():
+    parse = cli._parse_capturer_event
+
+    # Non-event lines (including the ordinary log prologue) parse to None.
+    assert parse("onoats-capturer: WARNING mic: something") is None
+    assert parse("") is None
+    assert parse("ONOATS-EVENT") is None  # bare prefix, no trailing space
+    assert parse("ONOATS-EVENT ") is None  # no event type
+
+    assert parse("ONOATS-EVENT zero-run-clear branch=mic") == (
+        "zero-run-clear",
+        {"branch": "mic"},
+    )
+
+    etype, fields = parse(
+        "ONOATS-EVENT zero-run-warning branch=system "
+        "hint=capture callbacks are active but have delivered only zero "
+        "samples for ~30 s — check the grant"
+    )
+    assert etype == "zero-run-warning"
+    assert fields["branch"] == "system"
+    assert fields["hint"].endswith("check the grant")
+
+    # hint= is the trailing free-text field BY CONTRACT: it consumes the rest
+    # of the line, even text that looks like further k=v fields.
+    assert parse("ONOATS-EVENT x branch=mic hint=try a=b c") == (
+        "x",
+        {"branch": "mic", "hint": "try a=b c"},
+    )
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_merges_warnings_and_tees(short_root, capfd):
+    """Unit-drive _drain_capturer_stderr with a hand-fed StreamReader: both
+    branches' warnings merge deterministically (branch order), non-event lines
+    are teed verbatim and otherwise ignored, and EOF returns."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"onoats-capturer: ordinary log line\n")
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=system hint=check the grant\n"
+    )
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=mic hint=check hardware mute\n"
+    )
+    reader.feed_data(b"ONOATS-EVENT bogus-future-event some=field\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+
+    got = status_file.read_status(data_dir)
+    assert got is not None
+    assert got.warning == "mic: check hardware mute; system: check the grant"
+    # Verbatim tee: the plain log line surfaced on the supervisor's stderr.
+    assert "ordinary log line" in capfd.readouterr().err
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_clear_event_clears_warning(short_root):
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=system hint=check the grant\n"
+    )
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=mic hint=check hardware mute\n"
+    )
+    reader.feed_data(b"ONOATS-EVENT zero-run-clear branch=mic\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+    got = status_file.read_status(data_dir)
+    assert got is not None and got.warning == "system: check the grant"
+
+    # Second session shape: warn then clear the SAME branch → field fully cleared.
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=system hint=check the grant\n"
+    )
+    reader.feed_data(b"ONOATS-EVENT zero-run-clear branch=system\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+    got = status_file.read_status(data_dir)
+    assert got is not None and got.warning is None
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_no_status_record_is_a_noop(short_root):
+    """An event racing ahead of the recorder's start write must not crash the
+    reader (set_warning is best-effort) — and must not invent a record."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"ONOATS-EVENT zero-run-warning branch=mic hint=early\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+    assert status_file.read_status(data_dir) is None
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_survives_overlong_line(short_root, log_sink):
+    """A line beyond the StreamReader limit is dropped (readline's documented
+    ValueError path) and the reader keeps draining — the event AFTER the
+    monster line still lands in the status file."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    reader = asyncio.StreamReader(limit=1024)
+    reader.feed_data(b"y" * 8192 + b"\n")  # 8 KiB line >> 1 KiB limit
+    reader.feed_data(b"ONOATS-EVENT zero-run-warning branch=mic hint=still alive\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+
+    got = status_file.read_status(data_dir)
+    assert got is not None and got.warning == "mic: still alive"
+    assert any("overlong" in r for r in log_sink.records)
+
+
+def test_capturer_stderr_tee_and_flood_cannot_block(
+    sup_env, log_sink, monkeypatch, set_capturer_behaviour, capfd
+):
+    """E2E pipe-drain + tee. The fake capturer writes a marker line plus a
+    512 KiB stderr flood BEFORE binding its sockets. Undrained, the flood
+    blocks at the ~64 KiB pipe capacity and the sockets never appear
+    (capturer-start-timeout); with the always-drain reader the session runs
+    normally and the marker reaches the supervisor's own stderr verbatim."""
+    _data_dir, pending_dir = sup_env
+    marker = "fake-capturer: tee-marker-7f3a"
+    set_capturer_behaviour(
+        "crash", nframes=5, stderr_lines=[marker], stderr_flood=512 * 1024
+    )
+    state = _install_fake_recorder(monkeypatch, post_eof_drain=1.5)
+
+    rc = _run_supervisor_bounded()
+
+    assert rc != 0  # normal crash-path exit, same as test_crash_fails_loud
+    assert state["frames_read"] > 0, (
+        "no frames flowed — the stderr flood likely blocked the capturer "
+        "before its sockets appeared (always-drain reader not draining)"
+    )
+    assert not any("did not create" in r for r in log_sink.records), (
+        "supervisor took the capturer-start-timeout path — the flood blocked "
+        "the capturer"
+    )
+    assert marker in capfd.readouterr().err, (
+        "capturer stderr was not teed verbatim to the supervisor's stderr"
+    )
+
+
+def test_zero_run_warning_event_sets_status_warning(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """E2E: a zero-run-warning event emitted mid-session lands in the v2
+    status `warning`, and coexists with the supervisor's crash stamp."""
+    data_dir, _ = sup_env
+    set_capturer_behaviour(
+        "crash",
+        nframes=5,
+        events=[
+            "ONOATS-EVENT zero-run-warning branch=system "
+            "hint=check the system-audio grant"
+        ],
+    )
+    _install_fake_recorder(monkeypatch, post_eof_drain=1.5, write_running=True)
+
+    rc = _run_supervisor_bounded()
+    assert rc != 0
+
+    from onoats import status as status_file
+
+    st = status_file.read_status(data_dir)
+    assert st is not None
+    assert st.warning == "system: check the system-audio grant"
+    # The crash stamp and the warning are independent fields on one record.
+    assert st.exit_reason == "capturer-crash"
+
+
+def test_zero_run_clear_event_clears_status_warning(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """E2E: warning followed by clear (real audio re-armed the detector)
+    leaves the final record with no warning."""
+    data_dir, _ = sup_env
+    set_capturer_behaviour(
+        "crash",
+        nframes=5,
+        events=[
+            "ONOATS-EVENT zero-run-warning branch=system hint=check the grant",
+            "ONOATS-EVENT zero-run-clear branch=system",
+        ],
+    )
+    _install_fake_recorder(monkeypatch, post_eof_drain=1.5, write_running=True)
+
+    rc = _run_supervisor_bounded()
+    assert rc != 0
+
+    from onoats import status as status_file
+
+    st = status_file.read_status(data_dir)
+    assert st is not None and st.warning is None

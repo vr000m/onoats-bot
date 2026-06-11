@@ -25,6 +25,7 @@ from onoats.status import (
     mark_rotation,
     read_status,
     resolve_liveness,
+    set_warning,
     stamp_supervisor_failure,
     status_path,
     write_running,
@@ -75,6 +76,40 @@ def test_round_trip_minimal(tmp_path: Path):
     assert got.schema == STATUS_SCHEMA_VERSION
 
 
+def test_round_trip_v2_fields(tmp_path: Path):
+    """Schema-v2 optionals (warning + device names) survive the round trip and
+    default to None when absent."""
+    rec = _record(
+        warning="system: only zero samples for ~30 s — check the grant",
+        mic_device="MacBook Pro Microphone (uid=abc)",
+        system_device="Studio Display Speakers (uid=def)",
+    )
+    write_status(tmp_path, rec)
+    assert read_status(tmp_path) == rec
+
+    write_status(tmp_path, _record())
+    got = read_status(tmp_path)
+    assert (got.warning, got.mic_device, got.system_device) == (None, None, None)
+
+
+def test_set_warning_sets_and_clears(tmp_path: Path):
+    # No record yet → best-effort no-op (the event raced ahead of the start write).
+    assert set_warning(tmp_path, "early") is None
+    assert read_status(tmp_path) is None
+
+    write_running(tmp_path, pid=4242, audio_source="socket", stt_label="mlx-whisper")
+    set_warning(tmp_path, "mic: only zero samples for ~30 s — check hardware mute")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == "mic: only zero samples for ~30 s — check hardware mute"
+    # The annotate must not clobber the session detail.
+    assert got.running is True and got.audio_source == "socket"
+
+    set_warning(tmp_path, None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
 def test_read_missing_returns_none(tmp_path: Path):
     assert read_status(tmp_path) is None
 
@@ -84,10 +119,13 @@ def test_read_missing_returns_none(tmp_path: Path):
     [
         "{not json",  # malformed
         "[]",  # not an object
-        '{"schema":1}',  # missing required fields
+        # CURRENT schema so these exercise field validation, not the
+        # version-mismatch branch (which test_read_unsupported_schema covers).
+        f'{{"schema":{STATUS_SCHEMA_VERSION}}}',  # missing required fields
         '{"schema":"x","pid":1,"start_time":0,"audio_source":"s",'
         '"stt_label":"l","running":true}',  # wrong type for schema
-        '{"schema":1,"pid":1,"start_time":0,"audio_source":"s",'
+        f'{{"schema":{STATUS_SCHEMA_VERSION},"pid":1,"start_time":0,'
+        '"audio_source":"s",'
         '"stt_label":"l","running":"false"}',  # running not a real boolean
         "",  # empty (half-written)
     ],

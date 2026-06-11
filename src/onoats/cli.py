@@ -191,6 +191,17 @@ _CAPTURER_RC_REASONS = {
 # rotate) after the capturer dies, before the supervisor force-cancels it.
 _RECORDER_DRAIN_GRACE_SEC = 30.0
 
+# Stable prefix for machine-parseable capturer stderr lines (mirrored by
+# Support.swift emitEvent; parity-pinned by tests/test_native_contract_parity.py
+# and documented in docs/audio-socket-contract.md "Capturer event lines").
+_ONOATS_EVENT_PREFIX = "ONOATS-EVENT "
+
+# After the capturer is stopped, how long the stderr reader gets to consume the
+# pipe's EOF before being cancelled. EOF normally arrives with process exit;
+# the bound exists so a still-open pipe fd (e.g. inherited by a straggling
+# child the group-kill is sweeping) can never extend supervisor teardown.
+_STDERR_READER_GRACE_SEC = 2.0
+
 # Grace for the capturer to exit on SIGTERM before SIGKILL during teardown.
 _CAPTURER_TERM_GRACE_SEC = 5.0
 
@@ -274,6 +285,108 @@ def _build_capturer_env(
     env["ONOATS_SYSTEM_SOCKET"] = system_sock
     env["ONOATS_CAPTURER_NONCE"] = nonce
     return env
+
+
+def _parse_capturer_event(line: str) -> tuple[str, dict[str, str]] | None:
+    """Parse one ``ONOATS-EVENT <type> k=v …`` capturer stderr line.
+
+    Returns ``(type, fields)`` or ``None`` for a non-event line. Field values
+    are single space-delimited tokens, EXCEPT ``hint=``, which by contract is
+    the trailing field and consumes the rest of the line (free text). Unknown
+    keys are carried through — the caller decides what it understands, so a
+    newer capturer emitting extra fields never breaks an older supervisor.
+    """
+    if not line.startswith(_ONOATS_EVENT_PREFIX):
+        return None
+    rest = line[len(_ONOATS_EVENT_PREFIX) :].strip()
+    if not rest:
+        return None
+    event_type, _, remainder = rest.partition(" ")
+    fields: dict[str, str] = {}
+    while remainder:
+        key, sep, after = remainder.partition("=")
+        if not sep:
+            break  # trailing non-k=v junk: ignore, keep what parsed
+        key = key.strip()
+        if key == "hint":
+            fields["hint"] = after.strip()
+            break
+        value, _, remainder = after.partition(" ")
+        fields[key] = value
+    return event_type, fields
+
+
+async def _drain_capturer_stderr(stderr, data_dir, logger) -> None:
+    """Always-drain reader for the capturer's piped stderr.
+
+    Three jobs, in priority order:
+
+    1. **Drain.** Runs from spawn to EOF so the capturer can never block on a
+       full stderr pipe — even before the sockets exist, even if every line is
+       noise. An overlong line (> the stream's 64 KiB limit) is dropped by
+       ``readline``'s documented ValueError path (the StreamReader clears its
+       buffer and resumes the transport), so the reader survives and the
+       capturer stays unblocked.
+    2. **Tee.** Every line is forwarded verbatim to the supervisor's own
+       stderr, preserving the pre-Phase-4 inherited-fd behaviour (the menu
+       bar's log redirect sees exactly what it used to).
+    3. **Parse.** ``ONOATS-EVENT`` lines update the status file: a
+       ``zero-run-warning`` sets the v2 ``warning`` field (per-branch messages
+       merged, deterministically ordered); ``zero-run-clear`` removes that
+       branch's message and clears the field when none remain. Unknown event
+       types are tee'd and otherwise ignored (forward-compatible: Phase 5's
+       ``device`` and Phase 7's ``waiting-for-permission`` arrive later).
+
+    Returns on EOF. Never raises out (a status write failing must not kill the
+    drain — job 1 outranks job 3).
+    """
+    from onoats import status as status_file
+
+    active_warnings: dict[str, str] = {}
+    while True:
+        try:
+            line = await stderr.readline()
+        except ValueError:
+            # Overlong line: StreamReader dropped it and resumed; keep draining.
+            logger.warning(
+                "Socket supervisor: capturer wrote an overlong stderr line "
+                "(>64 KiB) — dropped from the log tee, continuing to drain."
+            )
+            continue
+        if not line:
+            return  # EOF: capturer (and any child holding the fd) is gone
+        try:
+            sys.stderr.buffer.write(line)
+            sys.stderr.buffer.flush()
+        except (OSError, ValueError, AttributeError):
+            # A broken/replaced stderr must not stop the drain.
+            pass
+        parsed = _parse_capturer_event(
+            line.decode("utf-8", errors="replace").rstrip("\n")
+        )
+        if parsed is None:
+            continue
+        event_type, fields = parsed
+        branch = fields.get("branch", "?")
+        try:
+            if event_type == "zero-run-warning":
+                hint = fields.get("hint", "no detail provided")
+                active_warnings[branch] = f"{branch}: {hint}"
+                status_file.set_warning(
+                    data_dir,
+                    "; ".join(active_warnings[b] for b in sorted(active_warnings)),
+                )
+            elif event_type == "zero-run-clear":
+                if active_warnings.pop(branch, None) is not None:
+                    merged = "; ".join(
+                        active_warnings[b] for b in sorted(active_warnings)
+                    )
+                    status_file.set_warning(data_dir, merged or None)
+        except OSError as exc:
+            logger.warning(
+                f"Socket supervisor: could not update status warning ({exc}); "
+                "continuing to drain capturer stderr."
+            )
 
 
 def _run_socket_supervisor(rest: list[str]) -> int:
@@ -377,6 +490,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     os.environ["ONOATS_CAPTURER_NONCE"] = nonce
 
     capturer_proc: asyncio.subprocess.Process | None = None
+    stderr_task: "asyncio.Task[None] | None" = None
     rc = 0
     try:
         # 3b. Spawn the capturer pointed at both sockets. Pass the socket paths +
@@ -404,6 +518,13 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 "--nonce",
                 nonce,
                 env=capturer_env,
+                # Phase 4: pipe stderr through the supervisor instead of
+                # inheriting the fd. The always-drain reader task below tees
+                # every line to our own stderr (so the menu bar's log redirect
+                # is unchanged) and parses ONOATS-EVENT lines into the status
+                # file. Process.wait() is deadlock-prone with a PIPE only if
+                # nothing drains it — the reader starts before any wait.
+                stderr=asyncio.subprocess.PIPE,
                 # Spawn the capturer in its OWN session/process group
                 # (start_new_session=True is the portable subprocess spelling of
                 # setsid). On POSIX a terminal Ctrl+C/SIGTERM is delivered to the
@@ -427,6 +548,20 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 "See docs/audio-socket-contract.md."
             )
             return 1
+
+        # 3c. Start the always-drain stderr reader IMMEDIATELY — before any
+        # bounded wait — so a chatty capturer can never block on a full pipe
+        # while we wait for its sockets, and prestart stderr still reaches the
+        # log via the tee. Lifecycle: runs to pipe EOF (capturer death); the
+        # `finally` below bounds its retirement so it can never extend
+        # teardown. It must NOT be awaited alongside the recorder/capturer
+        # race in _run_recorder_with_capturer — it is deliberately not a
+        # participant there (EOF on stderr is not a lifecycle signal; process
+        # exit is).
+        stderr_task = asyncio.create_task(
+            _drain_capturer_stderr(capturer_proc.stderr, data_dir, logger),
+            name="socket_supervisor_capturer_stderr",
+        )
 
         # 4. Wait (bounded) for BOTH sockets to appear. If the capturer dies or
         # is too slow, fail loud rather than hang the recorder on a connect that
@@ -464,6 +599,16 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     finally:
         if capturer_proc is not None:
             await _stop_capturer(capturer_proc, logger)
+        if stderr_task is not None:
+            # The capturer group is gone, so the pipe's EOF is imminent — give
+            # the reader a bounded grace to consume it (flushing any final
+            # lines to the log), then cancel. Bounded so a leaked fd can never
+            # hang teardown; cancellation is safe (readline is the only await).
+            try:
+                # wait_for cancels (and awaits) the task itself on timeout.
+                await asyncio.wait_for(stderr_task, timeout=_STDERR_READER_GRACE_SEC)
+            except asyncio.TimeoutError:
+                pass
         # Remove the private socket dir. Best-effort: a leftover here is harmless
         # (next generation mints a new one), but tidy up so private dirs don't
         # accumulate under the system temp root across restarts.
@@ -898,6 +1043,8 @@ def _cmd_status(rest: list[str]) -> int:
             print(f"  audio source: {st.audio_source}")
         if st.stt_label:
             print(f"  STT: {st.stt_label}")
+        if st.warning:
+            print(f"  warning: {st.warning}")
         if st.last_rotation_time is not None:
             print(f"  last rotation: {st.last_rotation_time}")
         # Surface WHY a start failed, not just liveness — the menu bar reads the

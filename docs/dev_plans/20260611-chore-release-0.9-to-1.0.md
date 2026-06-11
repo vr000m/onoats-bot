@@ -598,7 +598,8 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 1 — LICENSE + license metadata (PR #9 merged 2026-06-11, `66a93cd`)
 - [x] Phase 2 — CHANGELOG + v0.9.0 (PR #10 merged 2026-06-11, `3a4e538`; tag `v0.9.0` pushed)
 - [x] Phase 3 — README overhaul + blackhole-fallback doc (PR #13)
-- [ ] Phase 4 — Menu-bar zero-run WARNING surfacing
+- [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
+  passed 2026-06-11)
 - [ ] Phase 5 — CLI device visibility
 - [ ] Phase 6 — Install streamlining + spike removal
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
@@ -631,3 +632,35 @@ retrieval is `git checkout spike-archive -- native/spike`.
   (Quickstart, Menu bar section), `native/README.md` owns build/sign/TCC
   internals, `docs/blackhole-fallback.md` owns the loopback fallback;
   cross-links in all three directions, no duplicated facts.
+- Phase 4 implementation (2026-06-11): event-line format settled as
+  `ONOATS-EVENT <type> k=v …` with `hint=` as the trailing free-text field by
+  contract (single split point, no quoting needed). Per-branch warnings merge
+  `; `-joined in branch order; `zero-run-clear` (new event, emitted when real
+  audio re-arms the detector) removes the branch and nulls the field when none
+  remain. Reader lifecycle: starts immediately after spawn (before the
+  socket wait, so a prestart stderr flood can't block the capturer), is NOT a
+  participant in the recorder/capturer completion race, and retires in the
+  session `finally` under a 2 s bound after `_stop_capturer`. Overlong stderr
+  lines (>64 KiB) are dropped via `StreamReader.readline`'s documented
+  ValueError path (buffer cleared, transport resumed) — the drain survives.
+  Pipe-drain proof in tests: a 512 KiB pre-bind stderr flood would block an
+  undrained capturer at the ~64 KiB pipe capacity before its sockets appear;
+  the E2E test passes only because the reader drains from spawn.
+- **Phase 4 live smoke PASSED (user, GUI topology, 2026-06-11).** Denied
+  Screen & System Audio Recording → Start → menu showed the ⚠ system-branch
+  hint within the 12:40 session (log shows the `ONOATS-EVENT
+  zero-run-warning`); the log also shows a full in-session re-arm cycle
+  (`zero-run-warning` → `zero-run-clear` → `zero-run-warning`), so the strict
+  warning-clears-on-real-audio path was exercised live, not just
+  across-session. Re-granted session (12:46) started clean (no warning).
+  Incidentals: (1) **rc=10 mic-denied fail-loud re-smoked live** on the new
+  stderr-reader code path (mic grant revoked → capturer exited rc=10
+  pre-socket, fresh `mic-denied` status — relevant to Phase 7's acceptance);
+  (2) revoking a TCC grant for a *running* app needs macOS's Quit & Reopen —
+  smoke procedure note; (3) a stale schema-v1 status file from a pre-upgrade
+  session shows the menu's drift line until the next session overwrites it —
+  benign, self-heals on first Start, recurs at every future schema bump;
+  (4) the ~200-char warning rendered as ONE native menu item stretched the
+  menu to its width — fixed pre-merge by splitting on the hint's em-dash
+  clauses into stacked caption lines (full text remains in `onoats status` +
+  the log).

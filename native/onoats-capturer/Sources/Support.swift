@@ -11,6 +11,16 @@ func logLine(_ s: String) {
     FileHandle.standardError.write(("onoats-capturer: " + s + "\n").data(using: .utf8)!)
 }
 
+/// Machine-parseable event line for the supervisor's stderr reader
+/// (docs/audio-socket-contract.md "Capturer event lines"). Format:
+/// `ONOATS-EVENT <type> k=v …` — the prefix starts the line (no `onoats-capturer:`
+/// prologue), values are single tokens except a trailing `hint=` field, which
+/// consumes the rest of the line. One line per event; never multi-line.
+func emitEvent(_ type: String, _ fields: String = "") {
+    let line = "ONOATS-EVENT " + type + (fields.isEmpty ? "" : " " + fields) + "\n"
+    FileHandle.standardError.write(line.data(using: .utf8)!)
+}
+
 struct CapturerError: Error, CustomStringConvertible {
     let message: String
     init(_ message: String) { self.message = message }

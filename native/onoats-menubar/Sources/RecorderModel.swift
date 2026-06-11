@@ -16,7 +16,9 @@ import CoreAudio
 import Foundation
 import SwiftUI
 
-/// Mirror of `src/onoats/status.py` `StatusRecord` (STATUS_SCHEMA_VERSION=1).
+/// Mirror of `src/onoats/status.py` `StatusRecord` (STATUS_SCHEMA_VERSION=2).
+/// v2 adds the optional `warning` (live capture anomaly, supervisor-managed)
+/// and `mic_device`/`system_device` (populated from Phase 5 onward).
 struct StatusRecord: Decodable {
     let schema: Int
     let pid: Int32
@@ -28,6 +30,9 @@ struct StatusRecord: Decodable {
     let last_error: String?
     let exit_reason: String?
     let supervisor_rc: Int?
+    let warning: String?
+    let mic_device: String?
+    let system_device: String?
 }
 
 enum RecorderState: Equatable {
@@ -40,7 +45,7 @@ enum RecorderState: Equatable {
 
 @MainActor
 final class RecorderModel: ObservableObject {
-    static let statusSchemaVersion = 1
+    static let statusSchemaVersion = 2
 
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"
@@ -50,6 +55,10 @@ final class RecorderModel: ObservableObject {
     @Published var sttLabel: String?
     @Published var audioSource: String?
     @Published var startTime: Date?
+    /// Schema-v2 live capture anomaly (the capturer's all-zero-input detector,
+    /// written/cleared by the supervisor). Session-scoped: only shown while
+    /// the recorder is alive — a stale record's warning is not a live warning.
+    @Published var warning: String?
     @Published var schemaDrift = false
     /// Configured STT service from config.toml (next-start value, distinct
     /// from `sttLabel`, which is what the *running* session reports).
@@ -223,10 +232,12 @@ final class RecorderModel: ObservableObject {
             sttLabel = s.stt_label.isEmpty ? nil : s.stt_label
             audioSource = s.audio_source.isEmpty ? nil : s.audio_source
             startTime = alive ? Date(timeIntervalSince1970: s.start_time) : nil
+            warning = alive ? s.warning : nil
         } else {
             sttLabel = nil
             audioSource = nil
             startTime = nil
+            warning = nil
         }
 
         if let p = proc {

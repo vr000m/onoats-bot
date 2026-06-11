@@ -30,6 +30,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel.swift"
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
+SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
 
 
 def _extract(pattern: str, path: Path) -> str:
@@ -51,6 +52,22 @@ def test_status_schema_version_matches_swift():
 
     swift = int(_extract(r"statusSchemaVersion\s*=\s*(\d+)", RECORDER_MODEL))
     assert swift == STATUS_SCHEMA_VERSION
+
+
+def test_status_record_fields_match_swift():
+    """The Swift StatusRecord mirror must carry exactly the Python dataclass's
+    fields, in the same order — a one-sided field addition (e.g. a schema-v2
+    optional) otherwise decodes fine and silently never renders."""
+    from dataclasses import fields as dc_fields
+
+    from onoats.status import StatusRecord
+
+    text = RECORDER_MODEL.read_text(encoding="utf-8")
+    m = re.search(r"struct StatusRecord: Decodable \{(.*?)\n\}", text, re.DOTALL)
+    assert m, "struct StatusRecord not found in RecorderModel.swift"
+    swift_fields = re.findall(r"let (\w+):", m.group(1))
+    python_fields = [f.name for f in dc_fields(StatusRecord)]
+    assert swift_fields == python_fields
 
 
 def test_status_file_relative_path_matches_swift():
@@ -107,6 +124,16 @@ def test_stt_service_list_matches_swift():
         f"keep it on one line or update this test's regex"
     )
     assert swift == tuple(VALID_STT_SERVICES)
+
+
+def test_event_line_prefix_matches_swift():
+    """The capturer's emitEvent prefix and the supervisor's parser prefix are
+    the same string-with-trailing-space, restated in two languages — a
+    one-sided edit silently turns every event into an ignored log line."""
+    from onoats.cli import _ONOATS_EVENT_PREFIX
+
+    swift = _extract(r'let line = "(ONOATS-EVENT )" \+ type', SUPPORT)
+    assert swift == _ONOATS_EVENT_PREFIX
 
 
 def test_capturer_exit_codes_are_all_accounted_for():
