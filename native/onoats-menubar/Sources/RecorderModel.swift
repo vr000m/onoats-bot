@@ -55,6 +55,10 @@ final class RecorderModel: ObservableObject {
     @Published var sttLabel: String?
     @Published var audioSource: String?
     @Published var startTime: Date?
+    /// Schema-v2 live capture anomaly (the capturer's all-zero-input detector,
+    /// written/cleared by the supervisor). Session-scoped: only shown while
+    /// the recorder is alive — a stale record's warning is not a live warning.
+    @Published var warning: String?
     @Published var schemaDrift = false
     /// Configured STT service from config.toml (next-start value, distinct
     /// from `sttLabel`, which is what the *running* session reports).
@@ -228,10 +232,12 @@ final class RecorderModel: ObservableObject {
             sttLabel = s.stt_label.isEmpty ? nil : s.stt_label
             audioSource = s.audio_source.isEmpty ? nil : s.audio_source
             startTime = alive ? Date(timeIntervalSince1970: s.start_time) : nil
+            warning = alive ? s.warning : nil
         } else {
             sttLabel = nil
             audioSource = nil
             startTime = nil
+            warning = nil
         }
 
         if let p = proc {
