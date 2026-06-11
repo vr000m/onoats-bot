@@ -109,6 +109,12 @@ creation; terminal launches attribute grants to the terminal):
   `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
   env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
 - `onoats bot` output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
+- **Settings** (submenu) edits `~/.config/onoats/config.toml` — the same file
+  the CLI reads, one source of truth: STT service picker
+  (whisper / websocket / deepgram), data-dir chooser, and an "Open
+  config.toml…" escape hatch for everything else. Changes apply on the next
+  Start. The writer is a surgical single-key editor — every other line,
+  comments included, stays byte-identical.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

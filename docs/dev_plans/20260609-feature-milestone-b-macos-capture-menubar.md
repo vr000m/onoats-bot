@@ -582,6 +582,13 @@ _(to be filled on completion)_
     `~/.local/share/onoats` only; shell-exported `ONOATS_DATA_DIR`/XDG vars
     don't apply to GUI-read status (set it in config.toml if it matters).
   - `onoats bot` stdout/stderr from GUI starts → `~/Library/Logs/Onoats/onoats-bot.log`.
+  - **Settings submenu added (2026-06-10, user request):** STT service picker
+    (whisper/websocket/deepgram, mirroring runtime.py's branches) + data-dir
+    chooser + open-config.toml. Writes go to `~/.config/onoats/config.toml`
+    itself via a surgical single-key line editor — one source of truth with the
+    CLI, no UserDefaults divergence; applies on next Start. Writer verified to
+    leave all untouched lines byte-identical. (Gotcha for future tests:
+    `NSHomeDirectory()` ignores a `$HOME` override — it reads the user DB.)
 - **Phase 4 capturer built + wire-contract verified end to end (2026-06-10).**
   `native/onoats-capturer/` (plain swiftc, 7 sources), built/signed via
   `native/Makefile` into `native/Onoats.app` — DR byte-identical to the spike's
