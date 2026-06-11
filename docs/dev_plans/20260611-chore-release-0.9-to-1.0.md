@@ -610,7 +610,13 @@ retrieval is `git checkout spike-archive -- native/spike`.
 
 - **`v0.9.0` tagged 2026-06-11** on PR #10's merge commit `3a4e538`
   (annotated; pushed to origin). `scripts/release_check.sh v0.9.0 3a4e538`
-  passed all four surface checks before the tag was pushed.
+  passed all four surface checks before the tag was pushed. GitHub
+  Release created from the CHANGELOG 0.9.0 section (user decision
+  2026-06-11): **standard post-tag step from now on** — after pushing a
+  release tag, run `gh release create vX.Y.Z --verify-tag --notes-file
+  <extracted CHANGELOG section>`. CHANGELOG.md stays canonical; the GitHub
+  Release is a rendered mirror. Applies to Phase 10 (v1.0.0). Only tagged
+  versions get releases — the reconstructed 0.x era stays changelog-only.
 - Phase 2 attribution audit: 23 CHANGELOG claims verified against history,
   zero refutations; one drafting misattribution caught pre-commit
   (`--category` came from `81afbc0`, not pre-extraction PR #34).
