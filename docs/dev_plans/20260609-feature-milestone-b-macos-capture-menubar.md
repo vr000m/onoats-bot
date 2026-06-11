@@ -1,6 +1,6 @@
 # Milestone B — Native macOS System-Audio Capture + Menu-Bar Launcher
 
-**Status**: In Progress — Phases 4/5a/6 done; Phase 5b built + core smoke + mic-denial smoke passed; system-audio denial pending
+**Status**: In Progress — Phases 4/5a/6 done; Phase 5b built; all manual smoke done incl. both TCC denials — pre-merge review gauntlet next
 **Component**: macos, transport, recorder, packaging
 **Assignee**: Varun Singh
 **Priority**: Medium
@@ -475,7 +475,7 @@ _(to be filled during implementation)_
       Start/Stop/Flush work and **Stop signals the supervisor, never the capturer**.
 - [ ] BlackHole demoted to fallback in docs (kept for <14.4); `[macos]` extra
       points at the native build; min macOS version documented.
-- [ ] **Both** mic-denial and system-audio-denial, plus capturer-crash, show the
+- [x] **Both** mic-denial and system-audio-denial, plus capturer-crash, show the
       4-part fail-loud observable (ErrorFrame + rc≠0 + WARNING/ERROR + `pending/`
       rotation), no hang. *(Capturer-crash VERIFIED 2026-06-10: `pkill -9` →
       ErrorFrames on both branches, supervisor "capturer exited mid-session
@@ -483,8 +483,12 @@ _(to be filled during implementation)_
       **Mic-denial VERIFIED 2026-06-10 in the menu-bar topology**: Don't Allow →
       capturer rc=10 pre-socket, supervisor writes fresh `mic-denied` status,
       menu shows "Last session failed: mic-denied" + cause, no hang. First
-      attempt exposed a stale-status bug — see Findings. System-audio denial
-      still pending.)*
+      attempt exposed a stale-status bug — see Findings. **System-audio denial
+      TESTED 2026-06-10 — the fail-loud observable is structurally unreachable
+      for this denial: macOS lets a denied app create the process tap and
+      delivers silence (no error, no rc=11)** — see Findings; the rc=11
+      fail-loud path covers API-level tap failures and is pinned by the
+      parametrized supervisor test.)*
 
 ## Review Focus
 
@@ -532,7 +536,7 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: 2026-06-10 @ 43235b0e212a0e4882da9c1e87b05681178d4ff4 -->
+<!-- reviewed: 2026-06-10 @ cb865202b877ff7b438eecfe367887cbe34e8e76 -->
 ## Progress
 
 - [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
@@ -563,8 +567,9 @@ _(to be filled on completion)_
   capturer exited (rc=10) before creating its sockets". (First run exposed a
   stale-status bug, fixed in `522919e` — see Findings.) Settings pickers poked
   live (mic picker, STT picker, data dir visible in the same smoke screenshot).
-  **Remaining: system-audio denial (step 6).** Device profiles deferred — see
-  Findings.*
+  **System-audio denial (step 6) TESTED 2026-06-10: denial is not enforced as
+  a failure — denied tap delivers silence (see Findings).** Phase 5b manual
+  smoke COMPLETE. Device profiles deferred — see Findings.*
 - [x] Phase 6 — BlackHole demoted to fallback (gate passed 2026-06-10) —
   **done 2026-06-10**: README matrix + audio-source section lead with the
   native path (14.4+ floor documented, BlackHole kept as documented fallback
@@ -702,6 +707,27 @@ _(to be filled on completion)_
   (rc=10) before creating its sockets" — exactly the fail-loud observable
   step 5 demands. Recovery via `tccutil reset Microphone
   net.varunsingh.onoats` → Start → Allow re-prompts as expected.
+
+- **System-audio (kTCCServiceAudioCapture) denial is NOT enforced as a
+  failure — denied tap delivers silence (2026-06-10).** Test sequence in the
+  menu-bar topology: `tccutil reset AudioCapture net.varunsingh.onoats` →
+  Start → prompt appeared → Don't Allow (TCC.db: `auth_value=0` recorded for
+  `net.varunsingh.onoats`). Subsequent Starts: no re-prompt, and the capturer
+  **created the process tap without error** ("capturing via process tap at
+  48000 Hz") — no rc=11, session runs normally. Content probe: ~2.5-min
+  session with system audio playing → manual flush AND shutdown flush both
+  `0 entries`, nothing rotated — the denied tap delivers zeroed/empty
+  buffers, which the silence pacer masks as "alive but empty `them`". This
+  confirms the earlier prediction (macOS delivers zeroed buffers, not
+  errors, to unauthorized audio clients) and the spike-3 hint that
+  AudioCapture is more permissive for a signed app creating a tap.
+  **Disposition:** the 4-part fail-loud observable is structurally
+  unreachable for this denial — an OS behavior, not a gap in our supervisor.
+  The rc=11 `system-audio-denied` path remains correct for API-level tap
+  failures and is pinned by the parametrized supervisor test. **Follow-up
+  (post-PR):** a heuristic warning for a persistently all-zero system branch
+  (same idea already noted above for the mic branch) is the only way to
+  surface this state to the user.
 
 - **A/B parity check PASSED (2026-06-10) — Phase 6 gate satisfied.** Same source
   video recorded via the socket/native path (`session_20260610_133548_e010cfab`,

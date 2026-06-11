@@ -723,8 +723,8 @@ in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 - **Phase 4** — Swift CoreAudio capturer → *delegated; status lives in the
   Milestone B plan (built + smoke-passed 2026-06-10)*
 - **Phase 5** — macOS menu-bar launcher → *delegated; status lives in the
-  Milestone B plan (5a shipped; 5b built + core smoke + mic-denial smoke
-  passed 2026-06-10; system-audio denial pending)*
+  Milestone B plan (5a shipped; 5b built, full manual smoke incl. both TCC
+  denials done 2026-06-10)*
 - **Phase 6** — Retire BlackHole from the default macOS story → *delegated;
   status lives in the Milestone B plan (done 2026-06-10 — demoted to fallback)*
 
