@@ -564,6 +564,17 @@ _(to be filled on completion)_
 
 ## Findings
 
+- **Post-review-fix verification PASSED (2026-06-10).** After the external
+  review fixes (RT-thread drop logging moved to the worker, unbind
+  serialization, Teardown registration order), the rebuilt capturer passed
+  `smoke_wire_check.sh` on real hardware: both branches PASS, drops=0, real
+  mic data (peak 0.0147) + system audio (peak 0.39–0.59). Bonus evidence: the
+  tap-create retry fired in anger (attempt 1 instant `noErr` +
+  `kAudioObjectUnknown`, retry succeeded — the exact documented flakiness,
+  handled). Two further real calls were recorded via the menu-bar app and
+  fully processed downstream by koda (transcripts render end-to-end). Note:
+  an agent/SSH shell cannot run this smoke — mic IOProc binds but delivers
+  nothing (the documented audio-context confound); local terminal only.
 - **Phase 5b built (2026-06-10): menu-bar app + single-bundle restructure +
   install chain.** `native/onoats-menubar/` (3 swiftc sources, MenuBarExtra,
   LSUIElement); `Onoats.app` main executable is now the menu-bar app with the
