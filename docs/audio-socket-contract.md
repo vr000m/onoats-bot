@@ -292,6 +292,44 @@ MUST: create both sockets, accept one connection each, write the v1 handshake
 per connection as it is accepted (echoing the nonce), then stream
 length-prefixed v1 frames per branch.
 
+### Capturer event lines (`ONOATS-EVENT`, stderr)
+
+Since release-plan Phase 4 the supervisor spawns the capturer with
+**`stderr=PIPE`** and runs an **always-drain reader task** from spawn to pipe
+EOF. The reader:
+
+- **tees every line verbatim** to the supervisor's own stderr — the
+  pre-Phase-4 inherited-fd behaviour (and the menu bar's log redirect) is
+  preserved exactly;
+- **never blocks the capturer**: it drains continuously (including before the
+  sockets exist), and an overlong line (>64 KiB) is dropped rather than
+  stalling the pipe;
+- **parses machine-readable event lines** and reflects them into the status
+  file.
+
+Event-line format (emitted by `Support.swift emitEvent`; parsed by
+`cli._parse_capturer_event`; prefix parity-pinned by
+`tests/test_native_contract_parity.py`):
+
+```
+ONOATS-EVENT <type> k=v …
+```
+
+- The line **starts with** `ONOATS-EVENT ` (no `onoats-capturer:` prologue).
+- Field values are single space-delimited tokens, **except `hint=`**, which is
+  by contract the trailing field and consumes the rest of the line (free text).
+- One line per event; never multi-line. Unknown event types / extra fields are
+  ignored by the supervisor (forward-compatible).
+
+Defined events:
+
+| Event | Fields | Supervisor action |
+|---|---|---|
+| `zero-run-warning` | `branch=<mic\|system> hint=<text>` | sets the status-file `warning` (schema v2) to `"<branch>: <hint>"`; per-branch messages merge `; `-joined in branch order. Emitted once per zero-run (30 s of all-zero real input); re-armed by real audio. |
+| `zero-run-clear` | `branch=<mic\|system>` | removes that branch's message; clears `warning` to `null` when none remain. |
+| `device` | *(reserved — release-plan Phase 5)* | populates `mic_device` / `system_device`. |
+| `waiting-for-permission` | *(reserved — release-plan Phase 7)* | extends the socket-appearance wait while a TCC prompt is pending. |
+
 ### Default-device changes (capturer requirement, verified live)
 
 The capturer MUST survive a **default-input-device change** mid-session — e.g. the

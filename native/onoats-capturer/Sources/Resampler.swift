@@ -137,13 +137,22 @@ final class FrameChunker {
         // hundred samples is negligible here.
         if samples.contains(where: { $0 != 0 }) {
             zeroRunSamples = 0
-            zeroRunWarned = false
+            if zeroRunWarned {
+                zeroRunWarned = false  // re-armed by real audio
+                // Supervisor clears the status-file `warning` on this event.
+                emitEvent("zero-run-clear", "branch=\(label)")
+            }
         } else {
             zeroRunSamples += UInt64(n)
             if !zeroRunWarned && zeroRunSamples >= Self.zeroRunWarnSamples {
                 zeroRunWarned = true  // once per zero-run; re-arms on real audio
-                logLine(
-                    "WARNING \(label): capture callbacks are active but have "
+                // Machine-parseable WARNING (stable ONOATS-EVENT prefix): the
+                // supervisor's stderr reader parses branch + hint into the
+                // status-file `warning`; the tee keeps the line in the log.
+                // `hint=` is the trailing free-text field by contract.
+                emitEvent(
+                    "zero-run-warning",
+                    "branch=\(label) hint=capture callbacks are active but have "
                         + "delivered only zero samples for ~30 s — \(zeroHint)")
             }
         }

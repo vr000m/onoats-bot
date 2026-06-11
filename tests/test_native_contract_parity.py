@@ -30,6 +30,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel.swift"
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
+SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
 
 
 def _extract(pattern: str, path: Path) -> str:
@@ -123,6 +124,16 @@ def test_stt_service_list_matches_swift():
         f"keep it on one line or update this test's regex"
     )
     assert swift == tuple(VALID_STT_SERVICES)
+
+
+def test_event_line_prefix_matches_swift():
+    """The capturer's emitEvent prefix and the supervisor's parser prefix are
+    the same string-with-trailing-space, restated in two languages — a
+    one-sided edit silently turns every event into an ignored log line."""
+    from onoats.cli import _ONOATS_EVENT_PREFIX
+
+    swift = _extract(r'let line = "(ONOATS-EVENT )" \+ type', SUPPORT)
+    assert swift == _ONOATS_EVENT_PREFIX
 
 
 def test_capturer_exit_codes_are_all_accounted_for():
