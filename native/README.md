@@ -78,6 +78,38 @@ LaunchServices-launched GUI app inherits no shell PATH). Reinstalling the app
 bundle does **not** re-prompt TCC: grants key on the designated requirement
 (bundle id + cert), not the filesystem path or cdhash.
 
+## Phase 5b: menu-bar launcher (`onoats-menubar/`)
+
+`Onoats.app` is the single native bundle: the SwiftUI menu-bar app
+(`Contents/MacOS/Onoats`, `LSUIElement` — no Dock icon) with the capturer
+embedded at `Contents/MacOS/onoats-capturer`. One bundle id ⇒ one TCC identity;
+both binaries are signed with the same identity + identifier (capturer first,
+then the bundle), so the DR is unchanged from the capturer-only bundle and
+existing TCC grants carry over.
+
+Launch from `~/Applications` (GUI launch — that's the point: LaunchServices
+makes `Onoats.app` its own TCC responsible process, restoring ~200 ms tap
+creation; terminal launches attribute grants to the terminal):
+
+- **Start** runs `~/.local/bin/onoats bot` with `AUDIO_SOURCE=socket` and
+  `ONOATS_CAPTURER_BIN` pointing at the embedded capturer. Override the CLI
+  path with `defaults write net.varunsingh.onoats cliPath /abs/path`.
+- **Stop** SIGTERMs the supervisor it spawned (graceful drain) — never the
+  capturer. Sessions started from a terminal are shown as "external" and not
+  signalled from the GUI.
+- **Flush** runs `onoats flush`.
+- The menu shows the **system default input/output devices** — the devices the
+  capturer will actually bind (guard against silent wrong-device capture).
+  There is no device picker yet: the capturer has no device-selection argument
+  (it captures the system default), so a picker would silently not apply.
+- Running indicator reads the Phase-5a status file
+  (`<data_dir>/.active/onoats.status.json`, schema-guarded) with the pid file
+  as liveness backstop; failed starts surface `exit_reason` / `last_error` in
+  the menu. Data dir resolves from `~/.config/onoats/config.toml`
+  `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
+  env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
+- `onoats bot` output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
+
 ## Phase 4: production capturer (`onoats-capturer/`)
 
 Build + sign from `native/` (NOT from `spike/` — that Makefile builds the
