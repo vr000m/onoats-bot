@@ -74,7 +74,9 @@ class StatusRecord:
     # capturer's all-zero-input detector) — set/cleared by the supervisor while
     # the session runs, so the menu bar can surface it without tailing logs.
     # `mic_device`/`system_device` are "<name> (uid=<uid>)" strings populated
-    # from the capturer's device events (release-plan Phase 5; None until then).
+    # from the capturer's `ONOATS-EVENT device` lines (release-plan Phase 5);
+    # None on the PortAudio path, where `onoats status` falls back to the
+    # configured [devices] names instead.
     warning: str | None = None
     mic_device: str | None = None
     system_device: str | None = None
@@ -254,6 +256,39 @@ def set_warning(data_dir: Path, warning: str | None) -> Path | None:
     if current is None:
         return None
     return write_status(data_dir, replace(current, warning=warning))
+
+
+def set_devices(
+    data_dir: Path,
+    *,
+    mic_device: str | None = None,
+    system_device: str | None = None,
+) -> Path | None:
+    """Set the capture-device fields on the current RUNNING record.
+
+    Called by the socket supervisor when the capturer reports the device it
+    bound (``ONOATS-EVENT device``) — at session start (via the deferred-apply
+    task, since the events outrun the recorder's start write) and again on a
+    mid-session mic rebind. ``None`` arguments leave that field untouched, so
+    one branch's update never clears the other's.
+
+    Unlike :func:`set_warning` this is a no-op on a NON-running record too:
+    device events fire within the capturer's first second, when the record on
+    disk (if any) still belongs to the *previous* session — annotating that
+    stopped record would mislabel history. Same last-writer-wins concurrency
+    contract as :func:`stamp_supervisor_failure`.
+    """
+    current = read_status(data_dir)
+    if current is None or not current.running:
+        return None
+    updates: dict[str, str] = {}
+    if mic_device is not None:
+        updates["mic_device"] = mic_device
+    if system_device is not None:
+        updates["system_device"] = system_device
+    if not updates:
+        return None
+    return write_status(data_dir, replace(current, **updates))
 
 
 def write_stopped(

@@ -25,6 +25,7 @@ from onoats.status import (
     mark_rotation,
     read_status,
     resolve_liveness,
+    set_devices,
     set_warning,
     stamp_supervisor_failure,
     status_path,
@@ -108,6 +109,47 @@ def test_set_warning_sets_and_clears(tmp_path: Path):
     set_warning(tmp_path, None)
     got = read_status(tmp_path)
     assert got is not None and got.warning is None
+
+
+def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):
+    # No record yet → best-effort no-op (device events outrun the start write).
+    assert set_devices(tmp_path, mic_device="Some Mic (uid=u1)") is None
+    assert read_status(tmp_path) is None
+
+    write_running(tmp_path, pid=4242, audio_source="socket", stt_label="mlx-whisper")
+    set_devices(tmp_path, mic_device="Some Mic (uid=u1)")
+    got = read_status(tmp_path)
+    assert got is not None and got.mic_device == "Some Mic (uid=u1)"
+    assert got.system_device is None
+    assert got.running is True and got.audio_source == "socket"
+
+    # One branch's update never clears the other's (None = leave untouched).
+    set_devices(tmp_path, system_device="system-output tap (uid=agg-7)")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.mic_device == "Some Mic (uid=u1)"
+    assert got.system_device == "system-output tap (uid=agg-7)"
+
+    # A mic rebind updates in place.
+    set_devices(tmp_path, mic_device="AirPods Pro (uid=u2)")
+    got = read_status(tmp_path)
+    assert got is not None and got.mic_device == "AirPods Pro (uid=u2)"
+
+    # No-args call is a no-op, not a clear.
+    assert set_devices(tmp_path) is None
+    got = read_status(tmp_path)
+    assert got is not None and got.mic_device == "AirPods Pro (uid=u2)"
+
+
+def test_set_devices_noop_on_stopped_record(tmp_path: Path):
+    """Device events fire within the capturer's first second, when the on-disk
+    record may still be the PREVIOUS session's — a stopped record must never be
+    device-stamped (unlike set_warning, which only requires existence)."""
+    write_running(tmp_path, pid=4242, audio_source="socket", stt_label="x")
+    write_stopped(tmp_path, exit_reason="graceful")
+    assert set_devices(tmp_path, mic_device="Some Mic (uid=u1)") is None
+    got = read_status(tmp_path)
+    assert got is not None and got.mic_device is None
 
 
 def test_read_missing_returns_none(tmp_path: Path):
@@ -382,3 +424,29 @@ def test_cli_status_running_shows_source_and_stt(tmp_path: Path, capsys, monkeyp
     assert re.search(r"RUNNING \(pid 999\)", out)
     assert "audio source: socket" in out
     assert "mlx-whisper" in out
+
+
+def test_cli_status_names_capture_devices(tmp_path: Path, capsys, monkeypatch):
+    """Socket path: the device fields populated from the capturer's
+    `ONOATS-EVENT device` lines render as their own status lines (release-plan
+    Phase 5 acceptance: `onoats status` names the capture device(s))."""
+    from onoats import cli
+
+    # Pin the resolved audio source so the PortAudio-configured-devices block
+    # stays out of this socket-path assertion regardless of the host's config.
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    write_running(tmp_path, pid=999, audio_source="socket", stt_label="mlx-whisper")
+    set_devices(
+        tmp_path,
+        mic_device="MacBook Pro Microphone (uid=BuiltIn)",
+        system_device="system-output tap (uid=agg-9)",
+    )
+    monkeypatch.setattr(cli, "_read_pid", lambda _d=None: 999)
+    monkeypatch.setattr(cli, "_process_alive", lambda _p: True)
+
+    rc = cli._cmd_status(["--data-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "mic device: MacBook Pro Microphone (uid=BuiltIn)" in out
+    assert "system device: system-output tap (uid=agg-9)" in out
+    assert "configured mic (PortAudio)" not in out
