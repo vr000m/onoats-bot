@@ -1,6 +1,6 @@
 # Task: macOS Menu-bar Launcher + CoreAudio Socket Audio Transport (retire BlackHole)
 
-**Status**: Milestone A (Phases 1–3 + post-adversarial-review hardening) merged in PR #4 (2026-06-09); Milestone B (Phases 4–6) in progress on `feat/socket-audio-transport-milestone-b` — see the Milestone B plan
+**Status**: Shipped — Milestone A (Phases 1–3 + hardening) merged in PR #4 (2026-06-09); Milestone B (Phases 4–6) merged in PR #5 (2026-06-11) — details in the Milestone B plan
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
@@ -702,7 +702,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-11 @ 619c615f9866a3d5dfbac3de2f779f387a4688ef -->
+<!-- reviewed: 2026-06-11 @ 075b8551767b918754df266e22edfac7180527fc -->
 
 ## Progress
 
