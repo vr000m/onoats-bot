@@ -4,13 +4,15 @@
 # against the resolved graph: the baseline `pipecat-ai[...whisper]` extra pulls
 # only faster-whisper (CPU), never mlx-whisper.
 [build-system]
-requires = ["hatchling"]
+# >=1.27: PEP 639 SPDX-string `license` support (emits License-Expression).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "onoats"
 version = "0.0.0"
 description = "Standalone onoats voice recorder (extracted from koda)."
+license = "BSD-2-Clause"
 # >=3.12: the pinned pipecat-local-stt-server requires Python >=3.12.
 requires-python = ">=3.12"
 dependencies = [
