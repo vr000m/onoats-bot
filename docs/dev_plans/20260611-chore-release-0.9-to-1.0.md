@@ -20,8 +20,11 @@ and a substantial pre-PR history but has never cut a release: `pyproject.toml`
 says `version = "0.0.0"`, the only tag is `stt-extraction-base`, there is no
 `LICENSE` file (README's License section says "See the repository for license
 details" — circular), no `CHANGELOG.md`, and **onoats is not on PyPI** — the
-README Quickstart's `uv tool install onoats` returns 404. The only working
-install path is from-source (`git clone` + `make -C native install`).
+README Quickstart's `uv tool install onoats` returns 404 (verified live
+2026-06-11: `curl https://pypi.org/pypi/onoats/json` → HTTP 404 — re-verify
+in Phase 3 before rewriting the Quickstart, since index state is external).
+The only working install path is from-source (`git clone` +
+`make -C native install`).
 
 The Milestone B plan recorded post-ship follow-ups (see its `## Findings`):
 menu-bar surfacing of the all-zero WARNING, named device+STT profiles,
@@ -164,7 +167,16 @@ lesson).
 - [ ] Add `scripts/release_check.sh`: for a given `vX.Y.Z`, assert the
   target commit's pyproject `version == X.Y.Z` and a matching CHANGELOG
   entry exists — run before pushing any release tag (Phases 2 and 10)
-- [ ] Bump `pyproject.toml` version `0.0.0` → `0.9.0`
+- [ ] Bump **all three version surfaces** (Codex finding, 2026-06-11):
+  `pyproject.toml` `0.0.0` → `0.9.0`; regenerate `uv.lock` (`uv lock` — the
+  editable-package entry at `uv.lock:2109` records the version); and
+  `native/onoats-menubar/Info.plist` `CFBundleShortVersionString`
+  `0.1.0` → `0.9.0` (the Makefile copies this plist into the assembled
+  `Onoats.app`). `scripts/release_check.sh` asserts all three match the tag
+- [ ] Acknowledge the git-pinned runtime dependency in the CHANGELOG/release
+  notes: `pipecat-local-stt-server @ git+…@5062b98` (`pyproject.toml:18`)
+  is intentional for the from-source install story; revisit only if PyPI
+  publishing is ever taken up
 - [ ] After PR merge: run `scripts/release_check.sh v0.9.0 <merge-commit>`,
   then `git tag -a v0.9.0 <merge-commit> && git push origin v0.9.0`
 
@@ -193,8 +205,8 @@ lesson).
 `native/onoats-capturer/Sources/main.swift`, `src/onoats/cli.py`,
 `src/onoats/status.py`, `native/onoats-menubar/Sources/RecorderModel.swift`,
 `native/onoats-menubar/Sources/OnoatsMenuBarApp.swift`
-**Test files:** `tests/test_status_file.py`, `tests/test_native_contract_parity.py`
-**Test command:** `uv run pytest tests/test_status_file.py tests/test_native_contract_parity.py -q`
+**Test files:** `tests/test_status_file.py`, `tests/test_native_contract_parity.py`, `tests/test_socket_supervisor.py`
+**Test command:** `uv run pytest tests/test_status_file.py tests/test_native_contract_parity.py tests/test_socket_supervisor.py -q`
 
 - [ ] **Build the supervisor stderr reader (new plumbing — it does not exist
   today).** The capturer is spawned with no `stderr=` argument
@@ -206,7 +218,11 @@ lesson).
   tee every line to the supervisor's own stderr so the existing log-file
   destination is preserved, never block the capturer on a full pipe, and
   define the reader's lifecycle against the existing recorder/capturer race
-  in `_run_recorder_with_capturer`
+  in `_run_recorder_with_capturer`. Extend
+  `tests/test_socket_supervisor.py` (the existing lifecycle/no-hang suite
+  for `_supervise_socket_session`) with pipe-drain, tee, and
+  reader-shutdown cases — the reader must never extend or hang the
+  bounded waits that suite pins
 - [ ] Capturer: make the zero-run WARNING line machine-parseable (stable
   `ONOATS-EVENT` prefix + branch + hint), still once per run, re-armed by
   real audio
@@ -268,10 +284,15 @@ supervisor handshake path in `cli.py:311–482`
   ever ran — `RecorderModel.start()` currently spawns `onoats bot` with no
   config-existence check; add a graceful guard ("Run `make -C native setup`
   first" affordance) if the observed behavior is confusing
+- [ ] **Rewire `native/residue_check.sh` off the spike tree first** — it
+  currently builds and executes `spike/onoats-capturer`
+  (`residue_check.sh:32-34`); point it at the production capturer build
+  before any deletion, and re-run it to confirm the kill-×3 residue check
+  still passes (Codex finding, 2026-06-11)
 - [ ] Tag `spike-archive` on the last commit containing `native/spike/`, then
-  delete `native/spike/` (note: `native/residue_check.sh` widened its scan to
-  production UIDs in Milestone B — confirm nothing else references the spike
-  tree: `rg -l "native/spike"`). **Tag timing:** push `spike-archive` after
+  delete `native/spike/`. Reference sweep must catch **relative** spike
+  paths, not just `native/spike`: `rg -l "spike" native/ docs/ README.md`
+  and clear every hit. **Tag timing:** push `spike-archive` after
   the PR merges — the mandated regular (non-rebase) merge preserves the
   intra-branch pre-deletion SHA — and record the SHA in `## Findings`
 - [ ] Update README Quickstart + `native/README.md` to the one-command story
@@ -364,7 +385,9 @@ supervisor handshake path in `cli.py:311–482`
 
 - [ ] Confirm gates: Phases 1–9 merged; soak/echo + drift ride-alongs have
   not surfaced blockers
-- [ ] CHANGELOG `1.0.0` entry; version bump; after merge: annotated tag
+- [ ] CHANGELOG `1.0.0` entry; bump all three version surfaces (pyproject,
+  `uv.lock` regen, menu-bar Info.plist `CFBundleShortVersionString`);
+  `scripts/release_check.sh v1.0.0`; after merge: annotated tag
   `v1.0.0` on the merge commit
 
 ## Technical Specifications
@@ -373,7 +396,9 @@ supervisor handshake path in `cli.py:311–482`
 
 - `pyproject.toml`: `name = "onoats"`, `version = "0.0.0"` (line 12); **no
   `license` or `classifiers` fields**. Deps: `pipecat-ai>=1.0.0,<2.0.0` (+
-  extras), `websockets>=13.0`, `python-dotenv>=1.2.1`, `loguru>=0.7.0`;
+  extras), `pipecat-local-stt-server @ git+…@5062b98` (git-pinned, line 18 —
+  intentional for the from-source story), `websockets>=13.0`,
+  `python-dotenv>=1.2.1`, `loguru>=0.7.0`;
   `[macos]` extra = `mlx-whisper>=0.4.0`, `kokoro-onnx>=0.4.0` (lines 33–36);
   dev: `pytest>=8`, `ruff>=0.15,<0.16`. PyAudio arrives transitively via
   `pipecat-ai[local]` — no direct dependency.
@@ -491,7 +516,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
 | Capturer stderr → supervisor | **New in Phase 4**: `stderr=PIPE` + always-drain reader; `ONOATS-EVENT <type> k=v…` stable-prefix lines parsed, everything teed to supervisor stderr (log destination unchanged) | 4, 5, 7 |
 | Status file schema | **One** `STATUS_SCHEMA_VERSION` bump (1→2, Phase 4) defining `warning`, `mic_device`, `system_device` (flat string scalars); Swift reader + parity greps + `docs/audio-socket-contract.md` updated in the same commit; schema-bumping PR mandates app+CLI reinstalled together | 4, 5 |
 | `native/Makefile` | `setup: cert install` + conditional `onoats init`; `cert` stays refuse-to-regenerate; `install-cli` must bootstrap `onoats` from a bare clone | 6 |
-| CHANGELOG ↔ tags | tag exists ⇔ changelog entry exists ⇔ pyproject version matches, from 0.9.0 forward — enforced by `scripts/release_check.sh` before every tag push | 2, 10 |
+| CHANGELOG ↔ tags | tag exists ⇔ changelog entry exists ⇔ **all three version surfaces** match (pyproject, `uv.lock` editable entry, menu-bar Info.plist `CFBundleShortVersionString`), from 0.9.0 forward — enforced by `scripts/release_check.sh` before every tag push | 2, 10 |
 | README ↔ native/README | top-level README owns the user story; native/README owns build/sign internals; cross-links not copies. **Merge-order constraint: Phase 3 → Phase 6 → Phase 8** (all three edit the Quickstart/matrix) | 3, 6, 8 |
 | Phase dependencies | Phase 5 and Phase 7 both require Phase 4's stderr reader + schema bump merged first | 4 → 5, 7 |
 
@@ -558,7 +583,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ edd8e81477f0c6d52a2be6cb5a7eeb11656b0e22 -->
+<!-- reviewed: 2026-06-11 @ 6bd2e5c0892779210ed736ea3cb957cb8d77470f -->
 
 ## Issues & Solutions
 
