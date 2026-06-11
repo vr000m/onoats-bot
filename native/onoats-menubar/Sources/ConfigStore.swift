@@ -148,6 +148,12 @@ enum ConfigStore {
 
         try FileManager.default.createDirectory(
             at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // atomically:true is temp-file + rename, like the Python status file's
+        // mkstemp + os.replace — but WITHOUT the fsync before rename. That
+        // weaker guarantee (a crash right here can lose the new content, never
+        // yield half-a-file) is intentional: config.toml is user preferences,
+        // not crash-critical session state. Don't assume the status-file
+        // durability contract holds for every shared file.
         try lines.joined(separator: "\n")
             .write(to: configURL, atomically: true, encoding: .utf8)
     }

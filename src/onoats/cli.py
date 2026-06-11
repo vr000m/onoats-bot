@@ -328,6 +328,13 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
     from loguru import logger
 
+    # 0. One canonical data-dir resolution per session. Every status write in
+    # this supervisor — the early-failure records below AND the recorder's own
+    # stamps (passed down through _run_recorder_with_capturer → run_onoats_dual)
+    # — uses this single value, so an env-configured non-default dir can never
+    # land the early-exit status in a different place than the session records.
+    data_dir = _resolve_data_dir()
+
     capturer_bin = os.environ.get("ONOATS_CAPTURER_BIN", "").strip()
     if not capturer_bin:
         logger.error(
@@ -437,7 +444,6 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             import time as _time
 
             from onoats import status as status_file
-            from onoats._vendor.store import onoats_data_dir
 
             rc_cap = capturer_proc.returncode
             if rc_cap is not None:
@@ -449,7 +455,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 exit_reason = "capturer-start-timeout"
                 last_error = "capturer did not create its sockets in time"
             status_file.write_status(
-                onoats_data_dir(),
+                data_dir,
                 status_file.StatusRecord(
                     schema=status_file.STATUS_SCHEMA_VERSION,
                     pid=os.getpid(),
@@ -466,7 +472,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
         # 5. Run the recorder against the sockets, watching the capturer
         # concurrently so its death tears the session down.
-        rc = await _run_recorder_with_capturer(rest, capturer_proc, logger)
+        rc = await _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir)
     finally:
         if capturer_proc is not None:
             await _stop_capturer(capturer_proc, logger)
@@ -528,7 +534,7 @@ async def _wait_for_sockets(capturer_proc, socket_paths, logger) -> bool:
         await asyncio.sleep(_SOCKET_WAIT_POLL_SEC)
 
 
-async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
+async def _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
 
     The recorder (``run_onoats_dual``) installs its own signal handlers and runs
@@ -542,10 +548,7 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
     import asyncio
 
     from onoats import status as status_file
-    from onoats._vendor.store import onoats_data_dir
     from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
-
-    data_dir = onoats_data_dir()
 
     # Parse + validate the same args dual.main would, through the shared helper,
     # so `onoats bot --live-terminal --category X` behaves identically in socket

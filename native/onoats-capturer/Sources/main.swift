@@ -63,6 +63,20 @@ final class Teardown {
         for path in socketPaths { unlink(path) }
         exit(rc)
     }
+
+    /// Registers the capture chain and only then starts the writer threads.
+    /// The ordering contract ("a writer hitting a terminal error must find a
+    /// fully-populated Teardown") is self-enforcing here: a writer's onTerminal
+    /// cannot fire before its start(), and start() is sequenced after every
+    /// field assignment by this method's body — callers cannot get it wrong.
+    func registerAndStart(mic: MicCapture, system: SystemCapture, writers: [FrameWriter]) {
+        lock.lock()
+        self.mic = mic
+        self.system = system
+        self.writers = writers
+        lock.unlock()
+        for writer in writers { writer.start() }
+    }
 }
 
 func fail(_ rc: Int32, _ message: String) -> Never {
@@ -295,14 +309,12 @@ let micCapture = MicCapture { pcm, ns in
 let systemCapture = SystemCapture { pcm, ns in
     systemWriter.enqueue(pcm: pcm, capturedMonotonicNs: ns)
 }
-// Register EVERYTHING with Teardown before any writer thread starts: a writer
+// Register EVERYTHING with Teardown, then start the writer threads — a writer
 // hitting a terminal error must find a fully-populated Teardown, never a
 // half-registered one (stop() on a never-started capture is a safe no-op).
-Teardown.shared.writers = [micWriter, systemWriter]
-Teardown.shared.mic = micCapture
-Teardown.shared.system = systemCapture
-micWriter.start()
-systemWriter.start()
+// registerAndStart makes that ordering structural rather than comment-enforced.
+Teardown.shared.registerAndStart(
+    mic: micCapture, system: systemCapture, writers: [micWriter, systemWriter])
 
 // System (tap) first, mic engine second — the spike-proven order. Creating the
 // tap while an AVAudioEngine is already running was intermittently flaky
