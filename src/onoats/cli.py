@@ -405,8 +405,8 @@ async def _drain_capturer_stderr(stderr, data_dir, logger, device_state=None) ->
                     )
         except OSError as exc:
             logger.warning(
-                f"Socket supervisor: could not update status warning ({exc}); "
-                "continuing to drain capturer stderr."
+                f"Socket supervisor: could not update status fields for a "
+                f"{event_type} event ({exc}); continuing to drain capturer stderr."
             )
 
 
@@ -1177,11 +1177,15 @@ def _cmd_status(rest: list[str]) -> int:
     # PortAudio fallback path: there are no capturer device events, so show the
     # configured [devices] names the recorder binds by — the wrong-device guard
     # for that path (an A/B finding: a stale name silently records the wrong
-    # input). Printed even without a record, so it helps before first start.
+    # input). Printed even without a record, so it helps before first start —
+    # but suppressed while a LIVE socket session is displayed (this shell's
+    # config may resolve portaudio even though the running session, e.g.
+    # menu-bar-launched, is socket; showing both blocks would mislead).
     from onoats.config import load_config
 
     cfg = load_config()
-    if cfg.audio_source != "socket":
+    socket_session_live = live.alive and st is not None and st.audio_source == "socket"
+    if cfg.audio_source != "socket" and not socket_session_live:
         mic = cfg.mic_device or "<system default>"
         system = cfg.system_device or "<not configured>"
         print(f"  configured mic (PortAudio): {mic} ({cfg.mic_device_source})")

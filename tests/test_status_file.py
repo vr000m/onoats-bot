@@ -450,3 +450,25 @@ def test_cli_status_names_capture_devices(tmp_path: Path, capsys, monkeypatch):
     assert "mic device: MacBook Pro Microphone (uid=BuiltIn)" in out
     assert "system device: system-output tap (uid=agg-9)" in out
     assert "configured mic (PortAudio)" not in out
+
+
+def test_cli_status_live_socket_session_suppresses_portaudio_config(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """A LIVE socket session hides the configured-(PortAudio) lines even when
+    THIS shell's config resolves portaudio (e.g. a menu-bar-launched session
+    whose AUDIO_SOURCE env never reached this shell) — showing both device
+    blocks at once would mislead."""
+    from onoats import cli
+
+    monkeypatch.delenv("AUDIO_SOURCE", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))  # default: portaudio
+    write_running(tmp_path, pid=999, audio_source="socket", stt_label="mlx-whisper")
+    monkeypatch.setattr(cli, "_read_pid", lambda _d=None: 999)
+    monkeypatch.setattr(cli, "_process_alive", lambda _p: True)
+
+    rc = cli._cmd_status(["--data-dir", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "audio source: socket" in out
+    assert "configured mic (PortAudio)" not in out
