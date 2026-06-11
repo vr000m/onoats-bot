@@ -74,9 +74,13 @@ def test_build_backend_pins_hatchling_with_pep639_support():
     hatchling = [r for r in requires if r.name == "hatchling"]
     assert hatchling, "hatchling missing from [build-system] requires"
     # PEP 639 License-Expression emission needs hatchling >= 1.27: the
-    # specifier must exclude everything below that.
-    assert not hatchling[0].specifier.contains("1.26.5"), (
-        f"hatchling pin must exclude <1.27 (PEP 639 support), got {hatchling[0]}"
+    # specifier must admit 1.27 and exclude everything below it (the
+    # high patch sentinel catches a lower bound inside the 1.26 series,
+    # e.g. >=1.26.6, which a single low sample like 1.26.5 would miss).
+    spec = hatchling[0].specifier
+    assert spec.contains("1.27.0"), f"hatchling pin excludes 1.27 itself: {spec}"
+    assert not spec.contains("1.26.999"), (
+        f"hatchling pin must exclude <1.27 (PEP 639 support), got {spec}"
     )
 
 

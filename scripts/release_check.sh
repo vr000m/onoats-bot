@@ -15,13 +15,12 @@ set -euo pipefail
 tag="${1:?usage: release_check.sh vX.Y.Z [commit-ish]}"
 commit="${2:-HEAD}"
 
-case "$tag" in
-v[0-9]*.[0-9]*.[0-9]*) version="${tag#v}" ;;
-*)
+if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    version="${BASH_REMATCH[1]}"
+else
     echo "FAIL: tag '$tag' is not of the form vX.Y.Z" >&2
     exit 1
-    ;;
-esac
+fi
 
 fail=0
 check() { # <label> <expected-marker-found 0|1> <detail>
@@ -35,10 +34,16 @@ check() { # <label> <expected-marker-found 0|1> <detail>
 
 # Capture each file once; parsing a variable avoids SIGPIPE killing the
 # `git show` pipeline under pipefail when a parser exits early.
-pyproject=$(git show "${commit}:pyproject.toml")
-lockfile=$(git show "${commit}:uv.lock")
-plist=$(git show "${commit}:native/onoats-menubar/Info.plist")
-changelog=$(git show "${commit}:CHANGELOG.md")
+fetch() {
+    git show "${commit}:$1" || {
+        echo "FAIL: $1 not readable at ${commit} — cannot verify release" >&2
+        exit 1
+    }
+}
+pyproject=$(fetch pyproject.toml)
+lockfile=$(fetch uv.lock)
+plist=$(fetch native/onoats-menubar/Info.plist)
+changelog=$(fetch CHANGELOG.md)
 
 py_ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' <<<"$pyproject" | sed -n 1p)
 check "pyproject.toml version == $version" \
@@ -46,6 +51,7 @@ check "pyproject.toml version == $version" \
     "found '$py_ver'"
 
 lock_ver=$(awk '
+    /^\[\[package\]\]$/ { found = 0 }
     /^name = "onoats"$/ { found = 1; next }
     found && /^version = / { gsub(/version = |"/, ""); print; exit }
 ' <<<"$lockfile")
