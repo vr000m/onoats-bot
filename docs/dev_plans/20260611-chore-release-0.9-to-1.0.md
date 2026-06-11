@@ -114,37 +114,59 @@ lesson).
 ### Phase 1 — LICENSE + license metadata
 **Branch:** `chore/license-bsd2`
 **Impl files:** `LICENSE`, `pyproject.toml`, `README.md`
-**Test files:** —
-**Test command:** `uv run pytest tests/ -q`
+**Test files:** `tests/test_release_meta.py` (new)
+**Test command:** `uv run pytest tests/test_release_meta.py -q`
 
 - [ ] Add `LICENSE` (BSD-2-Clause, "Copyright (c) 2025–2026 Varun Singh")
 - [ ] Add `license = "BSD-2-Clause"` to `pyproject.toml [project]` (line ~12
   area; no `license`/`classifiers` fields exist today)
+- [ ] Pin `requires = ["hatchling>=1.27"]` in `[build-system]` — the build
+  backend is **hatchling** (`pyproject.toml:7-8`), not setuptools, and the
+  PEP 639 SPDX-string `license` form needs hatchling ≥ 1.27; today the
+  requirement is unpinned
+- [ ] Run `uv build` and assert the wheel METADATA emits
+  `License-Expression: BSD-2-Clause`
+- [ ] Add `tests/test_release_meta.py`: LICENSE body matches the canonical
+  BSD-2-Clause template (placeholders filled), pyproject `license` field
+  present
 - [ ] README `## License` (lines 164–166): replace placeholder with
   "BSD-2-Clause — see [LICENSE](LICENSE)."
-- [ ] Verify `uv sync` / build still succeeds with the new metadata key
 
 ### Phase 2 — CHANGELOG + version 0.9.0 + tag
 **Branch:** `chore/changelog-v0.9.0`
-**Impl files:** `CHANGELOG.md`, `pyproject.toml`
-**Test files:** —
-**Test command:** `uv run pytest tests/ -q`
+**Impl files:** `CHANGELOG.md`, `pyproject.toml`, `scripts/release_check.sh` (new)
+**Test files:** `tests/test_release_meta.py`
+**Test command:** `uv run pytest tests/test_release_meta.py -q`
 
 - [ ] Create `CHANGELOG.md` (Keep a Changelog). Reconstruct the pre-0.9 era
   as untagged entries from history; anchor commits/PRs:
-  - pre-PR era + PR #1 `7f33e72` (STT RSS probe/config env fix) and
-    PR #2 `645d90b` (flush process-identity fix) — the initial dual-input
-    PortAudio recorder + converter + queue contract era → `0.1.0`–`0.x`
-    entries as the history warrants (use `git log --oneline` + the two
-    existing dev plans to date features; entries may be coarse)
+  - pre-PR-#1 era is **long** (the tag `stt-extraction-base` sits on a
+    "Merge pull request #89 … feat/bot-harness-decoupling" commit, so an
+    earlier PR series predates the current #1–#7 numbering) — derive
+    entries from `git log --oneline` + actual diffs, not from tag or
+    branch names
+  - PR #1 `7f33e72` (STT RSS probe/config env fix), PR #2 `645d90b`
+    (flush process-identity fix) — the dual-input PortAudio recorder +
+    converter + queue contract era → `0.1.0`–`0.x` entries as the history
+    warrants (entries may be coarse)
   - PR #3 `8e6c165` polish items
-  - tag `stt-extraction-base` (`2b3a9ee`) — STT extraction baseline
+  - tag `stt-extraction-base` (`2b3a9ee`) — read the commit's diff to
+    describe it (bot-harness decoupling), don't trust the tag name
   - PR #4 `1f9dfdc` Milestone A: socket transport + supervisor hardening → `0.8.0`
   - PR #5 `16da012` Milestone B: native capturer + menu bar → `0.9.0`
     (PRs #6 `6aa0025` / #7 `8db8840` are docs-only ride-alongs)
+- [ ] Verify every anchor SHA and its attributed feature set against
+  `git log --oneline` / `git show --stat` before writing its entry
 - [ ] Note in the CHANGELOG header that all listed versions are BSD-2-Clause
+- [ ] Extend `tests/test_release_meta.py`: CHANGELOG carries the
+  Keep-a-Changelog structural headings and an entry matching the current
+  pyproject version
+- [ ] Add `scripts/release_check.sh`: for a given `vX.Y.Z`, assert the
+  target commit's pyproject `version == X.Y.Z` and a matching CHANGELOG
+  entry exists — run before pushing any release tag (Phases 2 and 10)
 - [ ] Bump `pyproject.toml` version `0.0.0` → `0.9.0`
-- [ ] After PR merge: `git tag -a v0.9.0 <merge-commit> && git push origin v0.9.0`
+- [ ] After PR merge: run `scripts/release_check.sh v0.9.0 <merge-commit>`,
+  then `git tag -a v0.9.0 <merge-commit> && git push origin v0.9.0`
 
 ### Phase 3 — README overhaul + BlackHole fallback doc
 **Branch:** `docs/readme-menubar-first`
@@ -174,16 +196,32 @@ lesson).
 **Test files:** `tests/test_status_file.py`, `tests/test_native_contract_parity.py`
 **Test command:** `uv run pytest tests/test_status_file.py tests/test_native_contract_parity.py -q`
 
-- [ ] Decide the signal channel (Technical Specifications below): proposed —
-  capturer emits a structured warning line on stderr; the Python supervisor
-  (which already consumes capturer stderr) parses it and writes a
-  `warning` field into the status file; the menu bar (which already polls the
-  status file) displays it. Keeps Swift→Swift IPC out of scope and reuses
-  both existing channels.
+- [ ] **Build the supervisor stderr reader (new plumbing — it does not exist
+  today).** The capturer is spawned with no `stderr=` argument
+  (`cli.py:398`), so its stderr is *inherited* and flows straight to the
+  supervisor's own stderr (→ the menu bar's log redirect at
+  `RecorderModel.swift:268`) — nothing in `src/onoats/` reads or parses it.
+  Add `stderr=asyncio.subprocess.PIPE` + a concurrent always-drain reader
+  task in `_supervise_socket_session`: parse `ONOATS-EVENT`-prefixed lines,
+  tee every line to the supervisor's own stderr so the existing log-file
+  destination is preserved, never block the capturer on a full pipe, and
+  define the reader's lifecycle against the existing recorder/capturer race
+  in `_run_recorder_with_capturer`
 - [ ] Capturer: make the zero-run WARNING line machine-parseable (stable
-  prefix + branch + hint), still once per run, re-armed by real audio
-- [ ] `status.py`: add optional `warning` field (schema bump per the
-  contract-parity test expectations); supervisor writes/clears it
+  `ONOATS-EVENT` prefix + branch + hint), still once per run, re-armed by
+  real audio
+- [ ] `status.py`: **single schema bump 1→2 defining BOTH new optional
+  fields** — `warning` (this phase) and the Phase-5 device fields — so
+  Phase 5 adds no second bump (see sequencing constraint below); supervisor
+  writes/clears `warning`
+- [ ] Update the status-schema section of `docs/audio-socket-contract.md` in
+  the same commit as the bump (the doc's own bump-together rule)
+- [ ] Swift status reader + parity greps (`tests/test_native_contract_parity.py`)
+  updated in lockstep; PR notes that a schema bump requires reinstalling
+  the app and CLI together (`make -C native install`) — both readers
+  hard-reject a mismatched schema (`status.py:142`,
+  `RecorderModel.swift:133`), so a mixed-version window shows schemaDrift
+  rather than data
 - [ ] Menu bar: render the warning (icon change + menu line with the hint)
 - [ ] Live smoke (user, GUI topology): deny system audio → WARNING appears in
   the menu ≈30 s in; re-allow → warning clears on next real audio
@@ -196,8 +234,14 @@ supervisor handshake path in `cli.py:311–482`
 **Test command:** `uv run pytest tests/test_status_file.py tests/ -q -k "status or devices"`
 
 - [ ] Surface the capture device name/UID in `onoats status`: the capturer
-  already logs it at bind (`MicCapture.swift:199`); plumb it into the status
-  file (supervisor-parsed, same channel as Phase 4) or document why not
+  already logs it at bind (`MicCapture.swift:199`); emit it as an
+  `ONOATS-EVENT device …` line consumed by the Phase-4 stderr reader.
+  **Field shape decision:** two flat string scalars — `mic_device` and
+  `system_device` (`"<name> (uid=<uid>)"`) — keeping `StatusRecord` a flat
+  dataclass of scalars (`status.py:45-66`) so both decoders and the
+  grep-style parity tests stay unchanged in kind. The fields are defined in
+  Phase 4's single schema bump; this phase populates them. **Depends on
+  Phase 4 (stderr reader + schema bump) having merged.**
 - [ ] `onoats devices` (`cli.py:823–850`): when configured source is
   `socket`, print a note that the list is PortAudio-only and the socket path
   captures the system default input / default output tap
@@ -214,6 +258,12 @@ supervisor handshake path in `cli.py:311–482`
 
 - [ ] Add `setup` target: `cert` → `install` → `onoats init` (init only when
   `~/.config/onoats/config.toml` is absent; never regenerate the cert)
+- [ ] **Live-verify `make -C native setup` from a fresh clone with no prior
+  Python install** yields a working `onoats init` — the macOS Quickstart
+  has no separate editable-install step, so `install-cli` (inside
+  `install: sign install-cli`) must fully bootstrap the `onoats`
+  entry point on its own; if it doesn't, add the bootstrap to the target
+  or the Quickstart
 - [ ] Verify (live) what `Onoats.app` does when launched before `onoats init`
   ever ran — `RecorderModel.start()` currently spawns `onoats bot` with no
   config-existence check; add a graceful guard ("Run `make -C native setup`
@@ -221,7 +271,9 @@ supervisor handshake path in `cli.py:311–482`
 - [ ] Tag `spike-archive` on the last commit containing `native/spike/`, then
   delete `native/spike/` (note: `native/residue_check.sh` widened its scan to
   production UIDs in Milestone B — confirm nothing else references the spike
-  tree: `rg -l "native/spike"`)
+  tree: `rg -l "native/spike"`). **Tag timing:** push `spike-archive` after
+  the PR merges — the mandated regular (non-rebase) merge preserves the
+  intra-branch pre-deletion SHA — and record the SHA in `## Findings`
 - [ ] Update README Quickstart + `native/README.md` to the one-command story
 
 ### Phase 7 — Pre-socket tap preflight (1.0.0 gate; native; NOT /conduct-runnable)
@@ -235,15 +287,37 @@ supervisor handshake path in `cli.py:311–482`
 - [ ] Design (Technical Specifications below): create the process tap (the
   TCC-prompting call) **before** binding/announcing the sockets, so the
   prompt-pending block happens while the recorder's `read_idle_timeout`
-  (10 s, `socket_audio.py:232`) clock has not started — the supervisor's
-  socket-appearance wait (which has its own timeout mapped to
-  `capturer-start-timeout`) may need a longer/prompt-aware budget
-- [ ] Keep the existing fail-loud semantics for genuine API-level tap failure
-  (rc=11) and mic denial (rc=10) — order of authorization checks preserved
+  (10 s, `socket_audio.py:232`) clock has not started. **This inverts the
+  capturer's documented keystone startup order** (sockets-before-captures,
+  `main.swift:8-14`, made structural by `registerAndStart` at
+  `main.swift:336`) — the reorder is a coupled change across the Swift
+  keystone, the supervisor's socket-appearance wait, and the
+  rc=11/`socketFailed` error ordering, and each must be restated in the PR
+- [ ] Supervisor wait budget: a prompt-blocked capturer with no sockets is
+  currently indistinguishable from `capturer-start-timeout` in
+  `_wait_for_sockets` (`cli.py:153-174`). Emit a
+  `ONOATS-EVENT waiting-for-permission` stderr line from the capturer
+  before the tap call; the supervisor (Phase 4's reader — **this phase
+  depends on Phase 4**) extends the wait and surfaces
+  "waiting for the system-audio permission prompt…" in the status file
+- [ ] Keep the existing fail-loud semantics; pin the rc=11 meaning while
+  here: the code reason string is `system-audio-denied` (`cli.py:187`) but
+  a denied grant never produces rc=11 (denied taps succeed and deliver
+  zeros — verified 2026-06-11); rc=11 fires only on genuine
+  `AudioHardwareCreateProcessTap` API failure (e.g. retry exhaustion), and
+  denial's sole observable is the zero-run WARNING. Rename the reason
+  string or document the mismatch at both sites
+- [ ] Add supervisor unit tests (extend the parametrized fake-capturer
+  test): rc=10 → `mic-denied` and rc=11 mapping survive the reorder;
+  `capturer-start-timeout` still fires when no socket and no
+  waiting-for-permission event appear; the prompt-pending event extends
+  the wait. (rc=11 cannot be live-smoked — the unit test is its only
+  verification)
 - [ ] Live smokes (user, GUI topology): `tccutil reset AudioCapture
   net.varunsingh.onoats` → Start → leave the prompt unanswered >10 s →
   answer Allow → session proceeds (no 10 s death); also Don't Allow →
-  session starts, zero-run WARNING (Phase 4) fires ≈30 s in
+  session starts, zero-run WARNING (Phase 4) fires ≈30 s in; mic-denial
+  rc=10 fail-loud re-smoked once after the reorder
 
 ### Phase 8 — BlackHole config pruning (1.0.0 gate)
 **Branch:** `chore/prune-blackhole-configs`
@@ -258,6 +332,11 @@ supervisor handshake path in `cli.py:311–482`
   stays functional
 - [ ] Prune BlackHole-specific hints/branches/tests beyond that keep-list;
   point remaining mentions at `docs/blackhole-fallback.md`
+- [ ] Coverage bound (stated, not solved): there is no 13.x–14.3 hardware in
+  CI or on the author's machine — the config-wiring tests
+  (`test_init.py`/`test_config.py`/`test_stt_config_wiring.py`) are the
+  **accepted verification bound** for the PortAudio fallback; functional
+  proof on that matrix is explicitly out of scope
 
 ### Phase 9 — ConfigStore TOML-subset parity tests (1.0.0 gate)
 **Branch:** `test/configstore-parity`
@@ -269,8 +348,11 @@ supervisor handshake path in `cli.py:311–482`
 - [ ] Extend beyond the existing 4-case escaping round-trip (line 156):
   comments on/after lines, whitespace variants, absent section, absent key,
   duplicate keys, non-string values adjacent to edited keys, untouched-line
-  byte-identity, CRLF rejection/handling — each case round-trips Swift
-  writer output through `tomllib` and asserts untouched bytes
+  byte-identity, CRLF — each case round-trips Swift writer output through
+  `tomllib` and asserts untouched bytes. **CRLF contract (pinned):**
+  untouched lines keep their original bytes (CRLF preserved verbatim); the
+  edited line is written with LF; the result must still parse under
+  `tomllib`
 - [ ] Fix any ConfigStore divergence the new cases expose (Swift), keeping
   the documented TOML-subset contract doc in sync
 
@@ -349,28 +431,49 @@ supervisor handshake path in `cli.py:311–482`
 ### Key design decisions
 
 **Warning/device channel (Phases 4+5): capturer stderr → supervisor parse →
-status file → menu bar.** The supervisor already consumes capturer stderr and
-owns the status file; the menu bar already polls the status file. Adding a
-structured, stable-prefixed line protocol (e.g. `ONOATS-EVENT
-zero-run-warning branch=system` / `ONOATS-EVENT device name=… uid=…`) reuses
-both existing channels and needs no new IPC. Alternative (rejected): menu bar
-tails the capturer log file — couples the GUI to log format/location and
-duplicates the supervisor's parsing. Status schema gains optional fields
-(`warning`, `devices`) — bump `STATUS_SCHEMA_VERSION` and update the Swift
-reader + the contract-parity grep tests together (they pin schema version
-across the language boundary).
+status file → menu bar.** The supervisor owns the status file and the menu
+bar already polls it — but the stderr leg is **new plumbing, not reuse**:
+today the capturer is spawned with no `stderr=` argument (`cli.py:398`), so
+its stderr is inherited (flowing untouched into the supervisor's stderr and
+on to the menu bar's log redirect, `RecorderModel.swift:268`) and nothing in
+`src/onoats/` reads it. Phase 4 introduces `stderr=PIPE` + an always-drain
+reader task that parses `ONOATS-EVENT`-prefixed lines (e.g. `ONOATS-EVENT
+zero-run-warning branch=system`, `ONOATS-EVENT device …`,
+`ONOATS-EVENT waiting-for-permission`) and tees everything to the
+supervisor's stderr so the log destination is unchanged. Alternative
+(rejected): menu bar tails the capturer log file — couples the GUI to log
+format/location and duplicates parsing. Status schema: **one bump, 1→2, in
+Phase 4, defining all new optional fields** (`warning`, `mic_device`,
+`system_device` — flat string scalars to keep `StatusRecord` and the
+grep-style parity tests structurally unchanged); Phase 5 populates the
+device fields without a second bump. Both readers hard-reject a mismatched
+schema (`status.py:142` returns None; `RecorderModel.swift:133` sets
+schemaDrift), and the CLI and app are installed out-of-band of each other —
+so the bump is a hard cross-version read break: the schema-bumping PR must
+state that app + CLI are reinstalled together (`make -C native install`),
+with schemaDrift as the visible mixed-version symptom. The status-schema
+section of `docs/audio-socket-contract.md` updates in the same commit.
 
 **Tap preflight (Phase 7): reorder capturer startup so the TCC-prompting tap
-creation happens before the sockets are announced.** The recorder's 10 s
-`read_idle_timeout` only starts once the recorder connects; the supervisor's
-socket-appearance wait is the clock that must tolerate a pending prompt —
-either a generous fixed budget (prompt-answer time is human-scale) or a
-capturer "waiting-for-permission" stderr event the supervisor uses to extend
-the wait and surface state ("waiting for the system-audio permission
-prompt…") in the status file. Constraint from Milestone B findings: capture
-start order must remain tap+aggregate **before** mic engine (tap creation
-while the engine runs correlated with flaky creation), and the bounded
-tap-create retry (×3 @ 500 ms) must be preserved.
+creation happens before the sockets are announced.** This **inverts the
+documented keystone order** — `main.swift:8-14` pins
+"create BOTH listening sockets … only then start the captures", enforced
+structurally by `registerAndStart` (`main.swift:336`) — so the change is a
+coupled redesign across three things, not a local Swift edit: (1) the Swift
+keystone and its teardown registration order; (2) the supervisor's
+socket-appearance wait (`_wait_for_sockets`, `cli.py:153-174`), which today
+reads a pre-socket block as `capturer-start-timeout` and must learn the
+`ONOATS-EVENT waiting-for-permission` signal (via Phase 4's stderr reader —
+hard dependency) to extend its budget and surface prompt-pending state;
+(3) the rc=11/`socketFailed` error ordering, which must be restated and
+unit-tested post-reorder. The recorder's 10 s `read_idle_timeout` only
+starts once the recorder connects, so a prompt answered at human speed costs
+nothing once sockets appear after the tap. Constraints from Milestone B
+findings: capture start order must remain tap+aggregate **before** mic
+engine (tap creation while the engine runs correlated with flaky creation),
+and the bounded tap-create retry (×3 @ 500 ms) must be preserved. rc=11
+semantics pinned in-phase: fires on genuine tap API failure only — TCC
+denial never produces it (denied taps deliver zeros).
 
 **Versioning**: pre-0.9 entries are changelog-only (untagged) — nothing was
 ever distributed, so backdated tags add maintenance surface without value.
@@ -385,11 +488,12 @@ retrieval is `git checkout spike-archive -- native/spike`.
 
 | Seam | Contract | Phases |
 |---|---|---|
-| Capturer stderr → supervisor | `ONOATS-EVENT <type> k=v…` stable-prefix lines; everything else remains free-form log | 4, 5, 7 |
-| Status file schema | `STATUS_SCHEMA_VERSION` bump; optional `warning`, `devices` fields; Swift reader + parity greps updated in lockstep | 4, 5 |
-| `native/Makefile` | `setup: cert install` + conditional `onoats init`; `cert` stays refuse-to-regenerate | 6 |
-| CHANGELOG ↔ tags | tag exists ⇔ changelog entry exists ⇔ pyproject version matches, from 0.9.0 forward | 2, 10 |
-| README ↔ native/README | top-level README owns the user story; native/README owns build/sign internals; cross-links not copies | 3, 6 |
+| Capturer stderr → supervisor | **New in Phase 4**: `stderr=PIPE` + always-drain reader; `ONOATS-EVENT <type> k=v…` stable-prefix lines parsed, everything teed to supervisor stderr (log destination unchanged) | 4, 5, 7 |
+| Status file schema | **One** `STATUS_SCHEMA_VERSION` bump (1→2, Phase 4) defining `warning`, `mic_device`, `system_device` (flat string scalars); Swift reader + parity greps + `docs/audio-socket-contract.md` updated in the same commit; schema-bumping PR mandates app+CLI reinstalled together | 4, 5 |
+| `native/Makefile` | `setup: cert install` + conditional `onoats init`; `cert` stays refuse-to-regenerate; `install-cli` must bootstrap `onoats` from a bare clone | 6 |
+| CHANGELOG ↔ tags | tag exists ⇔ changelog entry exists ⇔ pyproject version matches, from 0.9.0 forward — enforced by `scripts/release_check.sh` before every tag push | 2, 10 |
+| README ↔ native/README | top-level README owns the user story; native/README owns build/sign internals; cross-links not copies. **Merge-order constraint: Phase 3 → Phase 6 → Phase 8** (all three edit the Quickstart/matrix) | 3, 6, 8 |
+| Phase dependencies | Phase 5 and Phase 7 both require Phase 4's stderr reader + schema bump merged first | 4 → 5, 7 |
 
 ## Review Focus
 
@@ -398,14 +502,21 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - Phases 4/5: status-file schema change crosses the Python↔Swift boundary;
   the contract-parity tests (`tests/test_native_contract_parity.py`) are the
   tripwire — confirm they pin the new fields and schema version on both sides.
-- Phase 7: regression risk to the four verified fail-loud paths (rc=10
-  mic-denied, rc=11 tap API failure, capturer-start-timeout, kill-mid-session
-  4-part observable) — each needs a re-check after the startup reorder.
+- Phase 4: the supervisor stderr reader is new plumbing — review its
+  lifecycle against the recorder/capturer race and confirm a full pipe can
+  never block the capturer.
+- Phase 7: regression risk to the verified fail-loud paths (rc=10
+  mic-denied, rc=11 genuine tap-API failure — note: TCC denial does NOT
+  produce rc=11, denied taps deliver zeros; capturer-start-timeout;
+  kill-mid-session 4-part observable) — each needs a unit-test re-check
+  after the startup reorder, plus a live rc=10 re-smoke.
 - Phase 8: pruning must not break the documented PortAudio fallback for
-  macOS 13.x–14.3 / off-mac (Cross-platform matrix promise).
+  macOS 13.x–14.3 / off-mac (Cross-platform matrix promise; config-wiring
+  tests are the accepted verification bound).
 - Licensing: BSD-2-Clause text verbatim; `pyproject` uses the SPDX string
-  form (`license = "BSD-2-Clause"`, PEP 639) — check setuptools version
-  compatibility for that form.
+  form (`license = "BSD-2-Clause"`, PEP 639) — the build backend is
+  **hatchling** (not setuptools); pin `hatchling>=1.27` and verify the
+  built wheel emits `License-Expression: BSD-2-Clause`.
 
 ## Testing Notes
 
@@ -418,15 +529,13 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - Tagging steps (Phases 2, 6, 10) are operator actions after merge — record
   the tag SHAs in `## Findings`.
 
-## Issues & Solutions
-
-*(populated during implementation)*
-
 ## Acceptance Criteria
 
 - [ ] `LICENSE` (BSD-2-Clause) at root; `pyproject.toml` has `license`
-  field; README License section is real; CHANGELOG notes license covers all
-  listed versions
+  field and `hatchling>=1.27` pin; `uv build` wheel METADATA emits
+  `License-Expression: BSD-2-Clause`; README License section is real;
+  CHANGELOG notes license covers all listed versions;
+  `tests/test_release_meta.py` green
 - [ ] `CHANGELOG.md` covers the full history (reconstructed 0.x → 0.9.0 →
   …) and `v0.9.0` tag exists on a commit with `version = "0.9.0"`
 - [ ] README Quickstart works as written on a clean machine (clone-based; no
@@ -440,14 +549,20 @@ retrieval is `git checkout spike-archive -- native/spike`.
   menu-bar launch is handled gracefully (live-verified)
 - [ ] `native/spike/` gone from HEAD; `spike-archive` tag retrieves it
 - [ ] First Start with the system-audio prompt left unanswered >10 s
-  survives to a working session once Allowed (live-smoked); rc=10/rc=11
-  fail-loud paths still verified
+  survives to a working session once Allowed (live-smoked); rc=10 re-smoked
+  live; rc=11 + start-timeout mappings pinned by supervisor unit tests
 - [ ] BlackHole surface pruned per the agreed keep-list; PortAudio fallback
   still documented and its tests green
 - [ ] ConfigStore parity suite covers the agreed case matrix; all green
 - [ ] `v1.0.0` tag on a merge commit with `version = "1.0.0"` and a 1.0.0
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
+
+<!-- reviewed: 2026-06-11 @ edd8e81477f0c6d52a2be6cb5a7eeb11656b0e22 -->
+
+## Issues & Solutions
+
+*(populated during implementation)*
 
 ## Final Results
 
