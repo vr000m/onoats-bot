@@ -74,7 +74,54 @@ def test_build_backend_pins_hatchling_with_pep639_support():
     hatchling = [r for r in requires if r.name == "hatchling"]
     assert hatchling, "hatchling missing from [build-system] requires"
     # PEP 639 License-Expression emission needs hatchling >= 1.27: the
-    # specifier must exclude everything below that.
-    assert not hatchling[0].specifier.contains("1.26.5"), (
-        f"hatchling pin must exclude <1.27 (PEP 639 support), got {hatchling[0]}"
+    # specifier must admit 1.27 and exclude everything below it (the
+    # high patch sentinel catches a lower bound inside the 1.26 series,
+    # e.g. >=1.26.6, which a single low sample like 1.26.5 would miss).
+    spec = hatchling[0].specifier
+    assert spec.contains("1.27.0"), f"hatchling pin excludes 1.27 itself: {spec}"
+    assert not spec.contains("1.26.999"), (
+        f"hatchling pin must exclude <1.27 (PEP 639 support), got {spec}"
+    )
+
+
+def test_changelog_has_keep_a_changelog_structure():
+    text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert text.startswith("# Changelog")
+    assert "keepachangelog.com" in text
+    assert "BSD-2-Clause" in text, "license-coverage note missing from header"
+    headings = re.findall(r"^## \[(\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2}$", text, re.M)
+    assert headings, "no '## [X.Y.Z] - YYYY-MM-DD' version headings"
+    # Newest-first ordering, as Keep a Changelog prescribes.
+    parsed = [tuple(int(p) for p in v.split(".")) for v in headings]
+    assert parsed == sorted(parsed, reverse=True), (
+        f"versions not newest-first: {headings}"
+    )
+
+
+def test_changelog_has_entry_for_current_version():
+    version = _load_pyproject()["project"]["version"]
+    text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert re.search(
+        rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", text, re.M
+    ), f"CHANGELOG has no entry for pyproject version {version}"
+
+
+def test_version_surfaces_agree():
+    """pyproject, uv.lock (editable onoats entry), and the menu-bar
+    Info.plist must all carry the same version — release_check.sh enforces
+    this at tag time; this test catches drift between releases."""
+    version = _load_pyproject()["project"]["version"]
+
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    m = re.search(r'^name = "onoats"\nversion = "([^"]+)"$', lock, re.M)
+    assert m, "onoats package entry missing from uv.lock"
+    assert m.group(1) == version, f"uv.lock has {m.group(1)}, pyproject has {version}"
+
+    plist = (REPO_ROOT / "native/onoats-menubar/Info.plist").read_text(encoding="utf-8")
+    m = re.search(
+        r"<key>CFBundleShortVersionString</key>\s*<string>([^<]+)</string>", plist
+    )
+    assert m, "CFBundleShortVersionString missing from Info.plist"
+    assert m.group(1) == version, (
+        f"Info.plist has {m.group(1)}, pyproject has {version}"
     )
