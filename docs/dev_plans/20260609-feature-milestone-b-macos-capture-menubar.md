@@ -1,6 +1,6 @@
 # Milestone B — Native macOS System-Audio Capture + Menu-Bar Launcher
 
-**Status**: Not Started
+**Status**: In Progress — Phases 4/5a/6 done; Phase 5b built + core smoke passed; TCC-denial smoke pending
 **Component**: macos, transport, recorder, packaging
 **Assignee**: Varun Singh
 **Priority**: Medium
@@ -431,12 +431,12 @@ _(to be filled during implementation)_
 
 ## Acceptance Criteria
 
-- [ ] **Pre-req spike 3 (TCC) passed:** `sw_vers ≥ 14.4`; self-signed cert obtains
+- [x] **Pre-req spike 3 (TCC) passed:** `sw_vers ≥ 14.4`; self-signed cert obtains
       **both** mic + system-audio grants and they survive 3 rebuilds without
       re-prompt, **exercised on the real `.app`+embedded-helper+supervisor-exec path**
       (`codesign -dr -` designated requirement byte-stable; cdhash expected to
       change). *(If failed, Open Question 2 reopened — paid Developer ID path.)*
-- [ ] **Pre-req spike 4 (Core Audio tap) passed:** tap + private aggregate device
+- [x] **Pre-req spike 4 (Core Audio tap) passed:** tap + private aggregate device
       yields a real system-audio stream, and start/kill/start ×3 leaves no stale
       aggregate/tap and no exclusive-tap contention.
 - [x] Native capturer produces me+them socket streams with **no BlackHole
@@ -519,7 +519,7 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: 2026-06-09 @ c5f90d8b6319890db3598f4b34d215ee8c6a7c2d -->
+<!-- reviewed: 2026-06-09 @ f40c29000ae86ba1ea144c394dacc079fa2bcd43 -->
 ## Progress
 
 - [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,

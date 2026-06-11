@@ -1,6 +1,6 @@
 # Task: macOS Menu-bar Launcher + CoreAudio Socket Audio Transport (retire BlackHole)
 
-**Status**: Milestone A (Phases 1–3 + post-adversarial-review hardening) on **open** PR #4, pending merge; Milestone B (Phases 4–6) not started
+**Status**: Milestone A (Phases 1–3 + post-adversarial-review hardening) merged in PR #4 (2026-06-09); Milestone B (Phases 4–6) in progress on `feat/socket-audio-transport-milestone-b` — see the Milestone B plan
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
@@ -702,7 +702,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-09 @ abea83a08f6309149d0dc336a96148458cd1227d -->
+<!-- reviewed: 2026-06-09 @ 6674e87be0cdae56a269ed1ae818a5653c2f92ef -->
 
 ## Progress
 
@@ -720,9 +720,12 @@ in headless CI and Phase 4 is gated on Open Question 2 (binary distribution).
 - [x] **Phase 3** — CLI supervisor + `docs/audio-socket-contract.md` — `4ccbb0c`
   (11 tests). Per-generation 0700 private socket dir, generation nonce, capturer
   spawn (`ONOATS_CAPTURER_BIN`), bounded socket-wait, fail-loud teardown.
-- [ ] **Phase 4** — Swift CoreAudio / ScreenCaptureKit capturer *(macOS native)*
-- [ ] **Phase 5** — macOS menu-bar launcher *(macOS native)*
-- [ ] **Phase 6** — Retire BlackHole from the default macOS story + docs/packaging
+- **Phase 4** — Swift CoreAudio capturer → *delegated; status lives in the
+  Milestone B plan (built + smoke-passed 2026-06-10)*
+- **Phase 5** — macOS menu-bar launcher → *delegated; status lives in the
+  Milestone B plan (5a shipped; 5b built + core smoke passed 2026-06-10)*
+- **Phase 6** — Retire BlackHole from the default macOS story → *delegated;
+  status lives in the Milestone B plan (done 2026-06-10 — demoted to fallback)*
 
 > **Phases 4–6 superseded → split into Milestone B**
 > (`docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md`, branch
