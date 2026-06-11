@@ -204,11 +204,45 @@ def test_status_running(capsys, _isolate_env, monkeypatch):
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text("4242\nonoats-bot\ncmd\n0.0\n", encoding="utf-8")
     monkeypatch.setattr(cli, "_process_alive", lambda pid: True)
+    # Live readback matches the stored fingerprint → genuine recorder.
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: "cmd")
     rc = cli.main(["status"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "RUNNING" in out
     assert "4242" in out
+
+
+def test_status_recycled_pid_reports_stopped(capsys, _isolate_env, monkeypatch):
+    """A stale pid file whose pid the kernel reassigned to an unrelated
+    program must NOT report RUNNING: kill(0) says alive, but the cmdline
+    fingerprint mismatch proves pid recycling."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("4242\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "onoats._vendor.pid._live_ps_cmdline", lambda pid: "/usr/bin/some-imposter"
+    )
+    rc = cli.main(["status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RUNNING" not in out
+    assert "not running" in out.lower()
+
+
+def test_status_indeterminate_ps_probe_stays_running(capsys, _isolate_env, monkeypatch):
+    """A failed ``ps`` readback is indeterminate, not proof of recycling —
+    the read-only verdict must not flap a live recorder to stopped."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("4242\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_process_alive", lambda pid: True)
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
+    rc = cli.main(["status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RUNNING" in out
 
 
 # ---------------------------------------------------------------------------

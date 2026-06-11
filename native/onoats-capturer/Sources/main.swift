@@ -8,7 +8,8 @@
 //   1. mic TCC grant (fail loud before any socket exists)
 //   2. create BOTH listening sockets (what _wait_for_sockets watches for)
 //   3. accept BOTH connections within one deadline (startup barrier)
-//   4. write BOTH handshakes (echoing the nonce)
+//   4. write each handshake AS ITS CONNECTION ARRIVES (echoing the nonce) —
+//      the recorder's handshake read is bounded tighter than the barrier
 //   5. only then start the captures: mic → mic socket, system tap → system
 //      socket — exactly one source per socket, never mixed (keystone)
 //
@@ -277,19 +278,22 @@ do {
     fail(ExitCode.socketFailed, "creating sockets: \(error)")
 }
 
-// MARK: - 3+4. startup barrier: accept both, then handshake both
+// MARK: - 3+4. startup barrier: accept both, handshake each as it arrives
 
 let micFd: Int32
 let systemFd: Int32
 do {
+    // Handshake per-accept (not after the barrier): the recorder's handshake
+    // read is bounded at 10 s while this barrier allows 30 s — a staggered
+    // second connection must not time out the first branch's read. Streaming
+    // still starts only after BOTH branches are connected (acceptBoth returns).
     let conns = try acceptBoth(
         listenFds: [("mic", micListenFd), ("system", systemListenFd)],
-        deadlineSeconds: acceptTimeoutSeconds)
+        deadlineSeconds: acceptTimeoutSeconds,
+        onAccept: { fd in try writeHandshake(fd: fd, nonce: nonce) })
     micFd = conns[0]
     systemFd = conns[1]
     Teardown.shared.connectionFds = conns
-    try writeHandshake(fd: micFd, nonce: nonce)
-    try writeHandshake(fd: systemFd, nonce: nonce)
     logLine("both branches connected; handshakes written (v\(WIRE_VERSION))")
 } catch {
     fail(ExitCode.socketFailed, "startup barrier: \(error)")

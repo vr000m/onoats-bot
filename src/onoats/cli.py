@@ -881,8 +881,18 @@ def _cmd_status(rest: list[str]) -> int:
 
     # pid-authoritative verdict; the status file supplies the rich detail and the
     # off-diagonal staleness note (see status.resolve_liveness — the 4-cell table).
+    # The injected aliveness is identity-checked (cmdline fingerprint) so a
+    # recycled pid behind a stale pid file is never reported as RUNNING.
+    from onoats._vendor.pid import fingerprint_matches, read_pid_record
+
+    rec = read_pid_record(_pid_path(data_dir))
     live = status_file.resolve_liveness(
-        data_dir, read_pid=_read_pid, process_alive=_process_alive
+        data_dir,
+        read_pid=_read_pid,
+        process_alive=lambda pid: (
+            _process_alive(pid)
+            and (rec is None or rec.pid != pid or fingerprint_matches(rec))
+        ),
     )
     st = live.status
 

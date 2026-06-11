@@ -140,7 +140,7 @@ final class RecorderModel: ObservableObject {
 
     /// Pid-file read, mirroring `_vendor/pid.py`: line 1 pid, line 2 must be
     /// the "onoats-bot" identity marker, else the file is ignored.
-    private func readPid() -> Int32? {
+    private func readPid() -> (pid: Int32, cmdline: String)? {
         let path = dataDir.appendingPathComponent(".active/onoats.pid")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -148,11 +148,53 @@ final class RecorderModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
         guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0])
         else { return nil }
-        return pid
+        // Line 3 is the recorder's `ps -o command=` self-fingerprint (empty
+        // for legacy pid files) — mirror of _vendor/pid.py PidRecord.
+        return (pid, lines.count >= 3 ? lines[2] : "")
     }
 
-    private func processAlive(_ pid: Int32) -> Bool {
-        kill(pid, 0) == 0 || errno == EPERM
+    /// Cached fingerprint verdicts so the 1 s poll doesn't spawn `ps` every
+    /// tick. Re-verified after `fingerprintTTL` — a recycled pid that lands
+    /// on the SAME number as a stale pid file is the (rare) case this bounds.
+    private var fingerprintCache: [Int32: (match: Bool, at: Date)] = [:]
+    private let fingerprintTTL: TimeInterval = 30
+
+    /// kill(0) liveness hardened against pid recycling: when the pid file
+    /// carries a cmdline fingerprint, the live process must match it
+    /// (mirror of _vendor/pid.py — resolve_flush_target uses the same check
+    /// before signalling). Legacy fingerprint-less files degrade to kill(0).
+    private func processAlive(_ pid: Int32, storedCmdline: String) -> Bool {
+        guard kill(pid, 0) == 0 || errno == EPERM else {
+            fingerprintCache[pid] = nil
+            return false
+        }
+        if storedCmdline.isEmpty { return true }
+        if let cached = fingerprintCache[pid],
+            Date().timeIntervalSince(cached.at) < fingerprintTTL
+        {
+            return cached.match
+        }
+        let match = psCommand(pid) == storedCmdline
+        fingerprintCache[pid] = (match, Date())
+        return match
+    }
+
+    /// `ps -p <pid> -o command=` — must stay byte-identical to the recorder's
+    /// own fingerprint capture (runtime._own_ps_cmdline) for genuine matches.
+    private nonisolated func psCommand(_ pid: Int32) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-p", "\(pid)", "-o", "command="]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        let out = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (out?.isEmpty == false) ? out : nil
     }
 
     // ---------------------------------------------------------------- refresh
@@ -168,7 +210,7 @@ final class RecorderModel: ObservableObject {
 
         let status = readStatus()
         let pid = readPid()
-        let alive = pid.map(processAlive) ?? false
+        let alive = pid.map { processAlive($0.pid, storedCmdline: $0.cmdline) } ?? false
 
         if let s = status {
             sttLabel = s.stt_label.isEmpty ? nil : s.stt_label
@@ -239,6 +281,17 @@ final class RecorderModel: ObservableObject {
         userRequestedStop = true
         state = .stopping
         p.terminate()  // SIGTERM → runtime's graceful-shutdown handler
+    }
+
+    /// Quit must never orphan a GUI-started session: a relaunched app would
+    /// see it as `running(ours: false)` with Stop disabled — unstoppable from
+    /// the GUI. SIGTERM the supervisor first; it drains and rotates
+    /// independently of this process exiting, so quitting immediately after
+    /// is safe. External (CLI-started) sessions are left alone — their
+    /// terminal owns them.
+    func quitApp() {
+        if let p = proc, p.isRunning { p.terminate() }
+        NSApp.terminate(nil)
     }
 
     /// Runs `onoats flush` and surfaces a non-zero exit in the menu (fail-loud

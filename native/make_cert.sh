@@ -47,13 +47,18 @@ echo "→ generating self-signed code-signing certificate '$IDENTITY' (${DAYS}d)
 openssl req -x509 -newkey rsa:2048 -sha256 -days "$DAYS" -nodes \
   -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -config "$tmp/cert.cnf" 2>/dev/null
 
-# Throwaway transport password: the p12 exists only inside $tmp for the import.
+# Throwaway transport password: random per-run, file-fed to openssl so it
+# never hits argv there. `security import` only takes -P on argv — a one-shot
+# random secret guarding a file that lives seconds inside $tmp (0700) is an
+# acceptable residual exposure window.
+transport_pw=$(openssl rand -hex 16)
+printf '%s' "$transport_pw" > "$tmp/pw"
 openssl pkcs12 -export -name "$IDENTITY" -inkey "$tmp/key.pem" \
-  -in "$tmp/cert.pem" -out "$tmp/identity.p12" -passout pass:onoats-transport
+  -in "$tmp/cert.pem" -out "$tmp/identity.p12" -passout "file:$tmp/pw"
 
 echo "→ importing into the login keychain (codesign pre-authorized via ACL)…"
 security import "$tmp/identity.p12" -k "$KEYCHAIN" \
-  -P onoats-transport -f pkcs12 -T /usr/bin/codesign
+  -P "$transport_pw" -f pkcs12 -T /usr/bin/codesign
 
 echo
 if security find-identity -p codesigning | grep "\"$IDENTITY\""; then

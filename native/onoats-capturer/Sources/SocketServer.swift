@@ -47,8 +47,15 @@ func makeListeningSocket(path: String) throws -> Int32 {
 /// deadline. This is the startup barrier: socket-file existence is not proof
 /// the recorder connected, so we block here until BOTH branches have a peer —
 /// and if either misses the deadline we throw, failing BOTH branches loud.
+///
+/// `onAccept` runs per connection AS IT ARRIVES (not after the barrier): the
+/// recorder bounds its post-connect handshake read at `read_idle_timeout`
+/// (10 s), which is shorter than this accept deadline (30 s) — handshaking
+/// only after both accepts would let a healthy-but-staggered startup time out
+/// the early branch.
 func acceptBoth(
-    listenFds: [(label: String, fd: Int32)], deadlineSeconds: Double
+    listenFds: [(label: String, fd: Int32)], deadlineSeconds: Double,
+    onAccept: (Int32) throws -> Void = { _ in }
 ) throws -> [Int32] {
     let deadlineNs = MonotonicClock.nowNanos() + UInt64(deadlineSeconds * 1e9)
     var accepted: [Int32: Int32] = [:]  // listen fd -> connection fd
@@ -83,6 +90,7 @@ func acceptBoth(
             if let label = listenFds.first(where: { $0.fd == p.fd })?.label {
                 logLine("accepted \(label) connection")
             }
+            try onAccept(conn)
         }
     }
     return listenFds.map { accepted[$0.fd]! }

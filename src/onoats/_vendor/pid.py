@@ -200,3 +200,27 @@ def resolve_flush_target(pid_path: Path) -> FlushTarget:
             stale=True,
         )
     return FlushTarget(rec.pid)
+
+
+def fingerprint_matches(rec: PidRecord) -> bool:
+    """Pid-recycling check for *read-only* liveness verdicts (status / menu).
+
+    ``os.kill(pid, 0)`` alone reports a *recycled* pid as alive — a crashed
+    recorder's stale pid file plus kernel pid reuse would render some unrelated
+    program as RUNNING. Callers AND this check with their liveness probe: when
+    the record carries a cmdline fingerprint, the live process must match it
+    (same comparison ``resolve_flush_target`` performs before signalling).
+
+    Read-only verdicts err on the side of "alive": legacy fingerprint-less
+    records and an indeterminate ``ps`` probe (unavailable / transient failure)
+    return True rather than flapping a live recorder to stopped — only a
+    *positive* mismatch returns False. (``resolve_flush_target`` makes the
+    opposite call for the same situations because it gates a signal, where
+    acting on uncertainty is the danger.)
+    """
+    if not rec.cmdline:
+        return True
+    live = _live_ps_cmdline(rec.pid)
+    if live is None:
+        return True
+    return live == rec.cmdline

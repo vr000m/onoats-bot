@@ -103,7 +103,14 @@ struct MenuContent: View {
 
         Text("CLI: \(model.cliPath)\(model.cliAvailable ? "" : "  ⚠ not found — run `make -C native install-cli`")")
             .font(.caption)
-        Button("Quit Onoats") { NSApp.terminate(nil) }
+        // Routed through the model: stops a GUI-started session first so Quit
+        // never orphans it as an unstoppable external session on relaunch.
+        Button(quitLabel) { model.quitApp() }
+    }
+
+    private var quitLabel: String {
+        if case .running(ours: true) = model.state { return "Stop & Quit Onoats" }
+        return "Quit Onoats"
     }
 
     private var micSelection: Binding<AudioObjectID> {
