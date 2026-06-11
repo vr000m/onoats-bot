@@ -80,12 +80,29 @@ final class FrameChunker {
     private var stopped = false
     private var silenceFramesTotal: UInt64 = 0
 
+    // All-zero-input detector (TCC-denial observable). A *denied* system-audio
+    // tap still fires callbacks but delivers only zero samples (verified live
+    // 2026-06-10: a 2.3-min denied session produced zero pacer fills on the
+    // system branch and nothing transcribable) — indistinguishable from real
+    // capture by liveness alone. A sustained run of bit-exact-zero REAL input
+    // is anomalous (rendering apps produce a noise floor; a paused player
+    // pumping digital silence is the known benign false positive), so it
+    // warrants a WARNING, never a hard failure.
+    private var zeroRunSamples: UInt64 = 0
+    private var zeroRunWarned = false
+    /// 30 s of continuous all-zero real input at 16 kHz.
+    private static let zeroRunWarnSamples: UInt64 = 480_000
+
+    /// Appended to the all-zero WARNING; names the branch-specific cause to check.
+    private let zeroHint: String
+
     /// Fill after 100 ms without real data (~5 missed tap callbacks).
     private let silenceAfterNs: UInt64 = 100_000_000
     private static let silentFrame = Data(count: BYTES_PER_FRAME)
 
-    init(label: String, emit: @escaping (Data, UInt64) -> Void) {
+    init(label: String, zeroHint: String, emit: @escaping (Data, UInt64) -> Void) {
         self.label = label
+        self.zeroHint = zeroHint
         self.emit = emit
     }
 
@@ -115,7 +132,22 @@ final class FrameChunker {
         lock.lock()
         defer { lock.unlock() }
         lastRealDataWallNs = MonotonicClock.nowNanos()
-        pending.append(contentsOf: UnsafeBufferPointer(start: data[0], count: n))
+        let samples = UnsafeBufferPointer(start: data[0], count: n)
+        // Worker thread (never the RT IOProc): a linear scan of ≤ a few
+        // hundred samples is negligible here.
+        if samples.contains(where: { $0 != 0 }) {
+            zeroRunSamples = 0
+            zeroRunWarned = false
+        } else {
+            zeroRunSamples += UInt64(n)
+            if !zeroRunWarned && zeroRunSamples >= Self.zeroRunWarnSamples {
+                zeroRunWarned = true  // once per zero-run; re-arms on real audio
+                logLine(
+                    "WARNING \(label): capture callbacks are active but have "
+                        + "delivered only zero samples for ~30 s — \(zeroHint)")
+            }
+        }
+        pending.append(contentsOf: samples)
         // Back-extrapolating from the TOTAL pending count treats any leftover
         // samples from the previous append as contiguous with this buffer —
         // exact while capture is continuous (it is, frame to frame); only a

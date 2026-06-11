@@ -105,7 +105,11 @@ final class MicCapture {
     }
 
     init(emit: @escaping (Data, UInt64) -> Void) {
-        chunker = FrameChunker(label: "mic", emit: emit)
+        chunker = FrameChunker(
+            label: "mic",
+            zeroHint: "if you expect mic audio, check the input device is not "
+                + "hardware-muted (gain at zero) and the right device is selected",
+            emit: emit)
     }
 
     func start() throws {
