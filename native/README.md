@@ -4,6 +4,11 @@ This directory holds the native macOS half of the socket-audio path (dev plan
 `docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md`). The pip
 wheel ships **no** native code; it discovers the capturer via `ONOATS_CAPTURER_BIN`.
 
+This README covers **build, signing, and TCC internals**. For the install
+commands and day-to-day menu-bar usage, see the top-level
+[README Quickstart](../README.md#quickstart) and
+[Menu bar (macOS)](../README.md#menu-bar-macos).
+
 > **Build-from-source + self-signed only.** No notarization, no Homebrew. The
 > bundle is signed with a **stable self-signed "Code Signing" certificate** so the
 > mic + system-audio TCC grants survive rebuilds. Public distribution (Developer ID
@@ -87,31 +92,29 @@ both binaries are signed with the same identity + identifier (capturer first,
 then the bundle), so the DR is unchanged from the capturer-only bundle and
 existing TCC grants carry over.
 
-Launch from `~/Applications` (GUI launch — that's the point: LaunchServices
-makes `Onoats.app` its own TCC responsible process, restoring ~200 ms tap
-creation; terminal launches attribute grants to the terminal):
+Day-to-day usage (Start/Flush/Stop, mic picker, Settings, status, log
+location, first-run TCC prompts) lives in the top-level
+[Menu bar (macOS)](../README.md#menu-bar-macos) section. The internals behind
+that surface:
 
+- **Launch from `~/Applications` via the GUI** — that's the point:
+  LaunchServices makes `Onoats.app` its own TCC responsible process,
+  restoring ~200 ms tap creation; terminal launches attribute grants to the
+  terminal.
 - **Start** runs `~/.local/bin/onoats bot` with `AUDIO_SOURCE=socket` and
   `ONOATS_CAPTURER_BIN` pointing at the embedded capturer. Override the CLI
   path with `defaults write net.varunsingh.onoats cliPath /abs/path`.
 - **Stop** SIGTERMs the supervisor it spawned (graceful drain) — never the
-  capturer. Sessions started from a terminal are shown as "external" and not
-  signalled from the GUI.
-- **Flush** runs `onoats flush`.
-- The menu shows the **system default input/output devices** — the devices the
-  capturer will actually bind (guard against silent wrong-device capture).
-  The **"Mic (me)" submenu is a picker**: selecting a device sets the macOS
-  **default input device** (system-wide, disclosed in the submenu) — the only
-  selection that actually applies, since the capturer binds the system default
-  at start. A running session keeps its device; changes apply on next Start.
-  Named device+STT profiles are a follow-up (need capturer `--mic-uid`).
-- Running indicator reads the Phase-5a status file
+  capturer directly.
+- The "Mic (me)" picker sets the macOS **default input device** because the
+  capturer binds the system default at start — the only selection that
+  actually applies. Named device+STT profiles are a follow-up (need capturer
+  `--mic-uid`).
+- The running indicator reads the Phase-5a status file
   (`<data_dir>/.active/onoats.status.json`, schema-guarded) with the pid file
-  as liveness backstop; failed starts surface `exit_reason` / `last_error` in
-  the menu. Data dir resolves from `~/.config/onoats/config.toml`
+  as liveness backstop. Data dir resolves from `~/.config/onoats/config.toml`
   `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
   env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
-- `onoats bot` output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
 - **First Start after a fresh install / permission reset:** the system-audio
   TCC prompt fires at tap creation, which *blocks* while the dialog is
   unanswered — if you take longer than ~10 s to click, the recorder's
@@ -123,12 +126,8 @@ creation; terminal launches attribute grants to the terminal):
   tap still fires callbacks, all-zero; mic → hardware mute / wrong device).
   Warning only, never a failure: an app rendering digital silence (paused
   player) triggers it benignly.
-- **Settings** (submenu) edits `~/.config/onoats/config.toml` — the same file
-  the CLI reads, one source of truth: STT service picker
-  (whisper / websocket / deepgram), data-dir chooser, and an "Open
-  config.toml…" escape hatch for everything else. Changes apply on the next
-  Start. The writer is a surgical single-key editor — every other line,
-  comments included, stays byte-identical.
+- **Settings** writes go through a surgical single-key TOML editor — every
+  other line of `config.toml`, comments included, stays byte-identical.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

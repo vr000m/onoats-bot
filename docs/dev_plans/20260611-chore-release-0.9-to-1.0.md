@@ -597,7 +597,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
 
 - [x] Phase 1 — LICENSE + license metadata (PR #9 merged 2026-06-11, `66a93cd`)
 - [x] Phase 2 — CHANGELOG + v0.9.0 (PR #10 merged 2026-06-11, `3a4e538`; tag `v0.9.0` pushed)
-- [ ] Phase 3 — README overhaul + blackhole-fallback doc
+- [x] Phase 3 — README overhaul + blackhole-fallback doc (PR #13)
 - [ ] Phase 4 — Menu-bar zero-run WARNING surfacing
 - [ ] Phase 5 — CLI device visibility
 - [ ] Phase 6 — Install streamlining + spike removal
@@ -623,3 +623,11 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - The plan-file review marker blocks above-marker edits (including checkbox
   ticks) — phase progress is recorded here and in `## Progress` below the
   marker instead; recomputing the marker hash requires the user.
+- Phase 3 (PR #13, 2026-06-11): PyPI 404 re-verified live before the rewrite
+  (`curl https://pypi.org/pypi/onoats/json` → 404), so the Quickstart is
+  clone-based as planned. macOS Quickstart documents the interim
+  `cert && install && init` flow — flips to `make -C native setup` in
+  Phase 6. Doc-ownership split settled: top-level README owns the user story
+  (Quickstart, Menu bar section), `native/README.md` owns build/sign/TCC
+  internals, `docs/blackhole-fallback.md` owns the loopback fallback;
+  cross-links in all three directions, no duplicated facts.
