@@ -775,9 +775,26 @@ denial smoke, PR description refresh, un-draft, merge.
   branch-specific hint (system → check the Screen & System Audio Recording
   grant; mic → check hardware mute/device). WARNING not failure: a paused
   player pumping digital silence is the known benign false positive.
-  Menu-bar surfacing of the warning stays a post-PR follow-up. **Verify on
-  the next denial smoke: deny AudioCapture → Start → play audio ≥30 s →
-  expect the WARNING in onoats-bot.log.**
+  Menu-bar surfacing of the warning stays a post-PR follow-up.
+  **VERIFIED LIVE 2026-06-11, both predicted behaviors:** (a) denied session
+  (~08:26): mic transcribing, system all-zero → WARNING fired ≈30 s in
+  (+ DualSilenceDetector heartbeat at 128 s) — the denial observable works;
+  (b) allowed session (~08:47): system transcribed real audio, playback
+  stopped, an app kept rendering digital silence → the predicted benign
+  false positive fired before Stop. Warning-only by design; costs a log
+  line. First-run prompt window + watchdog documented in native/README.md.
+
+- **First-run UX: a Start with the system-audio TCC prompt UNANSWERED fails
+  loud after 10 s (2026-06-11, observed live).** `AudioHardwareCreateProcessTap`
+  blocks while the prompt is pending; the recorder's 10 s read-idle then ends
+  both branches (fatal ErrorFrames, 0-entry rotation, rc≠0) before the user
+  can click. This is the fail-loud contract doing its job, not a hang — but
+  the first Start after a permission reset/fresh install dies if the prompt
+  isn't answered within ~10 s. Recovery: answer the prompt, Start again (the
+  very next session streamed fine, with the tap-create retry firing once:
+  "attempt 1 failed (OSStatus 0, tapID=0)" → retry → success). Documented in
+  native/README.md; a pre-socket tap preflight (surface the prompt before the
+  recorder's read clock starts) is a possible post-PR refinement.
 
 - **A/B parity check PASSED (2026-06-10) — Phase 6 gate satisfied.** Same source
   video recorded via the socket/native path (`session_20260610_133548_e010cfab`,

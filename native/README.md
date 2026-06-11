@@ -112,6 +112,17 @@ creation; terminal launches attribute grants to the terminal):
   `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
   env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
 - `onoats bot` output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
+- **First Start after a fresh install / permission reset:** the system-audio
+  TCC prompt fires at tap creation, which *blocks* while the dialog is
+  unanswered — if you take longer than ~10 s to click, the recorder's
+  read-idle watchdog fails the session loud (by design). Answer the prompt,
+  then Start again.
+- **All-zero watchdog:** if a branch's capture callbacks deliver only zero
+  samples for 30 s, the capturer logs a WARNING naming the likely cause
+  (system → the Screen & System Audio Recording grant is denied — a denied
+  tap still fires callbacks, all-zero; mic → hardware mute / wrong device).
+  Warning only, never a failure: an app rendering digital silence (paused
+  player) triggers it benignly.
 - **Settings** (submenu) edits `~/.config/onoats/config.toml` — the same file
   the CLI reads, one source of truth: STT service picker
   (whisper / websocket / deepgram), data-dir chooser, and an "Open
