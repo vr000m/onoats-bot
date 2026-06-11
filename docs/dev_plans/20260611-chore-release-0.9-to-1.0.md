@@ -600,7 +600,8 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 3 — README overhaul + blackhole-fallback doc (PR #13)
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
-- [ ] Phase 5 — CLI device visibility
+- [ ] Phase 5 — CLI device visibility (implemented on
+  `feat/cli-device-visibility`, PR pending)
 - [ ] Phase 6 — Install streamlining + spike removal
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
@@ -664,3 +665,22 @@ retrieval is `git checkout spike-archive -- native/spike`.
   menu to its width — fixed pre-merge by splitting on the hint's em-dash
   clauses into stacked caption lines (full text remains in `onoats status` +
   the log).
+- Phase 5 implementation (2026-06-11): two decisions worth recording.
+  (1) **The `device` event reuses the trailing `hint=` field** to carry
+  `<name> (uid=<uid>)` — device names contain spaces, and the contract
+  already defines exactly one free-text trailing field, so no parser change
+  and no quoting scheme. (2) **Device events outrun `write_running`** (they
+  fire within the capturer's first second; the recorder still has STT
+  preflight + model load ahead of it, and `write_running` builds a FRESH
+  record, clobbering any earlier stamp), so the live apply in the stderr
+  reader alone cannot work — a deferred supervisor task
+  (`_apply_device_fields_when_recorded`) polls for a running record whose
+  `start_time` is at/after a session floor taken before recorder start,
+  applies the shared `device_state`, and exits; the floor check is what
+  keeps a stale (crashed-previous-session, `running=true`) record from
+  being stamped, and `status.set_devices` is additionally gated on
+  `running` (unlike `set_warning`). Mic re-emits per bind, so a mid-session
+  default-input rebind updates `mic_device` live; the system branch is
+  identified as `system-output tap (uid=<aggregate uid>)` — the tap is
+  global (all processes' output), so naming the default output device
+  would be dishonest and go stale on output switches.
