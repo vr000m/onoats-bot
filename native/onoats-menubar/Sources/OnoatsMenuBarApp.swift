@@ -68,6 +68,26 @@ struct MenuContent: View {
 
         Divider()
 
+        Menu("Settings") {
+            // Writes config.toml — shared with the CLI. Applies on next Start.
+            Menu("STT service: \(model.sttService)") {
+                ForEach(RecorderModel.sttServices, id: \.self) { service in
+                    Button(service == model.sttService ? "✓ \(service)" : service) {
+                        model.setSTTService(service)
+                    }
+                }
+            }
+            Text("Data dir: \(model.dataDirDisplay)")
+            Button("Change data dir…") { model.chooseDataDir() }
+            Divider()
+            Button("Open config.toml…") { model.openConfig() }
+            if case .running = model.state {
+                Text("Changes apply on next Start")
+            }
+        }
+
+        Divider()
+
         Text("CLI: \(model.cliPath)\(model.cliAvailable ? "" : "  ⚠ not found — run `make -C native install-cli`")")
             .font(.caption)
         Button("Quit Onoats") { NSApp.terminate(nil) }

@@ -11,6 +11,7 @@
 // for the live/stopped VERDICT, the status file supplies the DETAIL (source,
 // STT label, start time, why a start failed). A stale status file must never
 // render a dead recorder as running.
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -47,6 +48,13 @@ final class RecorderModel: ObservableObject {
     @Published var audioSource: String?
     @Published var startTime: Date?
     @Published var schemaDrift = false
+    /// Configured STT service from config.toml (next-start value, distinct
+    /// from `sttLabel`, which is what the *running* session reports).
+    @Published var sttService = "whisper"
+    @Published var dataDirDisplay = ""
+
+    /// Valid `[stt].service` values (mirrors runtime.py's service branches).
+    static let sttServices = ["whisper", "websocket", "deepgram"]
 
     private var proc: Process?
     private var userRequestedStop = false
@@ -73,31 +81,10 @@ final class RecorderModel: ObservableObject {
     /// shell env, so no ONOATS_DATA_DIR/XDG vars): config.toml
     /// `[storage].data_dir` > `~/.local/share/onoats` (the XDG default).
     static func resolveDataDir() -> URL {
-        let home = NSHomeDirectory()
-        let cfg = URL(fileURLWithPath: home + "/.config/onoats/config.toml")
-        if let text = try? String(contentsOf: cfg, encoding: .utf8) {
-            var section = ""
-            for rawLine in text.components(separatedBy: "\n") {
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
-                if line.hasPrefix("["), line.hasSuffix("]") {
-                    section = String(line.dropFirst().dropLast())
-                    continue
-                }
-                guard section == "storage", line.hasPrefix("data_dir") else { continue }
-                guard let eq = line.firstIndex(of: "=") else { continue }
-                var value = String(line[line.index(after: eq)...])
-                    .trimmingCharacters(in: .whitespaces)
-                if value.hasPrefix("\""), let close = value.dropFirst().firstIndex(of: "\"") {
-                    value = String(value[value.index(after: value.startIndex)..<close])
-                } else if let hash = value.firstIndex(of: "#") {
-                    value = String(value[..<hash]).trimmingCharacters(in: .whitespaces)
-                }
-                if !value.isEmpty {
-                    return URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
-                }
-            }
+        if let value = ConfigStore.readValue(section: "storage", key: "data_dir") {
+            return URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
         }
-        return URL(fileURLWithPath: home + "/.local/share/onoats")
+        return URL(fileURLWithPath: NSHomeDirectory() + "/.local/share/onoats")
     }
 
     var dataDir: URL { Self.resolveDataDir() }
@@ -156,6 +143,9 @@ final class RecorderModel: ObservableObject {
     func refresh() {
         micDevice = AudioDevices.defaultInputName()
         outputDevice = AudioDevices.defaultOutputName()
+        sttService = ConfigStore.readValue(section: "stt", key: "service") ?? "whisper"
+        dataDirDisplay = dataDir.path.replacingOccurrences(
+            of: NSHomeDirectory(), with: "~")
 
         let status = readStatus()
         let pid = readPid()
@@ -232,6 +222,34 @@ final class RecorderModel: ObservableObject {
             p.standardError = log
         }
         try? p.run()
+    }
+
+    // --------------------------------------------------------------- settings
+    // All settings write config.toml — the same file the CLI reads — so GUI
+    // and terminal sessions share one source of truth. A change while a
+    // session is recording applies on the NEXT start (config loads at start).
+
+    func setSTTService(_ service: String) {
+        try? ConfigStore.writeValue(section: "stt", key: "service", value: service)
+        refresh()
+    }
+
+    func chooseDataDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = dataDir
+        panel.message = "Choose the onoats data directory (config.toml [storage].data_dir)"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? ConfigStore.writeValue(
+            section: "storage", key: "data_dir", value: url.path)
+        refresh()
+    }
+
+    func openConfig() {
+        NSWorkspace.shared.open(ConfigStore.configURL)
     }
 
     private func handleExit(_ p: Process) {
