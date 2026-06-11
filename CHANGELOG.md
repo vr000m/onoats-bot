@@ -1,0 +1,167 @@
+# Changelog
+
+All notable changes to onoats are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+All listed versions — including the reconstructed pre-0.9 era — are licensed
+under BSD-2-Clause (see [LICENSE](LICENSE)).
+
+Versions before 0.9.0 were never published or tagged; they are reconstructed
+retrospectively from the merged-PR history (nothing was ever distributed, so
+no backdated tags exist). PR numbers `#1`–`#7` refer to this repository;
+older history predates the extraction and is cited by merge-commit SHA.
+Annotated tags exist from `v0.9.0` forward.
+
+## [0.9.0] - 2026-06-11
+
+Milestone B: native macOS capture + menu-bar app (PR #5, `16da012`; docs
+ride-alongs PR #6 `6aa0025`, PR #7 `8db8840`).
+
+### Added
+- Native macOS system-audio capture via a Core Audio process tap
+  (`onoats-capturer` Swift binary); no loopback driver needed on macOS 14.4+.
+- SwiftUI menu-bar app (`Onoats.app`): Start/Flush/Stop, inline mic picker
+  (sets the macOS default input), STT service picker, data-dir chooser,
+  status display.
+- Per-chunk capture-generation stamping — each queued audio chunk carries its
+  generation's format and resampler, preventing stale-format races on device
+  switch.
+- Self-signed signing identity workflow: `make -C native cert` (refuses to
+  regenerate an existing cert) + `make -C native install` / `install-cli`.
+- Sustained all-zero-input detector (30 s) in the capturer — surfaces a
+  denied system-audio grant as a WARNING instead of silent empty recordings.
+- Kill-×3 tap/aggregate residue smoke (`native/residue_check.sh`) and
+  one-command wire smoke (`native/smoke_wire_check.sh`).
+
+### Changed
+- The native capturer is the default macOS capture story;
+  BlackHole/PortAudio demoted to the documented fallback (macOS 13.x–14.3 /
+  off-mac).
+- `ConfigStore` (menu bar) writes TOML with correct basic-string escaping;
+  data-dir handling made canonical and per-session.
+
+### Fixed
+- Pre-start capturer death now writes a status record — a denied grant no
+  longer surfaces as "failed: graceful".
+- Realtime-thread logging and state races; fail-loud flush path; IOProc
+  zero-guard.
+
+### Notes
+- The runtime dependency `pipecat-local-stt-server` is intentionally
+  git-pinned (`pyproject.toml`) — correct for the from-source install story;
+  revisit only if PyPI publishing is ever taken up.
+
+## [0.8.0] - 2026-06-09
+
+Milestone A: socket audio transport + supervisor (PR #4, `1f9dfdc`).
+
+### Added
+- `UnixSocketAudioTransport` — framed-PCM16 Unix-socket audio input pipeline
+  with bounded staging, downstream-queue gating, and fail-loud fatal errors.
+- `AUDIO_SOURCE=portaudio|socket` backend switch, branched in exactly one
+  place per layer.
+- CLI supervisor: private `0700` socket dir, per-session generation nonce
+  (handshake-enforced), bounded socket-appearance wait, process-group
+  teardown on both crash and graceful paths.
+- Audio-socket wire contract document (`docs/audio-socket-contract.md`) with
+  a parity test that fails CI when doc and code constants drift.
+- `AGENTS.md` contract notes; dev-plan review-marker CI gate
+  (`scripts/check_review_markers.py`).
+
+### Changed
+- Capturer environment built from a deny-by-default allowlist (blocks DYLD
+  injection); capturer spawned in an isolated session so terminal signals
+  don't trip the fail-loud path.
+
+### Fixed
+- Transport failures are fatal upstream errors, so the recorder terminates
+  instead of hanging; handshake reads bounded by the idle watchdog; tilde
+  expansion on socket paths; capturer group swept on the crash path.
+
+## [0.7.0] - 2026-06-08
+
+Packaging and extraction era: standalone `onoats` package (untagged;
+PR #1 `7f33e72`, PR #2 `645d90b`, PR #3 `8e6c165`, plus direct commits).
+
+### Added
+- `src/onoats/` installable package layout, extracted from the `bot/`
+  monolith; `onoats init` CLI; CI with ruff + PortAudio build steps.
+- Configurable `[storage].data_dir` (`config.toml` + `onoats init
+  --data-dir`); XDG data paths.
+- `STT_WS_LANGUAGE` env to control the websocket decoder language.
+
+### Changed
+- `config.toml` honoured in the recorder process for STT and device
+  settings; SQLite overlay removed; transcript date grouping uses local
+  date, not UTC.
+- STT server renamed `onoats-stt` → `pipecat-stt` (server v0.2.0): socket
+  paths and labels updated.
+
+### Fixed
+- STT RSS probe resolves `stt_server` from the config-layered env (PR #1).
+- Flush (SIGUSR1) verifies live process identity before signalling — a stale
+  PID file can no longer kill an unrelated process (PR #2).
+- Shutdown drains the final transcript segment before flush; Ctrl+C cancel
+  timeout capped (no more ~20 s hang); device provenance logged accurately
+  (PR #3).
+
+## [0.5.0] - 2026-05-21
+
+Dual-input diarization and STT-service era (untagged; pre-extraction
+history, cited by merge SHA).
+
+### Added
+- Standalone Whisper WebSocket transcription server with a Pipecat
+  `STTService` wrapper and launchd auto-restart (`c4f08d5`).
+- STT health preflight, status probe, and `./onoats stt` wrapper
+  (`e40f2de`).
+- Live passive transcript view with rotation and orphan guards (`2536687`).
+- SmartTurn V3 read-only shadow observer on the `me` branch + raw PCM dump
+  for offline A/B testing (`0e4ae64`).
+- Parakeet ASR backend with per-server multi-ASR selection (`21ebfae`).
+- Cron-driven post-processing worker decoupled from the bot harness; the
+  bot rotates session files instead of processing in-flight (`4d54b88`,
+  the `stt-extraction-base` tag's commit).
+
+### Changed
+- Dual-input pipeline became the default bot path — coarse Me/Them
+  diarization via two PortAudio branches (`196aef2`).
+- Post-processing queue rebuilt as an FSM; the bot harness no longer owns
+  worker state (`4d54b88`).
+
+### Fixed
+- Continuation-flush session-file swap race; speaker-label plumbing and
+  source resolution; STT reconnect backoff made exponential (0.5 → 8 s);
+  long turns chunked.
+
+## [0.3.0] - 2026-04-16
+
+Processing-pipeline era (untagged; pre-extraction history).
+
+### Added
+- Topic discovery, collation, and management pipeline (`6124d56`).
+- Multi-task LLM benchmark, LM Studio provider, per-task LLM routing, and
+  manual transcript flush via Ctrl+T / `./onoats flush` (`ced152a`).
+- "seminars" processing category + `--category` bot CLI flag (`81afbc0`).
+
+### Fixed
+- Timeline corruption: ownership-aware rollback + cross-midnight concat in
+  segmenter/classifier/merge (`7b97d7e`).
+- PID-file identity hardened; pipeline cancel interruptible on Ctrl+C
+  (`ced152a`).
+- `ONOATS_DATA_DIR` tilde expansion across all entry points.
+
+## [0.1.0] - 2026-04-04
+
+Initial recorder (untagged; root commit `d645650`, 2026-03-30).
+
+### Added
+- Pipecat-based meeting recorder: PortAudio input, silence detection,
+  transcript buffering, Ctrl+C graceful shutdown with the current session
+  processed before exit.
+- SQLite overlay, web intelligence layer, and transcript management
+  (`3d36ae3`).
+- Collation service: living documents aggregated from related idea
+  transcripts (`5cd908c`).
+- LLM transcript cleanup + dictionary/provenance plumbing (`9d974c1`).
