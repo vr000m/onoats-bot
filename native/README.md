@@ -100,8 +100,11 @@ creation; terminal launches attribute grants to the terminal):
 - **Flush** runs `onoats flush`.
 - The menu shows the **system default input/output devices** — the devices the
   capturer will actually bind (guard against silent wrong-device capture).
-  There is no device picker yet: the capturer has no device-selection argument
-  (it captures the system default), so a picker would silently not apply.
+  The **"Mic (me)" submenu is a picker**: selecting a device sets the macOS
+  **default input device** (system-wide, disclosed in the submenu) — the only
+  selection that actually applies, since the capturer binds the system default
+  at start. A running session keeps its device; changes apply on next Start.
+  Named device+STT profiles are a follow-up (need capturer `--mic-uid`).
 - Running indicator reads the Phase-5a status file
   (`<data_dir>/.active/onoats.status.json`, schema-guarded) with the pid file
   as liveness backstop; failed starts surface `exit_reason` / `last_error` in

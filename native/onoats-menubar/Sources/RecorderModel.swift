@@ -12,6 +12,7 @@
 // STT label, start time, why a start failed). A stale status file must never
 // render a dead recorder as running.
 import AppKit
+import CoreAudio
 import Foundation
 import SwiftUI
 
@@ -44,6 +45,8 @@ final class RecorderModel: ObservableObject {
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"
     @Published var outputDevice = "—"
+    @Published var inputDevices: [AudioInputDevice] = []
+    @Published var defaultInputID = AudioObjectID(kAudioObjectUnknown)
     @Published var sttLabel: String?
     @Published var audioSource: String?
     @Published var startTime: Date?
@@ -149,6 +152,8 @@ final class RecorderModel: ObservableObject {
     func refresh() {
         micDevice = AudioDevices.defaultInputName()
         outputDevice = AudioDevices.defaultOutputName()
+        inputDevices = AudioDevices.inputDevices()
+        defaultInputID = AudioDevices.defaultInputID()
         sttService = ConfigStore.readValue(section: "stt", key: "service") ?? "whisper"
         dataDirDisplay = dataDir.path.replacingOccurrences(
             of: NSHomeDirectory(), with: "~")
@@ -265,6 +270,15 @@ final class RecorderModel: ObservableObject {
 
     func openConfig() {
         NSWorkspace.shared.open(ConfigStore.configURL)
+    }
+
+    /// Sets the macOS DEFAULT input device (system-wide) — the only knob that
+    /// actually applies on the socket path, since the capturer binds the
+    /// system default at start. A running session keeps the device it bound;
+    /// the change takes effect on the next Start.
+    func setMicDevice(_ device: AudioInputDevice) {
+        AudioDevices.setDefaultInput(device.id)
+        refresh()
     }
 
     private func handleExit(_ p: Process) {

@@ -334,6 +334,15 @@ embeds the Phase-4 capturer at `Contents/MacOS/onoats-capturer`
   --source portaudio|socket` flag for ergonomics. The menu-bar app hardcodes
   `AUDIO_SOURCE=socket` only: the GUI exists for the TCC responsible-process
   topology, which is meaningless for the PortAudio path.
+- **Device picker = set the system default input ("option 2", decided
+  2026-06-10):** the capturer has no device-selection argument — it binds the
+  macOS default input at start — so the menu's mic picker sets
+  `kAudioHardwarePropertyDefaultInputDevice` (system-wide; disclosed in the
+  submenu). A running session keeps its bound device; the change applies on
+  the next Start. **Named profiles (desk/travel device+STT sets) move to a
+  follow-up plan** gated on capturer `--mic-uid` support — the Settings
+  submenu (STT service, data dir → config.toml) covers the single-profile
+  case today.
 
 ### Phase 6: Retire BlackHole from the default macOS story + docs
 
@@ -519,7 +528,7 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: 2026-06-09 @ f40c29000ae86ba1ea144c394dacc079fa2bcd43 -->
+<!-- reviewed: 2026-06-09 @ 320cb2f1226cf4a416652649080110e6721a2e76 -->
 ## Progress
 
 - [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,

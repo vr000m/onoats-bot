@@ -46,7 +46,20 @@ struct MenuContent: View {
 
         // The capturer binds the system DEFAULT devices; surfacing them here is
         // the guard against silent wrong-device capture (Findings, 2026-06-10).
-        Text("Mic (me): \(model.micDevice)")
+        // The picker sets the macOS default input (system-wide) — the only
+        // selection that actually applies on the socket path.
+        Menu("Mic (me): \(model.micDevice)") {
+            ForEach(model.inputDevices) { device in
+                Button(device.id == model.defaultInputID ? "✓ \(device.name)" : device.name) {
+                    model.setMicDevice(device)
+                }
+            }
+            Divider()
+            Text("Sets the macOS default input (system-wide)")
+            if case .running = model.state {
+                Text("Recording keeps its device — applies on next Start")
+            }
+        }
         Text("System (them): \(model.outputDevice)")
         if let stt = model.sttLabel {
             Text("STT: \(stt)")
