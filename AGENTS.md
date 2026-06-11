@@ -164,3 +164,13 @@ should NOT re-flag go here, one per line:
   capture is contiguous (leftovers are contiguous with the next buffer); only a
   frame straddling a capture gap inherits a bounded <20 ms skew, governed by the
   existing `lastEmittedEndNs` clamp. Comment added at the site. (2026-06-10)
+- **[Architecture] won't-fix**: `onoats bot --source` sets `AUDIO_SOURCE` in
+  `os.environ` rather than threading a parameter — deliberate: the env var is
+  the pre-existing public contract (config.toml/env already select the source),
+  the flag is a convenience alias onto that contract, and downstream re-parses
+  argv independently (documented at the site). Threading a parameter would
+  create a second, competing resolution path. (2026-06-11)
+- **[Security] won't-fix**: `make_cert.sh` passes the p12 transport password on
+  `security import -P` argv — `security import` has no file/stdin password
+  option. Residual is a one-shot random secret guarding a file that lives
+  seconds inside a 0700 tmpdir; documented at the site. (2026-06-11)

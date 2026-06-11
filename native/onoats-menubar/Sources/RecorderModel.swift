@@ -124,7 +124,7 @@ final class RecorderModel: ObservableObject {
 
     // ------------------------------------------------------------------ reads
 
-    private func readStatus() -> StatusRecord? {
+    private func readStatus(under dataDir: URL) -> StatusRecord? {
         let path = dataDir.appendingPathComponent(".active/onoats.status.json")
         guard let data = try? Data(contentsOf: path) else { return nil }
         // Schema guard first (the whole point of the schema int): a drifted
@@ -140,7 +140,7 @@ final class RecorderModel: ObservableObject {
 
     /// Pid-file read, mirroring `_vendor/pid.py`: line 1 pid, line 2 must be
     /// the "onoats-bot" identity marker, else the file is ignored.
-    private func readPid() -> (pid: Int32, cmdline: String)? {
+    private func readPid(under dataDir: URL) -> (pid: Int32, cmdline: String)? {
         let path = dataDir.appendingPathComponent(".active/onoats.pid")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -181,7 +181,10 @@ final class RecorderModel: ObservableObject {
 
     /// `ps -p <pid> -o command=` — must stay byte-identical to the recorder's
     /// own fingerprint capture (runtime._own_ps_cmdline) for genuine matches.
-    private nonisolated func psCommand(_ pid: Int32) -> String? {
+    /// MainActor-isolated deliberately (not `nonisolated`): its only caller
+    /// (`processAlive`) and the `fingerprintCache` it feeds are MainActor-bound;
+    /// an off-actor caller would race the cache.
+    private func psCommand(_ pid: Int32) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         p.arguments = ["-p", "\(pid)", "-o", "command="]
@@ -205,11 +208,15 @@ final class RecorderModel: ObservableObject {
         inputDevices = AudioDevices.inputDevices()
         defaultInputID = AudioDevices.defaultInputID()
         sttService = ConfigStore.readValue(section: "stt", key: "service") ?? "whisper"
+        // One data-dir resolution per refresh cycle: status and pid must be
+        // read from the SAME directory even if config.toml changes mid-cycle
+        // (mirrors the supervisor's one-resolution-per-session rule).
+        let dataDir = Self.resolveDataDir()
         dataDirDisplay = dataDir.path.replacingOccurrences(
             of: NSHomeDirectory(), with: "~")
 
-        let status = readStatus()
-        let pid = readPid()
+        let status = readStatus(under: dataDir)
+        let pid = readPid(under: dataDir)
         let alive = pid.map { processAlive($0.pid, storedCmdline: $0.cmdline) } ?? false
 
         if let s = status {
@@ -378,7 +385,7 @@ final class RecorderModel: ObservableObject {
             // "failed: graceful"): only trust a record written for THIS
             // session — a record whose start_time predates our spawn is the
             // previous session's and its exit_reason is a lie here.
-            var status = readStatus()
+            var status = readStatus(under: Self.resolveDataDir())
             if let s = status, let spawned = spawnedAt,
                Date(timeIntervalSince1970: s.start_time) < spawned.addingTimeInterval(-5) {
                 status = nil

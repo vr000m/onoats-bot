@@ -7,6 +7,18 @@
 // double-quoted. Env vars still override at runtime (env > config.toml >
 // default), but a GUI app sees no shell env, so for GUI starts config.toml is
 // effectively authoritative.
+//
+// TOML SUBSET CONTRACT (deliberately narrower than tomllib — no TOML library
+// ships with a plain-swiftc build). This editor only reads/writes:
+//   - `[section]` headers (whitespace-tolerant) and `key = "basic string"`
+//     pairs with `\\` / `\"` escapes; `#` comments (whole-line and trailing).
+// It does NOT understand literal strings ('…'), multi-line strings, dotted
+// keys, inline tables, arrays, or non-string scalars — keys it manages must
+// stay plain basic strings. tomllib accepts a superset, so a hand-edited
+// fancy value for a GUI-managed key reads back wrong here (readValue returns
+// the raw right-hand side) while the Python side parses it fine — keep
+// GUI-managed keys ([stt].service, [storage].data_dir) plain. The round-trip
+// subset is parity-checked by tests/test_native_contract_parity.py.
 import Foundation
 
 struct ConfigWriteError: Error, CustomStringConvertible {

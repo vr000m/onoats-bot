@@ -438,11 +438,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             # The recorder never started, so nothing else will write the status
             # file — without this, a stale record from the PREVIOUS session is
             # what `onoats status` / the menu bar would read (observed live:
-            # a mic-denial start rendered as "failed: graceful"). Write a FRESH
-            # stopped record (not write_stopped, which preserves the stale
-            # session's start_time/pid and would defeat any freshness check).
-            import time as _time
-
+            # a mic-denial start rendered as "failed: graceful").
             from onoats import status as status_file
 
             rc_cap = capturer_proc.returncode
@@ -454,19 +450,11 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             else:
                 exit_reason = "capturer-start-timeout"
                 last_error = "capturer did not create its sockets in time"
-            status_file.write_status(
+            status_file.write_prestart_failure(
                 data_dir,
-                status_file.StatusRecord(
-                    schema=status_file.STATUS_SCHEMA_VERSION,
-                    pid=os.getpid(),
-                    start_time=_time.time(),
-                    audio_source="socket",
-                    stt_label="",
-                    running=False,
-                    exit_reason=exit_reason,
-                    last_error=last_error,
-                    supervisor_rc=1,
-                ),
+                audio_source="socket",
+                exit_reason=exit_reason,
+                last_error=last_error,
             )
             return 1
 

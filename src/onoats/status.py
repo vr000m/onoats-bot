@@ -254,6 +254,38 @@ def write_stopped(
     return write_status(data_dir, record)
 
 
+def write_prestart_failure(
+    data_dir: Path,
+    *,
+    audio_source: str,
+    exit_reason: str,
+    last_error: str,
+    supervisor_rc: int = 1,
+) -> Path:
+    """Write a FRESH stopped record for a session that died before the recorder ran.
+
+    Unlike :func:`write_stopped`, this never preserves an existing record's
+    pid/start_time: the recorder never started, so whatever is on disk belongs
+    to a PREVIOUS session — preserving it would defeat readers' freshness
+    checks (the menu bar rejects records whose ``start_time`` predates the
+    session it spawned, falling back to the raw exit code).
+    """
+    return write_status(
+        data_dir,
+        StatusRecord(
+            schema=STATUS_SCHEMA_VERSION,
+            pid=os.getpid(),
+            start_time=time.time(),
+            audio_source=audio_source,
+            stt_label="",
+            running=False,
+            exit_reason=exit_reason,
+            last_error=last_error,
+            supervisor_rc=supervisor_rc,
+        ),
+    )
+
+
 def stamp_supervisor_failure(
     data_dir: Path,
     *,

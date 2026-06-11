@@ -33,12 +33,14 @@ final class Teardown {
     private let lock = NSLock()
     private var triggered = false
 
-    var mic: MicCapture?
-    var system: SystemCapture?
-    var writers: [FrameWriter] = []
-    var connectionFds: [Int32] = []
-    var listenFds: [Int32] = []
-    var socketPaths: [String] = []
+    // All resources are private and registered through the methods below, so
+    // partial/bypassed registration is structurally impossible at call sites.
+    private var mic: MicCapture?
+    private var system: SystemCapture?
+    private var writers: [FrameWriter] = []
+    private var connectionFds: [Int32] = []
+    private var listenFds: [Int32] = []
+    private var socketPaths: [String] = []
 
     /// First caller wins; runs the full teardown and exits the process.
     /// Subsequent callers (e.g. the second writer noticing its peer vanished
@@ -77,6 +79,22 @@ final class Teardown {
         self.writers = writers
         lock.unlock()
         for writer in writers { writer.start() }
+    }
+
+    /// Register a listening socket the moment it exists (fd + its filesystem
+    /// path together, so neither can be torn down without the other).
+    func registerListener(fd: Int32, path: String) {
+        lock.lock()
+        listenFds.append(fd)
+        socketPaths.append(path)
+        lock.unlock()
+    }
+
+    /// Register the accepted per-branch connections (post startup barrier).
+    func registerConnections(_ fds: [Int32]) {
+        lock.lock()
+        connectionFds = fds
+        lock.unlock()
     }
 }
 
@@ -269,11 +287,9 @@ let micListenFd: Int32
 let systemListenFd: Int32
 do {
     micListenFd = try makeListeningSocket(path: micSocketPath)
-    Teardown.shared.listenFds.append(micListenFd)
-    Teardown.shared.socketPaths.append(micSocketPath)
+    Teardown.shared.registerListener(fd: micListenFd, path: micSocketPath)
     systemListenFd = try makeListeningSocket(path: systemSocketPath)
-    Teardown.shared.listenFds.append(systemListenFd)
-    Teardown.shared.socketPaths.append(systemSocketPath)
+    Teardown.shared.registerListener(fd: systemListenFd, path: systemSocketPath)
 } catch {
     fail(ExitCode.socketFailed, "creating sockets: \(error)")
 }
@@ -293,7 +309,7 @@ do {
         onAccept: { fd in try writeHandshake(fd: fd, nonce: nonce) })
     micFd = conns[0]
     systemFd = conns[1]
-    Teardown.shared.connectionFds = conns
+    Teardown.shared.registerConnections(conns)
     logLine("both branches connected; handshakes written (v\(WIRE_VERSION))")
 } catch {
     fail(ExitCode.socketFailed, "startup barrier: \(error)")
