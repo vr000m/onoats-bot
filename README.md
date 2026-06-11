@@ -14,17 +14,42 @@ analysis; onoats itself stays files-only.
 
 ## Quickstart
 
+onoats installs **from source** (it is not published on PyPI).
+
+### macOS 14.4+ — menu bar + native capture (recommended)
+
+```bash
+git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+make -C native cert      # once, ever — stable self-signed signing identity
+make -C native install   # build + sign Onoats.app → ~/Applications; installs the CLI
+onoats init              # guided setup → config.toml + 0600 secrets.env
+```
+
+Then launch **Onoats.app** from `~/Applications` and record from the
+[menu bar](#menu-bar-macos). The first Start triggers the macOS permission
+prompts (microphone + system audio) — see the menu-bar section. For what the
+two `make` commands do (and how updates work), see
+[`native/README.md`](native/README.md).
+
+### Other platforms (and macOS below 14.4)
+
 ```bash
 # Linux: PortAudio dev headers are needed to build pyaudio
 #   sudo apt-get install -y portaudio19-dev   # (macOS Homebrew ships them)
 
-uv tool install onoats            # baseline (PortAudio + Deepgram/TCP STT)
-# uv tool install 'onoats[macos]' # Apple Silicon: Whisper-MLX + Kokoro
+git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+uv tool install --editable .            # baseline (PortAudio + Deepgram/TCP STT)
+# uv tool install --editable '.[macos]' # Apple Silicon: adds Whisper-MLX + Kokoro
 
 onoats init                       # guided setup → config.toml + 0600 secrets.env
 onoats bot                        # dual-input recorder (mic + system loopback)
 onoats convert                    # render pending sessions → markdown transcripts
 ```
+
+On this path, capturing system audio ("them") needs a loopback driver — see
+[docs/blackhole-fallback.md](docs/blackhole-fallback.md).
 
 Other subcommands:
 
@@ -47,15 +72,52 @@ onoats status       # recorder pid / running state + data dir
 | System audio ("them") capture     | loopback driver-dependent   | ✅ native capturer ⁺ |
 
 ⁺ On **macOS 14.4+** the default system-audio story is the **native capturer**
-(`AUDIO_SOURCE=socket` — Core Audio process tap, no virtual-audio driver; built
-from source, see [`native/README.md`](native/README.md) and
-[Audio source](#audio-source) below). On macOS 13.x–14.3 (below the Core Audio
-tap API floor) and on other platforms, the fallback is a loopback driver
-(e.g. BlackHole) on the default PortAudio path.
+(`AUDIO_SOURCE=socket` — Core Audio process tap, no virtual-audio driver; see
+[Menu bar (macOS)](#menu-bar-macos) and [Audio source](#audio-source) below).
+On macOS 13.x–14.3 (below the Core Audio tap API floor) and on other
+platforms, the fallback is a loopback driver on the default PortAudio path —
+setup in [docs/blackhole-fallback.md](docs/blackhole-fallback.md).
 
 The baseline ships **MLX-free**: `mlx-whisper` is only in the `[macos]` extra
 and its imports are lazy, so `onoats bot` runs off-mac with PortAudio plus
 either Deepgram or a TCP-reachable `pipecat-local-stt-server`.
+
+## Menu bar (macOS)
+
+`make -C native install` puts **Onoats.app** in `~/Applications`. Launch it
+from there — GUI launch matters: LaunchServices makes the app its own TCC
+permission subject (a terminal launch would attribute the permission grants to
+the terminal instead). It lives in the menu bar with no Dock icon.
+
+- **Start / Stop / Flush** — Start runs the recorder (`onoats bot` with the
+  native capturer); Stop ends the session gracefully (the recorder drains
+  in-flight audio before rotating the buffer into the queue); Flush rotates
+  the current buffer into the queue mid-session.
+- **Mic (me) picker** — the submenu lists input devices; selecting one sets
+  the macOS **default input device** (system-wide — disclosed in the submenu),
+  because the capturer binds the system default at Start. A running session
+  keeps its device; changes apply on the next Start.
+- **Devices line** — the menu shows the current system default input/output,
+  i.e. the devices the capturer will actually bind (a guard against silently
+  recording the wrong device).
+- **Settings** — STT service picker (whisper / websocket / deepgram), data-dir
+  chooser, and an "Open config.toml…" escape hatch. These edit the same
+  `~/.config/onoats/config.toml` the CLI reads — one source of truth; every
+  other line of the file is left byte-identical. Changes apply on the next
+  Start.
+- **Status** — a running indicator backed by the recorder's status file;
+  failed starts surface the exit reason / last error in the menu. Sessions
+  started from a terminal show as "external" and are not signalled from the
+  GUI.
+- **Logs** — recorder output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
+- **First run (TCC prompts)** — the first Start prompts for **Microphone**
+  and records a **Screen & System Audio Recording** grant ("Onoats" appears
+  in both panes of System Settings ▸ Privacy & Security). The system-audio
+  prompt *blocks* the session while unanswered — if you take longer than
+  ~10 s, the session fails loud by design; answer the prompt, then Start
+  again. Grants persist across rebuilds and reinstalls (they key on the
+  signing identity, not the binary — see
+  [`native/README.md`](native/README.md)).
 
 ## Configuration
 
@@ -85,8 +147,9 @@ Two capture backends:
   per-branch unix sockets (mic → `me`, system → `them`) written by the native
   capturer. No loopback driver, no PortAudio device enumeration.
 - **`portaudio`** (default) — PortAudio devices; system audio needs a loopback
-  driver (e.g. BlackHole). This is the path for other platforms and for macOS
-  below 14.4.
+  driver. This is the path for other platforms and for macOS below 14.4 —
+  driver install and device selection in
+  [docs/blackhole-fallback.md](docs/blackhole-fallback.md).
 
 Select via env `AUDIO_SOURCE` or `config.toml`:
 
@@ -112,8 +175,9 @@ precedence (CLI flag > env `AUDIO_SOURCE` > `config.toml` > default).
 > menu-bar app build from source — see [`native/README.md`](native/README.md)
 > for the one-time self-signed-cert setup and the `make -C native install`
 > flow (it also installs the CLI and wires `ONOATS_CAPTURER_BIN`). On other
-> platforms, or below macOS 14.4, keep the default `portaudio` source —
-> BlackHole remains the system-loopback fallback there.
+> platforms, or below macOS 14.4, keep the default `portaudio` source — a
+> loopback driver remains the system-audio fallback there
+> ([docs/blackhole-fallback.md](docs/blackhole-fallback.md)).
 
 ### Data location
 
