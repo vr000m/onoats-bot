@@ -4,7 +4,7 @@
 **Component**: recorder, transport, macos, packaging
 **Assigned to**: vr000m
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
-**Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); Milestone B TBD
+**Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); `feat/socket-audio-transport-milestone-b` (Milestone B)
 **Created**: 2026-06-07
 **Completed**: Milestone A core 2026-06-08 (Phases 1–3); post-adversarial-review supervisor hardening 2026-06-09; Milestone B pending (native, macOS-only)
 
@@ -702,7 +702,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-09 @ 6674e87be0cdae56a269ed1ae818a5653c2f92ef -->
+<!-- reviewed: 2026-06-11 @ 619c615f9866a3d5dfbac3de2f779f387a4688ef -->
 
 ## Progress
 

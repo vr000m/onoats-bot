@@ -431,12 +431,15 @@ native/
 - **Native (manual only):** Phases 4 and 5b use the per-phase manual macOS smoke
   checklists above. The A/B parity check (Phase 4 step 3) is the load-bearing
   acceptance evidence for "no BlackHole, same queue files."
-- Full existing suite (153 tests as of PR #4) must stay green after Phase 5a /
+- Full existing suite (202 tests) must stay green after Phase 5a /
   Phase 6 Python edits: `uv run pytest`.
 
 ## Issues & Solutions
 
-_(to be filled during implementation)_
+See **`## Findings`** below — issues encountered during implementation and their
+resolutions (copy-only IOProc, tap-create retry, pre-start stale-status bug,
+Settings `NSHomeDirectory` gotcha, system-audio-denial-delivers-silence) are
+recorded there as they were discovered.
 
 ## Acceptance Criteria
 
@@ -468,13 +471,16 @@ _(to be filled during implementation)_
 - [x] Capturer survives a default-input-device change mid-session without exiting
       *(verified live 2026-06-10: device switched mid-session, session continued,
       clean Ctrl+C after)*.
-- [ ] `onoats status` reads the status file with the pid backstop (4-cell truth
+- [x] `onoats status` reads the status file with the pid backstop (4-cell truth
       table); recorder writes the file atomically on start/stop;
       `tests/test_status_file.py` green (incl. producer test); full suite green.
-- [ ] Menu-bar `.app` launches, embeds the capturer, tracks the status file;
+      *(Phase 5a done.)*
+- [x] Menu-bar `.app` launches, embeds the capturer, tracks the status file;
       Start/Stop/Flush work and **Stop signals the supervisor, never the capturer**.
-- [ ] BlackHole demoted to fallback in docs (kept for <14.4); `[macos]` extra
-      points at the native build; min macOS version documented.
+      *(Phase 5b core smoke PASSED 2026-06-10 in the GUI topology.)*
+- [x] BlackHole demoted to fallback in docs (kept for <14.4); `[macos]` extra
+      points at the native build; min macOS version documented. *(Phase 6 done
+      2026-06-10.)*
 - [x] **Both** mic-denial and system-audio-denial, plus capturer-crash, show the
       4-part fail-loud observable (ErrorFrame + rc≠0 + WARNING/ERROR + `pending/`
       rotation), no hang. *(Capturer-crash VERIFIED 2026-06-10: `pkill -9` →
@@ -534,12 +540,36 @@ _(to be filled during implementation)_
 
 ## Final Results
 
-_(to be filled on completion)_
+All four phases landed on `feat/socket-audio-transport-milestone-b` (PR #5):
 
-<!-- reviewed: 2026-06-10 @ cb865202b877ff7b438eecfe367887cbe34e8e76 -->
+- **Phase 4 — Swift capturer:** produces the two socket streams natively with no
+  BlackHole installed, emitting JSON-object frames per the wire contract.
+  End-to-end dual-STT session, keystone me/them zero-crossover, kill-mid-session
+  4-part fail-loud, one-socket-close teardown, device-switch survival, A/B parity,
+  and 3× residue cleanup all PASSED on real hardware 2026-06-10. Deferred to
+  ride-along usage: soak/echo (steps 11–12) and the me/them drift soak (OQ4).
+- **Phase 5a — Python status file:** `onoats status` reads the status file with
+  the 4-cell pid backstop; recorder writes atomically on start/stop;
+  `tests/test_status_file.py` green.
+- **Phase 5b — SwiftUI menu-bar launcher:** app builds/signs/GUI-launches (DR
+  byte-identical through the bundle restructure), embeds the capturer, tracks the
+  status file. Core smoke PASSED 2026-06-10 (Start → mid-call Flush → menu-bar Stop
+  with content-bearing final flush → both sessions drained to `done/`, keystone
+  split intact). Mic-denial fail-loud PASSED; system-audio denial found to deliver
+  silence rather than an enforced failure (see Findings).
+- **Phase 6 — BlackHole demoted to fallback:** README + init warning + pyproject
+  `[macos]` note lead with the native 14.4+ path, BlackHole kept as documented
+  fallback for 13.x–14.3/off-mac.
+
+Full suite: **209 passed** (202 at smoke completion + tests added by the
+review-gauntlet fixes). Status going into merge: pre-merge review gauntlet
+(`/review` done — 4 findings fixed in `3aa08d2`; `/security-review` done — no
+findings; Codex adversarial review + `/deep-review` pending).
+
+<!-- reviewed: 2026-06-11 @ 4bd816ff677794bbf95bf237d90bb8c7e2f0b0cb -->
 ## Progress
 
-- [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
+- [x] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
   9, 10 PASSED on real hardware 2026-06-10** (end-to-end dual-STT session,
   keystone content routing me/them zero-crossover, kill-mid-session 4-part
   fail-loud, one-socket-close teardown, device-switch survival, graceful Ctrl+C
@@ -553,7 +583,7 @@ _(to be filled on completion)_
   so it sees production aggregates).** **Remaining:** steps 11–12
   soak/echo (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
-- [ ] Phase 5b — SwiftUI menu-bar launcher — ***BUILT 2026-06-10** (app compiles,
+- [x] Phase 5b — SwiftUI menu-bar launcher — ***BUILT 2026-06-10** (app compiles,
   signs, GUI-launches; DR byte-identical through the bundle restructure; install
   chain `make cert` / `make install-cli` / `make install` all verified live).
   **Core smoke PASSED 2026-06-10 on a real call (GUI topology):** Start →
