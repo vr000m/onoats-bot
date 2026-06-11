@@ -1,6 +1,6 @@
 # Milestone B — Native macOS System-Audio Capture + Menu-Bar Launcher
 
-**Status**: In Progress — all phases + manual smoke done; review gauntlet complete (all findings fixed/dispositioned); remaining: all-zero-WARNING denial smoke, PR refresh, merge
+**Status**: Shipped — merged in PR #5 (2026-06-11, regular merge `16da012`); all phases, full manual smoke (incl. both TCC denials + all-zero watchdog), and the review gauntlet complete
 **Component**: macos, transport, recorder, packaging
 **Assignee**: Varun Singh
 **Priority**: Medium
@@ -575,7 +575,7 @@ to the AGENTS.md checklist (--source env contract; cert argv residual).
 Remaining before merge: user verifies the all-zero WARNING on one more
 denial smoke, PR description refresh, un-draft, merge.
 
-<!-- reviewed: 2026-06-11 @ 24e00120ac298f412d3d68622ed84bcc86bf2338 -->
+<!-- reviewed: 2026-06-11 @ 26256cf2b8822e17b2ece7b27966143320f86227 -->
 ## Progress
 
 - [x] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
