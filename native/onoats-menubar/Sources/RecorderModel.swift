@@ -66,6 +66,7 @@ final class RecorderModel: ObservableObject {
 
     private var proc: Process?
     private var userRequestedStop = false
+    private var spawnedAt: Date?
     private var timer: Timer?
 
     // ------------------------------------------------------------------ paths
@@ -223,6 +224,7 @@ final class RecorderModel: ObservableObject {
         do {
             try p.run()
             proc = p
+            spawnedAt = Date()
             state = .starting
         } catch {
             state = .failed(reason: "spawn-failed", detail: error.localizedDescription)
@@ -319,7 +321,15 @@ final class RecorderModel: ObservableObject {
         } else {
             // Fail-loud surface: the supervisor stamps exit_reason/last_error
             // into the status file on the way down — show *why*, not just rc.
-            let status = readStatus()
+            // FRESHNESS GUARD (observed live: a mic-denial start rendered as
+            // "failed: graceful"): only trust a record written for THIS
+            // session — a record whose start_time predates our spawn is the
+            // previous session's and its exit_reason is a lie here.
+            var status = readStatus()
+            if let s = status, let spawned = spawnedAt,
+               Date(timeIntervalSince1970: s.start_time) < spawned.addingTimeInterval(-5) {
+                status = nil
+            }
             let reason = status?.exit_reason ?? "exit code \(p.terminationStatus)"
             state = .failed(reason: reason, detail: status?.last_error)
         }
