@@ -53,6 +53,22 @@ def test_status_schema_version_matches_swift():
     assert swift == STATUS_SCHEMA_VERSION
 
 
+def test_status_record_fields_match_swift():
+    """The Swift StatusRecord mirror must carry exactly the Python dataclass's
+    fields, in the same order — a one-sided field addition (e.g. a schema-v2
+    optional) otherwise decodes fine and silently never renders."""
+    from dataclasses import fields as dc_fields
+
+    from onoats.status import StatusRecord
+
+    text = RECORDER_MODEL.read_text(encoding="utf-8")
+    m = re.search(r"struct StatusRecord: Decodable \{(.*?)\n\}", text, re.DOTALL)
+    assert m, "struct StatusRecord not found in RecorderModel.swift"
+    swift_fields = re.findall(r"let (\w+):", m.group(1))
+    python_fields = [f.name for f in dc_fields(StatusRecord)]
+    assert swift_fields == python_fields
+
+
 def test_status_file_relative_path_matches_swift():
     from onoats.status import status_path
 

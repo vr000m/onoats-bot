@@ -16,7 +16,9 @@ import CoreAudio
 import Foundation
 import SwiftUI
 
-/// Mirror of `src/onoats/status.py` `StatusRecord` (STATUS_SCHEMA_VERSION=1).
+/// Mirror of `src/onoats/status.py` `StatusRecord` (STATUS_SCHEMA_VERSION=2).
+/// v2 adds the optional `warning` (live capture anomaly, supervisor-managed)
+/// and `mic_device`/`system_device` (populated from Phase 5 onward).
 struct StatusRecord: Decodable {
     let schema: Int
     let pid: Int32
@@ -28,6 +30,9 @@ struct StatusRecord: Decodable {
     let last_error: String?
     let exit_reason: String?
     let supervisor_rc: Int?
+    let warning: String?
+    let mic_device: String?
+    let system_device: String?
 }
 
 enum RecorderState: Equatable {
@@ -40,7 +45,7 @@ enum RecorderState: Equatable {
 
 @MainActor
 final class RecorderModel: ObservableObject {
-    static let statusSchemaVersion = 1
+    static let statusSchemaVersion = 2
 
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"

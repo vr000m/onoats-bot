@@ -9,7 +9,8 @@ so a mismatched capturer fails loud rather than emitting silently-misframed audi
 This is the third versioned contract in the system, alongside the JSONL queue
 contract (the `me`/`them` `source` enum — see `processors/source_tagger.py`) and
 the status-file schema (`src/onoats/status.py`, `STATUS_SCHEMA_VERSION` — shipped
-in Phase 5a). The constants below are read
+in Phase 5a; see [Status-file schema](#status-file-schema-v2) below). The
+constants below are read
 from `src/onoats/transports/socket_audio.py`; that module is the source of truth
 and this doc mirrors it.
 
@@ -311,6 +312,30 @@ the audio stream stopped mid-session and the recording is truncated. A deliberat
 success) is **reserved for a future capturer exit-code contract** — adopting it
 would also require redefining the transport's EOF-is-fatal rule, so it is out of
 scope for v1.
+
+## Status-file schema (v2)
+
+`src/onoats/status.py` (`StatusRecord` / `STATUS_SCHEMA_VERSION`) is the source
+of truth; the menu bar's `RecorderModel.swift` mirrors it (parity-pinned by
+`tests/test_native_contract_parity.py`). **Both readers hard-reject any other
+`schema` value** (Python returns "no status"; the menu bar shows schema drift)
+— so a schema bump requires reinstalling the app and the CLI **together**
+(`make -C native install`); the visible mixed-version symptom is schema drift,
+never mis-rendered data.
+
+Version history:
+
+- **v1** (Phase 5a): `schema`, `pid`, `start_time`, `audio_source`,
+  `stt_label`, `running`, `last_rotation_time`, `last_error`, `exit_reason`,
+  `supervisor_rc`.
+- **v2** (release-plan Phase 4): adds three **optional flat string** fields,
+  all default `null`:
+  - `warning` — live, non-fatal capture anomaly (today: the capturer's
+    all-zero-input detector). Set/cleared by the supervisor from
+    `ONOATS-EVENT` lines (above) while the session runs.
+  - `mic_device`, `system_device` — `"<name> (uid=<uid>)"` for the devices the
+    capturer actually bound. Defined in v2, populated from release-plan
+    Phase 5 onward (`null` until then).
 
 ## Fail-loud observable (acceptance shape)
 
