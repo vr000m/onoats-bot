@@ -539,8 +539,14 @@ _(to be filled on completion)_
 - [ ] Phase 5b — SwiftUI menu-bar launcher — ***BUILT 2026-06-10** (app compiles,
   signs, GUI-launches; DR byte-identical through the bundle restructure; install
   chain `make cert` / `make install-cli` / `make install` all verified live).
-  **Remaining: manual smoke incl. the two deferred TCC-denial tests.** Device
-  pickers/profiles deferred — see Findings.*
+  **Core smoke PASSED 2026-06-10 on a real call (GUI topology):** Start →
+  mid-call Flush (SIGUSR1, 25 entries rotated + fresh active swapped) →
+  continued talking → menu-bar Stop (SIGTERM graceful: 25-entry
+  **content-bearing final flush** ending in a real utterance — closes the
+  Milestone-A open edge), both sessions drained to `done/`,
+  `exit_reason=graceful`, pid file removed, keystone me/them split intact
+  (3/22 on the call leg). **Remaining: the two TCC-denial tests (steps 5–6)
+  + Settings-submenu poke.** Device pickers/profiles deferred — see Findings.*
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
 
 ## Findings
