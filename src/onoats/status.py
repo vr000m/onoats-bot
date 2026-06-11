@@ -264,6 +264,14 @@ def stamp_supervisor_failure(
     recorder's own fatal ErrorFrame) and the final rc. This stamps those without
     clobbering the recorder's start detail. No-op (returns ``None``) if there is no
     record to enrich.
+
+    Concurrency contract: this is a read-modify-write and is **deliberately
+    last-writer-wins**. The supervisor calls it after waiting for recorder drain,
+    but a force-cancelled recorder may still race its own stopped-write against
+    this one. ``os.replace`` keeps every individual write atomic (a reader never
+    sees torn JSON); the guarantee is "one complete record wins", NOT "updates
+    are serialized". Both racers write ``running=false``, so the liveness verdict
+    is unaffected either way — only the failure detail differs.
     """
     current = read_status(data_dir)
     if current is None:
@@ -320,4 +328,6 @@ def resolve_liveness(
             )
         elif not status.running and alive:
             note = "status file claims stopped but pid is alive — reporting running (pid backstop)"
-    return Liveness(alive=alive, pid=pid if alive else pid, status=status, note=note)
+    # pid is returned even when dead — `onoats status` prints "stale pid file
+    # (pid X not running)" and needs the number.
+    return Liveness(alive=alive, pid=pid, status=status, note=note)

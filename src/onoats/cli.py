@@ -174,6 +174,15 @@ def _cmd_bot(rest: list[str]) -> int:
 _SOCKET_WAIT_TIMEOUT_SEC = 10.0
 _SOCKET_WAIT_POLL_SEC = 0.05
 
+# Map the capturer's exit-code contract (native/onoats-capturer/Sources/
+# Support.swift ``ExitCode``) to the ``exit_reason`` vocabulary documented in
+# status.py, so a TCC denial shows as itself in `onoats status` / the menu bar
+# instead of a generic "capturer-crash".
+_CAPTURER_RC_REASONS = {
+    10: "mic-denied",  # ExitCode.micDenied
+    11: "system-audio-denied",  # ExitCode.systemAudioFailed
+}
+
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +
 # rotate) after the capturer dies, before the supervisor force-cancels it.
 _RECORDER_DRAIN_GRACE_SEC = 30.0
@@ -510,7 +519,11 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
 
     recorder_task = asyncio.create_task(
         run_onoats_dual(
-            live_terminal=args.live_terminal, locked_category=args.category
+            live_terminal=args.live_terminal,
+            locked_category=args.category,
+            # Same resolution the supervisor's own status stamps use — one
+            # canonical data dir per session (see run_onoats_dual).
+            data_dir=data_dir,
         ),
         name="socket_supervisor_recorder",
     )
@@ -593,12 +606,16 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger) -> int:
         # non-zero for the capturer death, so just record it.
         logger.warning(f"Socket supervisor: recorder drain raised: {exc}")
     # The supervisor alone knows this was a capturer-death (not the recorder's own
-    # ErrorFrame). Override the reason to capturer-crash + stamp the rc. If the
-    # recorder was force-cancelled before writing its stopped record, this also
-    # flips the lingering running=true start record to stopped.
+    # ErrorFrame). Stamp the specific reason: the capturer's exit-code contract
+    # (Support.swift ExitCode: 10=mic denied, 11=system-audio failed) is the only
+    # way the menu bar / `onoats status` can show WHY a start failed, not just
+    # that it crashed. Anything else — including rc=0 — is "capturer-crash".
+    # If the recorder was force-cancelled before writing its stopped record,
+    # this also flips the lingering running=true start record to stopped.
+    exit_reason = _CAPTURER_RC_REASONS.get(rc, "capturer-crash")
     status_file.stamp_supervisor_failure(
         data_dir,
-        exit_reason="capturer-crash",
+        exit_reason=exit_reason,
         supervisor_rc=1,
         last_error="capturer exited mid-session; partial recording rotated to pending/",
     )

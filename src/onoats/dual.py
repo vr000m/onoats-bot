@@ -333,7 +333,10 @@ def _build_socket_transports(cfg):
 
 
 async def run_onoats_dual(
-    *, live_terminal: bool = False, locked_category: str | None = None
+    *,
+    live_terminal: bool = False,
+    locked_category: str | None = None,
+    data_dir=None,
 ) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
@@ -344,7 +347,11 @@ async def run_onoats_dual(
     from onoats.processors.dual_silence_detector import DualSilenceDetector
     from onoats.processors.transcript_buffer import TranscriptBuffer
 
-    data_dir = onoats_data_dir()
+    # One canonical derivation per session: the socket supervisor resolves the
+    # data dir once and passes it in, so its failure stamps and the recorder's
+    # own status/pid writes can never target different directories. Standalone
+    # callers (the PortAudio path) resolve here as before.
+    data_dir = data_dir if data_dir is not None else onoats_data_dir()
 
     from onoats.config import load_config
 
