@@ -129,9 +129,13 @@ def _pick_devices_interactive(
         print(f"  [{idx}] {name} ({rate} Hz){flag}")
 
     if not any(_looks_like_loopback(n) for _, n, _ in inputs):
+        # Device pickers configure the PortAudio path only; the native socket
+        # path (macOS 14.4+) captures system audio without any loopback driver.
         print(
-            "  WARNING: no system-loopback device detected (e.g. BlackHole). "
-            "'Them' capture needs one — install a loopback driver, then re-run."
+            "  NOTE: no system-loopback device detected (e.g. BlackHole). "
+            "On the PortAudio path, 'Them' capture needs one. On macOS 14.4+ "
+            "prefer the native capture path instead — AUDIO_SOURCE=socket, "
+            "no loopback driver required (see native/README.md)."
         )
 
     def _pick(label: str, default: str | None) -> str | None:
