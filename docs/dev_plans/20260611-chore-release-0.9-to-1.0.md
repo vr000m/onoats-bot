@@ -596,7 +596,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
 ## Progress
 
 - [x] Phase 1 — LICENSE + license metadata (PR #9 merged 2026-06-11, `66a93cd`)
-- [x] Phase 2 — CHANGELOG + v0.9.0 (branch `chore/changelog-v0.9.0`, PR #10 open; tag after merge)
+- [x] Phase 2 — CHANGELOG + v0.9.0 (PR #10 merged 2026-06-11, `3a4e538`; tag `v0.9.0` pushed)
 - [ ] Phase 3 — README overhaul + blackhole-fallback doc
 - [ ] Phase 4 — Menu-bar zero-run WARNING surfacing
 - [ ] Phase 5 — CLI device visibility
@@ -608,4 +608,12 @@ retrieval is `git checkout spike-archive -- native/spike`.
 
 ## Findings
 
-*(durable findings recorded during implementation)*
+- **`v0.9.0` tagged 2026-06-11** on PR #10's merge commit `3a4e538`
+  (annotated; pushed to origin). `scripts/release_check.sh v0.9.0 3a4e538`
+  passed all four surface checks before the tag was pushed.
+- Phase 2 attribution audit: 23 CHANGELOG claims verified against history,
+  zero refutations; one drafting misattribution caught pre-commit
+  (`--category` came from `81afbc0`, not pre-extraction PR #34).
+- The plan-file review marker blocks above-marker edits (including checkbox
+  ticks) — phase progress is recorded here and in `## Progress` below the
+  marker instead; recomputing the marker hash requires the user.
