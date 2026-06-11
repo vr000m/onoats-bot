@@ -9,11 +9,40 @@
 // effectively authoritative.
 import Foundation
 
+struct ConfigWriteError: Error, CustomStringConvertible {
+    let description: String
+}
+
 enum ConfigStore {
     // NSHomeDirectory() consults the user database, NOT the $HOME env var —
     // a HOME override does not redirect this path (verified the hard way).
     static var configURL: URL {
         URL(fileURLWithPath: NSHomeDirectory() + "/.config/onoats/config.toml")
+    }
+
+    // TOML basic-string escaping, restricted to the subset this editor speaks
+    // (see writeValue): backslash and double-quote are the two characters
+    // legal in macOS paths that would otherwise break out of the quoted
+    // value and corrupt config.toml for the Python CLI (tomllib raises on
+    // the next `onoats` command — ANY command — until the file is hand-fixed).
+    private static func escape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// Inverse of `escape`: a backslash takes the next character literally
+    /// (single scan — sequential string replaces would mis-handle `\\"`).
+    private static func unescape(_ s: String) -> String {
+        var out = ""
+        var iter = s.makeIterator()
+        while let c = iter.next() {
+            if c == "\\", let next = iter.next() {
+                out.append(next)
+            } else {
+                out.append(c)
+            }
+        }
+        return out
     }
 
     /// Value of `key` inside `[section]`, unquoted/comment-stripped, or nil.
@@ -34,8 +63,27 @@ enum ConfigStore {
             guard lhs == key else { continue }
             var value = String(line[line.index(after: eq)...])
                 .trimmingCharacters(in: .whitespaces)
-            if value.hasPrefix("\""), let close = value.dropFirst().firstIndex(of: "\"") {
-                value = String(value[value.index(after: value.startIndex)..<close])
+            if value.hasPrefix("\"") {
+                // Scan to the closing UNESCAPED quote (a `\"` written by
+                // escape() must not terminate the string), then unescape.
+                var body = ""
+                var escaped = false
+                var closed = false
+                for c in value.dropFirst() {
+                    if escaped {
+                        body.append("\\")
+                        body.append(c)
+                        escaped = false
+                    } else if c == "\\" {
+                        escaped = true
+                    } else if c == "\"" {
+                        closed = true
+                        break
+                    } else {
+                        body.append(c)
+                    }
+                }
+                value = closed ? unescape(body) : ""
             } else if let hash = value.firstIndex(of: "#") {
                 value = String(value[..<hash]).trimmingCharacters(in: .whitespaces)
             }
@@ -46,10 +94,26 @@ enum ConfigStore {
 
     /// Replace (or insert) `key = "value"` inside `[section]`. Creates the
     /// file/section when missing. Atomic write; all other lines untouched.
+    ///
+    /// TOML subset contract (deliberately thin — this is a line editor, not a
+    /// serializer): plain `[section]` headers, single-line `key = "basic
+    /// string"` values with `\\`/`\"` escapes, `#` comments. NO dotted keys,
+    /// arrays, multi-line strings, or literal ('…') strings — the Python side
+    /// reads with full tomllib, so anything this writer emits must stay
+    /// inside the subset both agree on (tests/test_native_contract_parity.py
+    /// round-trips a sample through tomllib).
     static func writeValue(section: String, key: String, value: String) throws {
+        // A control character (esp. newline) would let the value break out of
+        // its line and inject arbitrary TOML keys — refuse, never sanitize.
+        guard value.rangeOfCharacter(from: .newlines) == nil,
+            value.rangeOfCharacter(from: .controlCharacters) == nil
+        else {
+            throw ConfigWriteError(
+                description: "config value for \(section).\(key) contains a control character")
+        }
         let text = (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
         var lines = text.components(separatedBy: "\n")
-        let newLine = "\(key) = \"\(value)\""
+        let newLine = "\(key) = \"\(escape(value))\""
 
         var current = ""
         var sectionHeaderIdx: Int? = nil

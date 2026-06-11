@@ -53,7 +53,9 @@ final class RecorderModel: ObservableObject {
     @Published var sttService = "whisper"
     @Published var dataDirDisplay = ""
 
-    /// Valid `[stt].service` values (mirrors runtime.py's service branches).
+    /// Valid `[stt].service` values — mirror of runtime.py
+    /// `VALID_STT_SERVICES` (parity-checked by
+    /// tests/test_native_contract_parity.py).
     static let sttServices = ["whisper", "websocket", "deepgram"]
 
     private var proc: Process?
@@ -77,9 +79,13 @@ final class RecorderModel: ObservableObject {
         Bundle.main.bundlePath + "/Contents/MacOS/onoats-capturer"
     }
 
-    /// Mirrors the Python resolution as seen from a LaunchServices app (no
-    /// shell env, so no ONOATS_DATA_DIR/XDG vars): config.toml
-    /// `[storage].data_dir` > `~/.local/share/onoats` (the XDG default).
+    /// Mirrors the Python resolution (store.py onoats_data_dir) as seen from
+    /// a LaunchServices app. Python's full chain is ONOATS_DATA_DIR env >
+    /// legacy env var > XDG_DATA_HOME/onoats > ~/.local/share/onoats; a GUI
+    /// app inherits no shell env, so the three env steps are intentionally
+    /// unreachable here and only config.toml `[storage].data_dir` >
+    /// `~/.local/share/onoats` remain. The XDG-default literal is
+    /// parity-checked against store.py by tests/test_native_contract_parity.py.
     static func resolveDataDir() -> URL {
         if let value = ConfigStore.readValue(section: "storage", key: "data_dir") {
             return URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
@@ -243,8 +249,17 @@ final class RecorderModel: ObservableObject {
         panel.message = "Choose the onoats data directory (config.toml [storage].data_dir)"
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        try? ConfigStore.writeValue(
-            section: "storage", key: "data_dir", value: url.path)
+        do {
+            try ConfigStore.writeValue(
+                section: "storage", key: "data_dir", value: url.path)
+        } catch {
+            // Rejected write (control character in the path) — say so rather
+            // than silently keeping the old dir.
+            let alert = NSAlert()
+            alert.messageText = "Could not save data directory"
+            alert.informativeText = "\(error)"
+            alert.runModal()
+        }
         refresh()
     }
 
