@@ -87,6 +87,8 @@ def test_read_missing_returns_none(tmp_path: Path):
         '{"schema":1}',  # missing required fields
         '{"schema":"x","pid":1,"start_time":0,"audio_source":"s",'
         '"stt_label":"l","running":true}',  # wrong type for schema
+        '{"schema":1,"pid":1,"start_time":0,"audio_source":"s",'
+        '"stt_label":"l","running":"false"}',  # running not a real boolean
         "",  # empty (half-written)
     ],
 )

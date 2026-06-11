@@ -289,18 +289,20 @@ let micWriter = FrameWriter(label: "mic", fd: micFd) { rc, reason in
 let systemWriter = FrameWriter(label: "system", fd: systemFd) { rc, reason in
     Teardown.shared.trigger(rc: rc, reason: reason)
 }
-Teardown.shared.writers = [micWriter, systemWriter]
-micWriter.start()
-systemWriter.start()
-
 let micCapture = MicCapture { pcm, ns in
     micWriter.enqueue(pcm: pcm, capturedMonotonicNs: ns)
 }
 let systemCapture = SystemCapture { pcm, ns in
     systemWriter.enqueue(pcm: pcm, capturedMonotonicNs: ns)
 }
+// Register EVERYTHING with Teardown before any writer thread starts: a writer
+// hitting a terminal error must find a fully-populated Teardown, never a
+// half-registered one (stop() on a never-started capture is a safe no-op).
+Teardown.shared.writers = [micWriter, systemWriter]
 Teardown.shared.mic = micCapture
 Teardown.shared.system = systemCapture
+micWriter.start()
+systemWriter.start()
 
 // System (tap) first, mic engine second — the spike-proven order. Creating the
 // tap while an AVAudioEngine is already running was intermittently flaky

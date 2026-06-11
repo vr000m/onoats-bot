@@ -147,6 +147,18 @@ should NOT re-flag go here, one per line:
   TCC persistence on the PRODUCTION designated requirement (bundle id + cert),
   so a distinct spike identity would invalidate the spike evidence. The spike
   tree is slated for deletion after Phase 5b/6. (2026-06-10)
+- **[Performance] won't-fix (scoped)**: the capturer IOProcs perform one bounded
+  heap copy (`Data(bytes:count:)`, ~10 ms chunk) and take an `NSCondition` lock
+  per callback (`MicCapture.enqueueChunk` / `SystemCapture.enqueueChunk`). A
+  textbook RT path would use a pre-allocated lock-free ring buffer; we keep the
+  copy+lock because (a) the worker holds the lock only for a queue pop —
+  microsecond contention window, (b) the pattern is hardware-verified across
+  the full Phase 4/5b smoke incl. hours-long real-call sessions with zero HAL
+  starvation, and (c) a ring-buffer rewrite would invalidate that evidence and
+  force a re-smoke for a latent, never-observed risk. What we DID fix
+  (2026-06-10): the drop-path `logLine` that ran on the realtime thread —
+  drops are now counted under the lock and reported from the worker thread.
+  Revisit only if a real session ever logs HAL silence/dropouts. (2026-06-10)
 - **[Logic] analysis-error**: `FrameChunker.append` back-extrapolating from the
   total `pending.count` "over-counts leftover samples" — the math is exact while
   capture is contiguous (leftovers are contiguous with the next buffer); only a

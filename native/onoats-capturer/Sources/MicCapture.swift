@@ -234,19 +234,18 @@ final class MicCapture {
         defer { lock.unlock() }
         if workerClosed { return }
         if queue.count >= maxQueuedChunks {
+            // Count only — NO logging here: this runs on the realtime thread,
+            // and string formatting + log IO is exactly the deadline overrun
+            // the header warns about. The worker thread reports drops.
             queue.removeFirst()
             droppedChunks += 1
-            if droppedChunks == 1 || droppedChunks % 100 == 0 {
-                logLine(
-                    "WARNING mic: capture queue full; dropped oldest chunk "
-                        + "(total dropped \(droppedChunks))")
-            }
         }
         queue.append((bytes, frames, endNs, format, resampler))
         lock.signal()
     }
 
     private func runWorker() {
+        var loggedDropped: UInt64 = 0
         while true {
             lock.lock()
             while queue.isEmpty && !workerClosed { lock.wait() }
@@ -255,7 +254,15 @@ final class MicCapture {
                 return
             }
             let item = queue.removeFirst()
+            let dropped = droppedChunks
             lock.unlock()
+
+            if dropped > loggedDropped, loggedDropped == 0 || dropped - loggedDropped >= 100 {
+                loggedDropped = dropped
+                logLine(
+                    "WARNING mic: capture queue full; dropping oldest chunks "
+                        + "(total dropped \(dropped))")
+            }
 
             guard item.frames > 0,
                 let buffer = AVAudioPCMBuffer(pcmFormat: item.format, frameCapacity: item.frames)
@@ -288,7 +295,10 @@ final class MicCapture {
             listenerInstalled = false
         }
         chunker.stop()
-        unbind()
+        // Serialize the final unbind with any in-flight rebind() — both touch
+        // deviceID/ioProcID, and an unbind racing a rebind on another thread
+        // could double-destroy the IOProcID or act on a stale device.
+        rebindQueue.sync { unbind() }
         lock.lock()
         workerClosed = true
         queue.removeAll()

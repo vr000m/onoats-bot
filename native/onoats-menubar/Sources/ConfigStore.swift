@@ -55,6 +55,7 @@ enum ConfigStore {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("["), line.hasSuffix("]") {
                 current = String(line.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespaces)  // tolerate hand-edited [ stt ]
                 continue
             }
             guard current == section, !line.hasPrefix("#") else { continue }
@@ -122,6 +123,7 @@ enum ConfigStore {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("["), line.hasSuffix("]") {
                 current = String(line.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespaces)  // tolerate hand-edited [ stt ]
                 if current == section { sectionHeaderIdx = i }
                 continue
             }

@@ -91,6 +91,10 @@ check-identity:
 # (unsigned, every AudioHardwareCreateProcessTap call blocks ~4 s in security
 # verification — the signature on the capturer BINARY is what avoids that),
 # then the bundle. Same identity + identifier for both => one DR.
+# NO --deep, deliberately: the capturer is the only nested code today and is
+# signed explicitly above. If a resource/helper is ever ADDED to the bundle,
+# it must get its own explicit codesign line here — an unsigned addition
+# silently invalidates the outer signature.
 sign: app check-identity
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(BIN)
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(APP)

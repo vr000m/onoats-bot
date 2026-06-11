@@ -55,6 +55,9 @@ final class RecorderModel: ObservableObject {
     /// from `sttLabel`, which is what the *running* session reports).
     @Published var sttService = "whisper"
     @Published var dataDirDisplay = ""
+    /// Non-nil when the last Flush failed — shown in the menu, cleared on the
+    /// next Flush or Start.
+    @Published var flushNote: String?
 
     /// Valid `[stt].service` values — mirror of runtime.py
     /// `VALID_STT_SERVICES` (parity-checked by
@@ -112,6 +115,10 @@ final class RecorderModel: ObservableObject {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    deinit {
+        timer?.invalidate()
     }
 
     // ------------------------------------------------------------------ reads
@@ -172,10 +179,17 @@ final class RecorderModel: ObservableObject {
             startTime = nil
         }
 
-        if let p = proc, p.isRunning {
-            if case .stopping = state { return }  // SIGTERM sent; draining
-            state = alive ? .running(ours: true) : .starting
-        } else if alive {
+        if let p = proc {
+            if p.isRunning {
+                if case .stopping = state { return }  // SIGTERM sent; draining
+                state = alive ? .running(ours: true) : .starting
+            }
+            // Exited but handleExit hasn't run yet (it clears `proc` LAST,
+            // after the state assignment): leave state alone so the poll
+            // can't clobber an imminent .failed with .stopped.
+            return
+        }
+        if alive {
             state = .running(ours: false)
         } else if case .failed = state {
             // Sticky until the next Start so the user actually sees it.
@@ -189,6 +203,7 @@ final class RecorderModel: ObservableObject {
     func start() {
         guard proc == nil || proc?.isRunning == false else { return }
         userRequestedStop = false
+        flushNote = nil
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cliPath)
@@ -224,7 +239,12 @@ final class RecorderModel: ObservableObject {
         p.terminate()  // SIGTERM → runtime's graceful-shutdown handler
     }
 
+    /// Runs `onoats flush` and surfaces a non-zero exit in the menu (fail-loud
+    /// like everything else). Deliberately works for EXTERNAL sessions too:
+    /// the CLI does its own identity-checked pid signalling (marker +
+    /// fingerprint), so flushing a terminal-started session from here is safe.
     func flush() {
+        flushNote = nil
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cliPath)
         p.arguments = ["flush"]
@@ -232,7 +252,19 @@ final class RecorderModel: ObservableObject {
             p.standardOutput = log
             p.standardError = log
         }
-        try? p.run()
+        p.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                if proc.terminationStatus != 0 {
+                    self?.flushNote =
+                        "Flush failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
+                }
+            }
+        }
+        do {
+            try p.run()
+        } catch {
+            flushNote = "Flush spawn failed: \(error.localizedDescription)"
+        }
     }
 
     // --------------------------------------------------------------- settings
@@ -282,7 +314,6 @@ final class RecorderModel: ObservableObject {
     }
 
     private func handleExit(_ p: Process) {
-        proc = nil
         if userRequestedStop || p.terminationStatus == 0 {
             state = .stopped
         } else {
@@ -293,6 +324,10 @@ final class RecorderModel: ObservableObject {
             state = .failed(reason: reason, detail: status?.last_error)
         }
         userRequestedStop = false
+        // Cleared LAST: refresh() treats a non-nil exited proc as
+        // "exit-in-flight" and leaves state alone, so the poll timer can
+        // never clobber the .failed assignment above with .stopped.
+        proc = nil
     }
 
     private func openLog() -> FileHandle? {

@@ -124,6 +124,10 @@ def _cmd_bot(rest: list[str]) -> int:
     # --source overrides via the env channel (top of the existing precedence:
     # env > config.toml > default), so the supervisor, the spawned recorder,
     # and the status file all see one consistent value with no new plumbing.
+    # Note: `rest` still contains --source and dual.main/_parse_args will
+    # parse it again downstream — that re-parse is deliberately ignored (the
+    # env var set here is the single effective channel), kept so both launch
+    # paths share one parser.
     if args.source:
         os.environ["AUDIO_SOURCE"] = args.source
 

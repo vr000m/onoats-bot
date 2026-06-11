@@ -186,19 +186,18 @@ final class SystemCapture {
         defer { lock.unlock() }
         if workerClosed { return }
         if queue.count >= maxQueuedChunks {
+            // Count only — NO logging here: this runs on the realtime thread,
+            // and string formatting + log IO is exactly the deadline overrun
+            // the header warns about. The worker thread reports drops.
             queue.removeFirst()
             droppedChunks += 1
-            if droppedChunks == 1 || droppedChunks % 100 == 0 {
-                logLine(
-                    "WARNING system: capture queue full; dropped oldest chunk "
-                        + "(total dropped \(droppedChunks))")
-            }
         }
         queue.append((bytes, frames, endNs))
         lock.signal()
     }
 
     private func runWorker() {
+        var loggedDropped: UInt64 = 0
         while true {
             lock.lock()
             while queue.isEmpty && !workerClosed { lock.wait() }
@@ -207,7 +206,15 @@ final class SystemCapture {
                 return
             }
             let item = queue.removeFirst()
+            let dropped = droppedChunks
             lock.unlock()
+
+            if dropped > loggedDropped, loggedDropped == 0 || dropped - loggedDropped >= 100 {
+                loggedDropped = dropped
+                logLine(
+                    "WARNING system: capture queue full; dropping oldest chunks "
+                        + "(total dropped \(dropped))")
+            }
 
             guard let format = tapFormat, let resampler else { continue }
             guard item.frames > 0,

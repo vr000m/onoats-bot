@@ -42,6 +42,9 @@ struct MenuContent: View {
         if model.schemaDrift {
             Text("⚠ status file schema drift — update onoats / this app")
         }
+        if let note = model.flushNote {
+            Text("⚠ \(note)")
+        }
 
         Divider()
 

@@ -141,13 +141,17 @@ def read_status(data_dir: Path) -> StatusRecord | None:
         # rendered as if it were ours.
         if int(obj["schema"]) != STATUS_SCHEMA_VERSION:
             return None
+        # `running` must be a real JSON boolean — truthy coercion would let a
+        # drifted producer (e.g. "running": "false") silently mis-render.
+        if not isinstance(obj["running"], bool):
+            return None
         return StatusRecord(
             schema=int(obj["schema"]),
             pid=int(obj["pid"]),
             start_time=float(obj["start_time"]),
             audio_source=str(obj["audio_source"]),
             stt_label=str(obj["stt_label"]),
-            running=bool(obj["running"]),
+            running=obj["running"],
             last_rotation_time=(
                 float(obj["last_rotation_time"])
                 if obj.get("last_rotation_time") is not None
