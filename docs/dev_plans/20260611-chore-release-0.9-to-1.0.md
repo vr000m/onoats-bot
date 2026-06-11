@@ -598,7 +598,8 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 1 — LICENSE + license metadata (PR #9 merged 2026-06-11, `66a93cd`)
 - [x] Phase 2 — CHANGELOG + v0.9.0 (PR #10 merged 2026-06-11, `3a4e538`; tag `v0.9.0` pushed)
 - [x] Phase 3 — README overhaul + blackhole-fallback doc (PR #13)
-- [ ] Phase 4 — Menu-bar zero-run WARNING surfacing
+- [ ] Phase 4 — Menu-bar zero-run WARNING surfacing (implemented; PR open —
+  live smoke pending before merge)
 - [ ] Phase 5 — CLI device visibility
 - [ ] Phase 6 — Install streamlining + spike removal
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
@@ -631,3 +632,17 @@ retrieval is `git checkout spike-archive -- native/spike`.
   (Quickstart, Menu bar section), `native/README.md` owns build/sign/TCC
   internals, `docs/blackhole-fallback.md` owns the loopback fallback;
   cross-links in all three directions, no duplicated facts.
+- Phase 4 implementation (2026-06-11): event-line format settled as
+  `ONOATS-EVENT <type> k=v …` with `hint=` as the trailing free-text field by
+  contract (single split point, no quoting needed). Per-branch warnings merge
+  `; `-joined in branch order; `zero-run-clear` (new event, emitted when real
+  audio re-arms the detector) removes the branch and nulls the field when none
+  remain. Reader lifecycle: starts immediately after spawn (before the
+  socket wait, so a prestart stderr flood can't block the capturer), is NOT a
+  participant in the recorder/capturer completion race, and retires in the
+  session `finally` under a 2 s bound after `_stop_capturer`. Overlong stderr
+  lines (>64 KiB) are dropped via `StreamReader.readline`'s documented
+  ValueError path (buffer cleared, transport resumed) — the drain survives.
+  Pipe-drain proof in tests: a 512 KiB pre-bind stderr flood would block an
+  undrained capturer at the ~64 KiB pipe capacity before its sockets appear;
+  the E2E test passes only because the reader drains from spawn.

@@ -109,6 +109,11 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   failed starts surface the exit reason / last error in the menu. Sessions
   started from a terminal show as "external" and are not signalled from the
   GUI.
+- **Capture warning** — if a stream delivers only silence for ~30 s (e.g. the
+  system-audio permission was denied, or the mic is hardware-muted), the icon
+  gains a warning badge and the menu shows a hint naming the likely cause.
+  The session keeps recording; the warning clears on its own once real audio
+  arrives.
 - **Logs** — recorder output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
 - **First run (TCC prompts)** — the first Start prompts for **Microphone**
   and records a **Screen & System Audio Recording** grant ("Onoats" appears

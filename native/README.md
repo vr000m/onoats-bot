@@ -121,11 +121,16 @@ that surface:
   read-idle watchdog fails the session loud (by design). Answer the prompt,
   then Start again.
 - **All-zero watchdog:** if a branch's capture callbacks deliver only zero
-  samples for 30 s, the capturer logs a WARNING naming the likely cause
+  samples for 30 s, the capturer emits a machine-parseable
+  `ONOATS-EVENT zero-run-warning` stderr line naming the likely cause
   (system → the Screen & System Audio Recording grant is denied — a denied
   tap still fires callbacks, all-zero; mic → hardware mute / wrong device).
-  Warning only, never a failure: an app rendering digital silence (paused
-  player) triggers it benignly.
+  The supervisor's stderr reader reflects it into the status file's `warning`
+  field, so it shows in the menu bar (badge icon + hint line) and
+  `onoats status`; real audio re-arms the detector and clears it
+  (`zero-run-clear`). Warning only, never a failure: an app rendering digital
+  silence (paused player) triggers it benignly. Event format:
+  `docs/audio-socket-contract.md` "Capturer event lines".
 - **Settings** writes go through a surgical single-key TOML editor — every
   other line of `config.toml`, comments included, stays byte-identical.
 
