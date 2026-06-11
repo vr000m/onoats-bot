@@ -1,6 +1,6 @@
 # Milestone B — Native macOS System-Audio Capture + Menu-Bar Launcher
 
-**Status**: In Progress — Phases 4/5a/6 done; Phase 5b built + core smoke passed; TCC-denial smoke pending
+**Status**: In Progress — Phases 4/5a/6 done; Phase 5b built + core smoke + mic-denial smoke passed; system-audio denial pending
 **Component**: macos, transport, recorder, packaging
 **Assignee**: Varun Singh
 **Priority**: Medium
@@ -480,7 +480,11 @@ _(to be filled during implementation)_
       rotation), no hang. *(Capturer-crash VERIFIED 2026-06-10: `pkill -9` →
       ErrorFrames on both branches, supervisor "capturer exited mid-session
       (rc=-9)" + non-zero exit, partial session rotated to `pending/`, no hang.
-      The two TCC-denial cases still pending.)*
+      **Mic-denial VERIFIED 2026-06-10 in the menu-bar topology**: Don't Allow →
+      capturer rc=10 pre-socket, supervisor writes fresh `mic-denied` status,
+      menu shows "Last session failed: mic-denied" + cause, no hang. First
+      attempt exposed a stale-status bug — see Findings. System-audio denial
+      still pending.)*
 
 ## Review Focus
 
@@ -528,7 +532,7 @@ _(to be filled during implementation)_
 
 _(to be filled on completion)_
 
-<!-- reviewed: 2026-06-09 @ 320cb2f1226cf4a416652649080110e6721a2e76 -->
+<!-- reviewed: 2026-06-10 @ 43235b0e212a0e4882da9c1e87b05681178d4ff4 -->
 ## Progress
 
 - [ ] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
@@ -554,8 +558,13 @@ _(to be filled on completion)_
   **content-bearing final flush** ending in a real utterance — closes the
   Milestone-A open edge), both sessions drained to `done/`,
   `exit_reason=graceful`, pid file removed, keystone me/them split intact
-  (3/22 on the call leg). **Remaining: the two TCC-denial tests (steps 5–6)
-  + Settings-submenu poke.** Device pickers/profiles deferred — see Findings.*
+  (3/22 on the call leg). **Mic-denial (step 5) PASSED 2026-06-10 in the GUI
+  topology** — Don't Allow → menu shows "Last session failed: mic-denied /
+  capturer exited (rc=10) before creating its sockets". (First run exposed a
+  stale-status bug, fixed in `522919e` — see Findings.) Settings pickers poked
+  live (mic picker, STT picker, data dir visible in the same smoke screenshot).
+  **Remaining: system-audio denial (step 6).** Device profiles deferred — see
+  Findings.*
 - [x] Phase 6 — BlackHole demoted to fallback (gate passed 2026-06-10) —
   **done 2026-06-10**: README matrix + audio-source section lead with the
   native path (14.4+ floor documented, BlackHole kept as documented fallback
@@ -674,6 +683,25 @@ _(to be filled on completion)_
   (where the "Onoats" toggles are the effective ones); also consider a 5b-era
   heuristic warning for a persistently all-zero mic branch (macOS can deliver
   zeroed buffers, not errors, to unauthorized audio clients).
+
+- **Mic-denial smoke PASSED in the menu-bar topology (2026-06-10) — after
+  exposing and fixing a stale-status bug.** First denial run: capturer
+  correctly exited rc=10 before creating its sockets, but the
+  `_wait_for_sockets` False path in `_supervise_socket_session` wrote NO
+  status record — the menu read the *previous* session's record and showed
+  the absurd "Last session failed: graceful". Fixed in `522919e`, two layers:
+  (1) the pre-start failure path now writes a fresh stopped record with the
+  rc-mapped reason (`10→mic-denied`, `11→system-audio-denied`, other→
+  `capturer-start-failed`, timeout→`capturer-start-timeout`); (2)
+  `RecorderModel.handleExit` gained a freshness guard — a status record whose
+  `start_time` predates the spawned session is ignored in favor of the raw
+  exit code, so a stale record can never mislabel a failure. Pinned by a
+  parametrized supervisor test (fake capturer dies pre-socket with chosen rc;
+  planted stale "graceful" record must be replaced). Re-run against the fixed
+  build: menu shows "Last session failed: mic-denied / capturer exited
+  (rc=10) before creating its sockets" — exactly the fail-loud observable
+  step 5 demands. Recovery via `tccutil reset Microphone
+  net.varunsingh.onoats` → Start → Allow re-prompts as expected.
 
 - **A/B parity check PASSED (2026-06-10) — Phase 6 gate satisfied.** Same source
   video recorded via the socket/native path (`session_20260610_133548_e010cfab`,
