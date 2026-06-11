@@ -547,7 +547,11 @@ _(to be filled on completion)_
   `exit_reason=graceful`, pid file removed, keystone me/them split intact
   (3/22 on the call leg). **Remaining: the two TCC-denial tests (steps 5–6)
   + Settings-submenu poke.** Device pickers/profiles deferred — see Findings.*
-- [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
+- [x] Phase 6 — BlackHole demoted to fallback (gate passed 2026-06-10) —
+  **done 2026-06-10**: README matrix + audio-source section lead with the
+  native path (14.4+ floor documented, BlackHole kept as documented fallback
+  for 13.x–14.3/off-mac), init.py warning softened to a NOTE, silence-detector
+  comment + pyproject `[macos]` note updated; suite 202 passed.
 
 ## Findings
 
