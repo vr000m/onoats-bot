@@ -1,6 +1,6 @@
 # Milestone B — Native macOS System-Audio Capture + Menu-Bar Launcher
 
-**Status**: In Progress — Phases 4/5a/6 done; Phase 5b built; all manual smoke done incl. both TCC denials — pre-merge review gauntlet next
+**Status**: In Progress — all phases + manual smoke done; review gauntlet complete (all findings fixed/dispositioned); remaining: all-zero-WARNING denial smoke, PR refresh, merge
 **Component**: macos, transport, recorder, packaging
 **Assignee**: Varun Singh
 **Priority**: Medium
@@ -562,11 +562,20 @@ All four phases landed on `feat/socket-audio-transport-milestone-b` (PR #5):
   fallback for 13.x–14.3/off-mac.
 
 Full suite: **209 passed** (202 at smoke completion + tests added by the
-review-gauntlet fixes). Status going into merge: pre-merge review gauntlet
-(`/review` done — 4 findings fixed in `3aa08d2`; `/security-review` done — no
-findings; Codex adversarial review + `/deep-review` pending).
+review-gauntlet fixes). Review gauntlet: `/review` — 4 findings fixed
+(`3aa08d2`); `/security-review` — clean; Codex adversarial — 2 findings, both
+resolved (markers recomputed; system-audio-denial AC explicitly amended, then
+strengthened with an in-PR all-zero detector once log forensics proved denied
+taps deliver zero-filled callbacks — see Findings); `/deep-review` (4 lenses) —
+logic+docs clean, 1 self-acknowledged security minor (won't-fix, checklist),
+6 architecture findings: 4 fixed (status.write_prestart_failure helper,
+Teardown private-field registration, RecorderModel dataDir-per-refresh +
+psCommand isolation, ConfigStore TOML-subset contract doc), 2 dispositioned
+to the AGENTS.md checklist (--source env contract; cert argv residual).
+Remaining before merge: user verifies the all-zero WARNING on one more
+denial smoke, PR description refresh, un-draft, merge.
 
-<!-- reviewed: 2026-06-11 @ 4bd816ff677794bbf95bf237d90bb8c7e2f0b0cb -->
+<!-- reviewed: 2026-06-11 @ 24e00120ac298f412d3d68622ed84bcc86bf2338 -->
 ## Progress
 
 - [x] Phase 4 — Swift capturer (manual smoke) — ***BUILT; smoke steps 1–3, 7,
@@ -754,10 +763,21 @@ findings; Codex adversarial review + `/deep-review` pending).
   **Disposition:** the 4-part fail-loud observable is structurally
   unreachable for this denial — an OS behavior, not a gap in our supervisor.
   The rc=11 `system-audio-denied` path remains correct for API-level tap
-  failures and is pinned by the parametrized supervisor test. **Follow-up
-  (post-PR):** a heuristic warning for a persistently all-zero system branch
-  (same idea already noted above for the mic branch) is the only way to
-  surface this state to the user.
+  failures and is pinned by the parametrized supervisor test.
+  **RESOLVED FURTHER 2026-06-11 — denied taps fire ZERO-FILLED CALLBACKS, and
+  a detector now ships in-PR.** Log forensics on the denied session settled
+  the open question: the system branch produced ZERO pacer-fill lines across
+  2.3 min (the pacer logs at filler 1 and every 500), so callbacks were firing
+  continuously — with all-zero samples. That makes an all-zero-run detector
+  sound: `FrameChunker.append` (worker thread, never the RT IOProc) now
+  tracks consecutive bit-exact-zero real input and logs a WARNING after 30 s
+  (`zeroRunWarnSamples`), once per run, re-armed by real audio, with a
+  branch-specific hint (system → check the Screen & System Audio Recording
+  grant; mic → check hardware mute/device). WARNING not failure: a paused
+  player pumping digital silence is the known benign false positive.
+  Menu-bar surfacing of the warning stays a post-PR follow-up. **Verify on
+  the next denial smoke: deny AudioCapture → Start → play audio ≥30 s →
+  expect the WARNING in onoats-bot.log.**
 
 - **A/B parity check PASSED (2026-06-10) — Phase 6 gate satisfied.** Same source
   video recorded via the socket/native path (`session_20260610_133548_e010cfab`,
