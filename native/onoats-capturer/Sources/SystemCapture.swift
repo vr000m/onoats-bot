@@ -1,8 +1,8 @@
 // System-output ("them") branch: Core Audio global process tap → private
 // aggregate device → IOProc → resample → 20 ms frames.
 //
-// Recipe proven by Pre-req spike 4 (native/spike/main.swift, Findings
-// 2026-06-09): global tap with EMPTY exclusion list (= tap all = system
+// Recipe proven by Pre-req spike 4 (spike tree retired — `spike-archive`
+// tag; Findings 2026-06-09): global tap with EMPTY exclusion list (= system
 // output), .unmuted so other apps stay audible, isPrivate, wrapped in a
 // private aggregate (auto-reclaimed by macOS on process death — no SIGKILL
 // residue). Signed builds create the tap in ~200 ms; unsigned blocks ~4 s in
