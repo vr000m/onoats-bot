@@ -601,7 +601,10 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
 - [x] Phase 5 — CLI device visibility (PR #15)
-- [ ] Phase 6 — Install streamlining + spike removal
+- [ ] Phase 6 — Install streamlining + spike removal (in progress 2026-06-11:
+  setup target, residue-enum port + rewire, spike deletion + sweep, README
+  flips all committed; kill-×3 re-run PASSED live; awaiting fresh-clone
+  `make -C native setup` + pre-init app-launch live verifies)
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
@@ -683,3 +686,21 @@ retrieval is `git checkout spike-archive -- native/spike`.
   identified as `system-output tap (uid=<aggregate uid>)` — the tap is
   global (all processes' output), so naming the default output device
   would be dishonest and go stale on output switches.
+- Phase 6 implementation (2026-06-11): the spike binary was the ONLY carrier
+  of the residue-enumeration commands, so "rewire residue_check.sh off the
+  spike" meant porting `list-aggregates`/`list-taps`/`clean-taps` into the
+  production capturer (`Maintenance.swift`, socket-less subcommands dispatched
+  before any TCC interaction; verdict lines on stdout, byte-compatible with
+  the script's greps). **Kill-×3 residue check re-PASSED live (user,
+  2026-06-11) against the production-binary checker** before any deletion.
+  **`spike-archive` tag target: `7ac0b2e`** — the last commit containing
+  `native/spike/` (parent of the deletion commit `9f4c15f`); user pushes the
+  tag after the regular merge. Sweep interpretation: every dangling
+  *path* reference cleared (native/README run-book sections → archived
+  History note carrying the durable conclusions; source comments → tag
+  pointer); pure historical prose with no path stays; dev plans untouched as
+  historical records. Pre-init launch analysis: menu-bar Start sets both
+  `AUDIO_SOURCE=socket` and `ONOATS_CAPTURER_BIN`, and STT defaults to
+  `whisper` (installed by the `[macos]` extra), so a pre-init Start is
+  expected to *work* with all-default settings (data → `~/.local/share/onoats`)
+  rather than fail — guard decision deferred to the live verify.
