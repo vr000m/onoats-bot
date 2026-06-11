@@ -21,6 +21,12 @@ import Foundation
 
 // MARK: - teardown coordinator (single exit path)
 
+// Scope note: Teardown is a process-lifetime singleton registered by the
+// module-level startup code below, not a reusable abstraction. The selftest
+// modes (--selftest-tap / --selftest-concurrent) intentionally do NOT register
+// with it — they are short-lived debug harnesses that rely on OS cleanup
+// (process exit destroys taps/aggregates), so a selftest crash skipping this
+// chain is by design.
 final class Teardown {
     static let shared = Teardown()
     private let lock = NSLock()

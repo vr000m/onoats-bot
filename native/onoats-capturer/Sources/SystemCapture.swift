@@ -153,7 +153,8 @@ final class SystemCapture {
             guard abl.mNumberBuffers >= 1 else { return }
             // Interleaved tap stream = single buffer; copy it verbatim.
             let buf = abl.mBuffers
-            guard let src = buf.mData, buf.mDataByteSize > 0 else { return }
+            guard let src = buf.mData, buf.mDataByteSize > 0, asbd.mBytesPerFrame > 0
+            else { return }
             let bytes = Data(bytes: src, count: Int(buf.mDataByteSize))
             let frames = AVAudioFrameCount(
                 Int(buf.mDataByteSize) / Int(asbd.mBytesPerFrame))

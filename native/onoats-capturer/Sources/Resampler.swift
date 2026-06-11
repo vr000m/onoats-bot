@@ -116,6 +116,11 @@ final class FrameChunker {
         defer { lock.unlock() }
         lastRealDataWallNs = MonotonicClock.nowNanos()
         pending.append(contentsOf: UnsafeBufferPointer(start: data[0], count: n))
+        // Back-extrapolating from the TOTAL pending count treats any leftover
+        // samples from the previous append as contiguous with this buffer —
+        // exact while capture is continuous (it is, frame to frame); only a
+        // frame straddling a capture gap inherits a bounded (<20 ms) skew,
+        // which the clamp below already governs.
         while pending.count >= SAMPLES_PER_FRAME {
             let samplesFromFrameStartToStreamEnd = UInt64(pending.count)
             let backNs = samplesFromFrameStartToStreamEnd * NS_PER_SAMPLE
@@ -135,6 +140,10 @@ final class FrameChunker {
             // emit under `lock`: the pacer thread emits under the same lock,
             // so the two producers are serialized — this is what guarantees
             // seq order == captured_monotonic_ns order into the writer.
+            // Lock-order invariant: emit → FrameWriter.enqueue acquires the
+            // writer's lock WHILE holding this chunker lock. Safe because the
+            // order is always chunker → writer and FrameWriter never calls
+            // back into the chunker; do not add a reverse path.
             emit(frame, ts)
         }
     }

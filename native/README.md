@@ -209,18 +209,18 @@ make build                       # compile-only; catches API errors before perms
 > id must report `mic_pre=0` (notDetermined) and **prompt**, attributed to "Onoats".
 > A non-zero `mic_pre` on first run means attribution went elsewhere.
 
-The helper writes results to `/tmp/onoats-spike-result.txt` (a GUI launch has no
+The helper writes results to `~/Library/Logs/Onoats/spike-result.txt` (a GUI launch has no
 stdout). Run 1 — obtain the grants against the bundle identity:
 
 ```sh
 make sign                        # rebuild + codesign + print the DR
 make dr  > /tmp/onoats-dr-1.txt  # capture the designated requirement (run 1)
 make cdhash                      # note the cdhash (it WILL change — that's fine)
-: > /tmp/onoats-spike-result.txt # clear the result log
+: > ~/Library/Logs/Onoats/spike-result.txt # clear the result log
 
 open Onoats.app                  # GUI launch → responsible process = Onoats.app
 #   Expect TWO prompts attributed to "Onoats" (mic + system audio) — ACCEPT both.
-cat /tmp/onoats-spike-result.txt #   → expect: mic_pre=0 mic=PASS system=PASS
+cat ~/Library/Logs/Onoats/spike-result.txt #   → expect: mic_pre=0 mic=PASS system=PASS
 ```
 
 Confirm **"Onoats"** now appears in System Settings ▸ Privacy & Security ▸
@@ -230,13 +230,13 @@ Confirm **"Onoats"** now appears in System Settings ▸ Privacy & Security ▸
 
 ```sh
 make rebuild && make dr > /tmp/onoats-dr-2.txt
-open Onoats.app && sleep 6 && cat /tmp/onoats-spike-result.txt  # mic_pre=3, no prompt
+open Onoats.app && sleep 6 && cat ~/Library/Logs/Onoats/spike-result.txt  # mic_pre=3, no prompt
 
 make rebuild && make dr > /tmp/onoats-dr-3.txt
-open Onoats.app && sleep 6 && cat /tmp/onoats-spike-result.txt  # mic_pre=3, no prompt
+open Onoats.app && sleep 6 && cat ~/Library/Logs/Onoats/spike-result.txt  # mic_pre=3, no prompt
 
 make rebuild && make dr > /tmp/onoats-dr-4.txt
-open Onoats.app && sleep 6 && cat /tmp/onoats-spike-result.txt  # mic_pre=3, no prompt
+open Onoats.app && sleep 6 && cat ~/Library/Logs/Onoats/spike-result.txt  # mic_pre=3, no prompt
 
 # The designated requirement MUST be byte-identical across rebuilds:
 diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-2.txt && \
@@ -259,19 +259,19 @@ needs the paid Developer ID path. Record the failure in the plan's `## Findings`
 > `./onoats-capturer`.** The unsigned standalone blocks **~3.9 s** inside
 > `AudioHardwareCreateProcessTap` (per-call security verification) and is
 > intermittently flaky; the **signed** bundle creates the tap in **~200 ms** with no
-> audible dropout. Results land in `/tmp/onoats-spike-result.txt`. Use `--mute
+> audible dropout. Results land in `~/Library/Logs/Onoats/spike-result.txt`. Use `--mute
 > unmuted` (the default) — other apps stay audible. (Residue/leak checks below run
 > the standalone deliberately, because signing is irrelevant to object lifecycle.)
 
 ```sh
 make sign
-: > /tmp/onoats-spike-result.txt
+: > ~/Library/Logs/Onoats/spike-result.txt
 
 # Real system-output stream, other apps stay audible (signed → ~200ms, no stutter):
 open Onoats.app --args tap --seconds 10        # play music in another app; KEEP LISTENING
 # Concurrent mic + system (no clock-domain conflict):
 open Onoats.app --args concurrent --seconds 10 # speak AND play audio
-sleep 12; cat /tmp/onoats-spike-result.txt
+sleep 12; cat ~/Library/Logs/Onoats/spike-result.txt
 #   expect: TAP … peak>0 PASS  and  CONCURRENT mic=PASS system=PASS
 
 # Residue: start/kill -9 ×3 must leave no stale aggregate OR tap.

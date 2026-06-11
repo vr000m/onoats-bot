@@ -35,13 +35,18 @@ func log(_ s: String) {
 
 // GUI launches (`open Onoats.app`) are detached — stderr/stdout go nowhere. Append
 // every result line to a fixed file so a GUI-rooted run (the only faithful TCC test
-// for the menu-bar topology) is observable. `cat /tmp/onoats-spike-result.txt`.
-let RESULT_FILE = "/tmp/onoats-spike-result.txt"
+// for the menu-bar topology) is observable: `cat` the path below. Lives under the
+// user's own ~/Library/Logs (not world-writable /tmp, where a fixed name is a
+// symlink-planting target on a multi-user box).
+let RESULT_FILE = NSHomeDirectory() + "/Library/Logs/Onoats/spike-result.txt"
 
 func result(_ s: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
     let line = "[\(stamp)] pid=\(getpid()) \(s)\n"
     log(s)
+    try? FileManager.default.createDirectory(
+        atPath: (RESULT_FILE as NSString).deletingLastPathComponent,
+        withIntermediateDirectories: true)
     if let fh = FileHandle(forWritingAtPath: RESULT_FILE) {
         fh.seekToEndOfFile()
         fh.write(line.data(using: .utf8)!)
