@@ -95,9 +95,53 @@ def test_xdg_default_data_dir_matches_swift(monkeypatch: pytest.MonkeyPatch):
 def test_stt_service_list_matches_swift():
     from onoats.runtime import VALID_STT_SERVICES
 
+    # The [^\]]+ capture assumes a SINGLE-LINE, comment-free Swift array
+    # literal (re.DOTALL is off, so a multi-line reformat truncates the
+    # match). The count assertion below turns a partial parse into a loud
+    # failure instead of a garbled comparison.
     raw = _extract(r"sttServices\s*=\s*\[([^\]]+)\]", RECORDER_MODEL)
     swift = tuple(re.findall(r'"([^"]+)"', raw))
+    assert len(swift) == len(VALID_STT_SERVICES), (
+        f"parsed {len(swift)} services from Swift, expected "
+        f"{len(VALID_STT_SERVICES)} — if the Swift array went multi-line, "
+        f"keep it on one line or update this test's regex"
+    )
     assert swift == tuple(VALID_STT_SERVICES)
+
+
+def test_capturer_exit_codes_are_all_accounted_for():
+    """Every non-ok ExitCode in Support.swift must be either mapped to a
+    specific exit_reason in cli._CAPTURER_RC_REASONS or deliberately listed
+    as generic below. Adding a new ExitCode fails here until someone decides
+    which bucket it belongs in."""
+    from onoats.cli import _CAPTURER_RC_REASONS
+
+    support = (
+        REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
+    ).read_text(encoding="utf-8")
+    swift_codes = {
+        name: int(value)
+        for name, value in re.findall(r"static let (\w+): Int32 = (\d+)", support)
+    }
+    assert swift_codes, "no ExitCode constants found in Support.swift"
+
+    # Deliberately generic: these stamp as plain "capturer-crash" because the
+    # menu bar has no more-useful label for them. ok/usage never reach the
+    # mid-session stamping path.
+    generic = {"ok", "usage", "socketFailed", "captureFailed"}
+
+    assert swift_codes["micDenied"] in _CAPTURER_RC_REASONS
+    assert swift_codes["systemAudioFailed"] in _CAPTURER_RC_REASONS
+    mapped_values = set(_CAPTURER_RC_REASONS)
+    unaccounted = {
+        name
+        for name, value in swift_codes.items()
+        if value not in mapped_values and name not in generic
+    }
+    assert not unaccounted, (
+        f"new ExitCode(s) {sorted(unaccounted)} are neither mapped in "
+        f"cli._CAPTURER_RC_REASONS nor listed as deliberately generic here"
+    )
 
 
 @pytest.mark.parametrize(

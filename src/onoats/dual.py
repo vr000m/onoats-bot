@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -279,7 +280,6 @@ def _build_socket_transports(cfg):
     Returns ``(mic_transport, system_transport, mic_label, system_label)`` where
     the labels are the socket paths (logged in the startup banner).
     """
-    from pathlib import Path
 
     from onoats.transports.socket_audio import UnixSocketAudioTransport
 
@@ -336,7 +336,7 @@ async def run_onoats_dual(
     *,
     live_terminal: bool = False,
     locked_category: str | None = None,
-    data_dir=None,
+    data_dir: Path | None = None,
 ) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor

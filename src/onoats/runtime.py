@@ -647,6 +647,13 @@ async def _create_stt_service():
     service = cfg.stt_service
     model_name = cfg.stt_model
     vocabulary = _vocabulary_bias()
+    # Enforce the canonical set, not just document it: a typo'd STT_SERVICE
+    # used to silently fall through to the whisper branch — fail loud instead.
+    if service not in VALID_STT_SERVICES:
+        raise RuntimeError(
+            f"Unknown STT_SERVICE {service!r} — valid values: "
+            f"{', '.join(VALID_STT_SERVICES)}"
+        )
     if service == "websocket":
         try:
             from onoats.stt.websocket_stt_service import WebSocketSTTService
