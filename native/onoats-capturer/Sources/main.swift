@@ -132,6 +132,17 @@ let appNapActivity = ProcessInfo.processInfo.beginActivity(
     reason: "realtime audio capture for onoats")
 _ = appNapActivity  // held until exit; never endActivity while capturing
 
+// Maintenance subcommands (no sockets, no TCC): residue enumeration/sweep for
+// residue_check.sh — see Maintenance.swift for the stdout verdict contract.
+if cliArgs.count > 1 {
+    switch cliArgs[1] {
+    case "list-aggregates": listAggregates(); exit(0)
+    case "list-taps": listTaps(); exit(0)
+    case "clean-taps": cleanTaps(); exit(0)
+    default: break
+    }
+}
+
 // Hidden debug mode: run ONLY the system tap chain for N seconds (no sockets,
 // no mic) and report emitted frames — bisection harness for IOProc stalls.
 if cliArgs.contains("--selftest-tap") {
