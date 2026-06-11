@@ -600,8 +600,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 3 — README overhaul + blackhole-fallback doc (PR #13)
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
-- [ ] Phase 5 — CLI device visibility (implemented on
-  `feat/cli-device-visibility`, PR #15 open)
+- [x] Phase 5 — CLI device visibility (PR #15)
 - [ ] Phase 6 — Install streamlining + spike removal
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
