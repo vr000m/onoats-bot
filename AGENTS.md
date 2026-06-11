@@ -142,3 +142,17 @@ should NOT re-flag go here, one per line:
 - **[Logic] analysis-error**: `nonce[:8]` in the handshake log assumes a `str` —
   unreachable: `parse_handshake` validates `nonce` is `str | None` and the log
   guards on truthiness, so a non-string nonce can never reach the slice. (2026-06-09)
+- **[Documentation] won't-fix**: README cross-platform matrix still lists only
+  BlackHole for system loopback — deliberately deferred to Phase 6 (BlackHole
+  demotion); the footnote covering the socket path keeps the matrix accurate
+  until then. (2026-06-10)
+- **[Architecture] won't-fix**: `native/spike/Info.plist` shares the production
+  `CFBundleIdentifier` — intentional: Spike 3's entire purpose was validating
+  TCC persistence on the PRODUCTION designated requirement (bundle id + cert),
+  so a distinct spike identity would invalidate the spike evidence. The spike
+  tree is slated for deletion after Phase 5b/6. (2026-06-10)
+- **[Logic] analysis-error**: `FrameChunker.append` back-extrapolating from the
+  total `pending.count` "over-counts leftover samples" — the math is exact while
+  capture is contiguous (leftovers are contiguous with the next buffer); only a
+  frame straddling a capture gap inherits a bounded <20 ms skew, governed by the
+  existing `lastEmittedEndNs` clamp. Comment added at the site. (2026-06-10)

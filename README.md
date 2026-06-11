@@ -97,11 +97,16 @@ socket directory + generation nonce and spawns the capturer named by
 endianness, backpressure, versioning) is pinned in
 [`docs/audio-socket-contract.md`](docs/audio-socket-contract.md).
 
-> **Status:** the Python transport, supervisor, and wire contract are in place,
-> but the native capturer (`ONOATS_CAPTURER_BIN`) is not yet shipped — so
-> `AUDIO_SOURCE=socket` is **not runnable end-to-end yet**. Leave the default
-> `portaudio` source unless you are wiring up your own capturer against the
-> contract.
+A one-off override is available on the command line — `onoats bot --source
+socket` (or `--source portaudio`) — which sits at the top of the usual
+precedence (CLI flag > env `AUDIO_SOURCE` > `config.toml` > default).
+
+> **Status:** runnable end-to-end on macOS 14.4+. The native capturer +
+> menu-bar app build from source — see [`native/README.md`](native/README.md)
+> for the one-time self-signed-cert setup and the `make -C native install`
+> flow (it also installs the CLI and wires `ONOATS_CAPTURER_BIN`). On other
+> platforms, or below macOS 14.4, keep the default `portaudio` source —
+> BlackHole remains the system-loopback fallback there.
 
 ### Data location
 

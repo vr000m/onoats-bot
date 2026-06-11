@@ -25,8 +25,9 @@ dependencies = [
 # macOS-only acceleration. Apple Silicon Whisper (mlx-whisper) + Kokoro TTS.
 # Install with `uv tool install 'onoats[macos]'`. NOT in the baseline — the
 # off-mac baseline (PortAudio + Deepgram/TCP STT) ships MLX-free.
-# A future CoreAudio loopback bridge (BlackHole-free system capture) will be
-# added here when it lands.
+# The CoreAudio system-capture path (BlackHole-free) ships as a native binary
+# built from source (see native/README.md), NOT as a Python dependency, so it
+# never appears here. Demoting BlackHole in the docs is the Phase 6 task.
 macos = [
     "mlx-whisper>=0.4.0",
     "kokoro-onnx>=0.4.0",
