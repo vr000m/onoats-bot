@@ -601,7 +601,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
 - [ ] Phase 5 — CLI device visibility (implemented on
-  `feat/cli-device-visibility`, PR pending)
+  `feat/cli-device-visibility`, PR #15 open)
 - [ ] Phase 6 — Install streamlining + spike removal
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)

@@ -56,8 +56,12 @@ Other subcommands:
 ```bash
 onoats bot-single   # legacy mic-only recorder
 onoats flush        # tell the running recorder to rotate its buffer now
-onoats devices      # list audio input/output devices
-onoats status       # recorder pid / running state + data dir
+onoats devices      # list audio input/output devices (PortAudio's view; under
+                    # the socket path it adds a note — the native capturer binds
+                    # the system default input / default-output tap instead)
+onoats status       # recorder pid / running state + data dir; names the capture
+                    # devices (socket: what the running session bound; PortAudio:
+                    # the configured [devices] names) and any live capture warning
 ```
 
 ## Cross-platform matrix
