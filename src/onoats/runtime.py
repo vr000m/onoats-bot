@@ -616,6 +616,13 @@ def _vocabulary_bias() -> list[str]:
         return []
 
 
+# Canonical set of STT_SERVICE values dispatched by _create_stt_service below
+# ("whisper" is the fall-through default branch). The menu bar's STT picker
+# (native/onoats-menubar/Sources/RecorderModel.swift `sttServices`) mirrors
+# this tuple; tests/test_native_contract_parity.py keeps the two in sync.
+VALID_STT_SERVICES = ("whisper", "websocket", "deepgram")
+
+
 async def _create_stt_service():
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
