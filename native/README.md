@@ -312,5 +312,6 @@ on a different primitive. Record it in `## Findings`.
 
 Record both spike outcomes (DR stability, grant persistence, tap PASS, residue
 none) in the dev plan's `## Findings` and tick the two Pre-req acceptance boxes.
-The throwaway `native/spike/` tree can be deleted once Phase 4 (`native/onoats-capturer/`)
-is built from its proven recipe.
+The throwaway `native/spike/` tree is now safe to delete — Phase 4
+(`native/onoats-capturer/`) and Phase 5b both shipped from its proven recipe
+(Milestone B, PR #5). Deletion is a recorded post-ship follow-up.

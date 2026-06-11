@@ -240,7 +240,7 @@ surviving child (the teardown does not give up just because the leader is gone).
 On platforms without process groups the teardown falls back to a single-PID
 signal.
 
-> **Residual race (accepted, same-UID; close in Phase 4).** The group is targeted
+> **Residual race (accepted, same-UID; NOT closed in Milestone B).** The group is targeted
 > by the leader's PID (`os.killpg(pid, …)`). If, on the crash path, the leader is
 > reaped **and** every surviving group member also exits before a `killpg` fires,
 > the PGID is released and that PID can be recycled — so a late `SIGTERM`/`SIGKILL`
@@ -264,9 +264,10 @@ The **entire `DYLD_*` family is excluded** — it is a dynamic-loader injection
 surface end to end: `DYLD_INSERT_LIBRARIES` (dylib injection),
 `DYLD_LIBRARY_PATH` / `DYLD_FRAMEWORK_PATH` / `DYLD_FALLBACK_*` (planted-dylib
 search-path redirection), `DYLD_PRINT_TO_FILE` (arbitrary file write), etc. A
-Phase-4 capturer that genuinely needs a specific `DYLD_*` var for framework
-resolution must add it **explicitly** to the allowlist in source (see the Phase-4
-limitation below) — it is never forwarded by default.
+capturer that genuinely needs a specific `DYLD_*` var for framework resolution
+must add it **explicitly** to the allowlist in source (see the limitation
+below) — it is never forwarded by default. (The shipped Milestone B capturer
+needed none.)
 
 STT / application **secrets are never forwarded** to the capturer — anything not
 on the allowlist (e.g. `DEEPGRAM_API_KEY`, any `*_API_KEY` / `*_TOKEN` /
@@ -277,19 +278,20 @@ deny-by-default, a newly added secret can't leak by omission. This keeps a buggy
 / replaced / crash-reporting capturer from ever seeing credentials it doesn't
 need.
 
-> **Limitation (Phase 4).** If a real capturer ever needs a non-secret env var
-> outside this allowlist (e.g. a device index or a non-credential license token),
-> it must be added to `_CAPTURER_ENV_POLICY` in source — there is no runtime
-> override today. A blessed pass-through mechanism (e.g. an
-> `ONOATS_CAPTURER_ENV_EXTRA` allowlist-extension var) is **deferred to Phase 4**,
-> when the native capturer exists to define the actual requirement; adding it now
-> would be speculative.
+> **Limitation.** If a capturer ever needs a non-secret env var outside this
+> allowlist (e.g. a device index or a non-credential license token), it must be
+> added to `_CAPTURER_ENV_POLICY` in source — there is no runtime override
+> today. A blessed pass-through mechanism (e.g. an `ONOATS_CAPTURER_ENV_EXTRA`
+> allowlist-extension var) remains **deferred indefinitely**: the shipped
+> Milestone B capturer needed nothing beyond the allowlist, so adding one would
+> still be speculative.
 
-The capturer (Phase 4, not yet built) MUST: create both sockets, accept one
-connection each, write the v1 handshake (echoing the nonce), then stream
+The capturer (`native/onoats-capturer/`, shipped in Milestone B / PR #5)
+MUST: create both sockets, accept one connection each, write the v1 handshake
+per connection as it is accepted (echoing the nonce), then stream
 length-prefixed v1 frames per branch.
 
-### Default-device changes (Phase 4 capturer requirement)
+### Default-device changes (capturer requirement, verified live)
 
 The capturer MUST survive a **default-input-device change** mid-session — e.g. the
 user's AirPods disconnect and macOS switches the default input to the built-in
