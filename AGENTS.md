@@ -62,7 +62,12 @@ Python contract constants):
 Release metadata (canonical BSD-2-Clause LICENSE body, pyproject SPDX
 `license` field, `hatchling>=1.27` pin for PEP 639) is pinned by
 `tests/test_release_meta.py` — don't weaken those without touching the
-licensing decision in the release plan.
+licensing decision in the release plan. The version lives on **three
+surfaces** that must agree — `pyproject.toml`, the `uv.lock` onoats entry
+(regenerate via `uv lock`), and the menu-bar Info.plist
+`CFBundleShortVersionString` — pinned by the same test file and gated at
+tag time by `scripts/release_check.sh vX.Y.Z <commit>` (run before pushing
+any release tag).
 
 ## Supervisor ↔ capturer lifecycle (`cli._run_socket_supervisor`)
 
