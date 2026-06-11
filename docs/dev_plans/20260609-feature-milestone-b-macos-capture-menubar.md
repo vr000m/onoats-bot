@@ -536,11 +536,52 @@ _(to be filled on completion)_
   so it sees production aggregates).** **Remaining:** steps 11–12
   soak/echo (ride along with normal usage). Pre-req spikes 3+4 PASSED 2026-06-09.*
 - [x] Phase 5a — Python status file (`tests/test_status_file.py`) — **done**
-- [ ] Phase 5b — SwiftUI menu-bar launcher (manual smoke)
+- [ ] Phase 5b — SwiftUI menu-bar launcher — ***BUILT 2026-06-10** (app compiles,
+  signs, GUI-launches; DR byte-identical through the bundle restructure; install
+  chain `make cert` / `make install-cli` / `make install` all verified live).
+  **Remaining: manual smoke incl. the two deferred TCC-denial tests.** Device
+  pickers/profiles deferred — see Findings.*
 - [ ] Phase 6 — retire BlackHole + docs (GATED on Phase 4 acceptance)
 
 ## Findings
 
+- **Phase 5b built (2026-06-10): menu-bar app + single-bundle restructure +
+  install chain.** `native/onoats-menubar/` (3 swiftc sources, MenuBarExtra,
+  LSUIElement); `Onoats.app` main executable is now the menu-bar app with the
+  capturer embedded at `Contents/MacOS/onoats-capturer`, both signed
+  inner-first with the same identity+identifier — **DR verified byte-identical
+  through the restructure** (`identifier "net.varunsingh.onoats" and
+  certificate leaf = H"aac7e2b9…"`), so existing TCC grants carry over.
+  Key sub-findings:
+  - **Scripted cert creation works fully prompt-free** (`native/make_cert.sh`,
+    `make cert`): verified empirically under a throwaway identity that codesign
+    needs **neither keychain trust nor a partition-list fix** — the
+    import-time ACL (`security import -T /usr/bin/codesign`) is sufficient.
+    The script refuses to regenerate an existing identity (new cert = new DR =
+    all TCC grants invalidated).
+  - **CLI discovery solved via `uv tool install --editable '<repo>[macos]'`**
+    → stable shim `~/.local/bin/onoats` in an isolated uv venv (editable +
+    extras + the git+https dep all verified working). The GUI invokes that
+    fixed path (override: `defaults write net.varunsingh.onoats cliPath …`);
+    config was already CWD/env-independent (`~/.config/onoats/`).
+  - **Stop semantics:** the GUI SIGTERMs only the supervisor it spawned
+    (`Process.terminate()`; `runtime.py:1130` handles SIGTERM as graceful
+    drain). Sessions started outside the menu bar are displayed as external
+    and NOT signalled from Swift — the identity-checked pid signalling
+    (marker + fingerprint + recycling guards) lives in the Python CLI, and
+    duplicating it in Swift would be drift-prone.
+  - **Device pickers / profiles DEFERRED (scope finding):** the capturer has
+    no device-selection argument — it captures the **system default** input
+    device (and the tap follows default output). A picker in the menu would
+    silently not apply. Shipped instead: the menu displays the live default
+    input/output device names (the wrong-device guard from the A/B finding
+    below). Pickers/profiles need capturer `--mic-uid` support + config
+    plumbing first — follow-up work, not part of the 5b smoke gate.
+  - **GUI data-dir caveat:** a LaunchServices app sees no shell env, so the
+    Swift status reader resolves `config.toml [storage].data_dir` →
+    `~/.local/share/onoats` only; shell-exported `ONOATS_DATA_DIR`/XDG vars
+    don't apply to GUI-read status (set it in config.toml if it matters).
+  - `onoats bot` stdout/stderr from GUI starts → `~/Library/Logs/Onoats/onoats-bot.log`.
 - **Phase 4 capturer built + wire-contract verified end to end (2026-06-10).**
   `native/onoats-capturer/` (plain swiftc, 7 sources), built/signed via
   `native/Makefile` into `native/Onoats.app` — DR byte-identical to the spike's
