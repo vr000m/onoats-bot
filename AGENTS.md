@@ -31,7 +31,9 @@ non-obvious parts; the code and `docs/` cover the rest.
 
 Load-bearing invariants — do not break these without updating the tests that
 pin them (`tests/test_dual_socket_source.py`, `tests/test_socket_audio_transport.py`,
-`tests/test_socket_supervisor.py`):
+`tests/test_socket_supervisor.py`, `tests/test_status_file.py`,
+`tests/test_native_contract_parity.py` — the last pins Swift literals to their
+Python contract constants):
 
 - **Never-mix.** One socket → one branch → one STT session → one `SourceTagger`.
   Nothing fans a socket to both branches. `_build_socket_transports` refuses to

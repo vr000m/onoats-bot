@@ -6,7 +6,7 @@
 **Priority**: Medium (quality-of-life + dependency reduction; not blocking the recorder)
 **Branch**: `feat/socket-audio-transport-milestone-a` (Milestone A); `feat/socket-audio-transport-milestone-b` (Milestone B)
 **Created**: 2026-06-07
-**Completed**: Milestone A core 2026-06-08 (Phases 1–3); post-adversarial-review supervisor hardening 2026-06-09; Milestone B pending (native, macOS-only)
+**Completed**: Milestone A core 2026-06-08 (Phases 1–3); post-adversarial-review supervisor hardening 2026-06-09; Milestone B (Phases 4–6, native macOS) merged in PR #5 2026-06-11
 
 > **Provenance.** This work was scoped out of koda's recorder-extraction plan
 > (`koda-pipecat: docs/dev_plans/20260606-refactor-extract-onoats-recorder.md`,
@@ -702,7 +702,7 @@ frozen queue-contract value koda's classifier keys on).
   marker before `SIGUSR1`), after which koda can revert to a thin `onoats flush`
   pass-through. See koda PR #104.
 
-<!-- reviewed: 2026-06-11 @ 075b8551767b918754df266e22edfac7180527fc -->
+<!-- reviewed: 2026-06-11 @ afcc4a48f668015979e8fa456e43fda833e9b053 -->
 
 ## Progress
 
