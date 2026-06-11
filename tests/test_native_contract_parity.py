@@ -136,6 +136,28 @@ def test_event_line_prefix_matches_swift():
     assert swift == _ONOATS_EVENT_PREFIX
 
 
+def test_device_event_emission_matches_supervisor_parser():
+    """Both capture branches emit `ONOATS-EVENT device branch=<b> hint=<desc>`
+    (hint is the trailing free-text field BY CONTRACT — device names contain
+    spaces) and the supervisor's stderr reader consumes exactly that event
+    type into the schema-v2 mic_device/system_device fields. A one-sided
+    rename silently turns every device event into an ignored log line."""
+    mic = REPO / "native" / "onoats-capturer" / "Sources" / "MicCapture.swift"
+    system = REPO / "native" / "onoats-capturer" / "Sources" / "SystemCapture.swift"
+    assert re.search(
+        r'emitEvent\("device", "branch=mic hint=', mic.read_text(encoding="utf-8")
+    ), "MicCapture.swift no longer emits the device event the supervisor parses"
+    assert re.search(
+        r'emitEvent\("device", "branch=system hint=',
+        system.read_text(encoding="utf-8"),
+    ), "SystemCapture.swift no longer emits the device event the supervisor parses"
+
+    supervisor = (REPO / "src" / "onoats" / "cli.py").read_text(encoding="utf-8")
+    assert 'event_type == "device"' in supervisor, (
+        "cli._drain_capturer_stderr no longer handles the `device` event type"
+    )
+
+
 def test_capturer_exit_codes_are_all_accounted_for():
     """Every non-ok ExitCode in Support.swift must be either mapped to a
     specific exit_reason in cli._CAPTURER_RC_REASONS or deliberately listed

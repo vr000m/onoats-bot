@@ -44,12 +44,10 @@ func defaultInputDeviceID() -> AudioObjectID {
     return err == noErr ? deviceID : AudioObjectID(kAudioObjectUnknown)
 }
 
-/// Name + UID of the system default INPUT device — logged at mic start so a
-/// wrong default (e.g. a leftover virtual loopback device) is diagnosable at
-/// a glance.
-func defaultInputDeviceDescription() -> String {
+/// id + name + UID of the system default INPUT device, or nil when none.
+func defaultInputDeviceIdentity() -> (id: AudioObjectID, name: String, uid: String)? {
     let deviceID = defaultInputDeviceID()
-    guard deviceID != kAudioObjectUnknown else { return "<no default input device>" }
+    guard deviceID != kAudioObjectUnknown else { return nil }
 
     func stringProp(_ selector: AudioObjectPropertySelector) -> String {
         var propAddr = AudioObjectPropertyAddress(
@@ -64,9 +62,23 @@ func defaultInputDeviceDescription() -> String {
         guard err == noErr, let s = cfStr else { return "?" }
         return s as String
     }
-    let name = stringProp(kAudioObjectPropertyName)
-    let uid = stringProp(kAudioDevicePropertyDeviceUID)
-    return "\"\(name)\" (uid=\(uid), id=\(deviceID))"
+    return (deviceID, stringProp(kAudioObjectPropertyName), stringProp(kAudioDevicePropertyDeviceUID))
+}
+
+/// Name + UID of the system default INPUT device — logged at mic start so a
+/// wrong default (e.g. a leftover virtual loopback device) is diagnosable at
+/// a glance.
+func defaultInputDeviceDescription() -> String {
+    guard let dev = defaultInputDeviceIdentity() else { return "<no default input device>" }
+    return "\"\(dev.name)\" (uid=\(dev.uid), id=\(dev.id))"
+}
+
+/// Status-file field shape for the device event: `<name> (uid=<uid>)` —
+/// the flat string the supervisor stores verbatim in `mic_device`
+/// (status schema v2; release-plan Phase 5).
+func defaultInputDeviceFieldDescription() -> String {
+    guard let dev = defaultInputDeviceIdentity() else { return "<no default input device>" }
+    return "\(dev.name) (uid=\(dev.uid))"
 }
 
 final class MicCapture {
@@ -198,6 +210,9 @@ final class MicCapture {
         logLine(
             "mic: capturing from \(defaultInputDeviceDescription()) at "
                 + "\(Int(format.sampleRate)) Hz / \(format.channelCount) ch")
+        // Re-emitted on every successful bind (initial + rebind) so a mid-session
+        // default-input change updates the status file's mic_device.
+        emitEvent("device", "branch=mic hint=\(defaultInputDeviceFieldDescription())")
     }
 
     private func unbind() {

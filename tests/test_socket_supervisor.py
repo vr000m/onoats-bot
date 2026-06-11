@@ -175,11 +175,16 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
     #   events: ONOATS-EVENT lines written to stderr when the MIC connection
     #       arrives (after the fake recorder has written its running status
     #       record, so set_warning has a record to annotate).
+    #   startup_events: ONOATS-EVENT lines written at STARTUP, before binding
+    #       sockets — the real capturer's `device` event timing (it outruns
+    #       the recorder's start write; the supervisor's deferred-apply task
+    #       must land these in THIS session's record anyway).
     STDERR_LINES = _control.get("stderr_lines") or []
     STDERR_FLOOD = int(_control.get("stderr_flood") or 0)
     EVENTS = _control.get("events") or []
+    STARTUP_EVENTS = _control.get("startup_events") or []
 
-    for _line in STDERR_LINES:
+    for _line in STDERR_LINES + STARTUP_EVENTS:
         sys.stderr.write(_line + "\\n")
     sys.stderr.flush()
     if STDERR_FLOOD:
@@ -308,6 +313,7 @@ def set_capturer_behaviour(fake_capturer):
         stderr_lines: list[str] | None = None,
         stderr_flood: int | None = None,
         events: list[str] | None = None,
+        startup_events: list[str] | None = None,
     ) -> None:
         control: dict = {"behaviour": behaviour}
         if nframes is not None:
@@ -322,6 +328,8 @@ def set_capturer_behaviour(fake_capturer):
             control["stderr_flood"] = stderr_flood
         if events is not None:
             control["events"] = events
+        if startup_events is not None:
+            control["startup_events"] = startup_events
         Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
 
     yield _set
@@ -1457,6 +1465,12 @@ def test_parse_capturer_event_unit():
         {"branch": "mic", "hint": "try a=b c"},
     )
 
+    # device events carry the "<name> (uid=<uid>)" description in the trailing
+    # hint field — names contain spaces, so the free-text contract is load-bearing.
+    assert parse(
+        "ONOATS-EVENT device branch=mic hint=MacBook Pro Microphone (uid=BuiltIn)"
+    ) == ("device", {"branch": "mic", "hint": "MacBook Pro Microphone (uid=BuiltIn)"})
+
 
 @pytest.mark.anyio
 async def test_stderr_reader_merges_warnings_and_tees(short_root, capfd):
@@ -1587,6 +1601,122 @@ def test_capturer_stderr_tee_and_flood_cannot_block(
     assert marker in capfd.readouterr().err, (
         "capturer stderr was not teed verbatim to the supervisor's stderr"
     )
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_device_event_updates_running_record(short_root):
+    """A device event against a RUNNING record applies live (the mid-session
+    mic-rebind path) and records into the shared device_state dict."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    device_state: dict[str, str] = {}
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"ONOATS-EVENT device branch=mic hint=MacBook Pro Microphone (uid=BuiltIn)\n"
+    )
+    reader.feed_data(
+        b"ONOATS-EVENT device branch=system hint=system-output tap (uid=agg-1)\n"
+    )
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger, device_state)
+
+    got = status_file.read_status(data_dir)
+    assert got is not None
+    assert got.mic_device == "MacBook Pro Microphone (uid=BuiltIn)"
+    assert got.system_device == "system-output tap (uid=agg-1)"
+    assert device_state == {
+        "mic": "MacBook Pro Microphone (uid=BuiltIn)",
+        "system": "system-output tap (uid=agg-1)",
+    }
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_device_event_without_record_records_state_only(
+    short_root,
+):
+    """Device events outrun the recorder's start write: with no record on disk
+    the reader must not invent one, but must still capture the descriptions in
+    device_state for the deferred apply."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    device_state: dict[str, str] = {}
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"ONOATS-EVENT device branch=mic hint=Some Mic (uid=u1)\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger, device_state)
+
+    assert status_file.read_status(data_dir) is None
+    assert device_state == {"mic": "Some Mic (uid=u1)"}
+
+
+@pytest.mark.anyio
+async def test_device_flush_waits_for_this_sessions_record(short_root):
+    """_apply_device_fields_when_recorded must skip a STALE running record
+    (start_time before the session floor) and stamp only the record this
+    session's recorder writes."""
+    import time
+
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    # Stale record from a "previous session" (running=True, e.g. after a crash).
+    status_file.write_running(
+        data_dir, pid=1, audio_source="socket", stt_label="old", start_time=1.0
+    )
+
+    device_state = {"mic": "Some Mic (uid=u1)", "system": "tap (uid=agg)"}
+    floor = time.time()
+    flush = asyncio.create_task(
+        cli._apply_device_fields_when_recorded(data_dir, device_state, floor, logger)
+    )
+    await asyncio.sleep(0.6)  # a couple of poll cycles against the stale record
+    assert not flush.done()
+    st = status_file.read_status(data_dir)
+    assert st is not None and st.mic_device is None  # stale record untouched
+
+    # The recorder's start write arrives → the flush stamps it and exits.
+    status_file.write_running(data_dir, pid=2, audio_source="socket", stt_label="new")
+    await asyncio.wait_for(flush, timeout=SUP_TIMEOUT)
+    st = status_file.read_status(data_dir)
+    assert st is not None
+    assert st.mic_device == "Some Mic (uid=u1)"
+    assert st.system_device == "tap (uid=agg)"
+
+
+def test_device_events_land_in_status_despite_outrunning_start_write(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """E2E: device events emitted at capturer STARTUP (before the sockets, so
+    before the fake recorder's write_running) still end up on this session's
+    record via the deferred apply — and survive the supervisor's crash stamp."""
+    data_dir, _ = sup_env
+    set_capturer_behaviour(
+        "crash",
+        nframes=5,
+        startup_events=[
+            "ONOATS-EVENT device branch=mic hint=MacBook Pro Microphone (uid=BuiltIn)",
+            "ONOATS-EVENT device branch=system hint=system-output tap (uid=agg-99)",
+        ],
+    )
+    _install_fake_recorder(monkeypatch, post_eof_drain=1.5, write_running=True)
+
+    rc = _run_supervisor_bounded()
+    assert rc != 0
+
+    from onoats import status as status_file
+
+    st = status_file.read_status(data_dir)
+    assert st is not None
+    assert st.mic_device == "MacBook Pro Microphone (uid=BuiltIn)"
+    assert st.system_device == "system-output tap (uid=agg-99)"
+    assert st.exit_reason == "capturer-crash"
 
 
 def test_zero_run_warning_event_sets_status_warning(

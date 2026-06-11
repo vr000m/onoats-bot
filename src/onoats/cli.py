@@ -205,6 +205,12 @@ _STDERR_READER_GRACE_SEC = 2.0
 # Grace for the capturer to exit on SIGTERM before SIGKILL during teardown.
 _CAPTURER_TERM_GRACE_SEC = 5.0
 
+# Poll cadence for the deferred device-field apply (see
+# _apply_device_fields_when_recorded): the capturer's `device` events fire
+# within its first second, before the recorder's write_running, so the
+# supervisor re-applies them once this session's record exists.
+_DEVICE_FLUSH_POLL_SEC = 0.25
+
 MIC_SOCKET_NAME = "mic.sock"
 SYSTEM_SOCKET_NAME = "system.sock"
 
@@ -316,7 +322,7 @@ def _parse_capturer_event(line: str) -> tuple[str, dict[str, str]] | None:
     return event_type, fields
 
 
-async def _drain_capturer_stderr(stderr, data_dir, logger) -> None:
+async def _drain_capturer_stderr(stderr, data_dir, logger, device_state=None) -> None:
     """Always-drain reader for the capturer's piped stderr.
 
     Three jobs, in priority order:
@@ -333,9 +339,14 @@ async def _drain_capturer_stderr(stderr, data_dir, logger) -> None:
     3. **Parse.** ``ONOATS-EVENT`` lines update the status file: a
        ``zero-run-warning`` sets the v2 ``warning`` field (per-branch messages
        merged, deterministically ordered); ``zero-run-clear`` removes that
-       branch's message and clears the field when none remain. Unknown event
-       types are tee'd and otherwise ignored (forward-compatible: Phase 5's
-       ``device`` and Phase 7's ``waiting-for-permission`` arrive later).
+       branch's message and clears the field when none remain. A ``device``
+       event records the branch's bound device into ``device_state`` (the
+       dict shared with _apply_device_fields_when_recorded — device events
+       fire before the recorder's start write, so the live set_devices below
+       is a no-op then and the deferred task applies them) and best-effort
+       updates the running record (covers mid-session mic rebinds). Unknown
+       event types are tee'd and otherwise ignored (forward-compatible:
+       Phase 7's ``waiting-for-permission`` arrives later).
 
     Returns on EOF. Never raises out (a status write failing must not kill the
     drain — job 1 outranks job 3).
@@ -382,11 +393,61 @@ async def _drain_capturer_stderr(stderr, data_dir, logger) -> None:
                         active_warnings[b] for b in sorted(active_warnings)
                     )
                     status_file.set_warning(data_dir, merged or None)
+            elif event_type == "device":
+                desc = fields.get("hint", "")
+                if branch in ("mic", "system") and desc:
+                    if device_state is not None:
+                        device_state[branch] = desc
+                    status_file.set_devices(
+                        data_dir,
+                        mic_device=desc if branch == "mic" else None,
+                        system_device=desc if branch == "system" else None,
+                    )
         except OSError as exc:
             logger.warning(
                 f"Socket supervisor: could not update status warning ({exc}); "
                 "continuing to drain capturer stderr."
             )
+
+
+async def _apply_device_fields_when_recorded(
+    data_dir, device_state, session_floor, logger
+) -> None:
+    """Deferred apply: stamp the capturer's device fields once THIS session's
+    record exists.
+
+    The capturer emits its ``device`` events within its first second — before
+    the recorder (STT preflight, model load) gets to ``write_running``, which
+    builds a FRESH record. So the live apply in the stderr reader either finds
+    no record / the previous session's record (no-op by design, see
+    status.set_devices) or gets clobbered by the start write. This task polls
+    until a running record stamped at/after ``session_floor`` appears, applies
+    whatever ``device_state`` holds by then, and exits; later rebind events
+    find a running record and apply live through the reader.
+
+    Lifecycle: spawned and cancelled by _run_recorder_with_capturer — it never
+    outlives the recorder/capturer race and never extends any bounded wait.
+    """
+    import asyncio
+
+    from onoats import status as status_file
+
+    while True:
+        st = status_file.read_status(data_dir)
+        if st is not None and st.running and st.start_time >= session_floor:
+            if device_state:
+                try:
+                    status_file.set_devices(
+                        data_dir,
+                        mic_device=device_state.get("mic"),
+                        system_device=device_state.get("system"),
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        f"Socket supervisor: could not stamp device fields ({exc})"
+                    )
+            return
+        await asyncio.sleep(_DEVICE_FLUSH_POLL_SEC)
 
 
 def _run_socket_supervisor(rest: list[str]) -> int:
@@ -491,6 +552,11 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
     capturer_proc: asyncio.subprocess.Process | None = None
     stderr_task: "asyncio.Task[None] | None" = None
+    # Latest device description per branch ("mic"/"system"), written by the
+    # stderr reader and applied to this session's status record by the
+    # deferred task in _run_recorder_with_capturer (the events outrun the
+    # recorder's start write — see _apply_device_fields_when_recorded).
+    device_state: dict[str, str] = {}
     rc = 0
     try:
         # 3b. Spawn the capturer pointed at both sockets. Pass the socket paths +
@@ -559,7 +625,9 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         # participant there (EOF on stderr is not a lifecycle signal; process
         # exit is).
         stderr_task = asyncio.create_task(
-            _drain_capturer_stderr(capturer_proc.stderr, data_dir, logger),
+            _drain_capturer_stderr(
+                capturer_proc.stderr, data_dir, logger, device_state
+            ),
             name="socket_supervisor_capturer_stderr",
         )
 
@@ -595,7 +663,9 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
         # 5. Run the recorder against the sockets, watching the capturer
         # concurrently so its death tears the session down.
-        rc = await _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir)
+        rc = await _run_recorder_with_capturer(
+            rest, capturer_proc, logger, data_dir, device_state
+        )
     finally:
         if capturer_proc is not None:
             await _stop_capturer(capturer_proc, logger)
@@ -667,7 +737,9 @@ async def _wait_for_sockets(capturer_proc, socket_paths, logger) -> bool:
         await asyncio.sleep(_SOCKET_WAIT_POLL_SEC)
 
 
-async def _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir) -> int:
+async def _run_recorder_with_capturer(
+    rest, capturer_proc, logger, data_dir, device_state=None
+) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
 
     The recorder (``run_onoats_dual``) installs its own signal handlers and runs
@@ -679,6 +751,7 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir) -> 
     drain grace.
     """
     import asyncio
+    import time
 
     from onoats import status as status_file
     from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
@@ -691,6 +764,9 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir) -> 
     if rc is not None:
         return rc
 
+    # Any write_running at/after this instant belongs to THIS session — the
+    # deferred device-apply task keys on it so it never stamps a stale record.
+    session_floor = time.time()
     recorder_task = asyncio.create_task(
         run_onoats_dual(
             live_terminal=args.live_terminal,
@@ -704,96 +780,117 @@ async def _run_recorder_with_capturer(rest, capturer_proc, logger, data_dir) -> 
     capturer_task = asyncio.create_task(
         capturer_proc.wait(), name="socket_supervisor_capturer_wait"
     )
-
-    done, _pending = await asyncio.wait(
-        {recorder_task, capturer_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-
-    if recorder_task in done:
-        # The recorder coroutine finished. Re-await to surface any exception
-        # (the caller maps SttPreflightError to rc=1), then honour its return
-        # code: run_onoats_dual returns non-zero when the pipeline ended via a
-        # fatal ErrorFrame (e.g. a silent/dead capturer tripped the read-idle
-        # watchdog) rather than a clean shutdown. That must propagate as a
-        # non-zero supervisor exit per the fail-loud contract — the capturer
-        # process is still alive (capturer_task pending), so we cannot infer
-        # success from "recorder finished first".
-        capturer_task.cancel()
-        try:
-            await capturer_task
-        except (asyncio.CancelledError, ProcessLookupError):
-            pass
-        rc = recorder_task.result()  # re-raise if the recorder failed
-        rc = rc if rc is not None else 0
-        if rc != 0:
-            logger.error(
-                f"Socket supervisor: recorder exited non-zero (rc={rc}) — a "
-                "capture branch surfaced a fatal ErrorFrame (silent/failed "
-                "capturer); stopping capturer and exiting non-zero."
-            )
-            # The recorder already wrote running=false + a fatal_error_frame
-            # reason; enrich it with the supervisor's final rc so `onoats status`
-            # / the menu bar can show the exit code.
-            status_file.stamp_supervisor_failure(
-                data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
-            )
-        else:
-            logger.info("Socket supervisor: recorder exited; stopping capturer")
-        return rc
-
-    # Capturer finished first → it died mid-session. The recorder's own
-    # ErrorFrame path is draining (flush + rotate). Give it a bounded grace, then
-    # force-cancel so the supervisor never hangs.
-    #
-    # Contract (Interpretation A): a capturer that exits BEFORE the recorder is
-    # ALWAYS a fail-loud event, even on a clean rc=0. The supervisor outlives the
-    # capturer by design — it stops the capturer when the recorder ends, never the
-    # reverse — so any capturer-initiated exit means the audio stream ended
-    # mid-session and the recording is truncated regardless of exit code. We do
-    # not branch on rc==0 here. A future, deliberate "clean stop" signal and its
-    # supervisor semantics are reserved for the Phase-4 capturer exit-code
-    # contract (see docs/audio-socket-contract.md); honouring it would also mean
-    # redefining the transport's EOF-is-fatal rule, which is out of scope.
-    rc = capturer_task.result()
-    logger.error(
-        f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
-        "branch surfaced an ErrorFrame and is rotating the partial session. "
-        "Supervisor will exit non-zero (capturer-exit-before-recorder is always "
-        "fail-loud, even on rc=0)."
-    )
-    try:
-        await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Socket supervisor: recorder did not finish draining within "
-            f"{_RECORDER_DRAIN_GRACE_SEC}s after capturer death — force-cancelling."
+    # Deferred device-field apply (see _apply_device_fields_when_recorded). It
+    # is NOT a participant in the recorder/capturer race below — the finally
+    # retires it so it can never extend a bounded wait or outlive the session.
+    device_flush_task = (
+        asyncio.create_task(
+            _apply_device_fields_when_recorded(
+                data_dir, device_state, session_floor, logger
+            ),
+            name="socket_supervisor_device_flush",
         )
-        recorder_task.cancel()
-        try:
-            await recorder_task
-        except asyncio.CancelledError:
-            pass
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        # The recorder may surface its own teardown error; we already log + exit
-        # non-zero for the capturer death, so just record it.
-        logger.warning(f"Socket supervisor: recorder drain raised: {exc}")
-    # The supervisor alone knows this was a capturer-death (not the recorder's own
-    # ErrorFrame). Stamp the specific reason: the capturer's exit-code contract
-    # (Support.swift ExitCode: 10=mic denied, 11=system-audio failed) is the only
-    # way the menu bar / `onoats status` can show WHY a start failed, not just
-    # that it crashed. Anything else — including rc=0 — is "capturer-crash".
-    # If the recorder was force-cancelled before writing its stopped record,
-    # this also flips the lingering running=true start record to stopped.
-    exit_reason = _CAPTURER_RC_REASONS.get(rc, "capturer-crash")
-    status_file.stamp_supervisor_failure(
-        data_dir,
-        exit_reason=exit_reason,
-        supervisor_rc=1,
-        last_error="capturer exited mid-session; partial recording rotated to pending/",
+        if device_state is not None
+        else None
     )
-    return 1
+
+    try:
+        done, _pending = await asyncio.wait(
+            {recorder_task, capturer_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if recorder_task in done:
+            # The recorder coroutine finished. Re-await to surface any exception
+            # (the caller maps SttPreflightError to rc=1), then honour its return
+            # code: run_onoats_dual returns non-zero when the pipeline ended via a
+            # fatal ErrorFrame (e.g. a silent/dead capturer tripped the read-idle
+            # watchdog) rather than a clean shutdown. That must propagate as a
+            # non-zero supervisor exit per the fail-loud contract — the capturer
+            # process is still alive (capturer_task pending), so we cannot infer
+            # success from "recorder finished first".
+            capturer_task.cancel()
+            try:
+                await capturer_task
+            except (asyncio.CancelledError, ProcessLookupError):
+                pass
+            rc = recorder_task.result()  # re-raise if the recorder failed
+            rc = rc if rc is not None else 0
+            if rc != 0:
+                logger.error(
+                    f"Socket supervisor: recorder exited non-zero (rc={rc}) — a "
+                    "capture branch surfaced a fatal ErrorFrame (silent/failed "
+                    "capturer); stopping capturer and exiting non-zero."
+                )
+                # The recorder already wrote running=false + a fatal_error_frame
+                # reason; enrich it with the supervisor's final rc so `onoats status`
+                # / the menu bar can show the exit code.
+                status_file.stamp_supervisor_failure(
+                    data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
+                )
+            else:
+                logger.info("Socket supervisor: recorder exited; stopping capturer")
+            return rc
+
+        # Capturer finished first → it died mid-session. The recorder's own
+        # ErrorFrame path is draining (flush + rotate). Give it a bounded grace, then
+        # force-cancel so the supervisor never hangs.
+        #
+        # Contract (Interpretation A): a capturer that exits BEFORE the recorder is
+        # ALWAYS a fail-loud event, even on a clean rc=0. The supervisor outlives the
+        # capturer by design — it stops the capturer when the recorder ends, never the
+        # reverse — so any capturer-initiated exit means the audio stream ended
+        # mid-session and the recording is truncated regardless of exit code. We do
+        # not branch on rc==0 here. A future, deliberate "clean stop" signal and its
+        # supervisor semantics are reserved for the Phase-4 capturer exit-code
+        # contract (see docs/audio-socket-contract.md); honouring it would also mean
+        # redefining the transport's EOF-is-fatal rule, which is out of scope.
+        rc = capturer_task.result()
+        logger.error(
+            f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
+            "branch surfaced an ErrorFrame and is rotating the partial session. "
+            "Supervisor will exit non-zero (capturer-exit-before-recorder is always "
+            "fail-loud, even on rc=0)."
+        )
+        try:
+            await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Socket supervisor: recorder did not finish draining within "
+                f"{_RECORDER_DRAIN_GRACE_SEC}s after capturer death — force-cancelling."
+            )
+            recorder_task.cancel()
+            try:
+                await recorder_task
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The recorder may surface its own teardown error; we already log + exit
+            # non-zero for the capturer death, so just record it.
+            logger.warning(f"Socket supervisor: recorder drain raised: {exc}")
+        # The supervisor alone knows this was a capturer-death (not the recorder's own
+        # ErrorFrame). Stamp the specific reason: the capturer's exit-code contract
+        # (Support.swift ExitCode: 10=mic denied, 11=system-audio failed) is the only
+        # way the menu bar / `onoats status` can show WHY a start failed, not just
+        # that it crashed. Anything else — including rc=0 — is "capturer-crash".
+        # If the recorder was force-cancelled before writing its stopped record,
+        # this also flips the lingering running=true start record to stopped.
+        exit_reason = _CAPTURER_RC_REASONS.get(rc, "capturer-crash")
+        status_file.stamp_supervisor_failure(
+            data_dir,
+            exit_reason=exit_reason,
+            supervisor_rc=1,
+            last_error="capturer exited mid-session; partial recording rotated to pending/",
+        )
+        return 1
+    finally:
+        if device_flush_task is not None:
+            device_flush_task.cancel()
+            try:
+                await device_flush_task
+            except asyncio.CancelledError:
+                pass
 
 
 def _signal_capturer_group(capturer_proc, sig, logger) -> bool:
@@ -968,6 +1065,21 @@ def _cmd_flush(rest: list[str]) -> int:
 def _cmd_devices(rest: list[str]) -> int:
     """List audio input/output devices (reuses the device picker's enumeration)."""
     argparse.ArgumentParser(prog="onoats devices").parse_args(rest)
+
+    from onoats.config import load_config
+
+    if load_config().audio_source == "socket":
+        # This enumeration is PortAudio's view; the socket path never picks
+        # from it — the native capturer binds the system default input and a
+        # global system-output tap. `onoats status` shows what a running
+        # session actually bound.
+        print(
+            "note: AUDIO_SOURCE=socket — this list is PortAudio-only and not "
+            "what the recorder uses. The native capturer captures the system "
+            "default input (mic) and the default-output tap (system audio); "
+            "see `onoats status` for the devices bound by a running session.\n"
+        )
+
     import pyaudio
 
     pa = pyaudio.PyAudio()
@@ -1043,6 +1155,12 @@ def _cmd_status(rest: list[str]) -> int:
             print(f"  audio source: {st.audio_source}")
         if st.stt_label:
             print(f"  STT: {st.stt_label}")
+        # Socket path: the devices the capturer actually bound (ONOATS-EVENT
+        # device → status schema v2), updated on mid-session mic rebinds.
+        if st.mic_device:
+            print(f"  mic device: {st.mic_device}")
+        if st.system_device:
+            print(f"  system device: {st.system_device}")
         if st.warning:
             print(f"  warning: {st.warning}")
         if st.last_rotation_time is not None:
@@ -1055,6 +1173,19 @@ def _cmd_status(rest: list[str]) -> int:
             print(f"  last error: {st.last_error}")
         if st.supervisor_rc is not None:
             print(f"  supervisor rc: {st.supervisor_rc}")
+
+    # PortAudio fallback path: there are no capturer device events, so show the
+    # configured [devices] names the recorder binds by — the wrong-device guard
+    # for that path (an A/B finding: a stale name silently records the wrong
+    # input). Printed even without a record, so it helps before first start.
+    from onoats.config import load_config
+
+    cfg = load_config()
+    if cfg.audio_source != "socket":
+        mic = cfg.mic_device or "<system default>"
+        system = cfg.system_device or "<not configured>"
+        print(f"  configured mic (PortAudio): {mic} ({cfg.mic_device_source})")
+        print(f"  configured system (PortAudio): {system} ({cfg.system_device_source})")
     return 0
 
 

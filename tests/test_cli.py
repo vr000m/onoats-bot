@@ -186,6 +186,44 @@ def test_devices_routes(monkeypatch):
     assert rc == 0
 
 
+def _install_fake_pyaudio(monkeypatch):
+    class FakePA:
+        def get_device_count(self):
+            return 0
+
+        def get_device_info_by_index(self, i):  # pragma: no cover - count is 0
+            raise IndexError(i)
+
+        def terminate(self):
+            pass
+
+    import sys
+    import types
+
+    fake_pyaudio = types.ModuleType("pyaudio")
+    fake_pyaudio.PyAudio = FakePA
+    monkeypatch.setitem(sys.modules, "pyaudio", fake_pyaudio)
+
+
+def test_devices_socket_note(monkeypatch, capsys):
+    """Under AUDIO_SOURCE=socket the enumeration gets the PortAudio-only note —
+    the native capturer binds the default input / default-output tap, never a
+    device from this list (release-plan Phase 5)."""
+    _install_fake_pyaudio(monkeypatch)
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    assert cli.main(["devices"]) == 0
+    out = capsys.readouterr().out
+    assert "PortAudio-only" in out
+    assert "onoats status" in out
+
+
+def test_devices_no_note_on_portaudio(monkeypatch, capsys):
+    _install_fake_pyaudio(monkeypatch)
+    monkeypatch.delenv("AUDIO_SOURCE", raising=False)
+    assert cli.main(["devices"]) == 0
+    assert "PortAudio-only" not in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
@@ -243,6 +281,50 @@ def test_status_indeterminate_ps_probe_stays_running(capsys, _isolate_env, monke
     out = capsys.readouterr().out
     assert rc == 0
     assert "RUNNING" in out
+
+
+def test_status_portaudio_shows_configured_device_names(
+    capsys, _isolate_env, monkeypatch, tmp_path
+):
+    """PortAudio fallback path: `onoats status` surfaces the [devices] names the
+    recorder binds by (the wrong-device guard — release-plan Phase 5)."""
+    cfg_dir = tmp_path / "config" / "onoats"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.toml").write_text(
+        '[devices]\nmic = "Built-in Mic"\nsystem = "BlackHole 2ch"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AUDIO_SOURCE", raising=False)  # default: portaudio
+    monkeypatch.delenv("MIC_INPUT_DEVICE", raising=False)
+    monkeypatch.delenv("SYSTEM_INPUT_DEVICE", raising=False)
+
+    rc = cli.main(["status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "configured mic (PortAudio): Built-in Mic (from config)" in out
+    assert "configured system (PortAudio): BlackHole 2ch (from config)" in out
+
+
+def test_status_portaudio_defaults_without_devices_config(
+    capsys, _isolate_env, monkeypatch
+):
+    monkeypatch.delenv("AUDIO_SOURCE", raising=False)
+    monkeypatch.delenv("MIC_INPUT_DEVICE", raising=False)
+    monkeypatch.delenv("SYSTEM_INPUT_DEVICE", raising=False)
+
+    rc = cli.main(["status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "configured mic (PortAudio): <system default> (default)" in out
+    assert "configured system (PortAudio): <not configured> (default)" in out
+
+
+def test_status_socket_hides_portaudio_config_lines(capsys, _isolate_env, monkeypatch):
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    rc = cli.main(["status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "configured mic (PortAudio)" not in out
 
 
 # ---------------------------------------------------------------------------
