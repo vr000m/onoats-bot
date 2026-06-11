@@ -595,7 +595,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
 
 ## Progress
 
-- [ ] Phase 1 — LICENSE + license metadata
+- [x] Phase 1 — LICENSE + license metadata (branch `chore/license-bsd2`, PR open)
 - [ ] Phase 2 — CHANGELOG + v0.9.0
 - [ ] Phase 3 — README overhaul + blackhole-fallback doc
 - [ ] Phase 4 — Menu-bar zero-run WARNING surfacing

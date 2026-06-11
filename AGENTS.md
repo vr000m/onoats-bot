@@ -59,6 +59,11 @@ Python contract constants):
   pump; that's the bug Codex caught (re-verified via the integrated reader+pump
   regression tests in `tests/test_socket_audio_transport.py`).
 
+Release metadata (canonical BSD-2-Clause LICENSE body, pyproject SPDX
+`license` field, `hatchling>=1.27` pin for PEP 639) is pinned by
+`tests/test_release_meta.py` — don't weaken those without touching the
+licensing decision in the release plan.
+
 ## Supervisor ↔ capturer lifecycle (`cli._run_socket_supervisor`)
 
 - The **supervisor owns the capturer process.** It mints a private `0700` socket

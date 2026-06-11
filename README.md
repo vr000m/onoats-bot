@@ -163,4 +163,4 @@ a consumer drains.
 
 ## License
 
-See the repository for license details.
+BSD-2-Clause — see [LICENSE](LICENSE).
