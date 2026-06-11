@@ -184,6 +184,10 @@ final class SystemCapture {
         logLine(
             "system: capturing via process tap at \(Int(format.sampleRate)) Hz / "
                 + "\(format.channelCount) ch (aggregate uid=\(aggregateUID))")
+        // The tap is global (all processes' output), not bound to one output
+        // device, so the honest identity is the tap's own aggregate — emitted
+        // once per session (the tap never rebinds; see header).
+        emitEvent("device", "branch=system hint=system-output tap (uid=\(aggregateUID))")
     }
 
     private func enqueueChunk(bytes: Data, frames: AVAudioFrameCount, endNs: UInt64) {

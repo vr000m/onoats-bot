@@ -327,7 +327,7 @@ Defined events:
 |---|---|---|
 | `zero-run-warning` | `branch=<mic\|system> hint=<text>` | sets the status-file `warning` (schema v2) to `"<branch>: <hint>"`; per-branch messages merge `; `-joined in branch order. Emitted once per zero-run (30 s of all-zero real input); re-armed by real audio. |
 | `zero-run-clear` | `branch=<mic\|system>` | removes that branch's message; clears `warning` to `null` when none remain. |
-| `device` | *(reserved — release-plan Phase 5)* | populates `mic_device` / `system_device`. |
+| `device` | `branch=<mic\|system> hint=<name> (uid=<uid>)` | populates the status-file `mic_device` / `system_device` (schema v2) with the hint text verbatim — the trailing free-text `hint` is load-bearing here, since device names contain spaces. Mic: emitted on **every successful bind** (initial + default-input rebind), naming the bound device. System: emitted **once per session**; the tap is global (all processes' output), not bound to one output device, so the description is `system-output tap (uid=<aggregate uid>)`. The events outrun the recorder's start write, so the supervisor records them and applies via a deferred task keyed on this session's `write_running` (`cli._apply_device_fields_when_recorded`); a non-running record is never device-stamped. |
 | `waiting-for-permission` | *(reserved — release-plan Phase 7)* | extends the socket-appearance wait while a TCC prompt is pending. |
 
 ### Default-device changes (capturer requirement, verified live)
