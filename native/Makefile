@@ -19,12 +19,13 @@
 #   make install-cli  uv tool install --editable the repo → ~/.local/bin/onoats
 #                     (idempotent; re-run after dependency changes = the update)
 #   make install  sign + install-cli + copy Onoats.app → ~/Applications
-#                 (full story: `make cert` once, then `make install`; update =
-#                  `git pull && make install`. TCC grants survive: they key on
-#                  the DR — bundle id + cert — not the path or cdhash.)
+#                 (update = `git pull && make install`. TCC grants survive:
+#                  they key on the DR — bundle id + cert — not path or cdhash.)
+#   make setup    the one-command fresh-clone story: cert → install →
+#                 `onoats init` (init only when no config.toml exists yet;
+#                 cert is a no-op when the identity exists — make_cert.sh
+#                 refuses to regenerate, which would invalidate TCC grants)
 #   make clean
-#
-# The throwaway spike kit lives in spike/ with its own Makefile.
 
 ARCH      := $(shell uname -m)
 DEPLOY    := 14.4
@@ -57,7 +58,7 @@ REPO        := $(abspath ..)
 INSTALL_DIR := $(HOME)/Applications
 
 .PHONY: build app sign dr cdhash rebuild print-bin clean check-identity \
-	cert install-cli install
+	cert install-cli install setup
 
 build: $(BUILD)/onoats-capturer $(BUILD)/Onoats
 
@@ -128,6 +129,20 @@ install: sign install-cli
 	rm -rf $(INSTALL_DIR)/$(APP)
 	ditto $(APP) $(INSTALL_DIR)/$(APP)
 	@echo "✓ installed $(INSTALL_DIR)/$(APP)"
+
+# Fresh-clone bootstrap. cert is idempotent (make_cert.sh exits 0 — and never
+# regenerates — when the identity exists). init runs only on a missing
+# config.toml: re-running setup must never clobber an existing config. The
+# CLI is invoked via its stable shim path — a fresh shell may not have
+# ~/.local/bin on PATH yet.
+setup: cert install
+	@CONFIG="$${XDG_CONFIG_HOME:-$$HOME/.config}/onoats/config.toml"; \
+	if [ -f "$$CONFIG" ]; then \
+	  echo "✓ $$CONFIG exists — skipping 'onoats init' (delete it to re-run)"; \
+	else \
+	  "$$HOME/.local/bin/onoats" init; \
+	fi
+	@echo "✓ setup complete — launch Onoats.app from $(INSTALL_DIR)"
 
 clean:
 	rm -rf $(BUILD) $(APP)
