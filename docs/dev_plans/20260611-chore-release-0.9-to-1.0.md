@@ -632,7 +632,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 8 — BlackHole pruning (1.0.0 gate; PR #18 merged 2026-06-12,
   `5f7a857` — conservative keep-list applied, `setup-cli` target added,
   three install paths documented)
-- [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
+- [x] Phase 9 — ConfigStore parity tests (1.0.0 gate; PR #19 merged
+  2026-06-12, `101d368` — 12 new cases incl. pinned CRLF contract; real
+  CRLF divergence found and fixed in ConfigStore.swift)
 - [ ] Phase 10 — Cut v1.0.0
 
 ## Findings
