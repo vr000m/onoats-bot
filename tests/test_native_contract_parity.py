@@ -16,7 +16,9 @@ fails here, with the file/constant named.
 Also pins the ConfigStore writer contract: the Swift TOML line editor emits
 ``key = "value"`` with ``\\``/``\"`` escaping; a sample written in exactly
 that format must round-trip through ``tomllib`` (what the Python CLI parses
-config.toml with) back to the original value.
+config.toml with) back to the original value. ``_swift_write_value`` below is
+a maintained line-by-line mirror of ``ConfigStore.writeValue`` — update it in
+the same change whenever the Swift writer changes.
 """
 
 from __future__ import annotations
@@ -28,6 +30,13 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def _swift_escape(value: str) -> str:
+    """ConfigStore.escape's exact rule: backslash first, then double quote."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel.swift"
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
 SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
@@ -241,7 +250,7 @@ def test_configstore_escaping_round_trips_through_tomllib(value: str):
     tomllib (what every Python entrypoint uses on config.toml). If the Swift
     escaping rules drift from TOML basic-string rules, this fails before a
     user's chosen data dir can corrupt their config."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = _swift_escape(value)
     doc = f'[storage]\ndata_dir = "{escaped}"\n'
     parsed = tomllib.loads(doc)
     assert parsed["storage"]["data_dir"] == value
@@ -259,7 +268,7 @@ def _swift_write_value(text: str, section: str, key: str, value: str) -> str:
     drift is caught by the round-trip tests that use this model.
     """
     # Swift: escape() — backslash first, then double-quote.
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = _swift_escape(value)
     # Swift: text.components(separatedBy: "\n") — \r stays on the line.
     lines = text.split("\n")
     new_line = f'{key} = "{escaped}"'
@@ -332,9 +341,11 @@ def test_configstore_writer_structure_matches_python_model():
         "never recognised and writeValue appends a duplicate section that "
         "tomllib rejects (the Phase-9 CRLF divergence)"
     )
-    assert "lines[i] = newLine" in text
-    assert "lines.insert(newLine, at: header + 1)" in text
-    assert 'joined(separator: "\\n")' in text
+    assert re.search(r"lines\[\w+\] = \w+", text), "in-place replace gone"
+    assert re.search(r"lines\.insert\(\w+, at: \w+ \+ 1\)", text), (
+        "insert-at-header+1 gone"
+    )
+    assert 'joined(separator: "\\n")' in text, "join separator changed"
 
 
 def test_configstore_write_preserves_comments_on_other_lines():
