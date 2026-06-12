@@ -192,6 +192,7 @@ def test_interactive_local_websocket_branch_runs_preflight(_isolate_env, monkeyp
             "y",  # local STT? yes
             "y",  # use websocket socket? yes
             "/tmp/stt.sock",  # socket path
+            "auto",  # STT language → [stt].language
             "",  # categories (none)
             "Me",  # me name
             "Them",  # them label
@@ -215,6 +216,7 @@ def test_interactive_local_websocket_branch_runs_preflight(_isolate_env, monkeyp
     cfg = _load_toml(config_toml_path())
     assert cfg["stt"]["service"] == "websocket"
     assert cfg["stt"]["ws_socket"] == "/tmp/stt.sock"
+    assert cfg["stt"]["language"] == "auto"
 
 
 def test_interactive_warns_when_loopback_absent(_isolate_env, monkeypatch, capsys):

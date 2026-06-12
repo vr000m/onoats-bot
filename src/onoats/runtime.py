@@ -616,6 +616,21 @@ def _vocabulary_bias() -> list[str]:
         return []
 
 
+def _resolve_stt_language(cfg) -> str | None:
+    """Map ``cfg.stt_language`` to the value the STT backends expect.
+
+    ``auto`` maps to ``None`` (omit the field) rather than the literal string
+    "auto": ``None`` is the only value that means auto-detect uniformly across
+    backends — whisper/mlx *rejects* a literal "auto" (ValueError -> failed
+    decode) and uses ``None`` for built-in detection, while nemotron maps
+    client-``None`` to its own "auto" language-ID. onoats is backend-agnostic
+    over the socket, so it cannot branch per backend. Resolved in one place so
+    the websocket and local whisper branches cannot drift.
+    """
+    raw = cfg.stt_language
+    return None if raw.lower() == "auto" else raw
+
+
 # Canonical set of STT_SERVICE values dispatched by _create_stt_service below
 # ("whisper" is the fall-through default branch). The menu bar's STT picker
 # (native/onoats-menubar/Sources/RecorderModel.swift `sttServices`) mirrors
@@ -646,6 +661,7 @@ async def _create_stt_service():
     cfg = load_config()
     service = cfg.stt_service
     model_name = cfg.stt_model
+    language = _resolve_stt_language(cfg)
     vocabulary = _vocabulary_bias()
     # Enforce the canonical set, not just document it: a typo'd STT_SERVICE
     # used to silently fall through to the whisper branch — fail loud instead.
@@ -669,18 +685,11 @@ async def _create_stt_service():
         logger.info(f"STT: websocket (server={target})")
         await _preflight_stt_ws(kwargs, target)
         # The language is forwarded to the server's decoder via
-        # ``update_session`` (see ``WebSocketSTTService``). Default ``en``
-        # preserves prior behavior. ``auto`` maps to ``None`` (omit the field)
-        # rather than the literal string "auto": ``None`` is the only value
-        # that means auto-detect uniformly across backends — whisper/mlx
-        # *rejects* a literal "auto" (ValueError -> failed decode) and uses
-        # ``None`` for built-in detection, while nemotron maps client-``None``
-        # to its own "auto" language-ID. onoats is backend-agnostic over the
-        # socket, so it cannot branch per backend. Not threaded through
+        # ``update_session`` (see ``WebSocketSTTService``). Resolved from
+        # ``cfg.stt_language`` above (env STT_WS_LANGUAGE > config.toml
+        # [stt].language > "en"). Not threaded through
         # ``_resolve_stt_ws_target`` because that dict also feeds
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
-        raw = (os.environ.get("STT_WS_LANGUAGE") or "en").strip() or "en"
-        language = None if raw.lower() == "auto" else raw
         return WebSocketSTTService(language=language, **kwargs)
 
     if service == "deepgram":
@@ -739,20 +748,27 @@ async def _create_stt_service():
                 f"Unknown MLX model name '{model_name}', falling back to large-v3-turbo"
             )
             mlx_model = MLXModel.LARGE_V3_TURBO
-        logger.info(f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon)")
+        logger.info(
+            f"STT: whisper-mlx (model={mlx_model.name}, device=Apple Silicon, "
+            f"language={language or 'auto'})"
+        )
+        # language=None reaches mlx_whisper.transcribe unchanged, which then
+        # auto-detects per segment.
         return WhisperSTTServiceMLX(
-            settings=WhisperSTTServiceMLX.Settings(model=mlx_model.value, language="en")
+            settings=WhisperSTTServiceMLX.Settings(
+                model=mlx_model.value, language=language
+            )
         )
     else:
         from pipecat.services.whisper.stt import WhisperSTTService
 
         model = model_name or "base"
-        logger.info(f"STT: whisper-cpu (model={model})")
+        logger.info(f"STT: whisper-cpu (model={model}, language={language or 'auto'})")
         # device/compute_type are WhisperSTTService constructor kwargs, NOT
         # Settings fields — passing device into Settings raises TypeError.
         return WhisperSTTService(
             device="cpu",
-            settings=WhisperSTTService.Settings(model=model, language="en"),
+            settings=WhisperSTTService.Settings(model=model, language=language),
         )
 
 

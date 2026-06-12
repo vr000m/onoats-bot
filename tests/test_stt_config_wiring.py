@@ -49,6 +49,52 @@ def test_stt_service_defaults_to_whisper_when_unset(monkeypatch):
     assert OnoatsConfig(raw={}).stt_service == "whisper"
 
 
+# --- A1. STT language comes from config.toml (env wins), auto -> None -------
+
+
+def test_stt_language_defaults_to_en(monkeypatch):
+    monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
+    assert OnoatsConfig(raw={}).stt_language == "en"
+
+
+def test_stt_language_from_config_toml(monkeypatch):
+    monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
+    cfg = OnoatsConfig(raw={"stt": {"language": "sv"}})
+    assert cfg.stt_language == "sv"
+
+
+def test_env_language_overrides_config(monkeypatch):
+    monkeypatch.setenv("STT_WS_LANGUAGE", "de")
+    cfg = OnoatsConfig(raw={"stt": {"language": "sv"}})
+    assert cfg.stt_language == "de"
+
+
+def test_resolve_stt_language_maps_auto_to_none(monkeypatch):
+    """``auto`` must reach the backends as None, never the literal string.
+
+    whisper/mlx raises on a literal "auto"; None means auto-detect uniformly
+    (mlx built-in detection / nemotron's own auto language-ID).
+    """
+    monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
+    assert runtime._resolve_stt_language(OnoatsConfig(raw={})) == "en"
+    assert (
+        runtime._resolve_stt_language(OnoatsConfig(raw={"stt": {"language": "Auto"}}))
+        is None
+    )
+    monkeypatch.setenv("STT_WS_LANGUAGE", "auto")
+    assert runtime._resolve_stt_language(OnoatsConfig(raw={})) is None
+
+
+def test_whisper_settings_accept_language_none():
+    """The auto-detect path builds Settings(language=None) — pin that the
+    pinned pipecat accepts it (assert_given rejects only NOT_GIVEN, not None).
+    """
+    from pipecat.services.whisper.stt import WhisperSTTService
+
+    settings = WhisperSTTService.Settings(model="base", language=None)
+    assert settings.language is None
+
+
 # --- A2. the RSS probe resolves the SAME endpoint as the data path ----------
 
 

@@ -13,6 +13,17 @@ no backdated tags exist). PR numbers `#1`–`#7` refer to this repository;
 older history predates the extraction and is cited by merge-commit SHA.
 Annotated tags exist from `v0.9.0` forward.
 
+## [Unreleased]
+
+### Added
+- `[stt] language` in `config.toml`: the STT decode language is now a
+  first-class config key (env `STT_WS_LANGUAGE` > `[stt].language` > `en`),
+  shared by every launch path (CLI, menu-bar app, `onoats init`). `auto`
+  means auto-detect and maps to `None` at the backend boundary. The local
+  whisper/MLX branches now honour it too (they previously hardcoded `en`);
+  Deepgram does not consume it. `onoats init` prompts for it in the local
+  STT branch.
+
 ## [1.0.0] - 2026-06-12
 
 First stable release. Closes out the 0.9.x series' 1.0.0 gates: pre-socket
