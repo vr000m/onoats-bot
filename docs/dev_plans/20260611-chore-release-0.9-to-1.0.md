@@ -351,7 +351,16 @@ supervisor handshake path in `cli.py:311–482`
 
 - [ ] Decide the keep-list with the user first (gate: user is "happy with the
   menubar" in daily use) — the documented fallback for 13.x–14.3/off-mac
-  stays functional
+  stays functional. **DECIDED 2026-06-11 (user): conservative keep-list.**
+  PortAudio/BlackHole stays a supported path — the user has older Intel
+  MacBooks that may be capped below macOS 14.4 (no process-tap API), where
+  BlackHole is the only system-audio route. KEEP: the `_LOOPBACK_HINTS`
+  auto-detection (`init.py:91`) and the no-loopback NOTE (`init.py:135`)
+  everywhere they fire today; the `dual.py:665` backend help text; all
+  config-wiring tests (BlackHole fixture names may stay). PRUNE only:
+  redundant prose/comments that re-explain BlackHole where a link to
+  `docs/blackhole-fallback.md` suffices (README mentions, `pyproject.toml`
+  comment).
 - [ ] Prune BlackHole-specific hints/branches/tests beyond that keep-list;
   point remaining mentions at `docs/blackhole-fallback.md`
 - [ ] Coverage bound (stated, not solved): there is no 13.x–14.3 hardware in
@@ -585,7 +594,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ 53c29110b9a83cc2505dd3fa2e2048160e79b7bf -->
+<!-- reviewed: 2026-06-11 @ f4c5eb03f9871aff955adffba42e112c46808001 -->
 ## Issues & Solutions
 
 *(populated during implementation)*
