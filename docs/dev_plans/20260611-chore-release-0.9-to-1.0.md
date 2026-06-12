@@ -629,7 +629,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 7 — Tap preflight (1.0.0 gate; PR #17 merged 2026-06-12,
   `46894fe` — implementation + unit tests + parity pins; all three live
   smokes PASSED 2026-06-11, see Findings)
-- [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
+- [x] Phase 8 — BlackHole pruning (1.0.0 gate; PR #18 merged 2026-06-12,
+  `5f7a857` — conservative keep-list applied, `setup-cli` target added,
+  three install paths documented)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
 - [ ] Phase 10 — Cut v1.0.0
 
