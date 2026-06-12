@@ -25,6 +25,10 @@
 #                 `onoats init` (init only when no config.toml exists yet;
 #                 cert is a no-op when the identity exists — make_cert.sh
 #                 refuses to regenerate, which would invalidate TCC grants)
+#   make setup-cli  CLI-only bootstrap (no app bundle): cert → build + sign
+#                   the bare capturer → install-cli → `onoats init` (same
+#                   cert/init idempotency as setup). Run sessions with
+#                   AUDIO_SOURCE=socket + ONOATS_CAPTURER_BIN (printed at end).
 #   make clean
 
 ARCH      := $(shell uname -m)
@@ -58,7 +62,7 @@ REPO        := $(abspath ..)
 INSTALL_DIR := $(HOME)/Applications
 
 .PHONY: build app sign dr cdhash rebuild print-bin clean check-identity \
-	cert install-cli install setup
+	cert install-cli install setup sign-cli setup-cli
 
 build: $(BUILD)/onoats-capturer $(BUILD)/Onoats
 
@@ -147,6 +151,35 @@ setup:
 	  "$$HOME/.local/bin/onoats" init; \
 	fi
 	@echo "✓ setup complete — launch Onoats.app from $(INSTALL_DIR)"
+
+# CLI-only signing: signs the bare capturer at build/onoats-capturer (no app
+# bundle). Same identity + identifier as the bundle signing above, so the
+# designated requirement — and any existing TCC grants — match. The signature
+# on the capturer binary is what avoids the ~4 s-per-tap-call verification
+# stall. Note: a later `make build`/`make setup` recompiles this binary and
+# drops the signature — re-run setup-cli (or sign-cli) after updates.
+sign-cli: $(BUILD)/onoats-capturer check-identity
+	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(BUILD)/onoats-capturer
+	@echo "✓ signed $(BUILD)/onoats-capturer"
+
+# CLI + native capture bootstrap (macOS 14.4+, no menu-bar app). Mirrors
+# `setup`: cert is idempotent (make_cert.sh refuses to regenerate — a new cert
+# would invalidate TCC grants), init runs only when config.toml is missing,
+# and the CLI is invoked via its stable shim path. Recursive $(MAKE) for the
+# same reason as setup: cert MUST complete before check-identity under -j.
+# The CLI discovers the capturer via ONOATS_CAPTURER_BIN (env-only).
+setup-cli:
+	$(MAKE) cert
+	$(MAKE) sign-cli
+	$(MAKE) install-cli
+	@CONFIG="$${XDG_CONFIG_HOME:-$$HOME/.config}/onoats/config.toml"; \
+	if [ -f "$$CONFIG" ]; then \
+	  echo "✓ $$CONFIG exists — skipping 'onoats init' (delete it to re-run)"; \
+	else \
+	  "$$HOME/.local/bin/onoats" init; \
+	fi
+	@echo "✓ setup-cli complete — run sessions with:"
+	@echo "  AUDIO_SOURCE=socket ONOATS_CAPTURER_BIN=$(CURDIR)/$(BUILD)/onoats-capturer onoats bot"
 
 clean:
 	rm -rf $(BUILD) $(APP)

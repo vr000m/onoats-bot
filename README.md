@@ -14,7 +14,14 @@ analysis; onoats itself stays files-only.
 
 ## Quickstart
 
-onoats installs **from source** (it is not published on PyPI).
+onoats installs **from source** (it is not published on PyPI). Three install
+paths, by platform and how you want to drive it:
+
+| Path | One command (after clone) | Works on |
+|------|---------------------------|----------|
+| **Menu bar + native capture** (recommended) | `make -C native setup` | macOS 14.4+ |
+| **CLI + native capture** | `make -C native setup-cli` | macOS 14.4+ |
+| **CLI + PortAudio** | `uv tool install --editable .` then `onoats init` | everywhere else (Linux / Windows / Intel mac / macOS ≤ 14.3) — no native toolchain |
 
 ### macOS 14.4+ — menu bar + native capture (recommended)
 
@@ -43,7 +50,35 @@ cert or touches an existing config); reconfigure any time with `onoats init`
 or the menu bar's Settings, and update after a `git pull` with
 `make -C native install`. Details in [`native/README.md`](native/README.md).
 
-### Other platforms (and macOS below 14.4)
+### macOS 14.4+ — CLI + native capture (no menu bar)
+
+Same prerequisites (Xcode CLT + uv), same native system-audio capture —
+without installing the app bundle:
+
+```bash
+git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+make -C native setup-cli   # cert + build/sign the capturer,
+                           # CLI → ~/.local/bin/onoats, then guided `onoats init`
+```
+
+`setup-cli` ends by printing the exact run line — sessions need
+`AUDIO_SOURCE=socket` plus `ONOATS_CAPTURER_BIN` pointing at the signed
+capturer:
+
+```bash
+AUDIO_SOURCE=socket \
+ONOATS_CAPTURER_BIN=/path/to/onoats-bot/native/build/onoats-capturer \
+onoats bot
+```
+
+Like `setup`, it never regenerates the signing cert and never touches an
+existing `config.toml`. One caveat versus the menu-bar path: launched from a
+terminal, the macOS permission grants (microphone, system audio) attribute to
+the **terminal app**, not to onoats — see
+[`native/README.md`](native/README.md) for the TCC details.
+
+### Other platforms (and macOS below 14.4) — CLI + PortAudio
 
 ```bash
 # Linux: PortAudio dev headers are needed to build pyaudio
@@ -59,8 +94,9 @@ onoats bot                        # dual-input recorder (mic + system loopback)
 onoats convert                    # render pending sessions → markdown transcripts
 ```
 
-On this path, capturing system audio ("them") needs a loopback driver — see
-[docs/blackhole-fallback.md](docs/blackhole-fallback.md).
+No native toolchain (no `make`, `swiftc`, or `codesign`) is needed on this
+path. Capturing system audio ("them") needs a loopback driver — install and
+routing in [docs/blackhole-fallback.md](docs/blackhole-fallback.md).
 
 Other subcommands:
 
