@@ -601,10 +601,10 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
 - [x] Phase 5 — CLI device visibility (PR #15)
-- [ ] Phase 6 — Install streamlining + spike removal (implemented 2026-06-11:
-  setup target, residue-enum port + rewire, spike deletion + sweep, README
-  flips; kill-×3 re-run PASSED live; fresh-clone + pre-init verifies
-  DEFERRED — see Findings)
+- [x] Phase 6 — Install streamlining + spike removal (PR #16; kill-×3 re-run
+  PASSED live 2026-06-11; fresh-clone + pre-init verifies DEFERRED to the
+  next fresh-machine install — see Findings; post-merge: push `spike-archive`
+  tag on `7ac0b2e`)
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
