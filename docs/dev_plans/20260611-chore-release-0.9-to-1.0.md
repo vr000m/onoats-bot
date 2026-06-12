@@ -343,7 +343,8 @@ supervisor handshake path in `cli.py:311–482`
 
 ### Phase 8 — BlackHole config pruning (1.0.0 gate)
 **Branch:** `chore/prune-blackhole-configs`
-**Impl files:** `src/onoats/init.py` (lines ~91, ~135), `src/onoats/dual.py`
+**Impl files:** `native/Makefile` (new `setup-cli` target),
+`src/onoats/init.py` (lines ~91, ~135), `src/onoats/dual.py`
 (help text ~665), `pyproject.toml` (comment ~31), `README.md`,
 `docs/blackhole-fallback.md`
 **Test files:** `tests/test_init.py`, `tests/test_stt_config_wiring.py`, `tests/test_config.py`
@@ -604,7 +605,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ ec9c76f55fb20d072c5375f199405703d6f66fb8 -->
+<!-- reviewed: 2026-06-11 @ 0d68b5a07007a22333d589a3524f2ef7b7710607 -->
 ## Issues & Solutions
 
 *(populated during implementation)*
