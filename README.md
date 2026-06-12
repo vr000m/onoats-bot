@@ -18,6 +18,13 @@ onoats installs **from source** (it is not published on PyPI).
 
 ### macOS 14.4+ — menu bar + native capture (recommended)
 
+Prerequisites on a fresh machine (everything else is handled by `setup`):
+
+```bash
+xcode-select --install    # Xcode Command Line Tools (swiftc, git, codesign)
+curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (installs the CLI)
+```
+
 ```bash
 git clone https://github.com/vr000m/onoats-bot.git
 cd onoats-bot
@@ -25,12 +32,15 @@ make -C native setup     # cert + build + sign Onoats.app → ~/Applications,
                          # CLI → ~/.local/bin/onoats, then guided `onoats init`
 ```
 
-Then launch **Onoats.app** from `~/Applications` and record from the
-[menu bar](#menu-bar-macos). The first Start triggers the macOS permission
-prompts (microphone + system audio) — see the menu-bar section. `setup` is
-safe to re-run (it never regenerates the signing cert or touches an existing
-config); updating after a `git pull` is `make -C native install`. Details in
-[`native/README.md`](native/README.md).
+`setup` walks you through configuration (`onoats init`: data dir, STT
+service, secrets — see [Configuration](#configuration)) and ends with
+**Onoats.app** installed. Launch it from `~/Applications` and record from
+the [menu bar](#menu-bar-macos); the first Start triggers the macOS
+permission prompts (microphone + system audio) — see the menu-bar section.
+`setup` is safe to re-run at every step (it never regenerates the signing
+cert or touches an existing config); reconfigure any time with `onoats init`
+or the menu bar's Settings, and update after a `git pull` with
+`make -C native install`. Details in [`native/README.md`](native/README.md).
 
 ### Other platforms (and macOS below 14.4)
 

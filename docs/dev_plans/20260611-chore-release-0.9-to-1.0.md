@@ -601,10 +601,10 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
 - [x] Phase 5 — CLI device visibility (PR #15)
-- [ ] Phase 6 — Install streamlining + spike removal (in progress 2026-06-11:
+- [ ] Phase 6 — Install streamlining + spike removal (implemented 2026-06-11:
   setup target, residue-enum port + rewire, spike deletion + sweep, README
-  flips all committed; kill-×3 re-run PASSED live; awaiting fresh-clone
-  `make -C native setup` + pre-init app-launch live verifies)
+  flips; kill-×3 re-run PASSED live; fresh-clone + pre-init verifies
+  DEFERRED — see Findings)
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
@@ -704,3 +704,13 @@ retrieval is `git checkout spike-archive -- native/spike`.
   `whisper` (installed by the `[macos]` extra), so a pre-init Start is
   expected to *work* with all-default settings (data → `~/.local/share/onoats`)
   rather than fail — guard decision deferred to the live verify.
+- Phase 6 live-verify deferral (user decision 2026-06-11): no spare machine
+  for the fresh-clone `make -C native setup` verify, and the pre-init
+  app-launch verify is moot on a configured machine — both DEFERRED to the
+  user's next fresh-machine install, not blocking the merge. Mitigation:
+  README Quickstart now documents the full fresh-machine procedure including
+  prerequisites (`xcode-select --install`, uv installer) so the deferred
+  verify is a documented walk-through, not tribal knowledge. The
+  `RecorderModel.start()` pre-init guard was NOT added (code-level analysis
+  predicts a pre-init Start works with defaults rather than confusing the
+  user); revisit if the deferred verify observes otherwise.
