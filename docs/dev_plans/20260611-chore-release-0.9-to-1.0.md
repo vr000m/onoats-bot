@@ -744,3 +744,18 @@ retrieval is `git checkout spike-archive -- native/spike`.
   emit-before-tap-before-sockets order in main.swift + the supervisor's
   event handler (a one-sided rename or sockets-first reorder fails CI).
   Suite: 247 passed. Live smokes pending (user, GUI topology).
+- Phase 7 live smoke, round 1 (2026-06-11 22:25–22:30, new binary): the
+  preflight machinery worked as designed — `waiting-for-permission` emitted,
+  supervisor extended the wait at exactly 10 s (+120 s), menu showed
+  "starting…" instead of dying, tap created before sockets, and the
+  user's Allow click (~42 s in) unblocked `AudioHardwareCreateProcessTap`
+  (attempt 1 also reproduced the flaky `OSStatus 0, tapID=0` shape; the ×3
+  retry recovered). **New bug exposed**: the mic branch had no silence pacer
+  until `bind()` completed, and the post-Allow HAL bind on AirPods Pro 2
+  blocked >10 s with the recorder already connected → mic read-idle →
+  `fatal_error_frame`. The system branch survived the identical window only
+  because its pacer was already pacing. Fixed in `9ea72ba`: mic
+  `chunker.activate()` moved before `bind()` (paced silence from writer
+  attach until the device delivers). Also recorded: the first smoke round
+  (17:49–17:53) ran the pre-Phase-7 capturer binary (app not reinstalled)
+  and faithfully reproduced both old failure modes — a useful baseline.
