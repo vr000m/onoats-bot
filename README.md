@@ -133,9 +133,11 @@ the terminal instead). It lives in the menu bar with no Dock icon.
 - **First run (TCC prompts)** — the first Start prompts for **Microphone**
   and records a **Screen & System Audio Recording** grant ("Onoats" appears
   in both panes of System Settings ▸ Privacy & Security). The system-audio
-  prompt *blocks* the session while unanswered — if you take longer than
-  ~10 s, the session fails loud by design; answer the prompt, then Start
-  again. Grants persist across rebuilds and reinstalls (they key on the
+  prompt fires before the capture session starts streaming: the supervisor
+  extends its startup wait (+120 s) while the dialog is unanswered and the
+  menu bar shows "waiting for the system-audio permission prompt" — answer
+  at human speed and the session proceeds, no restart needed.
+  Grants persist across rebuilds and reinstalls (they key on the
   signing identity, not the binary — see
   [`native/README.md`](native/README.md)).
 

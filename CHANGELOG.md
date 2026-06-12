@@ -13,6 +13,29 @@ no backdated tags exist). PR numbers `#1`–`#7` refer to this repository;
 older history predates the extraction and is cited by merge-commit SHA.
 Annotated tags exist from `v0.9.0` forward.
 
+## [Unreleased]
+
+### Changed
+- Pre-socket tap preflight (release-plan Phase 7, PR #17): the capturer makes
+  the TCC-prompting tap call **before** binding its sockets, announced by
+  `ONOATS-EVENT waiting-for-permission`. A first Start with the Screen &
+  System Audio Recording dialog unanswered no longer dies at ~10 s — the
+  supervisor extends its socket wait once (+120 s) and surfaces "waiting for
+  the system-audio permission prompt" in the status file / menu bar.
+- rc=11 `exit_reason` renamed `system-audio-denied` → `system-audio-failed`:
+  a TCC denial never exits the capturer (denied taps deliver zeros and
+  surface as the zero-run warning); rc=11 fires only on genuine tap API
+  failure.
+
+### Fixed
+- Mic silence pacer now activates before the HAL bind, so a slow bind
+  (pending TCC dialog, Bluetooth device activation) can no longer trip the
+  recorder's 10 s read-idle and kill the session.
+- Latent start-timeout stamping bug: the prestart failure stamp read the
+  capturer's exit code after reaping it, so a hung-but-alive capturer was
+  mislabeled `capturer-start-failed`; `capturer-start-timeout` is now
+  reachable end-to-end.
+
 ## [0.9.0] - 2026-06-11
 
 Milestone B: native macOS capture + menu-bar app (PR #5, `16da012`; docs

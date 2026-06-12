@@ -322,7 +322,8 @@ supervisor handshake path in `cli.py:311–482`
   depends on Phase 4**) extends the wait and surfaces
   "waiting for the system-audio permission prompt…" in the status file
 - [ ] Keep the existing fail-loud semantics; pin the rc=11 meaning while
-  here: the code reason string is `system-audio-denied` (`cli.py:187`) but
+  here: the code reason string was `system-audio-denied` (`cli.py:187`
+  pre-branch; renamed to `system-audio-failed` in PR #17 — see Findings) but
   a denied grant never produces rc=11 (denied taps succeed and deliver
   zeros — verified 2026-06-11); rc=11 fires only on genuine
   `AudioHardwareCreateProcessTap` API failure (e.g. retry exhaustion), and
@@ -546,7 +547,8 @@ retrieval is `git checkout spike-archive -- native/spike`.
 ## Testing Notes
 
 - Python phases: full suite (`uv run pytest tests/ -q`, 209 tests at
-  Milestone B close) plus phase-specific files named in each contract block.
+  Milestone B close; 247 after Phase 7) plus phase-specific files named in
+  each contract block.
 - Swift phases: no Swift test runner exists; coverage is (a) the Python
   grep/round-trip parity tests, (b) `make -C native rebuild` compile+sign,
   (c) live GUI-topology smokes run by the user (TCC denials, prompt-pending
@@ -583,8 +585,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ 6bd2e5c0892779210ed736ea3cb957cb8d77470f -->
-
+<!-- reviewed: 2026-06-11 @ 53c29110b9a83cc2505dd3fa2e2048160e79b7bf -->
 ## Issues & Solutions
 
 *(populated during implementation)*
