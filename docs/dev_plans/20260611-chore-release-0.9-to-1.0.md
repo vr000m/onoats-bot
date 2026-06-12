@@ -1,6 +1,6 @@
 # Release plan: 0.9.x series → 1.0.0
 
-**Status**: Not Started
+**Status**: Shipped — v1.0.0 tagged 2026-06-12
 **Component**: packaging, macos, recorder
 **Assignee**: Varun Singh
 **Priority**: High
@@ -605,14 +605,25 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ 0d68b5a07007a22333d589a3524f2ef7b7710607 -->
+<!-- reviewed: 2026-06-12 @ 6bfbf1b3d7c8ee2879c68f666afc965607709e5c -->
 ## Issues & Solutions
 
 *(populated during implementation)*
 
 ## Final Results
 
-*(to be filled at completion)*
+**v1.0.0 shipped 2026-06-12.** All ten phases merged via individually
+reviewed PRs (#9, #10, #13–#20), regular merges throughout. The repo went
+from version `0.0.0` / no LICENSE / no CHANGELOG / no tags to: BSD-2-Clause
+licensed, Keep-a-Changelog history reconstructed back through the PortAudio
+era, `v0.9.0` (Milestone B) and `v1.0.0` annotated tags with GitHub
+releases, a three-path documented install story (menubar `setup` /
+CLI+native `setup-cli` / CLI+PortAudio toolchain-free), tap preflight
+eliminating the unanswered-TCC-prompt startup death, and the ConfigStore
+TOML-subset parity suite (which caught and fixed a real CRLF config
+corruption bug). Suite at close: 259 passing. Deferred past this plan:
+named device+STT profiles (gated on capturer `--mic-uid`), public
+distribution (Developer ID + Homebrew cask, on hold).
 
 ## Progress
 
@@ -635,7 +646,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 9 — ConfigStore parity tests (1.0.0 gate; PR #19 merged
   2026-06-12, `101d368` — 12 new cases incl. pinned CRLF contract; real
   CRLF divergence found and fixed in ConfigStore.swift)
-- [ ] Phase 10 — Cut v1.0.0
+- [x] Phase 10 — Cut v1.0.0 (PR #20 merged 2026-06-12, `1d3ccd2`;
+  annotated tag `v1.0.0` on the merge commit, pushed; GitHub release
+  created from the CHANGELOG 1.0.0 section)
 
 ## Findings
 
@@ -798,3 +811,10 @@ retrieval is `git checkout spike-archive -- native/spike`.
   fresh `mic-denied` status ("capturer exited (rc=10) before creating its
   sockets"). All three observables verified against
   ~/Library/Logs/Onoats/onoats-bot.log timestamps.
+- **`v1.0.0` tagged 2026-06-12** on PR #20's merge commit `1d3ccd2`
+  (annotated; pushed). `scripts/release_check.sh v1.0.0` passed all four
+  surface checks both pre-merge (branch HEAD) and on the merge commit
+  before tagging. GitHub release created with `gh release create v1.0.0
+  --verify-tag` from the CHANGELOG 1.0.0 section, per the standard
+  post-tag step. Ride-along gate (soak/echo + drift) operator-confirmed
+  clean before Phase 10 started.
