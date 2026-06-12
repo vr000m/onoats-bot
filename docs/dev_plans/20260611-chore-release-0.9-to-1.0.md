@@ -363,6 +363,16 @@ supervisor handshake path in `cli.py:311–482`
   comment).
 - [ ] Prune BlackHole-specific hints/branches/tests beyond that keep-list;
   point remaining mentions at `docs/blackhole-fallback.md`
+- [ ] **Install-path branching (DECIDED 2026-06-12, user):** the install
+  layer — not `onoats init` — encodes the menubar-vs-CLI choice; `init`
+  stays untouched. Add `make -C native setup-cli` (cert → capturer build +
+  sign → `install-cli` → init; skips the app bundle) alongside the existing
+  `setup` (menubar, unchanged default). CLI/PortAudio keeps the old way —
+  no make target (it must not require the native toolchain): documented
+  two-liner in `docs/blackhole-fallback.md`. No justfile — make is the
+  established entry point (PR #16 README story). Docs job: README explains
+  the THREE paths side by side (menubar `setup` / CLI+native `setup-cli` /
+  CLI+PortAudio for Intel / ≤14.3 / off-mac)
 - [ ] Coverage bound (stated, not solved): there is no 13.x–14.3 hardware in
   CI or on the author's machine — the config-wiring tests
   (`test_init.py`/`test_config.py`/`test_stt_config_wiring.py`) are the
@@ -594,7 +604,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ f4c5eb03f9871aff955adffba42e112c46808001 -->
+<!-- reviewed: 2026-06-11 @ ec9c76f55fb20d072c5375f199405703d6f66fb8 -->
 ## Issues & Solutions
 
 *(populated during implementation)*
