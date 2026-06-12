@@ -41,6 +41,14 @@ Annotated tags exist from `v0.9.0` forward.
   failure.
 
 ### Fixed
+- Menu-bar settings edits no longer corrupt a `config.toml` with CRLF line
+  endings (release-plan Phase 9): ConfigStore's line scan trimmed with a
+  whitespace set that excludes `\r`, so CRLF section headers were never
+  matched and `writeValue` appended a duplicate section that fails TOML
+  parsing. Untouched lines keep their CRLF bytes verbatim; the edited line
+  is written with LF. Pinned by the new TOML-subset parity suite
+  (12 cases: comments, whitespace variants, absent section/key, duplicate
+  keys, non-string neighbours, byte-identity, CRLF).
 - Mic silence pacer now activates before the HAL bind, so a slow bind
   (pending TCC dialog, Bluetooth device activation) can no longer trip the
   recorder's 10 s read-idle and kill the session.
