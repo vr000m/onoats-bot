@@ -605,7 +605,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
   PASSED live 2026-06-11; fresh-clone + pre-init verifies DEFERRED to the
   next fresh-machine install — see Findings; post-merge: push `spike-archive`
   tag on `7ac0b2e`)
-- [ ] Phase 7 — Tap preflight (1.0.0 gate)
+- [ ] Phase 7 — Tap preflight (1.0.0 gate; PR #17 open 2026-06-11 —
+  implementation + unit tests + parity pins done; live smokes
+  (prompt-pending Start / Don't Allow / rc=10 re-smoke) pending user)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
 - [ ] Phase 10 — Cut v1.0.0
@@ -714,3 +716,31 @@ retrieval is `git checkout spike-archive -- native/spike`.
   `RecorderModel.start()` pre-init guard was NOT added (code-level analysis
   predicts a pre-init Start works with defaults rather than confusing the
   user); revisit if the deferred verify observes otherwise.
+- Phase 7 implementation (PR #17, 2026-06-11): four decisions worth recording.
+  (1) **The preflight starts the FULL system chain** (tap → aggregate →
+  IOProc), not just the tap: the tap-created→IOProc-started window is the
+  audible output dropout (~200 ms signed, SystemCapture header), and a
+  tap-only preflight would stretch that dropout across the accept barrier
+  (recorder connect comes after STT preflight + model load — seconds). Frames
+  emitted before the system FrameWriter attaches are dropped by a
+  `LateBoundWriter` (pre-session audio); streaming still starts at the accept
+  barrier, exactly as pre-reorder. (2) **`waiting-for-permission` is emitted
+  unconditionally** — there is no TCC preflight API, so the capturer cannot
+  know whether the tap call will block. The supervisor extension is therefore
+  armed on every start but applies only when the 10 s base budget expires
+  (+120 s, once); the granted/fast path never pays it. Surfacing uses new
+  `status.write_prestart_waiting` (fresh `running=true` record, note in the
+  v2 `warning` field; replaced by the recorder's start write or the
+  prestart-failure stamp). (3) **rc=11 reason renamed**
+  `system-audio-denied` → `system-audio-failed` at both sites (cli map,
+  status.py vocabulary; ExitCode + contract doc document the semantics):
+  denial never exits the capturer. Post-reorder error ordering: rc=10 and
+  rc=11 both pre-socket; rc=12 only after a healthy tap. (4) **Latent bug
+  found by the new start-timeout test**: the prestart-failure stamp read
+  `capturer_proc.returncode` AFTER `_stop_capturer` (which always reaps), so
+  a hung-but-alive capturer was stamped `capturer-start-failed` with the
+  SIGTERM exit code — `capturer-start-timeout` was unreachable end-to-end.
+  Fixed by reading the code before stopping. Parity pin added:
+  emit-before-tap-before-sockets order in main.swift + the supervisor's
+  event handler (a one-sided rename or sockets-first reorder fails CI).
+  Suite: 247 passed. Live smokes pending (user, GUI topology).
