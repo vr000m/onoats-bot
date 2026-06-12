@@ -62,6 +62,10 @@ class StatusRecord:
     pid: int
     start_time: float
     audio_source: str
+    # "" is the documented pre-recorder sentinel: records written before the
+    # recorder has started (write_prestart_waiting / write_prestart_failure /
+    # the write_stopped fallback) have no STT label yet. Readers must guard on
+    # truthiness, not presence (`onoats status` does).
     stt_label: str
     running: bool
     last_rotation_time: float | None = None
@@ -375,7 +379,9 @@ def write_prestart_waiting(data_dir: Path, *, audio_source: str, note: str) -> P
 
     The record is ``running=True`` with ``note`` in the v2 ``warning`` field —
     the session is genuinely in progress (the supervisor pid is live), just not
-    capturing yet. Every successor overwrites it: the recorder's
+    capturing yet. ``stt_label`` is the pre-recorder ``""`` sentinel (see
+    :class:`StatusRecord`): the recorder, which owns STT resolution, has not
+    started. Every successor overwrites it: the recorder's
     :func:`write_running` builds a fresh record once the prompt is answered,
     and :func:`write_prestart_failure` replaces it if the wait times out.
     """

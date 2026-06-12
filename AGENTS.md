@@ -191,3 +191,13 @@ should NOT re-flag go here, one per line:
   `security import -P` argv — `security import` has no file/stdin password
   option. Residual is a one-shot random secret guarding a file that lives
   seconds inside a 0700 tmpdir; documented at the site. (2026-06-11)
+- **[Architecture] won't-fix**: `LateBoundWriter` stays defined at file scope in
+  `main.swift` rather than moving to `Support.swift` — it is private plumbing of
+  main.swift's startup reorder (preflight-before-sockets), used nowhere else,
+  and the Swift sources just passed the full Phase 7 live smokes; relocating
+  code in a file with no Swift test runner would invalidate that evidence for
+  zero behavioural gain. (2026-06-11)
+- **[Architecture] analysis-error**: `permission_event` "is not documented in
+  the data-flow comment near `device_state`" — it is: the comment block at the
+  declaration site in `_supervise_socket_session` (directly under the
+  `device_state` comment) documents who sets it and who reads it. (2026-06-11)

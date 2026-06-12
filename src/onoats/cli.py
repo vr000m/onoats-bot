@@ -756,6 +756,13 @@ async def _wait_for_sockets(
     bounded timeout elapses. A short poll loop is used rather than inotify so the
     behaviour is identical on macOS / Linux and trivially testable.
 
+    Two modes, selected by the keyword args: with ``data_dir`` and
+    ``permission_event`` both ``None`` (the default) this is a pure,
+    side-effect-free poller; with both supplied it additionally coordinates the
+    Phase 7 permission-wait below (reads the event, may extend the deadline
+    once, and writes a status record). The ``is not None`` guards are this
+    interface seam, not defensive checks.
+
     Phase 7 (tap preflight): the capturer makes the TCC-prompting tap call
     BEFORE binding its sockets, announced by ``ONOATS-EVENT
     waiting-for-permission`` (relayed here via ``permission_event``, set by the
