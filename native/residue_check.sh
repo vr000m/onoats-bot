@@ -3,8 +3,8 @@
 #
 # Loop ×N (default 3): start the PRODUCTION capturer with live socket
 # clients (so the Core Audio tap + private aggregate actually exist),
-# kill -9 it mid-capture, then use the spike binary's enumeration
-# commands to assert nothing survived:
+# kill -9 it mid-capture, then use the same binary's maintenance
+# subcommands (Maintenance.swift) to assert nothing survived:
 #   list-aggregates → RESIDUE: none   (any onoats-* aggregate UID)
 #   list-taps       → TAPS: none      (all process taps, system-wide)
 #
@@ -28,10 +28,7 @@ fi
 echo "→ building + signing production capturer…"
 make -s sign >/dev/null || { echo "✗ make sign failed"; exit 1; }
 BIN="$(make -s print-bin)"
-
-echo "→ building spike checker (residue enumeration)…"
-make -s -C spike build >/dev/null || { echo "✗ spike build failed"; exit 1; }
-CHECKER=spike/onoats-capturer
+CHECKER="$BIN"   # the production binary carries its own residue enumeration
 
 # Baseline: refuse to run against a dirty system, otherwise a pre-existing
 # leak would be misattributed to this test's kills.
@@ -40,7 +37,7 @@ if ! "$CHECKER" list-aggregates 2>/dev/null | grep -q "^RESIDUE: none" \
     echo "✗ residue present BEFORE the test — clean up first:"
     "$CHECKER" list-aggregates
     "$CHECKER" list-taps
-    echo "  (./spike/onoats-capturer clean-taps sweeps leftover taps;"
+    echo "  ('$CHECKER' clean-taps sweeps leftover taps;"
     echo "   leftover aggregates clear on reboot or via AudioHardwareDestroyAggregateDevice)"
     exit 1
 fi

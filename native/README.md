@@ -1,4 +1,4 @@
-# onoats native (macOS) — build, sign, and the Phase-4 Pre-req spikes
+# onoats native (macOS) — build, sign, and TCC internals
 
 This directory holds the native macOS half of the socket-audio path (dev plan
 `docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md`). The pip
@@ -62,13 +62,17 @@ You only do this once. The same cert signs the capturer and the menu-bar `.app`.
 ## Install / update (the whole story)
 
 ```sh
-make -C native cert      # once, ever (see Step 0 above)
-make -C native install   # build + sign Onoats.app → ~/Applications,
-                         # and uv-tool-install the CLI → ~/.local/bin/onoats
+make -C native setup     # fresh clone, one command: cert (no-op if the
+                         # identity exists) → build + sign Onoats.app →
+                         # ~/Applications + CLI → ~/.local/bin/onoats →
+                         # `onoats init` (only when no config.toml yet)
 ```
 
-Updating after a `git pull` is the same single command — `make -C native
-install`. What each kind of change needs:
+`setup` is safe to re-run: the cert is never regenerated (that would
+invalidate the TCC grants — `make_cert.sh` refuses), and an existing
+`config.toml` is never touched. Updating after a `git pull` is
+`make -C native install` (everything `setup` does minus cert + init).
+What each kind of change needs:
 
 | Change                     | Needed action                                  |
 |----------------------------|------------------------------------------------|
@@ -136,8 +140,7 @@ that surface:
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 
-Build + sign from `native/` (NOT from `spike/` — that Makefile builds the
-throwaway spike):
+Build + sign from `native/`:
 
 ```sh
 cd native
@@ -188,134 +191,37 @@ The binary also has socket-less debug modes: `--selftest-tap` and
 
 `residue_check.sh` automates the start → `kill -9` → ×3 loop against the
 **production** binary with live socket clients (the tap + aggregate only exist
-once a client connects), then asserts via the spike's enumeration commands that
-no `onoats-*` aggregate or process tap survived:
+once a client connects), then asserts via the capturer's own maintenance
+subcommands (`list-aggregates` / `list-taps`; `clean-taps` force-sweeps
+leftover taps) that no `onoats-*` aggregate or process tap survived:
 
 ```sh
 ./residue_check.sh        # default 3 rounds; expect "residue check PASS"
 ```
 
-(PASSED 2026-06-10 — see the dev plan's manual-smoke checklist.)
+(PASSED 2026-06-10 against the spike-based checker, re-PASSED 2026-06-11
+against the production binary's own subcommands — see the dev plans'
+manual-smoke checklists.)
 
-## Phase-4 Pre-req spikes (BLOCKING — run before any production Swift)
+## History: Phase-4 Pre-req spikes (archived)
 
-Two unverified Apple-platform premises gate Phase 4. Resolve **both** here.
+A throwaway spike kit in `native/spike/` de-risked Phase 4 before any
+production Swift was written: it proved TCC grant persistence across rebuilds
+(byte-stable designated requirement from the stable self-signed cert) and the
+Core Audio process-tap recipe, including kill-residue behavior. The tree was
+deleted in Phase 6 of the 0.9→1.0 plan after its residue-enumeration commands
+were ported into the production capturer (`Maintenance.swift`); the full kit —
+sources, Makefile, and run-books — is preserved at the `spike-archive` git
+tag, and the outcomes are recorded in the `## Findings` of
+`docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md`.
 
-All commands run from `native/spike/`:
+Durable conclusions baked into this directory:
 
-```sh
-cd native/spike
-```
-
-### Pre-flight: OS floor + compile
-
-```sh
-sw_vers -productVersion          # must be ≥ 14.4 (Core Audio process-tap floor)
-make build                       # compile-only; catches API errors before perms
-```
-
-### Spike 3 — TCC persistence (mic + system audio, across 3 rebuilds)
-
-> **Attribution gotcha (learned the hard way, 2026-06-09).** TCC attributes a
-> grant to the **responsible GUI process at the session root**. A helper
-> `posix_spawn`'d from a **terminal** (`shell → uv → python → capturer`) is
-> attributed to the **terminal**, and inherits *its* grants — so running this from
-> a terminal is a **false-pass confound** (you'd be testing your terminal's grants,
-> not the bundle's). The menu-bar topology's responsible process is `Onoats.app`
-> itself, so the faithful test **GUI-launches the app** via `open` (LaunchServices),
-> making `Onoats.app` its own responsible process. The tell: a **brand-new** bundle
-> id must report `mic_pre=0` (notDetermined) and **prompt**, attributed to "Onoats".
-> A non-zero `mic_pre` on first run means attribution went elsewhere.
-
-The helper writes results to `~/Library/Logs/Onoats/spike-result.txt` (a GUI launch has no
-stdout). Run 1 — obtain the grants against the bundle identity:
-
-```sh
-make sign                        # rebuild + codesign + print the DR
-make dr  > /tmp/onoats-dr-1.txt  # capture the designated requirement (run 1)
-make cdhash                      # note the cdhash (it WILL change — that's fine)
-: > ~/Library/Logs/Onoats/spike-result.txt # clear the result log
-
-open Onoats.app                  # GUI launch → responsible process = Onoats.app
-#   Expect TWO prompts attributed to "Onoats" (mic + system audio) — ACCEPT both.
-cat ~/Library/Logs/Onoats/spike-result.txt #   → expect: mic_pre=0 mic=PASS system=PASS
-```
-
-Confirm **"Onoats"** now appears in System Settings ▸ Privacy & Security ▸
-**Microphone** and ▸ **Screen & System Audio Recording**. Then **rebuild + re-sign
-3×** and confirm macOS does **not** re-prompt and both grants persist (now
-`mic_pre=3`, no prompt):
-
-```sh
-make rebuild && make dr > /tmp/onoats-dr-2.txt
-open Onoats.app && sleep 6 && cat ~/Library/Logs/Onoats/spike-result.txt  # mic_pre=3, no prompt
-
-make rebuild && make dr > /tmp/onoats-dr-3.txt
-open Onoats.app && sleep 6 && cat ~/Library/Logs/Onoats/spike-result.txt  # mic_pre=3, no prompt
-
-make rebuild && make dr > /tmp/onoats-dr-4.txt
-open Onoats.app && sleep 6 && cat ~/Library/Logs/Onoats/spike-result.txt  # mic_pre=3, no prompt
-
-# The designated requirement MUST be byte-identical across rebuilds:
-diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-2.txt && \
-diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-3.txt && \
-diff /tmp/onoats-dr-1.txt /tmp/onoats-dr-4.txt && echo "DR STABLE ✓"
-```
-
-**PASS:** run 1 shows `mic_pre=0` + two "Onoats" prompts → `mic=PASS system=PASS`;
-runs 2–4 show `mic_pre=3` with **no** re-prompt; the four DR files are byte-identical
-(the cdhash differing is expected). The end-to-end menu-bar→supervisor→capturer path
-is verified later in Phase 5b (the embedded capturer shares the bundle id, so this
-grant covers it).
-**FAIL → STOP:** if run 1 re-shows `mic_pre≠0` (attribution still wrong) or grants
-don't persist, the `$0` / no-notarization conclusion (Open Question 2) reopens and
-needs the paid Developer ID path. Record the failure in the plan's `## Findings`.
-
-### Spike 4 — Core Audio tap recipe + residue
-
-> **ALWAYS test the SIGNED app (`open Onoats.app --args …`), not the unsigned
-> `./onoats-capturer`.** The unsigned standalone blocks **~3.9 s** inside
-> `AudioHardwareCreateProcessTap` (per-call security verification) and is
-> intermittently flaky; the **signed** bundle creates the tap in **~200 ms** with no
-> audible dropout. Results land in `~/Library/Logs/Onoats/spike-result.txt`. Use `--mute
-> unmuted` (the default) — other apps stay audible. (Residue/leak checks below run
-> the standalone deliberately, because signing is irrelevant to object lifecycle.)
-
-```sh
-make sign
-: > ~/Library/Logs/Onoats/spike-result.txt
-
-# Real system-output stream, other apps stay audible (signed → ~200ms, no stutter):
-open Onoats.app --args tap --seconds 10        # play music in another app; KEEP LISTENING
-# Concurrent mic + system (no clock-domain conflict):
-open Onoats.app --args concurrent --seconds 10 # speak AND play audio
-sleep 12; cat ~/Library/Logs/Onoats/spike-result.txt
-#   expect: TAP … peak>0 PASS  and  CONCURRENT mic=PASS system=PASS
-
-# Residue: start/kill -9 ×3 must leave no stale aggregate OR tap.
-for i in 1 2 3; do
-  ./onoats-capturer tap --seconds 30 & pid=$!; sleep 2; kill -9 $pid; wait $pid 2>/dev/null
-done
-./onoats-capturer list-aggregates   # expect: RESIDUE: none
-./onoats-capturer list-taps         # expect: TAPS: none   (clean-taps to force-sweep)
-```
-
-**PASS:** `tap` yields a real stream (peak > 0) while other apps keep playing,
-`concurrent` streams both, and after start/kill/start ×3 both `list-aggregates` and
-`list-taps` report none.
-**FAIL → STOP:** Open Question 1 (system-audio API) reopens; Phase 4 must be built
-on a different primitive. Record it in `## Findings`.
-
-> **Two TCC services — CONFIRMED.** Both `NSMicrophoneUsageDescription` and
-> `NSAudioCaptureUsageDescription` are real, separate services: macOS lists
-> **Microphone** and **System Audio Recording Only** as distinct panes and the tap
-> added "Onoats" to the latter. Only the **mic** prompt is interactive; the
-> system-audio grant is recorded without a visible separate prompt yet capture works.
-
-## After the spikes
-
-Record both spike outcomes (DR stability, grant persistence, tap PASS, residue
-none) in the dev plan's `## Findings` and tick the two Pre-req acceptance boxes.
-The throwaway `native/spike/` tree is now safe to delete — Phase 4
-(`native/onoats-capturer/`) and Phase 5b both shipped from its proven recipe
-(Milestone B, PR #5). Deletion is a recorded post-ship follow-up.
+- A stable self-signed cert ⇒ byte-stable DR ⇒ mic + system-audio TCC grants
+  survive rebuilds (Step 0; the whole reason `make cert` exists).
+- **Microphone** and **Screen & System Audio Recording** are two distinct TCC
+  services; only the mic prompt is interactive (confirmed by spike 3).
+- Private aggregate devices are auto-reclaimed on process death, but process
+  taps **survive SIGKILL** — the reason `residue_check.sh` exists.
+- Unsigned binaries block ~4 s per `AudioHardwareCreateProcessTap` call in
+  security verification; signed builds take ~200 ms.

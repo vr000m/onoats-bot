@@ -158,7 +158,8 @@ should NOT re-flag go here, one per line:
   `CFBundleIdentifier` — intentional: Spike 3's entire purpose was validating
   TCC persistence on the PRODUCTION designated requirement (bundle id + cert),
   so a distinct spike identity would invalidate the spike evidence. The spike
-  tree is slated for deletion after Phase 5b/6. (2026-06-10)
+  tree was deleted in Phase 6 of the 0.9→1.0 plan (preserved at the
+  `spike-archive` tag). (2026-06-10; resolved 2026-06-11)
 - **[Performance] won't-fix (scoped)**: the capturer IOProcs perform one bounded
   heap copy (`Data(bytes:count:)`, ~10 ms chunk) and take an `NSCondition` lock
   per callback (`MicCapture.enqueueChunk` / `SystemCapture.enqueueChunk`). A

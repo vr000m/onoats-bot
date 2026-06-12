@@ -1,9 +1,9 @@
 // onoats-capturer — shared helpers: logging, errors, exit codes, monotonic clock.
 //
 // Production capturer for AUDIO_SOURCE=socket (wire contract v1,
-// docs/audio-socket-contract.md). Built from the recipe proven in
-// native/spike/ (Pre-req spikes 3 + 4, dev plan
-// docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md).
+// docs/audio-socket-contract.md). Built from the recipe proven by the
+// Pre-req spikes 3 + 4 (tree retired; preserved at the `spike-archive` tag —
+// dev plan docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md).
 
 import Foundation
 

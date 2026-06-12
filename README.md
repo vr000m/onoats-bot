@@ -18,19 +18,30 @@ onoats installs **from source** (it is not published on PyPI).
 
 ### macOS 14.4+ — menu bar + native capture (recommended)
 
+Prerequisites on a fresh machine (everything else is handled by `setup`):
+
+```bash
+xcode-select --install    # Xcode Command Line Tools (swiftc, git, codesign)
+curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (installs the CLI)
+# then open a new shell (or follow the installer's PATH note) so `uv` resolves
+```
+
 ```bash
 git clone https://github.com/vr000m/onoats-bot.git
 cd onoats-bot
-make -C native cert      # once, ever — stable self-signed signing identity
-make -C native install   # build + sign Onoats.app → ~/Applications; installs the CLI
-onoats init              # guided setup → config.toml + 0600 secrets.env
+make -C native setup     # cert + build + sign Onoats.app → ~/Applications,
+                         # CLI → ~/.local/bin/onoats, then guided `onoats init`
 ```
 
-Then launch **Onoats.app** from `~/Applications` and record from the
-[menu bar](#menu-bar-macos). The first Start triggers the macOS permission
-prompts (microphone + system audio) — see the menu-bar section. For what the
-two `make` commands do (and how updates work), see
-[`native/README.md`](native/README.md).
+`setup` walks you through configuration (`onoats init`: data dir, STT
+service, secrets — see [Configuration](#configuration)) and ends with
+**Onoats.app** installed. Launch it from `~/Applications` and record from
+the [menu bar](#menu-bar-macos); the first Start triggers the macOS
+permission prompts (microphone + system audio) — see the menu-bar section.
+`setup` is safe to re-run at every step (it never regenerates the signing
+cert or touches an existing config); reconfigure any time with `onoats init`
+or the menu bar's Settings, and update after a `git pull` with
+`make -C native install`. Details in [`native/README.md`](native/README.md).
 
 ### Other platforms (and macOS below 14.4)
 
@@ -182,8 +193,8 @@ precedence (CLI flag > env `AUDIO_SOURCE` > `config.toml` > default).
 
 > **Status:** runnable end-to-end on macOS 14.4+. The native capturer +
 > menu-bar app build from source — see [`native/README.md`](native/README.md)
-> for the one-time self-signed-cert setup and the `make -C native install`
-> flow (it also installs the CLI and wires `ONOATS_CAPTURER_BIN`). On other
+> for the `make -C native setup` flow (one command: signing cert, app + CLI
+> install, guided init; the app wires `ONOATS_CAPTURER_BIN`). On other
 > platforms, or below macOS 14.4, keep the default `portaudio` source — a
 > loopback driver remains the system-audio fallback there
 > ([docs/blackhole-fallback.md](docs/blackhole-fallback.md)).

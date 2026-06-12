@@ -601,7 +601,10 @@ retrieval is `git checkout spike-archive -- native/spike`.
 - [x] Phase 4 — Menu-bar zero-run WARNING surfacing (PR #14; live smoke
   passed 2026-06-11)
 - [x] Phase 5 — CLI device visibility (PR #15)
-- [ ] Phase 6 — Install streamlining + spike removal
+- [x] Phase 6 — Install streamlining + spike removal (PR #16; kill-×3 re-run
+  PASSED live 2026-06-11; fresh-clone + pre-init verifies DEFERRED to the
+  next fresh-machine install — see Findings; post-merge: push `spike-archive`
+  tag on `7ac0b2e`)
 - [ ] Phase 7 — Tap preflight (1.0.0 gate)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
@@ -683,3 +686,31 @@ retrieval is `git checkout spike-archive -- native/spike`.
   identified as `system-output tap (uid=<aggregate uid>)` — the tap is
   global (all processes' output), so naming the default output device
   would be dishonest and go stale on output switches.
+- Phase 6 implementation (2026-06-11): the spike binary was the ONLY carrier
+  of the residue-enumeration commands, so "rewire residue_check.sh off the
+  spike" meant porting `list-aggregates`/`list-taps`/`clean-taps` into the
+  production capturer (`Maintenance.swift`, socket-less subcommands dispatched
+  before any TCC interaction; verdict lines on stdout, byte-compatible with
+  the script's greps). **Kill-×3 residue check re-PASSED live (user,
+  2026-06-11) against the production-binary checker** before any deletion.
+  **`spike-archive` tag target: `7ac0b2e`** — the last commit containing
+  `native/spike/` (parent of the deletion commit `9f4c15f`); user pushes the
+  tag after the regular merge. Sweep interpretation: every dangling
+  *path* reference cleared (native/README run-book sections → archived
+  History note carrying the durable conclusions; source comments → tag
+  pointer); pure historical prose with no path stays; dev plans untouched as
+  historical records. Pre-init launch analysis: menu-bar Start sets both
+  `AUDIO_SOURCE=socket` and `ONOATS_CAPTURER_BIN`, and STT defaults to
+  `whisper` (installed by the `[macos]` extra), so a pre-init Start is
+  expected to *work* with all-default settings (data → `~/.local/share/onoats`)
+  rather than fail — guard decision deferred to the live verify.
+- Phase 6 live-verify deferral (user decision 2026-06-11): no spare machine
+  for the fresh-clone `make -C native setup` verify, and the pre-init
+  app-launch verify is moot on a configured machine — both DEFERRED to the
+  user's next fresh-machine install, not blocking the merge. Mitigation:
+  README Quickstart now documents the full fresh-machine procedure including
+  prerequisites (`xcode-select --install`, uv installer) so the deferred
+  verify is a documented walk-through, not tribal knowledge. The
+  `RecorderModel.start()` pre-init guard was NOT added (code-level analysis
+  predicts a pre-init Start works with defaults rather than confusing the
+  user); revisit if the deferred verify observes otherwise.
