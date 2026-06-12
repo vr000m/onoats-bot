@@ -178,13 +178,28 @@ def _cmd_bot(rest: list[str]) -> int:
 _SOCKET_WAIT_TIMEOUT_SEC = 10.0
 _SOCKET_WAIT_POLL_SEC = 0.05
 
+# Extra socket wait granted ONCE when the capturer announced
+# `ONOATS-EVENT waiting-for-permission` (release-plan Phase 7): its tap
+# preflight runs the TCC-prompting AudioHardwareCreateProcessTap call BEFORE
+# the sockets exist, and a pending Screen & System Audio Recording prompt
+# blocks that call until the user answers. The event is emitted on EVERY start
+# (there is no TCC preflight API, so the capturer cannot know whether the call
+# will block), but the extension only applies if the base wait actually
+# expires — the granted/fast path never pays it. Generous on purpose: a human
+# reading a first-run permission prompt is the thing being waited on.
+_PERMISSION_WAIT_EXTRA_SEC = 120.0
+
 # Map the capturer's exit-code contract (native/onoats-capturer/Sources/
 # Support.swift ``ExitCode``) to the ``exit_reason`` vocabulary documented in
 # status.py, so a TCC denial shows as itself in `onoats status` / the menu bar
 # instead of a generic "capturer-crash".
 _CAPTURER_RC_REASONS = {
     10: "mic-denied",  # ExitCode.micDenied
-    11: "system-audio-denied",  # ExitCode.systemAudioFailed
+    # ExitCode.systemAudioFailed: a GENUINE AudioHardwareCreateProcessTap API
+    # failure (retry exhaustion). NOT a TCC denial — a denied tap succeeds and
+    # delivers zeros (verified 2026-06-11), so denial never exits the capturer;
+    # its only observable is the zero-run WARNING.
+    11: "system-audio-failed",
 }
 
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +
@@ -322,7 +337,9 @@ def _parse_capturer_event(line: str) -> tuple[str, dict[str, str]] | None:
     return event_type, fields
 
 
-async def _drain_capturer_stderr(stderr, data_dir, logger, device_state=None) -> None:
+async def _drain_capturer_stderr(
+    stderr, data_dir, logger, device_state=None, permission_event=None
+) -> None:
     """Always-drain reader for the capturer's piped stderr.
 
     Three jobs, in priority order:
@@ -344,9 +361,12 @@ async def _drain_capturer_stderr(stderr, data_dir, logger, device_state=None) ->
        dict shared with _apply_device_fields_when_recorded — device events
        fire before the recorder's start write, so the live set_devices below
        is a no-op then and the deferred task applies them) and best-effort
-       updates the running record (covers mid-session mic rebinds). Unknown
-       event types are tee'd and otherwise ignored (forward-compatible:
-       Phase 7's ``waiting-for-permission`` arrives later).
+       updates the running record (covers mid-session mic rebinds). A
+       ``waiting-for-permission`` event (Phase 7's tap preflight, emitted
+       before the TCC-prompting tap call) sets ``permission_event`` so
+       _wait_for_sockets can extend its budget while the prompt is pending.
+       Unknown event types are tee'd and otherwise ignored
+       (forward-compatible).
 
     Returns on EOF. Never raises out (a status write failing must not kill the
     drain — job 1 outranks job 3).
@@ -403,6 +423,12 @@ async def _drain_capturer_stderr(stderr, data_dir, logger, device_state=None) ->
                         mic_device=desc if branch == "mic" else None,
                         system_device=desc if branch == "system" else None,
                     )
+            elif event_type == "waiting-for-permission":
+                # The capturer is about to make the TCC-prompting tap call; no
+                # status write here — _wait_for_sockets surfaces the pending
+                # prompt only if its base budget actually expires.
+                if permission_event is not None:
+                    permission_event.set()
         except OSError as exc:
             logger.warning(
                 f"Socket supervisor: could not update status fields for a "
@@ -557,6 +583,10 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # deferred task in _run_recorder_with_capturer (the events outrun the
     # recorder's start write — see _apply_device_fields_when_recorded).
     device_state: dict[str, str] = {}
+    # Set by the stderr reader when the capturer announces its tap preflight
+    # (`ONOATS-EVENT waiting-for-permission`) — lets _wait_for_sockets extend
+    # its budget while a TCC prompt is pending (release-plan Phase 7).
+    permission_event = asyncio.Event()
     rc = 0
     try:
         # 3b. Spawn the capturer pointed at both sockets. Pass the socket paths +
@@ -626,7 +656,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         # exit is).
         stderr_task = asyncio.create_task(
             _drain_capturer_stderr(
-                capturer_proc.stderr, data_dir, logger, device_state
+                capturer_proc.stderr, data_dir, logger, device_state, permission_event
             ),
             name="socket_supervisor_capturer_stderr",
         )
@@ -634,9 +664,20 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         # 4. Wait (bounded) for BOTH sockets to appear. If the capturer dies or
         # is too slow, fail loud rather than hang the recorder on a connect that
         # never succeeds.
-        ready = await _wait_for_sockets(capturer_proc, (mic_sock, system_sock), logger)
+        ready = await _wait_for_sockets(
+            capturer_proc,
+            (mic_sock, system_sock),
+            logger,
+            data_dir=data_dir,
+            permission_event=permission_event,
+        )
         if not ready:
             # _wait_for_sockets already logged the cause (capturer death / timeout).
+            # Read the exit code BEFORE stopping: _stop_capturer always reaps,
+            # so reading afterwards would mis-stamp a hung-but-alive capturer
+            # (a start-timeout) with the SIGTERM exit code as
+            # "capturer-start-failed" instead of "capturer-start-timeout".
+            rc_cap = capturer_proc.returncode
             await _stop_capturer(capturer_proc, logger)
             # The recorder never started, so nothing else will write the status
             # file — without this, a stale record from the PREVIOUS session is
@@ -644,7 +685,6 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             # a mic-denial start rendered as "failed: graceful").
             from onoats import status as status_file
 
-            rc_cap = capturer_proc.returncode
             if rc_cap is not None:
                 exit_reason = _CAPTURER_RC_REASONS.get(rc_cap, "capturer-start-failed")
                 last_error = (
@@ -653,6 +693,15 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             else:
                 exit_reason = "capturer-start-timeout"
                 last_error = "capturer did not create its sockets in time"
+                if permission_event.is_set():
+                    # The wait was already extended once for the pending TCC
+                    # prompt — name it, so a never-answered prompt is
+                    # diagnosable from the status file.
+                    last_error += (
+                        " (the system-audio permission prompt may still be "
+                        "unanswered — see System Settings ▸ Privacy & Security "
+                        "▸ Screen & System Audio Recording)"
+                    )
             status_file.write_prestart_failure(
                 data_dir,
                 audio_source="socket",
@@ -697,18 +746,31 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     return rc
 
 
-async def _wait_for_sockets(capturer_proc, socket_paths, logger) -> bool:
+async def _wait_for_sockets(
+    capturer_proc, socket_paths, logger, *, data_dir=None, permission_event=None
+) -> bool:
     """Wait (bounded) for every path in ``socket_paths`` to exist.
 
     Returns ``True`` once all sockets exist. Returns ``False`` — having logged
     the cause loudly — if the capturer exits before the sockets appear or the
     bounded timeout elapses. A short poll loop is used rather than inotify so the
     behaviour is identical on macOS / Linux and trivially testable.
+
+    Phase 7 (tap preflight): the capturer makes the TCC-prompting tap call
+    BEFORE binding its sockets, announced by ``ONOATS-EVENT
+    waiting-for-permission`` (relayed here via ``permission_event``, set by the
+    stderr reader). A pending Screen & System Audio Recording prompt therefore
+    looks exactly like a pre-socket hang — so when the base budget expires with
+    that event seen, the wait is extended ONCE by ``_PERMISSION_WAIT_EXTRA_SEC``
+    and the pending prompt is surfaced in the status file (a fresh record the
+    recorder's own start write later replaces). Without the event, the base
+    ``capturer-start-timeout`` behaviour is unchanged.
     """
     import asyncio
     import time
 
     deadline = time.monotonic() + _SOCKET_WAIT_TIMEOUT_SEC
+    extended = False
     while True:
         if all(os.path.exists(p) for p in socket_paths):
             logger.info("Socket supervisor: both branch sockets are present")
@@ -726,10 +788,45 @@ async def _wait_for_sockets(capturer_proc, socket_paths, logger) -> bool:
             return False
 
         if time.monotonic() >= deadline:
+            if (
+                not extended
+                and permission_event is not None
+                and permission_event.is_set()
+            ):
+                extended = True
+                deadline = time.monotonic() + _PERMISSION_WAIT_EXTRA_SEC
+                logger.info(
+                    "Socket supervisor: capturer announced waiting-for-permission "
+                    "and its sockets have not appeared — the system-audio "
+                    f"permission prompt is likely pending; extending the wait by "
+                    f"{_PERMISSION_WAIT_EXTRA_SEC:.0f}s."
+                )
+                if data_dir is not None:
+                    from onoats import status as status_file
+
+                    try:
+                        status_file.write_prestart_waiting(
+                            data_dir,
+                            audio_source="socket",
+                            note=(
+                                "waiting for the system-audio permission prompt — "
+                                "answer the Screen & System Audio Recording dialog "
+                                "to start the session"
+                            ),
+                        )
+                    except OSError as exc:
+                        logger.warning(
+                            f"Socket supervisor: could not write the "
+                            f"waiting-for-permission status record ({exc})"
+                        )
+                continue
             missing = [p for p in socket_paths if not os.path.exists(p)]
+            budget = _SOCKET_WAIT_TIMEOUT_SEC + (
+                _PERMISSION_WAIT_EXTRA_SEC if extended else 0.0
+            )
             logger.error(
                 "Socket supervisor: capturer did not create "
-                f"{missing} within {_SOCKET_WAIT_TIMEOUT_SEC}s — refusing to start "
+                f"{missing} within {budget}s — refusing to start "
                 "the recorder rather than hang on a connect that never succeeds."
             )
             return False

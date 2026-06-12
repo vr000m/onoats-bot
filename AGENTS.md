@@ -75,7 +75,11 @@ any release tag).
   dir + a fresh generation **nonce**, exports `ONOATS_MIC_SOCKET` /
   `ONOATS_SYSTEM_SOCKET` / `ONOATS_CAPTURER_NONCE`, spawns `ONOATS_CAPTURER_BIN`
   (paths + nonce via **both** argv and env), waits (bounded) for both sockets,
-  then runs the recorder.
+  then runs the recorder. The capturer's tap preflight (release-plan Phase 7)
+  makes the TCC-prompting tap call **before** binding sockets, announced by
+  `ONOATS-EVENT waiting-for-permission`; if the base socket wait expires with
+  that event seen, the supervisor extends the wait once (+120 s) and surfaces
+  the pending prompt in the status file.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →
   transport `expected_nonce`. A capturer presenting a missing/stale nonce on the
   supervisor's paths is rejected at handshake. Ungated (None) when socket mode is

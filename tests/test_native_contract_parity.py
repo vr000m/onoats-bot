@@ -158,6 +158,40 @@ def test_device_event_emission_matches_supervisor_parser():
     )
 
 
+def test_tap_preflight_precedes_sockets_and_announces_permission_wait():
+    """Phase 7 keystone (inverted startup order): the TCC-prompting tap call
+    runs BEFORE the listening sockets exist, announced by
+    `ONOATS-EVENT waiting-for-permission` — and the supervisor consumes
+    exactly that event type to extend its socket wait. A one-sided rename
+    (or a reorder back to sockets-first) silently revives the 10 s
+    prompt-pending death this phase removed."""
+    main_swift = (
+        REPO / "native" / "onoats-capturer" / "Sources" / "main.swift"
+    ).read_text(encoding="utf-8")
+
+    emit_pos = main_swift.find('emitEvent(\n    "waiting-for-permission"')
+    if emit_pos == -1:
+        emit_pos = main_swift.find('emitEvent("waiting-for-permission"')
+    assert emit_pos != -1, (
+        "main.swift no longer emits the waiting-for-permission event the "
+        "supervisor keys its extended socket wait on"
+    )
+    tap_start_pos = main_swift.find("try systemCapture.start()")
+    socket_pos = main_swift.find("makeListeningSocket")
+    assert tap_start_pos != -1 and socket_pos != -1
+    assert emit_pos < tap_start_pos < socket_pos, (
+        "startup order regressed: the waiting-for-permission emit and the "
+        "system-tap start (the TCC-prompting call) must both precede socket "
+        "creation — see the Phase-7 startup-sequence comment in main.swift"
+    )
+
+    supervisor = (REPO / "src" / "onoats" / "cli.py").read_text(encoding="utf-8")
+    assert 'event_type == "waiting-for-permission"' in supervisor, (
+        "cli._drain_capturer_stderr no longer handles the "
+        "waiting-for-permission event type"
+    )
+
+
 def test_capturer_exit_codes_are_all_accounted_for():
     """Every non-ok ExitCode in Support.swift must be either mapped to a
     specific exit_reason in cli._CAPTURER_RC_REASONS or deliberately listed
