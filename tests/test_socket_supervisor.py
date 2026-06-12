@@ -111,6 +111,8 @@ def short_root():
 #   "crash"  -> write N frames, then exit (process death + EOF on the sockets)
 #   "silent" -> handshake only, never send a frame (hung-but-alive)
 #   "stream" -> stream frames until killed (clean-shutdown path)
+#   "hang"   -> never bind a socket, stay alive (the pre-socket block a TCC
+#               prompt produces during the Phase-7 tap preflight)
 #
 # The supervisor passes socket paths + nonce via BOTH argv (--mic-socket /
 # --system-socket / --nonce) AND env (ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET /
@@ -183,6 +185,9 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
     STDERR_FLOOD = int(_control.get("stderr_flood") or 0)
     EVENTS = _control.get("events") or []
     STARTUP_EVENTS = _control.get("startup_events") or []
+    # Phase-7 control: seconds to sleep BEFORE binding the sockets — models the
+    # tap preflight blocking on a pending TCC prompt (sockets appear late).
+    BIND_DELAY = float(_control.get("bind_delay") or 0)
 
     for _line in STDERR_LINES + STARTUP_EVENTS:
         sys.stderr.write(_line + "\\n")
@@ -197,6 +202,13 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
         # Die BEFORE creating any socket — the shape of a TCC denial at
         # startup (real capturer: ExitCode.micDenied=10 / systemAudioFailed=11).
         sys.exit(int(_control.get("rc") or 10))
+
+    if BEHAVIOUR == "hang":
+        # Stay alive but never bind a socket — a pre-socket block with no
+        # eventual recovery (e.g. a permission prompt nobody ever answers).
+        import time as _time
+
+        _time.sleep(3600)
 
     if not MIC or not SYSTEM:
         sys.stderr.write(
@@ -267,6 +279,8 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
 
 
     async def main():
+        if BIND_DELAY:
+            await asyncio.sleep(BIND_DELAY)
         mic_srv = await serve_one(MIC)
         sys_srv = await serve_one(SYSTEM)
         async with mic_srv, sys_srv:
@@ -314,6 +328,7 @@ def set_capturer_behaviour(fake_capturer):
         stderr_flood: int | None = None,
         events: list[str] | None = None,
         startup_events: list[str] | None = None,
+        bind_delay: float | None = None,
     ) -> None:
         control: dict = {"behaviour": behaviour}
         if nframes is not None:
@@ -330,6 +345,8 @@ def set_capturer_behaviour(fake_capturer):
             control["events"] = events
         if startup_events is not None:
             control["startup_events"] = startup_events
+        if bind_delay is not None:
+            control["bind_delay"] = bind_delay
         Path(str(fake_capturer) + ".control").write_text(json.dumps(control))
 
     yield _set
@@ -631,7 +648,7 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
 
 @pytest.mark.parametrize(
     ("cap_rc", "expected_reason"),
-    [(10, "mic-denied"), (11, "system-audio-denied"), (7, "capturer-start-failed")],
+    [(10, "mic-denied"), (11, "system-audio-failed"), (7, "capturer-start-failed")],
 )
 def test_prestart_capturer_death_writes_fresh_failure_status(
     sup_env, log_sink, set_capturer_behaviour, cap_rc, expected_reason
@@ -1770,3 +1787,180 @@ def test_zero_run_clear_event_clears_status_warning(
 
     st = status_file.read_status(data_dir)
     assert st is not None and st.warning is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 (release plan): pre-socket tap preflight — the capturer makes the
+# TCC-prompting tap call BEFORE binding its sockets, announced by
+# `ONOATS-EVENT waiting-for-permission`. The supervisor must:
+#   * keep the base capturer-start-timeout when no event arrives (a genuine
+#     pre-socket hang is still bounded);
+#   * extend the wait ONCE when the event arrived and the base budget expired
+#     (a prompt answered at human speed must not kill the launch), surfacing
+#     the pending prompt in the status file;
+#   * keep the rc=10/rc=11 prestart mappings (parametrized test above) intact
+#     across the reorder.
+# ---------------------------------------------------------------------------
+
+
+def test_start_timeout_without_permission_event_keeps_base_budget(
+    sup_env, log_sink, set_capturer_behaviour, monkeypatch
+):
+    """A pre-socket hang WITHOUT a waiting-for-permission event must still be
+    declared `capturer-start-timeout` on the BASE budget — the Phase-7
+    extension is keyed on the event, never granted by default."""
+    import time
+
+    from onoats import status as status_file
+
+    data_dir, _ = sup_env
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 1.0)
+    monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", 30.0)
+    set_capturer_behaviour("hang")
+
+    t0 = time.monotonic()
+    rc = _run_supervisor_bounded()
+    elapsed = time.monotonic() - t0
+
+    assert rc != 0, "a pre-socket hang must fail loud"
+    rec = status_file.read_status(data_dir)
+    assert rec is not None and rec.exit_reason == "capturer-start-timeout"
+    assert elapsed < 30.0, (
+        f"the wait was extended ({elapsed:.1f}s) although the capturer never "
+        "announced waiting-for-permission — the extension must be event-keyed"
+    )
+
+
+def test_waiting_for_permission_extends_socket_wait_to_success(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """E2E prompt-answered shape: the capturer announces the tap preflight,
+    blocks past the BASE socket budget (the pending prompt), then binds and
+    streams. The supervisor must extend the wait (instead of declaring
+    capturer-start-timeout) and run the session to a clean rc=0 — and the
+    prompt-pending state must have been surfaced in the status file (the fake
+    recorder here writes no status, so the waiting record survives to assert)."""
+    from onoats import status as status_file
+
+    data_dir, _ = sup_env
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 1.0)
+    monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", float(SUP_TIMEOUT))
+    set_capturer_behaviour(
+        "stream",
+        startup_events=[
+            "ONOATS-EVENT waiting-for-permission branch=system "
+            "hint=tap creation pending the TCC prompt"
+        ],
+        bind_delay=2.5,  # > the 1.0s base budget: without the extension this
+        # run is a capturer-start-timeout
+    )
+
+    state: dict = {"frames_read": 0}
+
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)  # handshake
+            for _ in range(3):
+                chunk = await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT)
+                if not chunk:
+                    break
+                state["frames_read"] += len(chunk)
+        finally:
+            writer.close()
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
+
+    rc = _run_supervisor_bounded()
+
+    assert rc == 0, (
+        f"a prompt answered after the base socket budget must still yield a "
+        f"working session (rc=0), got {rc} — the waiting-for-permission "
+        "extension did not apply"
+    )
+    assert state["frames_read"] > 0, "recorder read no frames after the extension"
+    rec = status_file.read_status(data_dir)
+    assert rec is not None and rec.warning is not None
+    assert "permission prompt" in rec.warning, (
+        "the prompt-pending state must be surfaced in the status file while "
+        f"the wait is extended; got warning={rec.warning!r}"
+    )
+
+
+def test_waiting_for_permission_timeout_names_the_prompt(
+    sup_env, log_sink, set_capturer_behaviour, monkeypatch
+):
+    """Never-answered prompt: event seen, extension granted, sockets still never
+    appear. The wait must END (extended budget, no hang) with the standard
+    `capturer-start-timeout` reason and a last_error naming the pending prompt."""
+    from onoats import status as status_file
+
+    data_dir, _ = sup_env
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 0.5)
+    monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", 1.0)
+    set_capturer_behaviour(
+        "hang",
+        startup_events=[
+            "ONOATS-EVENT waiting-for-permission branch=system hint=prompt pending"
+        ],
+    )
+
+    rc = _run_supervisor_bounded()
+
+    assert rc != 0, "an unanswered prompt must still end in a bounded fail-loud exit"
+    rec = status_file.read_status(data_dir)
+    assert rec is not None and rec.exit_reason == "capturer-start-timeout"
+    assert rec.last_error and "permission prompt" in rec.last_error, (
+        "the timeout record must name the (possibly still pending) prompt; "
+        f"got last_error={rec.last_error!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_wait_for_sockets_extension_writes_waiting_record(
+    short_root, monkeypatch
+):
+    """Unit: _wait_for_sockets grants the extension exactly when the permission
+    event is set and the base budget expires — writing the prestart waiting
+    record — and still returns True once the (late) sockets appear."""
+    from onoats import status as status_file
+
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", float(SUP_TIMEOUT))
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+
+    class _FakeProc:
+        returncode = None
+
+    permission_event = asyncio.Event()
+    permission_event.set()
+    sock = short_root / "late.sock"
+
+    async def _bind_late():
+        await asyncio.sleep(1.0)  # past the 0.3s base budget
+        sock.touch()
+
+    binder = asyncio.create_task(_bind_late())
+    try:
+        ok = await asyncio.wait_for(
+            cli._wait_for_sockets(
+                _FakeProc(),
+                (str(sock),),
+                logger,
+                data_dir=data_dir,
+                permission_event=permission_event,
+            ),
+            timeout=SUP_TIMEOUT,
+        )
+    finally:
+        await binder
+    assert ok is True
+
+    rec = status_file.read_status(data_dir)
+    assert rec is not None, "the extension must write the prestart waiting record"
+    assert rec.running is True
+    assert rec.warning and "permission prompt" in rec.warning

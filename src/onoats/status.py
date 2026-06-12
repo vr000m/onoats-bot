@@ -62,12 +62,18 @@ class StatusRecord:
     pid: int
     start_time: float
     audio_source: str
+    # "" is the documented pre-recorder sentinel: records written before the
+    # recorder has started (write_prestart_waiting / write_prestart_failure /
+    # the write_stopped fallback) have no STT label yet. Readers must guard on
+    # truthiness, not presence (`onoats status` does).
     stt_label: str
     running: bool
     last_rotation_time: float | None = None
     last_error: str | None = None
     # e.g. "graceful", "fatal_error_frame", "capturer-crash", "mic-denied",
-    # "system-audio-denied". Free-form but stable across producers.
+    # "system-audio-failed" (genuine tap API failure — a TCC denial never
+    # exits the capturer; denied taps deliver zeros and surface as `warning`).
+    # Free-form but stable across producers.
     exit_reason: str | None = None
     supervisor_rc: int | None = None
     # Schema v2. `warning` is a live, non-fatal capture anomaly (today: the
@@ -357,6 +363,38 @@ def write_prestart_failure(
             exit_reason=exit_reason,
             last_error=last_error,
             supervisor_rc=supervisor_rc,
+        ),
+    )
+
+
+def write_prestart_waiting(data_dir: Path, *, audio_source: str, note: str) -> Path:
+    """Write a FRESH record for the prompt-pending window before the recorder runs.
+
+    Release-plan Phase 7: the capturer's tap preflight makes the TCC-prompting
+    call before its sockets exist, so a first start can legitimately sit for
+    tens of seconds waiting on the Screen & System Audio Recording dialog. The
+    supervisor calls this (once, when it extends its socket wait) so
+    ``onoats status`` / the menu bar show *why* nothing is recording yet
+    instead of a stale previous-session record.
+
+    The record is ``running=True`` with ``note`` in the v2 ``warning`` field —
+    the session is genuinely in progress (the supervisor pid is live), just not
+    capturing yet. ``stt_label`` is the pre-recorder ``""`` sentinel (see
+    :class:`StatusRecord`): the recorder, which owns STT resolution, has not
+    started. Every successor overwrites it: the recorder's
+    :func:`write_running` builds a fresh record once the prompt is answered,
+    and :func:`write_prestart_failure` replaces it if the wait times out.
+    """
+    return write_status(
+        data_dir,
+        StatusRecord(
+            schema=STATUS_SCHEMA_VERSION,
+            pid=os.getpid(),
+            start_time=time.time(),
+            audio_source=audio_source,
+            stt_label="",
+            running=True,
+            warning=note,
         ),
     )
 

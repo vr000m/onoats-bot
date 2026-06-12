@@ -34,6 +34,10 @@ enum ExitCode {
     static let ok: Int32 = 0
     static let usage: Int32 = 2
     static let micDenied: Int32 = 10
+    // Genuine AudioHardwareCreateProcessTap API failure (after the ×3@500 ms
+    // retry) — NEVER a TCC denial: a denied tap succeeds and delivers zeros
+    // (verified 2026-06-11), so denial's only observable is the zero-run
+    // WARNING. The supervisor maps this to exit_reason "system-audio-failed".
     static let systemAudioFailed: Int32 = 11
     static let socketFailed: Int32 = 12
     static let captureFailed: Int32 = 13

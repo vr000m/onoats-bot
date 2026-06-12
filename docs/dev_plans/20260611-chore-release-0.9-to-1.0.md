@@ -322,7 +322,8 @@ supervisor handshake path in `cli.py:311–482`
   depends on Phase 4**) extends the wait and surfaces
   "waiting for the system-audio permission prompt…" in the status file
 - [ ] Keep the existing fail-loud semantics; pin the rc=11 meaning while
-  here: the code reason string is `system-audio-denied` (`cli.py:187`) but
+  here: the code reason string was `system-audio-denied` (`cli.py:187`
+  pre-branch; renamed to `system-audio-failed` in PR #17 — see Findings) but
   a denied grant never produces rc=11 (denied taps succeed and deliver
   zeros — verified 2026-06-11); rc=11 fires only on genuine
   `AudioHardwareCreateProcessTap` API failure (e.g. retry exhaustion), and
@@ -342,7 +343,8 @@ supervisor handshake path in `cli.py:311–482`
 
 ### Phase 8 — BlackHole config pruning (1.0.0 gate)
 **Branch:** `chore/prune-blackhole-configs`
-**Impl files:** `src/onoats/init.py` (lines ~91, ~135), `src/onoats/dual.py`
+**Impl files:** `native/Makefile` (new `setup-cli` target),
+`src/onoats/init.py` (lines ~91, ~135), `src/onoats/dual.py`
 (help text ~665), `pyproject.toml` (comment ~31), `README.md`,
 `docs/blackhole-fallback.md`
 **Test files:** `tests/test_init.py`, `tests/test_stt_config_wiring.py`, `tests/test_config.py`
@@ -350,9 +352,28 @@ supervisor handshake path in `cli.py:311–482`
 
 - [ ] Decide the keep-list with the user first (gate: user is "happy with the
   menubar" in daily use) — the documented fallback for 13.x–14.3/off-mac
-  stays functional
+  stays functional. **DECIDED 2026-06-11 (user): conservative keep-list.**
+  PortAudio/BlackHole stays a supported path — the user has older Intel
+  MacBooks that may be capped below macOS 14.4 (no process-tap API), where
+  BlackHole is the only system-audio route. KEEP: the `_LOOPBACK_HINTS`
+  auto-detection (`init.py:91`) and the no-loopback NOTE (`init.py:135`)
+  everywhere they fire today; the `dual.py:665` backend help text; all
+  config-wiring tests (BlackHole fixture names may stay). PRUNE only:
+  redundant prose/comments that re-explain BlackHole where a link to
+  `docs/blackhole-fallback.md` suffices (README mentions, `pyproject.toml`
+  comment).
 - [ ] Prune BlackHole-specific hints/branches/tests beyond that keep-list;
   point remaining mentions at `docs/blackhole-fallback.md`
+- [ ] **Install-path branching (DECIDED 2026-06-12, user):** the install
+  layer — not `onoats init` — encodes the menubar-vs-CLI choice; `init`
+  stays untouched. Add `make -C native setup-cli` (cert → capturer build +
+  sign → `install-cli` → init; skips the app bundle) alongside the existing
+  `setup` (menubar, unchanged default). CLI/PortAudio keeps the old way —
+  no make target (it must not require the native toolchain): documented
+  two-liner in `docs/blackhole-fallback.md`. No justfile — make is the
+  established entry point (PR #16 README story). Docs job: README explains
+  the THREE paths side by side (menubar `setup` / CLI+native `setup-cli` /
+  CLI+PortAudio for Intel / ≤14.3 / off-mac)
 - [ ] Coverage bound (stated, not solved): there is no 13.x–14.3 hardware in
   CI or on the author's machine — the config-wiring tests
   (`test_init.py`/`test_config.py`/`test_stt_config_wiring.py`) are the
@@ -546,7 +567,8 @@ retrieval is `git checkout spike-archive -- native/spike`.
 ## Testing Notes
 
 - Python phases: full suite (`uv run pytest tests/ -q`, 209 tests at
-  Milestone B close) plus phase-specific files named in each contract block.
+  Milestone B close; 247 after Phase 7) plus phase-specific files named in
+  each contract block.
 - Swift phases: no Swift test runner exists; coverage is (a) the Python
   grep/round-trip parity tests, (b) `make -C native rebuild` compile+sign,
   (c) live GUI-topology smokes run by the user (TCC denials, prompt-pending
@@ -583,8 +605,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-11 @ 6bd2e5c0892779210ed736ea3cb957cb8d77470f -->
-
+<!-- reviewed: 2026-06-11 @ 0d68b5a07007a22333d589a3524f2ef7b7710607 -->
 ## Issues & Solutions
 
 *(populated during implementation)*
@@ -605,7 +626,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
   PASSED live 2026-06-11; fresh-clone + pre-init verifies DEFERRED to the
   next fresh-machine install — see Findings; post-merge: push `spike-archive`
   tag on `7ac0b2e`)
-- [ ] Phase 7 — Tap preflight (1.0.0 gate)
+- [ ] Phase 7 — Tap preflight (1.0.0 gate; PR #17 — implementation + unit
+  tests + parity pins done; all three live smokes PASSED 2026-06-11, see
+  Findings; awaiting review gauntlet + merge)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
 - [ ] Phase 10 — Cut v1.0.0
@@ -714,3 +737,59 @@ retrieval is `git checkout spike-archive -- native/spike`.
   `RecorderModel.start()` pre-init guard was NOT added (code-level analysis
   predicts a pre-init Start works with defaults rather than confusing the
   user); revisit if the deferred verify observes otherwise.
+- Phase 7 implementation (PR #17, 2026-06-11): four decisions worth recording.
+  (1) **The preflight starts the FULL system chain** (tap → aggregate →
+  IOProc), not just the tap: the tap-created→IOProc-started window is the
+  audible output dropout (~200 ms signed, SystemCapture header), and a
+  tap-only preflight would stretch that dropout across the accept barrier
+  (recorder connect comes after STT preflight + model load — seconds). Frames
+  emitted before the system FrameWriter attaches are dropped by a
+  `LateBoundWriter` (pre-session audio); streaming still starts at the accept
+  barrier, exactly as pre-reorder. (2) **`waiting-for-permission` is emitted
+  unconditionally** — there is no TCC preflight API, so the capturer cannot
+  know whether the tap call will block. The supervisor extension is therefore
+  armed on every start but applies only when the 10 s base budget expires
+  (+120 s, once); the granted/fast path never pays it. Surfacing uses new
+  `status.write_prestart_waiting` (fresh `running=true` record, note in the
+  v2 `warning` field; replaced by the recorder's start write or the
+  prestart-failure stamp). (3) **rc=11 reason renamed**
+  `system-audio-denied` → `system-audio-failed` at both sites (cli map,
+  status.py vocabulary; ExitCode + contract doc document the semantics):
+  denial never exits the capturer. Post-reorder error ordering: rc=10 and
+  rc=11 both pre-socket; rc=12 only after a healthy tap. (4) **Latent bug
+  found by the new start-timeout test**: the prestart-failure stamp read
+  `capturer_proc.returncode` AFTER `_stop_capturer` (which always reaps), so
+  a hung-but-alive capturer was stamped `capturer-start-failed` with the
+  SIGTERM exit code — `capturer-start-timeout` was unreachable end-to-end.
+  Fixed by reading the code before stopping. Parity pin added:
+  emit-before-tap-before-sockets order in main.swift + the supervisor's
+  event handler (a one-sided rename or sockets-first reorder fails CI).
+  Suite: 247 passed. Live smokes pending (user, GUI topology).
+- Phase 7 live smoke, round 1 (2026-06-11 22:25–22:30, new binary): the
+  preflight machinery worked as designed — `waiting-for-permission` emitted,
+  supervisor extended the wait at exactly 10 s (+120 s), menu showed
+  "starting…" instead of dying, tap created before sockets, and the
+  user's Allow click (~42 s in) unblocked `AudioHardwareCreateProcessTap`
+  (attempt 1 also reproduced the flaky `OSStatus 0, tapID=0` shape; the ×3
+  retry recovered). **New bug exposed**: the mic branch had no silence pacer
+  until `bind()` completed, and the post-Allow HAL bind on AirPods Pro 2
+  blocked >10 s with the recorder already connected → mic read-idle →
+  `fatal_error_frame`. The system branch survived the identical window only
+  because its pacer was already pacing. Fixed in `9ea72ba`: mic
+  `chunker.activate()` moved before `bind()` (paced silence from writer
+  attach until the device delivers). Also recorded: the first smoke round
+  (17:49–17:53) ran the pre-Phase-7 capturer binary (app not reinstalled)
+  and faithfully reproduced both old failure modes — a useful baseline.
+- **Phase 7 live smokes PASSED (user, GUI topology, 2026-06-11 22:38–22:47,
+  binary with `9ea72ba` mic-pacer fix).** (1) Allow-after-pause: prompt left
+  unanswered ~36 s → menu showed "starting…", supervisor extended at 10 s
+  (+120 s), Allow → tap → sockets → recording with NO second Start; bonus
+  zero-run warn/clear cycle observed. (2) Don't Allow: tap creation
+  SUCCEEDED on denial (re-confirms denied-taps-deliver-zeros), session
+  recorded since 22:42, system zero-run warning ≈30 s in and persisting, no
+  fatal_error_frame; the mic pacer visibly saved the session (500 paced
+  filler frames ≈10 s before "mic: capturing from AirPods Pro 2" — would
+  have read-idled pre-fix). (3) Mic-denial: rc=10 in ~56 ms pre-socket,
+  fresh `mic-denied` status ("capturer exited (rc=10) before creating its
+  sockets"). All three observables verified against
+  ~/Library/Logs/Onoats/onoats-bot.log timestamps.

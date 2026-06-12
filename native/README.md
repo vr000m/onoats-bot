@@ -120,10 +120,12 @@ that surface:
   `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
   env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
 - **First Start after a fresh install / permission reset:** the system-audio
-  TCC prompt fires at tap creation, which *blocks* while the dialog is
-  unanswered — if you take longer than ~10 s to click, the recorder's
-  read-idle watchdog fails the session loud (by design). Answer the prompt,
-  then Start again.
+  TCC prompt fires at tap creation. Since release-plan Phase 7 the capturer
+  creates the tap **before** its sockets exist (announced by `ONOATS-EVENT
+  waiting-for-permission`), so the supervisor extends its socket wait
+  (+120 s) while the dialog is unanswered and the menu bar shows
+  "waiting for the system-audio permission prompt". Answer the prompt at
+  human speed and the session proceeds — no restart needed.
 - **All-zero watchdog:** if a branch's capture callbacks deliver only zero
   samples for 30 s, the capturer emits a machine-parseable
   `ONOATS-EVENT zero-run-warning` stderr line naming the likely cause
@@ -157,9 +159,12 @@ AUDIO_SOURCE=socket ONOATS_CAPTURER_BIN="$(make -s print-bin)" onoats bot
 Design notes baked into the capturer (each learned the hard way — see the dev
 plan `## Findings` for the evidence):
 
-- **Startup order is load-bearing:** mic TCC grant → create both sockets →
-  accept both → write both handshakes → only then start captures (tap first,
-  then mic engine).
+- **Startup order is load-bearing:** mic TCC grant → system-tap preflight
+  (emit `waiting-for-permission`, start the tap/aggregate/IOProc chain — the
+  TCC-prompting call, before any socket exists) → create both sockets →
+  accept both → write both handshakes → attach the system writer + start the
+  mic engine (strictly after the tap; pre-socket system frames are dropped as
+  pre-session audio).
 - **Copy-only IOProc.** Doing AVAudioConverter work in the Core Audio realtime
   callback makes the HAL silently stop calling it after ~5 cycles. The IOProc
   memcpys into a bounded queue; a worker thread resamples and chunks.

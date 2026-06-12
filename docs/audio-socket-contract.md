@@ -214,7 +214,13 @@ When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor
    - **env:** `ONOATS_MIC_SOCKET`, `ONOATS_SYSTEM_SOCKET`, `ONOATS_CAPTURER_NONCE`
 
 5. waits (bounded, default 10 s) for **both** socket files to appear, then runs
-   the recorder;
+   the recorder. **Phase-7 extension:** if the capturer announced
+   `ONOATS-EVENT waiting-for-permission` (its tap preflight is about to make
+   the TCC-prompting call, which a pending Screen & System Audio Recording
+   prompt blocks) and the base budget expires, the wait is extended **once**
+   (default +120 s) and the pending prompt is surfaced in the status file
+   (`write_prestart_waiting`: fresh `running=true` record, note in `warning`).
+   Without the event the base `capturer-start-timeout` behaviour is unchanged;
 6. on shutdown stops the recorder, then the capturer's **entire process group**
    (SIGTERM → bounded wait → SIGKILL); on capturer death tears down cleanly.
 
@@ -288,9 +294,15 @@ need.
 > still be speculative.
 
 The capturer (`native/onoats-capturer/`, shipped in Milestone B / PR #5)
-MUST: create both sockets, accept one connection each, write the v1 handshake
-per connection as it is accepted (echoing the nonce), then stream
-length-prefixed v1 frames per branch.
+MUST: run its **system-tap preflight first** (release-plan Phase 7: emit
+`ONOATS-EVENT waiting-for-permission`, then make the TCC-prompting tap call —
+**before any socket exists**, so a pending permission prompt blocks while no
+recorder clock is running); then create both sockets, accept one connection
+each, write the v1 handshake per connection as it is accepted (echoing the
+nonce), then stream length-prefixed v1 frames per branch. Exit code 11
+(`systemAudioFailed` → `exit_reason: system-audio-failed`) means a **genuine
+tap API failure** (retry exhaustion) — never a TCC denial: a denied tap
+succeeds and delivers zeros, surfacing only as the zero-run `warning`.
 
 ### Capturer event lines (`ONOATS-EVENT`, stderr)
 
@@ -328,7 +340,7 @@ Defined events:
 | `zero-run-warning` | `branch=<mic\|system> hint=<text>` | sets the status-file `warning` (schema v2) to `"<branch>: <hint>"`; per-branch messages merge `; `-joined in branch order. Emitted once per zero-run (30 s of all-zero real input); re-armed by real audio. |
 | `zero-run-clear` | `branch=<mic\|system>` | removes that branch's message; clears `warning` to `null` when none remain. |
 | `device` | `branch=<mic\|system> hint=<name> (uid=<uid>)` | populates the status-file `mic_device` / `system_device` (schema v2) with the hint text verbatim — the trailing free-text `hint` is load-bearing here, since device names contain spaces. Mic: emitted on **every successful bind** (initial + default-input rebind), naming the bound device. System: emitted **once per session**; the tap is global (all processes' output), not bound to one output device, so the description is `system-output tap (uid=<aggregate uid>)`. The events outrun the recorder's start write, so the supervisor records them and applies via a deferred task keyed on this session's `write_running` (`cli._apply_device_fields_when_recorded`); a non-running record is never device-stamped. |
-| `waiting-for-permission` | *(reserved — release-plan Phase 7)* | extends the socket-appearance wait while a TCC prompt is pending. |
+| `waiting-for-permission` | `branch=system hint=<text>` | emitted on **every start**, immediately before the TCC-prompting tap call (there is no TCC preflight API, so the capturer cannot know whether the call will block). If the supervisor's base socket wait then expires, it extends the wait once (+120 s) and writes the prompt-pending status record; on the granted/fast path the event has no effect. |
 
 ### Default-device changes (capturer requirement, verified live)
 

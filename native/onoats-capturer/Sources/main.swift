@@ -4,14 +4,36 @@
 // by the onoats supervisor with --mic-socket/--system-socket/--nonce (also in
 // env as ONOATS_MIC_SOCKET / ONOATS_SYSTEM_SOCKET / ONOATS_CAPTURER_NONCE).
 //
-// Startup sequence (the order is load-bearing):
+// Startup sequence (the order is load-bearing; reordered by release-plan
+// Phase 7 — tap preflight BEFORE the sockets):
 //   1. mic TCC grant (fail loud before any socket exists)
-//   2. create BOTH listening sockets (what _wait_for_sockets watches for)
-//   3. accept BOTH connections within one deadline (startup barrier)
-//   4. write each handshake AS ITS CONNECTION ARRIVES (echoing the nonce) —
+//   2. system tap preflight: emit `ONOATS-EVENT waiting-for-permission`, then
+//      start the FULL system capture chain (tap → aggregate → IOProc). The
+//      tap creation is the system-audio TCC-prompting call, and a pending
+//      prompt BLOCKS it — doing this before any socket exists means the
+//      supervisor (which extends its socket wait on the event) absorbs the
+//      block, instead of the recorder's 10 s read-idle watchdog killing the
+//      session while the user reads the prompt. The full chain (not just the
+//      tap) starts here so the tap-created→IOProc-started window stays
+//      ~200 ms (that window is the audible output dropout — SystemCapture
+//      header); frames emitted before the system writer attaches are
+//      pre-session audio and are dropped by LateBoundWriter by design.
+//   3. create BOTH listening sockets (what _wait_for_sockets watches for)
+//   4. accept BOTH connections within one deadline (startup barrier)
+//   5. write each handshake AS ITS CONNECTION ARRIVES (echoing the nonce) —
 //      the recorder's handshake read is bounded tighter than the barrier
-//   5. only then start the captures: mic → mic socket, system tap → system
-//      socket — exactly one source per socket, never mixed (keystone)
+//   6. attach the system writer + start the mic capture: mic → mic socket,
+//      system tap → system socket — exactly one source per socket, never
+//      mixed (keystone). The mic engine still starts strictly AFTER the tap
+//      (Milestone B: tap creation while the engine runs was flaky), which the
+//      preflight makes structural.
+//
+// Error ordering after the reorder (restated for the supervisor's mapping):
+// rc=10 (mic denied) and rc=11 (tap API failure, AFTER the ×3@500 ms retry)
+// now both fire BEFORE any socket exists; rc=12 (socket/barrier failure) can
+// only fire after a healthy tap. rc=11 is NEVER produced by a TCC denial —
+// a denied tap succeeds and delivers zeros (verified 2026-06-11); denial's
+// sole observable is the zero-run WARNING.
 //
 // Any terminal event — SIGTERM/SIGINT, either socket closing, a write error,
 // a capture failure — tears down BOTH branches and the full Core Audio chain
@@ -67,15 +89,27 @@ final class Teardown {
         exit(rc)
     }
 
-    /// Registers the capture chain and only then starts the writer threads.
-    /// The ordering contract ("a writer hitting a terminal error must find a
-    /// fully-populated Teardown") is self-enforcing here: a writer's onTerminal
-    /// cannot fire before its start(), and start() is sequenced after every
-    /// field assignment by this method's body — callers cannot get it wrong.
-    func registerAndStart(mic: MicCapture, system: SystemCapture, writers: [FrameWriter]) {
+    /// Register the system capture the moment it exists — BEFORE its start()
+    /// is attempted. The tap preflight (startup step 2) runs the system chain
+    /// long before the writers exist, so every later failure path (socket
+    /// creation, accept barrier, mic start) must already find it here and tear
+    /// the Core Audio chain down.
+    func registerSystem(_ system: SystemCapture) {
+        lock.lock()
+        self.system = system
+        lock.unlock()
+    }
+
+    /// Registers the mic capture + writers and only then starts the writer
+    /// threads. The ordering contract ("a writer hitting a terminal error must
+    /// find a fully-populated Teardown") is self-enforcing here: a writer's
+    /// onTerminal cannot fire before its start(), and start() is sequenced
+    /// after every field assignment by this method's body — callers cannot get
+    /// it wrong. (The system capture is registered earlier, by the tap
+    /// preflight, via registerSystem.)
+    func registerAndStart(mic: MicCapture, writers: [FrameWriter]) {
         lock.lock()
         self.mic = mic
-        self.system = system
         self.writers = writers
         lock.unlock()
         for writer in writers { writer.start() }
@@ -283,7 +317,7 @@ guard let micSocketPath, let systemSocketPath else {
     exit(ExitCode.usage)
 }
 
-// MARK: - 1. mic grant (system-audio TCC surfaces at tap creation, step 5)
+// MARK: - 1. mic grant (system-audio TCC surfaces at tap creation, step 2)
 
 if !requestMicGrantBlocking() {
     logLine(
@@ -292,7 +326,53 @@ if !requestMicGrantBlocking() {
     exit(ExitCode.micDenied)
 }
 
-// MARK: - 2. listening sockets (created BEFORE capture; the supervisor waits on these)
+// MARK: - 2. system tap preflight (TCC-prompting call BEFORE any socket exists)
+
+/// Late-binding handoff from the already-running system capture to its
+/// FrameWriter. The tap preflight starts the system chain before the sockets
+/// (and therefore the writers) exist; frames emitted before attach() are
+/// pre-session audio and are dropped here by design — the session still
+/// starts at the accept barrier, exactly as before the Phase 7 reorder.
+final class LateBoundWriter {
+    private let lock = NSLock()
+    private var writer: FrameWriter?
+    func attach(_ w: FrameWriter) {
+        lock.lock()
+        writer = w
+        lock.unlock()
+    }
+    func enqueue(pcm: Data, capturedMonotonicNs ns: UInt64) {
+        lock.lock()
+        let w = writer
+        lock.unlock()
+        w?.enqueue(pcm: pcm, capturedMonotonicNs: ns)
+    }
+}
+
+// Emitted UNCONDITIONALLY before the tap call: there is no TCC preflight API,
+// so the capturer cannot know whether the next call will block on a prompt.
+// The supervisor extends its socket wait only if the base wait actually
+// expires, so the granted/fast path costs nothing.
+emitEvent(
+    "waiting-for-permission",
+    "branch=system hint=creating the system-audio tap — a pending Screen & "
+        + "System Audio Recording prompt blocks here until answered")
+
+let systemWriterBox = LateBoundWriter()
+let systemCapture = SystemCapture { pcm, ns in
+    systemWriterBox.enqueue(pcm: pcm, capturedMonotonicNs: ns)
+}
+// Register BEFORE start(): every failure path from here on (tap failure,
+// socket creation, accept barrier, mic start) must find the system chain in
+// Teardown so the tap/aggregate are destroyed on the way out.
+Teardown.shared.registerSystem(systemCapture)
+do {
+    try systemCapture.start()
+} catch {
+    fail(ExitCode.systemAudioFailed, "system capture: \(error)")
+}
+
+// MARK: - 3. listening sockets (the supervisor waits on these)
 
 let micListenFd: Int32
 let systemListenFd: Int32
@@ -305,7 +385,7 @@ do {
     fail(ExitCode.socketFailed, "creating sockets: \(error)")
 }
 
-// MARK: - 3+4. startup barrier: accept both, handshake each as it arrives
+// MARK: - 4+5. startup barrier: accept both, handshake each as it arrives
 
 let micFd: Int32
 let systemFd: Int32
@@ -326,7 +406,7 @@ do {
     fail(ExitCode.socketFailed, "startup barrier: \(error)")
 }
 
-// MARK: - 5. capture → exactly one source per socket (keystone: never mix)
+// MARK: - 6. writers + mic → exactly one source per socket (keystone: never mix)
 
 let micWriter = FrameWriter(label: "mic", fd: micFd) { rc, reason in
     Teardown.shared.trigger(rc: rc, reason: reason)
@@ -337,24 +417,21 @@ let systemWriter = FrameWriter(label: "system", fd: systemFd) { rc, reason in
 let micCapture = MicCapture { pcm, ns in
     micWriter.enqueue(pcm: pcm, capturedMonotonicNs: ns)
 }
-let systemCapture = SystemCapture { pcm, ns in
-    systemWriter.enqueue(pcm: pcm, capturedMonotonicNs: ns)
-}
-// Register EVERYTHING with Teardown, then start the writer threads — a writer
-// hitting a terminal error must find a fully-populated Teardown, never a
-// half-registered one (stop() on a never-started capture is a safe no-op).
+// Register the mic capture + writers with Teardown, then start the writer
+// threads — a writer hitting a terminal error must find a fully-populated
+// Teardown, never a half-registered one (stop() on a never-started capture is
+// a safe no-op; the system capture was registered by the preflight above).
 // registerAndStart makes that ordering structural rather than comment-enforced.
-Teardown.shared.registerAndStart(
-    mic: micCapture, system: systemCapture, writers: [micWriter, systemWriter])
+Teardown.shared.registerAndStart(mic: micCapture, writers: [micWriter, systemWriter])
 
-// System (tap) first, mic engine second — the spike-proven order. Creating the
-// tap while an AVAudioEngine is already running was intermittently flaky
-// (AudioHardwareCreateProcessTap returning noErr + kAudioObjectUnknown).
-do {
-    try systemCapture.start()
-} catch {
-    fail(ExitCode.systemAudioFailed, "system capture: \(error)")
-}
+// Attach the system writer only after its thread is started: system frames
+// begin streaming here — the same point they did pre-reorder.
+systemWriterBox.attach(systemWriter)
+
+// Mic engine strictly AFTER the tap (started in the preflight) — the
+// spike-proven order. Creating the tap while an AVAudioEngine is already
+// running was intermittently flaky (AudioHardwareCreateProcessTap returning
+// noErr + kAudioObjectUnknown); the preflight makes the order structural.
 do {
     try micCapture.start()
 } catch {

@@ -763,7 +763,10 @@ denial smoke, PR description refresh, un-draft, merge.
   **Disposition:** the 4-part fail-loud observable is structurally
   unreachable for this denial — an OS behavior, not a gap in our supervisor.
   The rc=11 `system-audio-denied` path remains correct for API-level tap
-  failures and is pinned by the parametrized supervisor test.
+  failures and is pinned by the parametrized supervisor test. *(Post-ship
+  note: the 0.9→1.0 plan Phase 7 / PR #17 renamed the reason string to
+  `system-audio-failed` precisely because denial never produces rc=11;
+  `system-audio-denied` references in this shipped plan are historical.)*
   **RESOLVED FURTHER 2026-06-11 — denied taps fire ZERO-FILLED CALLBACKS, and
   a detector now ships in-PR.** Log forensics on the denied session settled
   the open question: the system branch produced ZERO pacer-fill lines across

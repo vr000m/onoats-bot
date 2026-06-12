@@ -29,6 +29,7 @@ from onoats.status import (
     set_warning,
     stamp_supervisor_failure,
     status_path,
+    write_prestart_waiting,
     write_running,
     write_status,
     write_stopped,
@@ -340,14 +341,14 @@ def test_write_stopped_records_failure_fields(tmp_path: Path):
     write_running(tmp_path, pid=5, audio_source="socket", stt_label="mlx")
     write_stopped(
         tmp_path,
-        exit_reason="system-audio-denied",
-        last_error="TCC: system-audio grant denied",
+        exit_reason="system-audio-failed",
+        last_error="tap creation failed after 3 attempts",
         supervisor_rc=1,
     )
     st = read_status(tmp_path)
     assert st.running is False
-    assert st.exit_reason == "system-audio-denied"
-    assert st.last_error == "TCC: system-audio grant denied"
+    assert st.exit_reason == "system-audio-failed"
+    assert st.last_error == "tap creation failed after 3 attempts"
     assert st.supervisor_rc == 1
 
 
@@ -396,8 +397,8 @@ def test_cli_status_surfaces_failure(tmp_path: Path, capsys):
     write_running(tmp_path, pid=321, audio_source="socket", stt_label="mlx-whisper")
     write_stopped(
         tmp_path,
-        exit_reason="system-audio-denied",
-        last_error="TCC: system-audio grant denied",
+        exit_reason="system-audio-failed",
+        last_error="tap creation failed after 3 attempts",
         supervisor_rc=1,
     )
 
@@ -405,8 +406,8 @@ def test_cli_status_surfaces_failure(tmp_path: Path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "not running" in out  # no live pid
-    assert "system-audio-denied" in out
-    assert "TCC: system-audio grant denied" in out
+    assert "system-audio-failed" in out
+    assert "tap creation failed after 3 attempts" in out
     assert "supervisor rc: 1" in out
 
 
@@ -472,3 +473,31 @@ def test_cli_status_live_socket_session_suppresses_portaudio_config(
     assert rc == 0
     assert "audio source: socket" in out
     assert "configured mic (PortAudio)" not in out
+
+
+def test_write_prestart_waiting_is_fresh_running_with_warning(tmp_path: Path):
+    """Phase 7: the prompt-pending record is FRESH (not the previous session's
+    record annotated), running=True, with the note in the v2 `warning` field —
+    and the recorder's own start write replaces it wholesale once the prompt
+    is answered."""
+    # Stale stopped record from a previous session.
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="old")
+    write_stopped(tmp_path, exit_reason="graceful")
+    stale = read_status(tmp_path)
+
+    write_prestart_waiting(
+        tmp_path,
+        audio_source="socket",
+        note="waiting for the system-audio permission prompt",
+    )
+    st = read_status(tmp_path)
+    assert st is not None and st.running is True
+    assert st.warning == "waiting for the system-audio permission prompt"
+    assert st.audio_source == "socket"
+    assert st.start_time > stale.start_time, "must be a fresh record"
+    assert st.exit_reason is None and st.last_error is None
+
+    # The recorder's start write builds a fresh record — warning cleared.
+    write_running(tmp_path, pid=2, audio_source="socket", stt_label="mlx")
+    st = read_status(tmp_path)
+    assert st.warning is None and st.pid == 2

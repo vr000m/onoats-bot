@@ -75,7 +75,11 @@ any release tag).
   dir + a fresh generation **nonce**, exports `ONOATS_MIC_SOCKET` /
   `ONOATS_SYSTEM_SOCKET` / `ONOATS_CAPTURER_NONCE`, spawns `ONOATS_CAPTURER_BIN`
   (paths + nonce via **both** argv and env), waits (bounded) for both sockets,
-  then runs the recorder.
+  then runs the recorder. The capturer's tap preflight (release-plan Phase 7)
+  makes the TCC-prompting tap call **before** binding sockets, announced by
+  `ONOATS-EVENT waiting-for-permission`; if the base socket wait expires with
+  that event seen, the supervisor extends the wait once (+120 s) and surfaces
+  the pending prompt in the status file.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →
   transport `expected_nonce`. A capturer presenting a missing/stale nonce on the
   supervisor's paths is rejected at handshake. Ungated (None) when socket mode is
@@ -187,3 +191,13 @@ should NOT re-flag go here, one per line:
   `security import -P` argv — `security import` has no file/stdin password
   option. Residual is a one-shot random secret guarding a file that lives
   seconds inside a 0700 tmpdir; documented at the site. (2026-06-11)
+- **[Architecture] won't-fix**: `LateBoundWriter` stays defined at file scope in
+  `main.swift` rather than moving to `Support.swift` — it is private plumbing of
+  main.swift's startup reorder (preflight-before-sockets), used nowhere else,
+  and the Swift sources just passed the full Phase 7 live smokes; relocating
+  code in a file with no Swift test runner would invalidate that evidence for
+  zero behavioural gain. (2026-06-11)
+- **[Architecture] analysis-error**: `permission_event` "is not documented in
+  the data-flow comment near `device_state`" — it is: the comment block at the
+  declaration site in `_supervise_socket_session` (directly under the
+  `device_state` comment) documents who sets it and who reads it. (2026-06-11)

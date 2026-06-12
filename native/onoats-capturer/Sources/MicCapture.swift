@@ -130,6 +130,16 @@ final class MicCapture {
         worker = workerThread
         workerThread.start()
 
+        // Pacer BEFORE bind (live finding, 2026-06-11 22:26 smoke): the HAL
+        // bind/start calls below can block >10 s — observed with the
+        // system-audio TCC dialog still pending and a Bluetooth default input
+        // (AirPods) activating — and the recorder's read-idle clock is already
+        // running by the time start() is called. The system branch survived
+        // that exact window only because its pacer was already emitting
+        // silence; activating the mic chunker first gives this branch the
+        // same protection (paced silence until the device delivers data).
+        chunker.activate()
+
         try bind()
 
         var addr = AudioObjectPropertyAddress(
@@ -144,7 +154,6 @@ final class MicCapture {
             logLine("WARNING mic: could not install device-change listener (\(fourCC(err)))")
         }
 
-        chunker.activate()
         running = true
     }
 
