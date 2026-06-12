@@ -229,10 +229,13 @@ class OnoatsConfig:
         ``None`` for the backend, never the literal string (whisper rejects
         a literal "auto"). Not consumed by the Deepgram backend.
         """
-        return str(
-            _env_or("STT_WS_LANGUAGE", self.raw.get("stt", {}).get("language"))
-            or _DEFAULTS["stt"]["language"]
+        # strip-then-default: a whitespace-only file value must fall back to
+        # "en", not reach the backend as language="" (env values are already
+        # strip-guarded inside _env_or).
+        val = str(
+            _env_or("STT_WS_LANGUAGE", self.raw.get("stt", {}).get("language")) or ""
         ).strip()
+        return val or _DEFAULTS["stt"]["language"]
 
     # websocket endpoint (env wins; else config.toml [stt].ws_*). None when
     # neither set — the runtime then falls back to the built-in default socket.

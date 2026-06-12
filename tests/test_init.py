@@ -132,14 +132,23 @@ def test_idempotent_rerun_preserves_values(_isolate_env, monkeypatch):
         init_mod.main(["--categories", "work", "--me-name", "Ann", "--no-preflight"])
         == 0
     )
-    # Re-run with no flags (non-TTY) — must keep the prior categories + me-name.
+    # Simulate a hand-edited (or wizard-written) language, then re-run with no
+    # flags (non-TTY) — must keep the prior categories + me-name + language.
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace(
+            '[stt]\nservice = "', '[stt]\nlanguage = "auto"\nservice = "'
+        )
+    )
     _force_tty(monkeypatch, value=False)
     assert init_mod.main(["--no-preflight"]) == 0
-    from onoats.config import config_toml_path
 
     cfg = _load_toml(config_toml_path())
     assert "work" in cfg["categories"]["set"]
     assert cfg["speakers"]["me"] == "Ann"
+    assert cfg["stt"]["language"] == "auto"
 
 
 # ---------------------------------------------------------------------------

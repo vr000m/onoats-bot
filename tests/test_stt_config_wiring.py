@@ -69,6 +69,16 @@ def test_env_language_overrides_config(monkeypatch):
     assert cfg.stt_language == "de"
 
 
+def test_whitespace_only_language_falls_back_to_en(monkeypatch):
+    """A whitespace-only file value must resolve to "en", never reach the
+    backend as language="" (the pre-config inline code had this guard too).
+    """
+    monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
+    assert OnoatsConfig(raw={"stt": {"language": "   "}}).stt_language == "en"
+    monkeypatch.setenv("STT_WS_LANGUAGE", "   ")
+    assert OnoatsConfig(raw={}).stt_language == "en"
+
+
 def test_resolve_stt_language_maps_auto_to_none(monkeypatch):
     """``auto`` must reach the backends as None, never the literal string.
 
