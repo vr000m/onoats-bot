@@ -605,9 +605,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
   PASSED live 2026-06-11; fresh-clone + pre-init verifies DEFERRED to the
   next fresh-machine install — see Findings; post-merge: push `spike-archive`
   tag on `7ac0b2e`)
-- [ ] Phase 7 — Tap preflight (1.0.0 gate; PR #17 open 2026-06-11 —
-  implementation + unit tests + parity pins done; live smokes
-  (prompt-pending Start / Don't Allow / rc=10 re-smoke) pending user)
+- [ ] Phase 7 — Tap preflight (1.0.0 gate; PR #17 — implementation + unit
+  tests + parity pins done; all three live smokes PASSED 2026-06-11, see
+  Findings; awaiting review gauntlet + merge)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
 - [ ] Phase 10 — Cut v1.0.0
@@ -759,3 +759,16 @@ retrieval is `git checkout spike-archive -- native/spike`.
   attach until the device delivers). Also recorded: the first smoke round
   (17:49–17:53) ran the pre-Phase-7 capturer binary (app not reinstalled)
   and faithfully reproduced both old failure modes — a useful baseline.
+- **Phase 7 live smokes PASSED (user, GUI topology, 2026-06-11 22:38–22:47,
+  binary with `9ea72ba` mic-pacer fix).** (1) Allow-after-pause: prompt left
+  unanswered ~36 s → menu showed "starting…", supervisor extended at 10 s
+  (+120 s), Allow → tap → sockets → recording with NO second Start; bonus
+  zero-run warn/clear cycle observed. (2) Don't Allow: tap creation
+  SUCCEEDED on denial (re-confirms denied-taps-deliver-zeros), session
+  recorded since 22:42, system zero-run warning ≈30 s in and persisting, no
+  fatal_error_frame; the mic pacer visibly saved the session (500 paced
+  filler frames ≈10 s before "mic: capturing from AirPods Pro 2" — would
+  have read-idled pre-fix). (3) Mic-denial: rc=10 in ~56 ms pre-socket,
+  fresh `mic-denied` status ("capturer exited (rc=10) before creating its
+  sockets"). All three observables verified against
+  ~/Library/Logs/Onoats/onoats-bot.log timestamps.
