@@ -91,6 +91,10 @@ func listAggregates() {
         AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size),
         "get device-list size") else { return }
     let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    if count == 0 {
+        print("RESIDUE: none")
+        return
+    }
     var devices = [AudioObjectID](repeating: 0, count: count)
     guard ck(AudioObjectGetPropertyData(
         AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &devices),

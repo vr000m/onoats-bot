@@ -135,7 +135,11 @@ install: sign install-cli
 # config.toml: re-running setup must never clobber an existing config. The
 # CLI is invoked via its stable shim path — a fresh shell may not have
 # ~/.local/bin on PATH yet.
-setup: cert install
+# Recursive $(MAKE) (not prerequisites): cert MUST complete before install's
+# check-identity, and prerequisite order is not guaranteed under `make -j`.
+setup:
+	$(MAKE) cert
+	$(MAKE) install
 	@CONFIG="$${XDG_CONFIG_HOME:-$$HOME/.config}/onoats/config.toml"; \
 	if [ -f "$$CONFIG" ]; then \
 	  echo "✓ $$CONFIG exists — skipping 'onoats init' (delete it to re-run)"; \

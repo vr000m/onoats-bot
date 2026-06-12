@@ -23,6 +23,7 @@ Prerequisites on a fresh machine (everything else is handled by `setup`):
 ```bash
 xcode-select --install    # Xcode Command Line Tools (swiftc, git, codesign)
 curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (installs the CLI)
+# then open a new shell (or follow the installer's PATH note) so `uv` resolves
 ```
 
 ```bash
