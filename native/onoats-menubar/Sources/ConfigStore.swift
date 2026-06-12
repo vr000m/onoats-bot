@@ -17,8 +17,11 @@
 // stay plain basic strings. tomllib accepts a superset, so a hand-edited
 // fancy value for a GUI-managed key reads back wrong here (readValue returns
 // the raw right-hand side) while the Python side parses it fine — keep
-// GUI-managed keys ([stt].service, [storage].data_dir) plain. The round-trip
-// subset is parity-checked by tests/test_native_contract_parity.py.
+// GUI-managed keys ([stt].service, [storage].data_dir) plain. CRLF files are
+// tolerated: line scanning strips a trailing \r, untouched lines keep their
+// original bytes (CRLF verbatim), and the one edited/inserted line is written
+// with LF — tomllib accepts the mixed-ending result. The round-trip subset is
+// parity-checked by tests/test_native_contract_parity.py.
 import Foundation
 
 struct ConfigWriteError: Error, CustomStringConvertible {
@@ -64,7 +67,12 @@ enum ConfigStore {
         }
         var current = ""
         for rawLine in text.components(separatedBy: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            // .whitespacesAndNewlines (NOT .whitespaces, which excludes \r):
+            // a CRLF file's "[section]\r" must still register as a header,
+            // else every lookup misses and writeValue appends a duplicate
+            // section that tomllib rejects. Parity-pinned by
+            // tests/test_native_contract_parity.py.
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.hasPrefix("["), line.hasSuffix("]") {
                 current = String(line.dropFirst().dropLast())
                     .trimmingCharacters(in: .whitespaces)  // tolerate hand-edited [ stt ]
@@ -132,7 +140,8 @@ enum ConfigStore {
         var sectionHeaderIdx: Int? = nil
         var keyIdx: Int? = nil
         for (i, rawLine) in lines.enumerated() {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            // CRLF-tolerant scan; see the matching comment in readValue.
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.hasPrefix("["), line.hasSuffix("]") {
                 current = String(line.dropFirst().dropLast())
                     .trimmingCharacters(in: .whitespaces)  // tolerate hand-edited [ stt ]

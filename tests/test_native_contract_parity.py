@@ -245,3 +245,277 @@ def test_configstore_escaping_round_trips_through_tomllib(value: str):
     doc = f'[storage]\ndata_dir = "{escaped}"\n'
     parsed = tomllib.loads(doc)
     assert parsed["storage"]["data_dir"] == value
+
+
+def _swift_write_value(text: str, section: str, key: str, value: str) -> str:
+    """Line-by-line Python model of ConfigStore.writeValue (Swift).
+
+    Mirrors the Swift writer exactly — same line split (components on "\\n",
+    which keeps a CRLF file's "\\r" attached to each line), same
+    whitespace-and-newline trim for scanning, same escape rules, same
+    replace/insert/append placement, same "\\n" join. Structural drift between
+    this model and the Swift source is caught by
+    test_configstore_writer_structure_matches_python_model below; behavioural
+    drift is caught by the round-trip tests that use this model.
+    """
+    # Swift: escape() — backslash first, then double-quote.
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    # Swift: text.components(separatedBy: "\n") — \r stays on the line.
+    lines = text.split("\n")
+    new_line = f'{key} = "{escaped}"'
+
+    current = ""
+    section_header_idx: int | None = None
+    key_idx: int | None = None
+    for i, raw_line in enumerate(lines):
+        # Swift: trimmingCharacters(in: .whitespacesAndNewlines) — the
+        # CRLF-tolerant scan (a bare .whitespaces would leave "\r" on the
+        # line and miss every "[section]\r" header).
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()  # tolerate hand-edited [ stt ]
+            if current == section:
+                section_header_idx = i
+            continue
+        if current != section or line.startswith("#"):
+            continue
+        eq = line.find("=")
+        if eq != -1 and line[:eq].strip() == key:
+            key_idx = i
+            break  # Swift breaks on the FIRST in-section match
+
+    if key_idx is not None:
+        lines[key_idx] = new_line
+    elif section_header_idx is not None:
+        lines.insert(section_header_idx + 1, new_line)
+    else:
+        if text and lines[-1] != "":
+            lines.append("")
+        lines.append(f"[{section}]")
+        lines.append(new_line)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _assert_untouched_lines_byte_identical(
+    before: str, after: str, touched_after_idx: int, inserted: bool = False
+) -> None:
+    """Every output line except the edited/inserted one must be byte-identical
+    to its input counterpart — the writer's core promise (comments and
+    formatting elsewhere survive verbatim, CRLF terminators included)."""
+    before_lines = before.split("\n")
+    after_lines = after.split("\n")
+    if inserted:
+        rest = after_lines[:touched_after_idx] + after_lines[touched_after_idx + 1 :]
+        assert rest == before_lines
+    else:
+        assert len(after_lines) == len(before_lines)
+        for i, (b, a) in enumerate(zip(before_lines, after_lines)):
+            if i != touched_after_idx:
+                assert a == b, f"untouched line {i} changed: {b!r} -> {a!r}"
+
+
+def test_configstore_writer_structure_matches_python_model():
+    """Greps pinning the Swift writer's structural shape to the Python model
+    above: split on \\n, CRLF-tolerant trim in BOTH scan loops (readValue and
+    writeValue), in-place replace, insert at header+1, join with \\n. A Swift
+    refactor that breaks any of these invalidates every round-trip test below."""
+    text = (
+        REPO / "native" / "onoats-menubar" / "Sources" / "ConfigStore.swift"
+    ).read_text(encoding="utf-8")
+    assert text.count('components(separatedBy: "\\n")') == 2, (
+        "line split changed — model splits on bare \\n with \\r kept on lines"
+    )
+    assert text.count("trimmingCharacters(in: .whitespacesAndNewlines)") == 2, (
+        "both scan loops must trim with .whitespacesAndNewlines — bare "
+        ".whitespaces excludes \\r, so a CRLF file's `[section]\\r` header is "
+        "never recognised and writeValue appends a duplicate section that "
+        "tomllib rejects (the Phase-9 CRLF divergence)"
+    )
+    assert "lines[i] = newLine" in text
+    assert "lines.insert(newLine, at: header + 1)" in text
+    assert 'joined(separator: "\\n")' in text
+
+
+def test_configstore_write_preserves_comments_on_other_lines():
+    """Whole-line comments and trailing comments on UNTOUCHED lines survive
+    byte-identically; the edited value updates; the result still parses."""
+    doc = (
+        "# top-of-file comment\n"
+        "[storage]\n"
+        "# section comment\n"
+        'data_dir = "/old"\n'
+        'note = "keep"  # trailing comment on a neighbour\n'
+    )
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["storage"]["note"] == "keep"
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=3)
+
+
+def test_configstore_write_drops_trailing_comment_on_edited_line_only():
+    """The edited line is rewritten wholesale, so a trailing comment ON THAT
+    LINE is dropped — the documented cost of a line editor. Every other line
+    (including the other commented neighbour) is byte-identical, and the
+    output parses."""
+    doc = (
+        "[storage]\n"
+        'data_dir = "/old"  # chosen in the GUI\n'
+        'note = "keep"  # untouched trailing comment\n'
+    )
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    out_lines = out.split("\n")
+    assert out_lines[1] == 'data_dir = "/new"'  # comment gone, by contract
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=1)
+
+
+def test_configstore_write_tolerates_whitespace_variants():
+    """Hand-edited `[ storage ]` headers and padded `key   =   "v"` lines are
+    still found; the replacement is canonical `key = "value"`; padded
+    neighbours keep their padding byte-for-byte."""
+    doc = '  [ storage ]  \n  data_dir   =   "/old"  \n\tnote =\t"keep"\n'
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["storage"]["note"] == "keep"
+    assert out.split("\n")[1] == 'data_dir = "/new"'  # canonical form
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=1)
+
+
+def test_configstore_write_absent_section_appends_at_end():
+    """Missing section: a blank separator + `[section]` + the key line are
+    appended; the original document is a byte-identical prefix; the result
+    parses with both tables intact."""
+    doc = '[stt]\nservice = "whisper"'  # no trailing newline, exercises padding
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["stt"]["service"] == "whisper"
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert out.startswith(doc), "original bytes must be an untouched prefix"
+    # The writer pads a blank separator line before the appended section.
+    assert out == doc + '\n\n[storage]\ndata_dir = "/new"\n'
+
+
+def test_configstore_write_absent_key_inserts_after_header():
+    """Section exists, key doesn't: the new line lands directly under the
+    header; every original line is byte-identical; the result parses."""
+    doc = "[storage]\n# keep me adjacent to the header\nother = 3\n"
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["storage"]["other"] == 3
+    assert out.split("\n")[1] == 'data_dir = "/new"'
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=1, inserted=True)
+
+
+def test_configstore_write_same_key_name_in_another_section_untouched():
+    """Key matching is section-scoped: the same key name in a different
+    section is not the writer's target and stays byte-identical (this is the
+    VALID-toml duplicate-key-name case; in-section duplicates are below)."""
+    doc = '[stt]\ndata_dir = "/stt-scratch"\n\n[storage]\ndata_dir = "/old"\n'
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["stt"]["data_dir"] == "/stt-scratch"
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=4)
+
+
+def test_configstore_write_duplicate_key_in_section_replaces_first_only():
+    """In-section duplicate keys are INVALID TOML on the way in (tomllib
+    rejects the input), so there is no parse contract to keep — the writer's
+    actual behaviour, modelled from the Swift `break` on first match, is:
+    replace the first occurrence, leave the second byte-identical. The output
+    is still duplicate-keyed (the writer never repairs a broken file), so
+    tomllib must reject it too — garbage in, the same garbage shape out."""
+    doc = '[storage]\ndata_dir = "/first"\ndata_dir = "/second"\n'
+    with pytest.raises(tomllib.TOMLDecodeError):
+        tomllib.loads(doc)  # the input was never valid
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    out_lines = out.split("\n")
+    assert out_lines[1] == 'data_dir = "/new"'
+    assert out_lines[2] == 'data_dir = "/second"'  # second occurrence untouched
+    with pytest.raises(tomllib.TOMLDecodeError):
+        tomllib.loads(out)
+
+
+def test_configstore_write_preserves_non_string_neighbours():
+    """Non-string scalars adjacent to the edited key (outside the writer's
+    subset, but legal tomllib input) pass through byte-identically with their
+    types intact — the writer only ever rewrites its one target line."""
+    doc = '[storage]\nmax_files = 5\ndata_dir = "/old"\ncompress = true\nratio = 0.5\n'
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"] == {
+        "max_files": 5,
+        "data_dir": "/new",
+        "compress": True,
+        "ratio": 0.5,
+    }
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=2)
+
+
+def test_configstore_write_untouched_line_byte_identity_across_sections():
+    """Belt-and-braces sweep: a document mixing comments, blank lines,
+    padding, and multiple sections — every byte outside the single edited
+    line survives, and the result round-trips through tomllib."""
+    doc = (
+        "# onoats config\n"
+        "\n"
+        "[stt]\n"
+        'service = "whisper"  # picked in the menu\n'
+        "\n"
+        "  [ storage ]\n"
+        "# data lives here\n"
+        'data_dir = "/old"\n'
+        "max_files = 5\n"
+        "\n"
+        "[devices]\n"
+        'mic = "Built-in"\n'
+    )
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["stt"]["service"] == "whisper"
+    assert parsed["devices"]["mic"] == "Built-in"
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=7)
+
+
+def test_configstore_write_crlf_untouched_lines_verbatim_edited_line_lf():
+    """CRLF contract (pinned in the release plan): untouched lines keep their
+    original bytes — CRLF terminators verbatim — while the edited line is
+    written with LF, and the mixed-ending result still parses under tomllib.
+    Before the Phase-9 fix, the Swift scan trimmed with .whitespaces (which
+    excludes \\r), so `[storage]\\r` was never seen as a header and writeValue
+    appended a DUPLICATE [storage] section that tomllib rejected."""
+    doc = '# saved on Windows\r\n[storage]\r\ndata_dir = "/old"\r\nnote = "keep"\r\n'
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["storage"]["note"] == "keep"
+    out_lines = out.split("\n")
+    assert out_lines[0] == "# saved on Windows\r"  # CRLF verbatim
+    assert out_lines[1] == "[storage]\r"  # CRLF verbatim
+    assert out_lines[2] == 'data_dir = "/new"'  # edited line: LF, no \r
+    assert out_lines[3] == 'note = "keep"\r'  # CRLF verbatim
+    assert "[storage]" in out and out.count("[storage]") == 1, (
+        "a second [storage] header means the CRLF header was not recognised "
+        "— the pre-fix divergence"
+    )
+
+
+def test_configstore_write_crlf_absent_key_inserts_lf_line():
+    """Same CRLF contract on the insert path: the new key lands under the
+    CRLF header as an LF-terminated line; all original CRLF lines verbatim."""
+    doc = "[storage]\r\nmax_files = 5\r\n"
+    out = _swift_write_value(doc, "storage", "data_dir", "/new")
+    parsed = tomllib.loads(out)
+    assert parsed["storage"]["data_dir"] == "/new"
+    assert parsed["storage"]["max_files"] == 5
+    out_lines = out.split("\n")
+    assert out_lines[0] == "[storage]\r"
+    assert out_lines[1] == 'data_dir = "/new"'
+    assert out_lines[2] == "max_files = 5\r"
+    _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=1, inserted=True)
