@@ -626,9 +626,9 @@ retrieval is `git checkout spike-archive -- native/spike`.
   PASSED live 2026-06-11; fresh-clone + pre-init verifies DEFERRED to the
   next fresh-machine install — see Findings; post-merge: push `spike-archive`
   tag on `7ac0b2e`)
-- [ ] Phase 7 — Tap preflight (1.0.0 gate; PR #17 — implementation + unit
-  tests + parity pins done; all three live smokes PASSED 2026-06-11, see
-  Findings; awaiting review gauntlet + merge)
+- [x] Phase 7 — Tap preflight (1.0.0 gate; PR #17 merged 2026-06-12,
+  `46894fe` — implementation + unit tests + parity pins; all three live
+  smokes PASSED 2026-06-11, see Findings)
 - [ ] Phase 8 — BlackHole pruning (1.0.0 gate)
 - [ ] Phase 9 — ConfigStore parity tests (1.0.0 gate)
 - [ ] Phase 10 — Cut v1.0.0
@@ -718,7 +718,8 @@ retrieval is `git checkout spike-archive -- native/spike`.
   2026-06-11) against the production-binary checker** before any deletion.
   **`spike-archive` tag target: `7ac0b2e`** — the last commit containing
   `native/spike/` (parent of the deletion commit `9f4c15f`); user pushes the
-  tag after the regular merge. Sweep interpretation: every dangling
+  tag after the regular merge. **DONE 2026-06-12: annotated `spike-archive`
+  tag created on `7ac0b2e` and pushed to origin.** Sweep interpretation: every dangling
   *path* reference cleared (native/README run-book sections → archived
   History note carrying the durable conclusions; source comments → tag
   pointer); pure historical prose with no path stays; dev plans untouched as

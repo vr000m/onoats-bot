@@ -72,6 +72,17 @@ make -C native setup     # fresh clone, one command: cert (no-op if the
 invalidate the TCC grants — `make_cert.sh` refuses), and an existing
 `config.toml` is never touched. Updating after a `git pull` is
 `make -C native install` (everything `setup` does minus cert + init).
+
+For terminal-driven use without the menu-bar app there is
+`make -C native setup-cli`: cert → build + sign the **bare** capturer
+(`build/onoats-capturer`, signed with the same identity + identifier, so the
+designated requirement matches the bundle's) → `install-cli` → guided init.
+It prints the `AUDIO_SOURCE=socket ONOATS_CAPTURER_BIN=… onoats bot` run line
+at the end. Same idempotency as `setup`. Caveat: launched from a terminal,
+TCC grants attribute to the terminal app, not to onoats (see "Launch from
+`~/Applications`" below); and a later `make build`/`make setup` recompile
+drops the bare binary's signature — re-run `setup-cli` after updates.
+
 What each kind of change needs:
 
 | Change                     | Needed action                                  |

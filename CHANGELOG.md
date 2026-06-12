@@ -15,7 +15,20 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+- `make -C native setup-cli` (release-plan Phase 8): one-command CLI +
+  native-capture install (cert → capturer build/sign → CLI shim → `onoats
+  init`) that skips the menu-bar app bundle. README now documents the three
+  install paths side by side: menubar (`setup`), CLI + native capture
+  (`setup-cli`, macOS 14.4+), and CLI + PortAudio (toolchain-free, see
+  `docs/blackhole-fallback.md`).
+
 ### Changed
+- BlackHole prose pruned to the conservative keep-list (release-plan
+  Phase 8): redundant README mentions and the `pyproject.toml` `[macos]`
+  comment now point at `docs/blackhole-fallback.md`; the `_LOOPBACK_HINTS`
+  auto-detection, no-loopback NOTE, backend help text, and all config-wiring
+  tests are unchanged.
 - Pre-socket tap preflight (release-plan Phase 7, PR #17): the capturer makes
   the TCC-prompting tap call **before** binding its sockets, announced by
   `ONOATS-EVENT waiting-for-permission`. A first Start with the Screen &

@@ -10,8 +10,16 @@ a PortAudio input device:
 - Linux / Windows / Intel macs without the native capturer
 - any setup where you prefer not to build the native capturer
 
-This is the default `portaudio` audio source — no native build required, just
-`uv tool install --editable .` plus the driver below.
+This is the default `portaudio` audio source. There is deliberately **no make
+target** for it — this path must not require the native toolchain (`make`,
+`swiftc`, `codesign`). The whole install, after cloning the repo, is:
+
+```bash
+uv tool install --editable .   # the CLI ('.[macos]' on Apple Silicon adds Whisper-MLX)
+onoats init                    # guided setup → config.toml + 0600 secrets.env
+```
+
+plus the loopback driver below.
 
 ## 1. Install a loopback driver
 

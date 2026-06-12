@@ -27,11 +27,9 @@ dependencies = [
 # macOS-only acceleration. Apple Silicon Whisper (mlx-whisper) + Kokoro TTS.
 # Install with `uv tool install 'onoats[macos]'`. NOT in the baseline — the
 # off-mac baseline (PortAudio + Deepgram/TCP STT) ships MLX-free.
-# The CoreAudio system-capture path — the default macOS (14.4+) capture story,
-# no loopback driver — ships as a native binary built from source
-# (`make -C native install`, see native/README.md), NOT as a Python
-# dependency, so it never appears here. BlackHole/PortAudio remains the
-# fallback below macOS 14.4 and off-mac.
+# The native macOS capturer is built from source (see native/README.md), never
+# a Python dependency; the PortAudio/loopback fallback for everything else is
+# documented in docs/blackhole-fallback.md.
 macos = [
     "mlx-whisper>=0.4.0",
     "kokoro-onnx>=0.4.0",
