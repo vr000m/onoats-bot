@@ -25,6 +25,11 @@ First PyPI release (`pip install onoats` / `uv tool install onoats`).
   metadata (readme, authors, URLs, classifiers) added for the PyPI page.
 
 ### Added
+- Tag-triggered PyPI publish via GitHub Actions trusted publishing
+  (`.github/workflows/release.yml`): pushing a `v*` tag runs the full suite
+  plus two guards (tag == pyproject version; no direct-URL deps in wheel
+  metadata), then publishes via OIDC behind the `pypi` GitHub environment —
+  no stored token.
 - `[stt] language` in `config.toml`: the STT decode language is now a
   first-class config key (env `STT_LANGUAGE` > legacy alias `STT_WS_LANGUAGE`
   > `[stt].language` > `en`),

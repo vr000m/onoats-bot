@@ -69,6 +69,17 @@ surfaces** that must agree — `pyproject.toml`, the `uv.lock` onoats entry
 tag time by `scripts/release_check.sh vX.Y.Z <commit>` (run before pushing
 any release tag).
 
+Releasing to PyPI (v1.1.0+): pushing a `v*` tag triggers
+`.github/workflows/release.yml` — full suite + two guards (tag must equal
+the pyproject version; wheel metadata must carry no direct-URL deps), then
+publish via PyPI **trusted publishing** (OIDC, no stored token) gated behind
+the GitHub `pypi` environment. One-time prerequisites: a PyPI trusted
+publisher (project `onoats`, repo `vr000m/onoats-bot`, workflow
+`release.yml`, environment `pypi`) and the GitHub `pypi` environment itself.
+PyPI rejects direct-URL `Requires-Dist` entries — dependencies must come
+from PyPI (this is why `pipecat-local-stt-server` is a `>=0.1.2,<0.2`
+registry dep, not a git pin).
+
 ## Supervisor ↔ capturer lifecycle (`cli._run_socket_supervisor`)
 
 - The **supervisor owns the capturer process.** It mints a private `0700` socket
