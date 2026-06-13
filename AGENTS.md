@@ -201,3 +201,15 @@ should NOT re-flag go here, one per line:
   the data-flow comment near `device_state`" — it is: the comment block at the
   declaration site in `_supervise_socket_session` (directly under the
   `device_state` comment) documents who sets it and who reads it. (2026-06-11)
+- **[Architecture] won't-fix**: the `auto`→`None` STT-language mapping lives in
+  `runtime._resolve_stt_language`, not in `OnoatsConfig.stt_language` —
+  deliberate: the property stays a plain `str` for parity with `stt_model`,
+  its docstring states the runtime does the mapping, and `_create_stt_service`
+  is the single consumer. Moving it would change the property's type contract
+  (`str | None`) for no caller. (2026-06-12)
+- **[Architecture] won't-fix**: `[stt].language` has no Swift menu-bar picker
+  or parity-test entry — intentional: the key is CLI/file-managed (like
+  `ws_socket`); the menu bar exposes config.toml via its open-config dropdown,
+  which is the supported edit path, and `ConfigStore` round-trips arbitrary
+  keys without code changes. A GUI picker would be a separate feature.
+  (2026-06-12)

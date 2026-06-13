@@ -182,8 +182,9 @@ the terminal instead). It lives in the menu bar with no Dock icon.
 `onoats init` writes:
 
 - `$XDG_CONFIG_HOME/onoats/config.toml` — `[storage]` (`data_dir`), `[devices]`
-  (by name), `[stt]`, `[speakers]` (render-only display labels), `[categories]`,
-  `[tuning]`.
+  (by name), `[stt]` (`service`, `model`, `language` — `"en"` default, `"auto"`
+  = detect; whisper + websocket backends only), `[speakers]` (render-only
+  display labels), `[categories]`, `[tuning]`.
 - `$XDG_CONFIG_HOME/onoats/secrets.env` — `0600`, STT secrets only
   (`DEEPGRAM_API_KEY` / `STT_WS_TOKEN`). **No LLM keys.**
 - `$XDG_CONFIG_HOME/onoats/dictionary.txt` — `wrong: correct` substitutions

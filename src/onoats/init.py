@@ -193,6 +193,14 @@ def _configure_stt_interactive(existing: dict) -> tuple[dict, dict]:
             )
             if model:
                 stt["model"] = model
+        # Consumed by both local backends (whisper + websocket); Deepgram
+        # ignores it, so the prompt lives in the `local` branch only.
+        lang = _prompt(
+            "STT language (blank = en, 'auto' = detect)",
+            existing.get("language"),
+        )
+        if lang:
+            stt["language"] = lang
     else:
         stt["service"] = _HOSTED_DEEPGRAM
         model = _prompt(
@@ -203,6 +211,10 @@ def _configure_stt_interactive(existing: dict) -> tuple[dict, dict]:
         key = _prompt("Deepgram API key (stored 0600 in secrets.env)")
         if key:
             secrets["DEEPGRAM_API_KEY"] = key
+        # Deepgram doesn't consume the language, but carry an existing value
+        # forward so switching backends and back doesn't silently drop it.
+        if existing.get("language"):
+            stt["language"] = existing["language"]
     return stt, secrets
 
 
@@ -293,6 +305,8 @@ def _render_config_toml(
         lines.append(f'model = "{_toml_escape(stt["model"])}"')
     if stt.get("ws_socket"):
         lines.append(f'ws_socket = "{_toml_escape(stt["ws_socket"])}"')
+    if stt.get("language"):
+        lines.append(f'language = "{_toml_escape(stt["language"])}"')
     lines.append("")
     lines.append("[speakers]")
     lines.append(f'me = "{_toml_escape(speakers.get("me", "Me"))}"')
@@ -500,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
         ws_socket = args.ws_socket or existing_stt.get("ws_socket")
         if ws_socket:
             stt["ws_socket"] = ws_socket
+        language = existing_stt.get("language")
+        if language:
+            stt["language"] = language
         if args.deepgram_key:
             secrets["DEEPGRAM_API_KEY"] = args.deepgram_key
 

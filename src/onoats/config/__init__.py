@@ -15,7 +15,8 @@ anything. A missing ``config.toml`` is not an error — sensible defaults apply.
 
     [storage]   data_dir = "..."                       # recorder data root (else XDG)
     [devices]   mic = "...", system = "..."           # by stable device name
-    [stt]       service = "...", model = "...", ws_socket/ws_host/ws_port/ws_uri = "..."
+    [stt]       service = "...", model = "...", language = "en"|"auto"|<code>,
+                ws_socket/ws_host/ws_port/ws_uri = "..."
     [speakers]  me = "Me", them = "Them"               # RENDER-ONLY display labels
     [categories] set = ["uncategorized", ...]
     [tuning]    silence_timeout_sec / segment_hint_threshold / audio_heartbeat_sec
@@ -70,7 +71,7 @@ def secrets_env_path() -> Path:
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
     "audio": {"source": "portaudio"},
-    "stt": {"service": "whisper", "model": ""},
+    "stt": {"service": "whisper", "model": "", "language": "en"},
     "speakers": {"me": "Me", "them": "Them"},
     "categories": {"set": ["uncategorized"]},
     "tuning": {
@@ -218,6 +219,31 @@ class OnoatsConfig:
             _env_or("STT_MODEL", self.raw.get("stt", {}).get("model"))
             or _DEFAULTS["stt"]["model"]
         ).strip()
+
+    @property
+    def stt_language(self) -> str:
+        """Decode language for the whisper/websocket backends.
+
+        env ``STT_LANGUAGE`` > env ``STT_WS_LANGUAGE`` (legacy alias) >
+        config.toml ``[stt].language`` > ``"en"``. The bare name matches the
+        other cross-backend vars (``STT_SERVICE`` / ``STT_MODEL``); the
+        ``STT_WS_``-prefixed alias predates the key applying beyond the
+        websocket backend and is kept for backward compatibility.
+        ``"auto"`` (any case) means auto-detect — the runtime maps it to
+        ``None`` for the backend, never the literal string (whisper rejects
+        a literal "auto"). Not consumed by the Deepgram backend.
+        """
+        # strip-then-default: a whitespace-only file value must fall back to
+        # "en", not reach the backend as language="" (env values are already
+        # strip-guarded inside _env_or).
+        val = str(
+            _env_or(
+                "STT_LANGUAGE",
+                _env_or("STT_WS_LANGUAGE", self.raw.get("stt", {}).get("language")),
+            )
+            or ""
+        ).strip()
+        return val or _DEFAULTS["stt"]["language"]
 
     # websocket endpoint (env wins; else config.toml [stt].ws_*). None when
     # neither set — the runtime then falls back to the built-in default socket.
