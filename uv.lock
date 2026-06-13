@@ -2107,7 +2107,7 @@ wheels = [
 
 [[package]]
 name = "onoats"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "loguru" },
@@ -2135,7 +2135,7 @@ requires-dist = [
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "mlx-whisper", marker = "extra == 'macos'", specifier = ">=0.4.0" },
     { name = "pipecat-ai", extras = ["deepgram", "google", "local", "runner", "silero", "soundfile", "webrtc", "whisper"], specifier = ">=1.0.0,<2.0.0" },
-    { name = "pipecat-local-stt-server", git = "https://github.com/vr000m/pipecat-local-stt-server.git?rev=5062b984b164baec1e2396cf412888b2b64f2fa1" },
+    { name = "pipecat-local-stt-server", specifier = ">=0.1.2,<0.2" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "websockets", specifier = ">=13.0" },
 ]
@@ -2352,9 +2352,13 @@ wheels = [
 [[package]]
 name = "pipecat-local-stt-server"
 version = "0.1.2"
-source = { git = "https://github.com/vr000m/pipecat-local-stt-server.git?rev=5062b984b164baec1e2396cf412888b2b64f2fa1#5062b984b164baec1e2396cf412888b2b64f2fa1" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/91/f0/b276694a03e6da0fa33c5275bb680bd9b85316ab54e5cccfac471661595c/pipecat_local_stt_server-0.1.2.tar.gz", hash = "sha256:1a4fbdc1f020b46a8a30e8af5c6da63ea4da22ddbee5a0d7f6fb6ab48dfb1770", size = 192315, upload-time = "2026-05-30T18:14:21.306Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f7/18/7f6b619550b70f4689c10ba59d6e458f678e227fd1017db8103b4a0687ab/pipecat_local_stt_server-0.1.2-py3-none-any.whl", hash = "sha256:52a325f4878af14833d44708c3eebc36c4f49414584e9ff0c48bc924069ee40e", size = 53267, upload-time = "2026-05-30T18:14:20.236Z" },
 ]
 
 [[package]]

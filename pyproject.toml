@@ -10,18 +10,37 @@ build-backend = "hatchling.build"
 
 [project]
 name = "onoats"
-version = "1.0.0"
+version = "1.1.0"
 description = "Standalone onoats voice recorder (extracted from koda)."
+readme = "README.md"
 license = "BSD-2-Clause"
+authors = [{ name = "Varun Singh" }]
 # >=3.12: the pinned pipecat-local-stt-server requires Python >=3.12.
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+]
 dependencies = [
     "pipecat-ai[deepgram,google,local,runner,silero,soundfile,webrtc,whisper]>=1.0.0,<2.0.0",
-    "pipecat-local-stt-server @ git+https://github.com/vr000m/pipecat-local-stt-server.git@5062b984b164baec1e2396cf412888b2b64f2fa1",
+    # 0.1.2 is the PyPI release of the exact commit previously pinned by git
+    # URL (5062b98 == tag v0.1.2). <0.2 until the 0.2/0.3 wire protocol is
+    # smoke-tested live against the recorder.
+    "pipecat-local-stt-server>=0.1.2,<0.2",
     "websockets>=13.0",
     "python-dotenv>=1.2.1",
     "loguru>=0.7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/vr000m/onoats-bot"
+Changelog = "https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md"
+Issues = "https://github.com/vr000m/onoats-bot/issues"
 
 [project.optional-dependencies]
 # macOS-only acceleration. Apple Silicon Whisper (mlx-whisper) + Kokoro TTS.
@@ -37,10 +56,6 @@ macos = [
 
 [project.scripts]
 onoats = "onoats.cli:main"
-
-[tool.hatch.metadata]
-# Allow the git+https direct reference for pipecat-local-stt-server.
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/onoats"]
