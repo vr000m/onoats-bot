@@ -53,26 +53,41 @@ def test_stt_service_defaults_to_whisper_when_unset(monkeypatch):
 
 
 def test_stt_language_defaults_to_en(monkeypatch):
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
     monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
     assert OnoatsConfig(raw={}).stt_language == "en"
 
 
 def test_stt_language_from_config_toml(monkeypatch):
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
     monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
     cfg = OnoatsConfig(raw={"stt": {"language": "sv"}})
     assert cfg.stt_language == "sv"
 
 
 def test_env_language_overrides_config(monkeypatch):
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
     monkeypatch.setenv("STT_WS_LANGUAGE", "de")
     cfg = OnoatsConfig(raw={"stt": {"language": "sv"}})
     assert cfg.stt_language == "de"
+
+
+def test_stt_language_env_beats_legacy_alias_and_config(monkeypatch):
+    """STT_LANGUAGE is the canonical env var (cross-backend, like STT_SERVICE /
+    STT_MODEL); STT_WS_LANGUAGE survives as a legacy alias below it.
+    """
+    monkeypatch.setenv("STT_LANGUAGE", "fi")
+    monkeypatch.setenv("STT_WS_LANGUAGE", "de")
+    assert OnoatsConfig(raw={"stt": {"language": "sv"}}).stt_language == "fi"
+    monkeypatch.delenv("STT_LANGUAGE")
+    assert OnoatsConfig(raw={"stt": {"language": "sv"}}).stt_language == "de"
 
 
 def test_whitespace_only_language_falls_back_to_en(monkeypatch):
     """A whitespace-only file value must resolve to "en", never reach the
     backend as language="" (the pre-config inline code had this guard too).
     """
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
     monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
     assert OnoatsConfig(raw={"stt": {"language": "   "}}).stt_language == "en"
     monkeypatch.setenv("STT_WS_LANGUAGE", "   ")
@@ -85,6 +100,7 @@ def test_resolve_stt_language_maps_auto_to_none(monkeypatch):
     whisper/mlx raises on a literal "auto"; None means auto-detect uniformly
     (mlx built-in detection / nemotron's own auto language-ID).
     """
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
     monkeypatch.delenv("STT_WS_LANGUAGE", raising=False)
     assert runtime._resolve_stt_language(OnoatsConfig(raw={})) == "en"
     assert (

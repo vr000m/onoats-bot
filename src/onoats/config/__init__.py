@@ -224,7 +224,11 @@ class OnoatsConfig:
     def stt_language(self) -> str:
         """Decode language for the whisper/websocket backends.
 
-        env ``STT_WS_LANGUAGE`` > config.toml ``[stt].language`` > ``"en"``.
+        env ``STT_LANGUAGE`` > env ``STT_WS_LANGUAGE`` (legacy alias) >
+        config.toml ``[stt].language`` > ``"en"``. The bare name matches the
+        other cross-backend vars (``STT_SERVICE`` / ``STT_MODEL``); the
+        ``STT_WS_``-prefixed alias predates the key applying beyond the
+        websocket backend and is kept for backward compatibility.
         ``"auto"`` (any case) means auto-detect — the runtime maps it to
         ``None`` for the backend, never the literal string (whisper rejects
         a literal "auto"). Not consumed by the Deepgram backend.
@@ -233,7 +237,11 @@ class OnoatsConfig:
         # "en", not reach the backend as language="" (env values are already
         # strip-guarded inside _env_or).
         val = str(
-            _env_or("STT_WS_LANGUAGE", self.raw.get("stt", {}).get("language")) or ""
+            _env_or(
+                "STT_LANGUAGE",
+                _env_or("STT_WS_LANGUAGE", self.raw.get("stt", {}).get("language")),
+            )
+            or ""
         ).strip()
         return val or _DEFAULTS["stt"]["language"]
 

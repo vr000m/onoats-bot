@@ -686,8 +686,8 @@ async def _create_stt_service():
         await _preflight_stt_ws(kwargs, target)
         # The language is forwarded to the server's decoder via
         # ``update_session`` (see ``WebSocketSTTService``). Resolved from
-        # ``cfg.stt_language`` above (env STT_WS_LANGUAGE > config.toml
-        # [stt].language > "en"). Not threaded through
+        # ``cfg.stt_language`` above (env STT_LANGUAGE > legacy STT_WS_LANGUAGE
+        # > config.toml [stt].language > "en"). Not threaded through
         # ``_resolve_stt_ws_target`` because that dict also feeds
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
         return WebSocketSTTService(language=language, **kwargs)

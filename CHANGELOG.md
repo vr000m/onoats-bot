@@ -17,7 +17,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Added
 - `[stt] language` in `config.toml`: the STT decode language is now a
-  first-class config key (env `STT_WS_LANGUAGE` > `[stt].language` > `en`),
+  first-class config key (env `STT_LANGUAGE` > legacy alias `STT_WS_LANGUAGE`
+  > `[stt].language` > `en`),
   shared by every launch path (CLI, menu-bar app, `onoats init`). `auto`
   means auto-detect and maps to `None` at the backend boundary. The local
   whisper/MLX branches now honour it too (they previously hardcoded `en`);
