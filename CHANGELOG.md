@@ -13,9 +13,23 @@ no backdated tags exist). PR numbers `#1`–`#7` refer to this repository;
 older history predates the extraction and is cited by merge-commit SHA.
 Annotated tags exist from `v0.9.0` forward.
 
-## [Unreleased]
+## [1.1.0] - 2026-06-12
+
+First PyPI release (`pip install onoats` / `uv tool install onoats`).
+
+### Changed
+- `pipecat-local-stt-server` is now consumed from PyPI (`>=0.1.2,<0.2`)
+  instead of a git-URL pin — `0.1.2` is the release of the exact commit
+  previously pinned (`5062b98` == tag `v0.1.2`). This removes the
+  direct-reference metadata PyPI rejects, unblocking publication. Packaging
+  metadata (readme, authors, URLs, classifiers) added for the PyPI page.
 
 ### Added
+- Tag-triggered PyPI publish via GitHub Actions trusted publishing
+  (`.github/workflows/release.yml`): pushing a `v*` tag runs the full suite
+  plus two guards (tag == pyproject version; no direct-URL deps in wheel
+  metadata), then publishes via OIDC behind the `pypi` GitHub environment —
+  no stored token.
 - `[stt] language` in `config.toml`: the STT decode language is now a
   first-class config key (env `STT_LANGUAGE` > legacy alias `STT_WS_LANGUAGE`
   > `[stt].language` > `en`),

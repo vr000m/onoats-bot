@@ -84,10 +84,15 @@ the **terminal app**, not to onoats — see
 # Linux: PortAudio dev headers are needed to build pyaudio
 #   sudo apt-get install -y portaudio19-dev   # (macOS Homebrew ships them)
 
+# From PyPI (v1.1.0+) — no clone needed:
+uv tool install onoats            # baseline (PortAudio + Deepgram/TCP STT)
+# uv tool install 'onoats[macos]' # Apple Silicon: adds Whisper-MLX + Kokoro
+
+# Or from a checkout (development):
 git clone https://github.com/vr000m/onoats-bot.git
 cd onoats-bot
-uv tool install --editable .            # baseline (PortAudio + Deepgram/TCP STT)
-# uv tool install --editable '.[macos]' # Apple Silicon: adds Whisper-MLX + Kokoro
+uv tool install --editable .            # baseline
+# uv tool install --editable '.[macos]' # Apple Silicon extras
 
 onoats init                       # guided setup → config.toml + 0600 secrets.env
 onoats bot                        # dual-input recorder (mic + system loopback)
