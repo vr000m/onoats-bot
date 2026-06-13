@@ -22,7 +22,14 @@ Annotated tags exist from `v0.9.0` forward.
   means auto-detect and maps to `None` at the backend boundary. The local
   whisper/MLX branches now honour it too (they previously hardcoded `en`);
   Deepgram does not consume it. `onoats init` prompts for it in the local
-  STT branch.
+  STT branch. (PR #22)
+
+### Fixed
+- Review fixes on the language key (PR #22): a whitespace-only
+  `[stt].language` now falls back to `en` instead of reaching the backend as
+  `language=""`; non-interactive `onoats init` re-runs carry an existing
+  `language` forward instead of silently erasing it; switching the wizard to
+  Deepgram preserves the key for a later switch back.
 
 ## [1.0.0] - 2026-06-12
 
