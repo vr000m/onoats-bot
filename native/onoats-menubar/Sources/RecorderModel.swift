@@ -72,12 +72,13 @@ final class RecorderModel: ObservableObject {
     /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
     /// spawn, and the direct argument to the Stop button's `.disabled(...)` — so
     /// a verified external/orphaned session can't be double-stopped while it
-    /// drains. Cleared level-triggered in `refresh()` once the supervisor is
-    /// actually gone (`!alive`). Invariant: ONLY `stopExternal()` sets it (plus a
-    /// spawn-failure reset so a failed launch doesn't wedge the button), ONLY
-    /// `refresh()` clears it on `!alive` — no other writer. We deliberately do
-    /// NOT use the `.stopping` enum case for external stops: `.stopping` is
-    /// cleared by `handleExit`, which never fires without a `Process` handle.
+    /// drains. Writers: `stopExternal()` sets it on entry and clears it on either
+    /// error path (spawn threw, OR the CLI exited non-zero = SIGTERM not
+    /// delivered) so a failed/stale-CLI stop can't wedge the sole Stop button;
+    /// `refresh()` clears it level-triggered once the supervisor is actually gone
+    /// (`!alive`) on the SUCCESS path. No other writer. We deliberately do NOT
+    /// use the `.stopping` enum case for external stops: `.stopping` is cleared
+    /// by `handleExit`, which never fires without a `Process` handle.
     @Published var stopRequested = false
 
     /// Valid `[stt].service` values — mirror of runtime.py
@@ -384,9 +385,15 @@ final class RecorderModel: ObservableObject {
         p.terminationHandler = { [weak self] proc in
             Task { @MainActor in
                 if proc.terminationStatus != 0 {
-                    // Non-zero rc means the CLI refused to signal (stale / identity
-                    // mismatch): the supervisor is gone or unverifiable, so
-                    // `refresh()` will observe `!alive` and clear stopRequested.
+                    // Non-zero rc means the CLI did NOT deliver SIGTERM — it
+                    // refused (stale / identity mismatch), errored, or is a stale
+                    // installed CLI lacking the `stop` subcommand (argparse rc 2).
+                    // The supervisor may still be ALIVE, so re-enable the button:
+                    // `refresh()` only clears stopRequested on `!alive`, and would
+                    // otherwise leave the sole Stop control wedged until restart.
+                    // A delivered SIGTERM (rc 0) leaves the flag set; refresh()
+                    // clears it when the supervisor actually exits.
+                    self?.stopRequested = false
                     self?.flushNote =
                         "Stop failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
                 }
