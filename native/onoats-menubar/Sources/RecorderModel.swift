@@ -68,6 +68,18 @@ final class RecorderModel: ObservableObject {
     /// next Flush or Start.
     @Published var flushNote: String?
 
+    /// Cosmetic "external stop in flight" flag for a handle-less session. Set
+    /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
+    /// spawn, and the direct argument to the Stop button's `.disabled(...)` — so
+    /// a verified external/orphaned session can't be double-stopped while it
+    /// drains. Cleared level-triggered in `refresh()` once the supervisor is
+    /// actually gone (`!alive`). Invariant: ONLY `stopExternal()` sets it (plus a
+    /// spawn-failure reset so a failed launch doesn't wedge the button), ONLY
+    /// `refresh()` clears it on `!alive` — no other writer. We deliberately do
+    /// NOT use the `.stopping` enum case for external stops: `.stopping` is
+    /// cleared by `handleExit`, which never fires without a `Process` handle.
+    @Published var stopRequested = false
+
     /// Valid `[stt].service` values — mirror of runtime.py
     /// `VALID_STT_SERVICES` (parity-checked by
     /// tests/test_native_contract_parity.py).
@@ -250,6 +262,12 @@ final class RecorderModel: ObservableObject {
             // can't clobber an imminent .failed with .stopped.
             return
         }
+        // External-stop convergence (handle-less session): clear the cosmetic
+        // stopRequested flag once the supervisor is actually GONE — process exit
+        // (kill(0) false), NOT pid-file removal. Placed AFTER the owned-proc
+        // early-return above so an owned session's `.stopping` drain never
+        // touches it. Sole clearing site (see the `stopRequested` invariant).
+        if !alive { stopRequested = false }
         if alive {
             state = .running(ours: false)
         } else if case .failed = state {
@@ -337,6 +355,51 @@ final class RecorderModel: ObservableObject {
             try p.run()
         } catch {
             flushNote = "Flush spawn failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Runs `onoats stop` for a session this app does NOT own — one started from
+    /// a terminal, or (the motivating case) a GUI-started session orphaned by an
+    /// app crash and seen as `running(ours: false)` on relaunch. Mirrors
+    /// `flush()`: the CLI does the identity-checked pid signalling (marker +
+    /// fingerprint + liveness → SIGTERM), so stopping a session we have no
+    /// `Process` handle for is safe and never signals a recycled pid.
+    ///
+    /// We do NOT block on exit and do NOT set the `.stopping` enum case (no
+    /// `handleExit` fires without a handle); convergence to `.stopped` is driven
+    /// by `refresh()` observing the supervisor exit (`processAlive` → false). The
+    /// cosmetic `stopRequested` flag is set HERE, synchronously, BEFORE the spawn
+    /// so a second `onoats stop` subprocess can't be launched mid-drain (the
+    /// button is `.disabled(stopRequested)`).
+    func stopExternal() {
+        stopRequested = true
+        flushNote = nil
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cliPath)
+        p.arguments = ["stop"]
+        if let log = openLog() {
+            p.standardOutput = log
+            p.standardError = log
+        }
+        p.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                if proc.terminationStatus != 0 {
+                    // Non-zero rc means the CLI refused to signal (stale / identity
+                    // mismatch): the supervisor is gone or unverifiable, so
+                    // `refresh()` will observe `!alive` and clear stopRequested.
+                    self?.flushNote =
+                        "Stop failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
+                }
+            }
+        }
+        do {
+            try p.run()
+        } catch {
+            // The subprocess never launched, so nothing is in flight — re-enable
+            // the button (the one writer other than refresh(), guarded to the
+            // spawn-failure path) so a missing/!executable CLI can be retried.
+            stopRequested = false
+            flushNote = "Stop spawn failed: \(error.localizedDescription)"
         }
     }
 
