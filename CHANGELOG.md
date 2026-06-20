@@ -13,6 +13,19 @@ no backdated tags exist). PR numbers `#1`–`#7` refer to this repository;
 older history predates the extraction and is cited by merge-commit SHA.
 Annotated tags exist from `v0.9.0` forward.
 
+## [Unreleased]
+
+### Added
+- `onoats stop` subcommand: signal the running recorder to stop gracefully
+  (SIGTERM → drain + final flush, then exit). It is a behavioural twin of
+  `onoats flush` and reuses the same identity gate (`resolve_flush_target`:
+  marker + cmdline-fingerprint + liveness), so it only ever signals the verified
+  recorder and never a recycled pid — which matters more than for flush because
+  SIGTERM kills by default. Returns on signal delivery, not confirmed exit; like
+  flush, `onoats stop --help` resolves without booting a service. (Phase 1 of the
+  stoppable-orphan-session fix: the menu-bar Stop rewiring that routes an
+  orphaned GUI session through this seam is a follow-up.)
+
 ## [1.1.0] - 2026-06-12
 
 First PyPI release (`pip install onoats` / `uv tool install onoats`).

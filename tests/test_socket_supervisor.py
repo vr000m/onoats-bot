@@ -1964,3 +1964,87 @@ async def test_wait_for_sockets_extension_writes_waiting_record(
     assert rec is not None, "the extension must write the prestart waiting record"
     assert rec.running is True
     assert rec.warning and "permission prompt" in rec.warning
+
+
+# ---------------------------------------------------------------------------
+# Graceful-teardown write ordering (RUNTIME): status-stopped lands on disk
+# BEFORE the pid file is unlinked.
+#
+# This is the contract `onoats stop` (and the menu bar's external-stop polling)
+# rely on indirectly: the GUI keys "stopped" off the supervisor PROCESS exiting,
+# but `onoats status` (and any pid-backstop reader) must never observe pid-gone
+# while the status file still claims running. The producer call order is asserted
+# STATICALLY in test_status_file.py (source-text index check). This test is the
+# RUNTIME complement: it drives the real teardown producers
+# (`onoats.runtime._write_pid_file` / `_write_status_running` /
+# `_write_status_stopped` / `_remove_pid_file` — the exact symbols dual.py's
+# `_run_shutdown` imports and calls) against a real filesystem and observes, AT
+# THE INSTANT the pid file is unlinked, that the on-disk status already reads
+# running=False. A producer whose status write lagged (non-durable / async) or a
+# reorder at the producer-call level would flip the observed value and fail here
+# — neither of which the static index check nor test_shutdown_drain.py (which
+# drives a FakeTask and never exercises _remove_pid_file) can catch.
+# ---------------------------------------------------------------------------
+
+
+def test_graceful_teardown_writes_status_stopped_before_pid_unlink(
+    tmp_path, monkeypatch
+):
+    from onoats import runtime
+    from onoats import status as status_file
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Start-of-session: real pid file + real running status (pid FIRST, then
+    # status — the start half of the same ordering contract).
+    pid_path = runtime._write_pid_file(data_dir)
+    runtime._write_status_running(data_dir, audio_source="socket", stt_label="fake-stt")
+    assert pid_path.exists()
+    start_rec = status_file.read_status(data_dir)
+    assert start_rec is not None and start_rec.running is True
+
+    # Instrument the unlink boundary: snapshot the on-disk status at the exact
+    # instant the pid file is removed. dual.py calls `_remove_pid_file` (this
+    # symbol) as the final teardown step; spying here observes the real order.
+    observed: dict = {}
+    real_remove = runtime._remove_pid_file
+
+    def _spy_remove(p):
+        rec = status_file.read_status(data_dir)
+        observed["running_at_unlink"] = None if rec is None else rec.running
+        observed["pid_file_present_at_unlink"] = p.exists()
+        return real_remove(p)
+
+    monkeypatch.setattr(runtime, "_remove_pid_file", _spy_remove)
+
+    # Graceful teardown, in dual.py `_run_shutdown` order: status-stopped FIRST…
+    runtime._write_status_stopped(data_dir, exit_reason="graceful")
+    # …status-stopped must be durably on disk (synchronous atomic write) the
+    # moment it returns, before the pid is touched.
+    mid_rec = status_file.read_status(data_dir)
+    assert mid_rec is not None and mid_rec.running is False, (
+        "status-stopped must be durable on disk before the pid file is unlinked"
+    )
+    # …then remove the pid file (instrumented).
+    runtime._remove_pid_file(pid_path)
+
+    # The unlink spy observed status already running=False — no window where a
+    # reader sees pid-gone while the status file still claims a live recorder.
+    assert observed["running_at_unlink"] is False, (
+        "pid file was unlinked while the on-disk status still claimed running — "
+        "a reader could observe pid-gone + status-running (the exact disagreement "
+        "the ordering contract forbids)"
+    )
+    assert observed["pid_file_present_at_unlink"] is True, (
+        "the pid file should still exist at the moment _remove_pid_file is entered"
+    )
+
+    # Final on-disk state: pid gone, status durably stopped, start detail kept.
+    assert not pid_path.exists()
+    end_rec = status_file.read_status(data_dir)
+    assert end_rec is not None and end_rec.running is False
+    assert end_rec.exit_reason == "graceful"
+    assert end_rec.audio_source == "socket", (
+        "stop must preserve start-of-session detail"
+    )

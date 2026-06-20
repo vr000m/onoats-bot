@@ -27,7 +27,16 @@ def test_top_level_help_no_command(capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "onoats" in out
-    for sub in ("init", "bot", "bot-single", "flush", "convert", "devices", "status"):
+    for sub in (
+        "init",
+        "bot",
+        "bot-single",
+        "flush",
+        "stop",
+        "convert",
+        "devices",
+        "status",
+    ):
         assert sub in out
 
 
@@ -459,3 +468,191 @@ def test_flush_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# stop — behavioural twin of flush, EXCEPT it sends SIGTERM (graceful shutdown)
+# instead of SIGUSR1. The identity-checked signalling (resolve_flush_target →
+# marker + cmdline fingerprint) is reused verbatim, so a recycled foreign pid is
+# never signalled — which matters MORE here because SIGTERM kills by default.
+# Every test_flush_* branch is mirrored 1:1 below.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_sends_sigterm(monkeypatch, _isolate_env):
+    """Happy path: live process cmdline matches the stored fingerprint."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+
+    sent = {}
+
+    def fake_kill(pid, sig):
+        # sig 0 is the liveness probe; record only the real signal.
+        if sig != 0:
+            sent["pid"] = pid
+            sent["sig"] = sig
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    # Live readback matches the stored 3rd-line fingerprint → identity confirmed.
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot")
+    rc = cli.main(["stop"])
+    assert rc == 0
+    assert sent["pid"] == 9001
+    assert sent["sig"] == signal.SIGTERM
+
+
+@pytest.mark.parametrize(
+    ("command", "want_sig", "reject_sig"),
+    [
+        ("stop", signal.SIGTERM, signal.SIGUSR1),
+        ("flush", signal.SIGUSR1, signal.SIGTERM),
+    ],
+)
+def test_stop_and_flush_send_distinct_signals(
+    monkeypatch, _isolate_env, command, want_sig, reject_sig
+):
+    """Differential guard: the ONLY intended divergence between stop and flush is
+    the signal number. ``stop`` MUST send SIGTERM and NOT SIGUSR1; ``flush`` MUST
+    send SIGUSR1 and NOT SIGTERM. A copy-paste/shared-helper signal swap (or a
+    handler accidentally calling the other) fails here."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+
+    sent = []
+
+    def fake_kill(pid, sig):
+        if sig != 0:  # ignore the liveness probe
+            sent.append(sig)
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot")
+
+    rc = cli.main([command])
+    assert rc == 0
+    assert sent == [want_sig], f"{command} must send exactly {want_sig!r}, got {sent!r}"
+    assert reject_sig not in sent, f"{command} must NOT send {reject_sig!r}"
+
+
+def test_stop_no_pid_file(_isolate_env):
+    assert cli.main(["stop"]) == 1
+
+
+def test_stop_stale_dead_pid(monkeypatch, _isolate_env):
+    """A pid whose process is gone is stale: no signal, pid file removed."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("12345\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+
+    def fake_kill(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    assert cli.main(["stop"]) == 1
+    assert not pid_path.exists()  # stale file cleaned up
+
+
+def test_stop_ignores_foreign_pid_marker(_isolate_env):
+    """A pid file without the onoats-bot marker is not stoppable."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nsomething-else\ncmd\n0.0\n", encoding="utf-8")
+    assert cli.main(["stop"]) == 1
+
+
+def test_stop_refuses_legacy_pid_file_without_fingerprint(monkeypatch, _isolate_env):
+    """A marker-valid but fingerprint-less (legacy) pid file is not signalled."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    # Two-line legacy format: pid + marker, no cmdline fingerprint.
+    pid_path.write_text("9001\nonoats-bot\n", encoding="utf-8")
+
+    def fake_kill(pid, sig):  # pragma: no cover - must never be called
+        raise AssertionError("stop must not signal a pid it cannot verify")
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    rc = cli.main(["stop"])
+    assert rc == 1
+    # No fingerprint to compare against → file is *not* treated as stale.
+    assert pid_path.exists()
+
+
+def test_stop_keeps_pid_file_when_ps_probe_fails(monkeypatch, capsys, _isolate_env):
+    """A live recorder whose ``ps`` identity probe fails (ps missing/timeout)
+    must NOT be signalled and must NOT have its pid file deleted — a transient
+    probe failure is indeterminate, not proof the recorder is gone."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            return  # liveness probe succeeds → process is alive
+        raise AssertionError("stop must not signal an unverifiable pid")
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    # Identity probe fails (e.g. ps unavailable / timed out).
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
+
+    rc = cli.main(["stop"])
+    err = capsys.readouterr().err.lower()
+
+    assert rc == 1
+    assert "could not verify" in err
+    # Live recorder's pid file must survive an indeterminate probe.
+    assert pid_path.exists()
+
+
+def test_stop_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
+    """Highest-value regression (given SIGTERM's lethality): a recycled pid
+    pointing at an unrelated *live* process must not be signalled. A blind
+    SIGTERM would terminate that foreign process; the identity check stops it.
+
+    Integration-flavoured: exercises the real ``ps`` readback path. Skips on the
+    (rare) host without ``ps``/``sleep`` rather than misreporting the mismatch as
+    a "not running" stale path.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("ps") or not shutil.which("sleep"):
+        pytest.skip("requires ps and sleep for the live identity readback")
+
+    # A real, unrelated live process whose cmdline will not match the stored
+    # fingerprint. SIGTERM would terminate it if stop signalled blindly.
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = cli._pid_path(_isolate_env)
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(
+            f"{proc.pid}\nonoats-bot\nonoats bot (this is not sleep)\n0.0\n",
+            encoding="utf-8",
+        )
+
+        rc = cli.main(["stop"])
+        err = capsys.readouterr().err.lower()
+
+        assert rc == 1
+        assert "identity mismatch" in err
+        # The unrelated process must still be ALIVE — no SIGTERM was sent.
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_stop_in_dispatch_table():
+    """`stop` is wired into the subcommand dispatch table."""
+    assert cli._HANDLERS["stop"] is cli._cmd_stop
+
+
+def test_stop_help_resolves_without_booting(capsys):
+    """`onoats stop --help` resolves via _cmd_stop's own local argparse (lazy
+    resolver import), so it never boots a service."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["stop", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out.lower()
+    assert "usage" in out
+    assert "onoats stop" in out

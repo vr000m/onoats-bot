@@ -149,13 +149,71 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Progress
 
-- [ ] Phase 1: `onoats stop` CLI subcommand (Python)
+- [x] Phase 1: `onoats stop` CLI subcommand (Python)
 - [ ] Phase 2: Menu-bar Stop rewiring (Swift)
 - [ ] Phase 3: Zero-sample watchdog escalation (separable)
 
 ## Findings
 
-- (append findings here as work proceeds)
+### Phase 1 (2026-06-19) — `onoats stop` CLI subcommand shipped
+
+- **Implementation.** `_cmd_stop` (`src/onoats/cli.py`) is a near-clone of
+  `_cmd_flush`: identical `--data-dir` arg, identical `resolve_flush_target`
+  call, identical stale-unlink + `ProcessLookupError` handling. The *only*
+  behavioural divergence is `os.kill(pid, signal.SIGTERM)` (vs SIGUSR1) plus
+  user-facing strings. The resolver is reused verbatim — no weakened or
+  duplicated identity check. Registered in `_HANDLERS` (anchored to the `flush`
+  entry) and via `sub.add_parser("stop", …)`; `"stop"` added to the
+  `test_top_level_help_no_command` subcommand tuple.
+
+- **Tests (all green, `tests/test_cli.py`).** Every `test_flush_*` branch mirrored
+  1:1 as `test_stop_*` (no-pid-file, stale-dead-pid, foreign-marker,
+  legacy-no-fingerprint, ps-probe-fails, recycled-identity-mismatch). The
+  recycled-pid case spawns a real `sleep` on the recycled pid and asserts it is
+  **still alive** after `onoats stop` (proves no SIGTERM reached an unrelated
+  live pid). A parametrized differential test asserts `stop` sends
+  SIGTERM-and-NOT-SIGUSR1 and `flush` sends SIGUSR1-and-NOT-SIGTERM, so a
+  copy-paste signal swap fails. Plus dispatch-table + `--help`-without-boot.
+
+- **Runtime write-order regression** (`tests/test_socket_supervisor.py`:
+  `test_graceful_teardown_writes_status_stopped_before_pid_unlink`). Drives the
+  real teardown producers (`runtime._write_pid_file` / `_write_status_running` /
+  `_write_status_stopped` / `_remove_pid_file` — the exact symbols dual.py's
+  `_run_shutdown` imports and calls) against a real filesystem and spies on the
+  pid-unlink boundary, observing that the on-disk status already reads
+  `running=False` at the instant the pid file is removed. This is the
+  **runtime** complement the plan asked for — distinct from the **static**
+  source-text index check in `test_status_file.py:243-245`.
+  - *Scope note (named, not hidden):* the producer **call order** inside
+    `dual._run_shutdown` is a nested closure unreachable without booting the heavy
+    STT/VAD stack, so it remains guarded by the static index check; this runtime
+    test proves the producers' on-disk effects are **synchronous + durable +
+    consistent** (status-stopped lands before pid removal, no async lag / no
+    pid-gone-while-status-running window). The plan's pointer to
+    "test_socket_supervisor.py's real-teardown harness" refers to that file's
+    teardown-timing harness; note its supervisor lifecycle tests substitute a
+    *fake* `run_onoats_dual`, so they do not themselves exercise the recorder's
+    pid/status writes — hence this dedicated producer-level runtime test.
+
+- **Content-bearing final flush on SIGTERM — WAIVER (per acceptance criteria).**
+  Not adding a new content-bearing unit assertion in Phase 1: the SIGTERM path
+  shares the existing `shutdown_event` → terminal-flush drain, and the
+  content-bearing final flush was **live-verified on 2026-06-10** (memory
+  `shutdown-drain-final-segment-edge`, recorded EDGE CLOSED after a 5b menu-bar
+  smoke). `test_shutdown_drain.py` asserts an EndFrame is *queued* before the
+  terminal flush; the content-drain itself needs a hardware/pipeline run, which
+  Phase 1 (CLI-only) does not boot. This waiver is the plan-sanctioned
+  alternative to a silent skip.
+
+- **Verification.** `uv run pytest` full suite: 278 passed. Target files
+  (`test_cli.py test_shutdown_drain.py test_socket_supervisor.py
+  test_native_contract_parity.py`): 112 passed. `uv run onoats stop --help`
+  resolves without booting a service. `ruff format` + `ruff check` clean.
+
+- **Remaining:** Phase 2 (Swift menu-bar Stop rewiring) requires building the
+  menu-bar app and a manual orphan-then-stop smoke on the user's machine — not
+  autonomously runnable; deferred. Phase 3 is separable/optional and sequenced
+  after P2.
 
 ## Issues & Solutions
 

@@ -1166,6 +1166,65 @@ def _cmd_flush(rest: list[str]) -> int:
     return 0
 
 
+def _cmd_stop(rest: list[str]) -> int:
+    """Send SIGTERM to the running recorder so it shuts down gracefully.
+
+    Near-clone of ``_cmd_flush``: the safe identity-checked signalling
+    (``resolve_flush_target`` → marker + cmdline fingerprint) is reused verbatim,
+    so a recycled foreign pid is never signalled. The PID-recycling guard matters
+    *more* here than for flush — SIGTERM's default disposition kills, so
+    signalling an unrelated pid would terminate it. The only behavioural change
+    from flush is the signal: SIGTERM (the graceful-shutdown trigger,
+    ``runtime.py`` — same as a single Ctrl-C / the GUI's owned
+    ``Process.terminate()``) instead of SIGUSR1. The recorder drains and writes a
+    final flush before exiting; the command returns on signal delivery, NOT on
+    confirmed exit.
+    """
+    parser = argparse.ArgumentParser(prog="onoats stop")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
+    )
+    args = parser.parse_args(rest)
+    data_dir = Path(args.data_dir) if args.data_dir else None
+
+    from onoats._vendor.pid import resolve_flush_target
+
+    pid_path = _pid_path(data_dir)
+    target = resolve_flush_target(pid_path)
+    if target.pid is None:
+        # Identity could not be confirmed. Drop a now-untrustworthy pid file so
+        # the next run starts clean, but never signal an unverified pid.
+        if target.stale:
+            try:
+                pid_path.unlink()
+            except OSError:
+                pass
+        print(f"onoats stop: {target.reason} (pid file {pid_path})", file=sys.stderr)
+        return 1
+    pid = target.pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # Raced: the verified recorder exited between the identity check and
+        # the signal. Treat as stale rather than signalling a recycled pid.
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+        print(
+            f"onoats stop: recorder pid {pid} is not running (stale pid file)",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(f"onoats stop: could not signal pid {pid}: {exc}", file=sys.stderr)
+        return 1
+    print(f"onoats stop: sent SIGTERM to recorder pid {pid} (graceful shutdown)")
+    return 0
+
+
 def _cmd_devices(rest: list[str]) -> int:
     """List audio input/output devices (reuses the device picker's enumeration)."""
     argparse.ArgumentParser(prog="onoats devices").parse_args(rest)
@@ -1302,6 +1361,7 @@ _HANDLERS = {
     "bot": _cmd_bot,
     "bot-single": _cmd_bot_single,
     "flush": _cmd_flush,
+    "stop": _cmd_stop,
     "convert": _cmd_convert,
     "devices": _cmd_devices,
     "status": _cmd_status,
@@ -1321,6 +1381,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("bot", help="Dual-input recorder (mic + system loopback).")
     sub.add_parser("bot-single", help="Legacy single-input (mic-only) recorder.")
     sub.add_parser("flush", help="Signal the running recorder to rotate its buffer.")
+    sub.add_parser(
+        "stop",
+        help="Signal the running recorder to stop gracefully (drain + final flush).",
+    )
     sub.add_parser("convert", help="Render pending/*.jsonl into markdown transcripts.")
     sub.add_parser("devices", help="List audio input/output devices.")
     sub.add_parser("status", help="Report recorder pid / running state + data dir.")
