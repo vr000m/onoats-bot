@@ -134,6 +134,21 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
 - **`onoats stop --help` resolves without booting a service** (local argparse +
   lazy resolver import), like `flush`.
 
+Single-instance + pid-file ownership (`runtime.py`, pinned by `tests/test_status_file.py`):
+
+- **Start refuses to launch over a live recorder.** `_write_pid_file` runs the
+  same identity gate (`resolve_flush_target`) and raises
+  `RecorderAlreadyRunningError` (clean rc=1 at all CLI boundaries) when an
+  identity-verified recorder is already alive — a stale/recycled/foreign pid does
+  NOT block a legitimate start. This is the single-instance lock; there is no
+  separate `flock` file.
+- **Pid removal is ownership-checked.** `_remove_pid_file(pid_path, owner_pid=…)`
+  unlinks only when the file still records that pid. Because `stop` returns on
+  signal delivery (not exit), a `stop`-then-immediate-`bot` could otherwise let a
+  draining recorder delete a NEWER recorder's pid file. Recorder teardown passes
+  `owner_pid=os.getpid()`; the GUI's menu gating (Start only in `.stopped`)
+  already prevents this from the app, so the guard protects the CLI/scripted path.
+
 ## Reviewing a subprocess / process-boundary change
 
 When a change spawns a child process (`create_subprocess_*` / `Popen` / `exec`)

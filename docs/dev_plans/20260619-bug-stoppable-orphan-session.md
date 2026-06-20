@@ -150,10 +150,58 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 ## Progress
 
 - [x] Phase 1: `onoats stop` CLI subcommand (Python)
-- [ ] Phase 2: Menu-bar Stop rewiring (Swift)
+- [x] Phase 2: Menu-bar Stop rewiring (Swift) — impl complete + compiles clean (`make build/Onoats`); **manual orphan-then-stop smoke matrix still pending on the user's machine**
 - [ ] Phase 3: Zero-sample watchdog escalation (separable)
 
 ## Findings
+
+### Phase 2 + pid-race hardening (2026-06-19) — Codex adversarial-review follow-up
+
+A Codex adversarial review of the Phase-1 branch returned **NO-SHIP** with two
+[high] findings; both are now addressed (the user authorised pulling Phase 2 and
+the deferred pid-race fix forward in response).
+
+- **[high] Orphaned GUI sessions still unstoppable from the menu bar → Phase 2
+  implemented.** `RecorderModel.stopExternal()` clones `flush()` to exec
+  `onoats stop` for handle-less sessions; the Stop button now routes on the
+  `ours` value the `.running(ours:)` enum carries (owned → `p.terminate()`,
+  verified external → `stopExternal()`), is enabled for all verified sessions,
+  and relabelled `"Stop"`. Convergence to `.stopped` is driven by `refresh()`
+  polling `processAlive` → false; a cosmetic `stopRequested` flag (set
+  synchronously in `stopExternal` before the spawn, cleared only in `refresh()`
+  on `!alive`) gates `.disabled(...)` and drives the "stopping (draining)…"
+  affordance — `.stopping` enum is NOT used (no `handleExit` without a handle).
+  - *Deviation from the plan's strict invariant, named:* `stopExternal()` also
+    clears `stopRequested` in its **spawn-failure catch** (the subprocess never
+    launched, so nothing is in flight) — otherwise a missing/non-executable CLI
+    would wedge the button disabled forever (the supervisor stays alive, so
+    `refresh()` never sees `!alive`). This is the only writer besides `refresh()`,
+    guarded to the error path.
+  - **Verified:** `make build/Onoats` compiles clean (full module, real
+    `swiftc`). **NOT verified by me:** the manual orphan-then-stop smoke matrix
+    (Phase 2 (a)–(e)) — requires running/crashing/relaunching the signed app with
+    real TCC + audio on the user's machine. Smoke precondition still applies:
+    install/refresh the console script so the *installed* `onoats` (resolved by
+    `cliPath`) has the `stop` subcommand — verify with the bare installed binary
+    `onoats stop --help`, not `uv run`.
+
+- **[high] `onoats stop && onoats bot` could delete the new recorder's pid file
+  → fixed in Python.** Two guards in `runtime.py`: (1) `_write_pid_file` refuses
+  to start over an identity-verified live recorder (`RecorderAlreadyRunningError`,
+  reusing `resolve_flush_target` — a stale/recycled/foreign pid never blocks a
+  legitimate start), mapped to a clean non-zero exit at all three CLI boundaries
+  (`cli.py`, `dual.py`, `__main__.py`); (2) `_remove_pid_file(pid_path, owner_pid=…)`
+  unlinks only when the file still records our pid, so a draining recorder never
+  deletes a pid file a newer recorder has overwritten. Recorder call sites
+  (`dual._finalize_shutdown_status`, `__main__`) pass `owner_pid=os.getpid()`.
+  Regression tests in `test_status_file.py` (refuse-live, overwrite-stale-dead,
+  ownership-skip, back-compat-unconditional). This supersedes the "out of scope
+  for Phases 1–2" note under *Issues & Solutions* — the guard landed here rather
+  than as a separate `flock` change; the resolver-identity guard is equivalent
+  protection without a new lock file.
+
+- **Verification:** full `uv run pytest` suite **283 passed**; `ruff format` +
+  `ruff check` clean; `make build/Onoats` compiles. Codex re-review not re-run.
 
 ### Phase 1 (2026-06-19) — `onoats stop` CLI subcommand shipped
 

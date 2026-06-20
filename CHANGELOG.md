@@ -22,9 +22,25 @@ Annotated tags exist from `v0.9.0` forward.
   marker + cmdline-fingerprint + liveness), so it only ever signals the verified
   recorder and never a recycled pid — which matters more than for flush because
   SIGTERM kills by default. Returns on signal delivery, not confirmed exit; like
-  flush, `onoats stop --help` resolves without booting a service. (Phase 1 of the
-  stoppable-orphan-session fix: the menu-bar Stop rewiring that routes an
-  orphaned GUI session through this seam is a follow-up.)
+  flush, `onoats stop --help` resolves without booting a service.
+- Menu-bar **Stop now works for orphaned/external sessions**: a GUI-started
+  recorder orphaned by an app crash (seen as `running(ours: false)` on relaunch),
+  or any terminal-started session, can be stopped from the menu. Owned sessions
+  keep the in-handle `Process.terminate()`; verified external sessions route
+  through `onoats stop`. The menu shows "stopping (draining)…" for the whole
+  drain and flips to Stopped only when the supervisor actually exits (polled),
+  never faking a terminal state. (Completes the stoppable-orphan-session fix.)
+
+### Fixed
+- **Stop→immediate-start pid-file race.** `onoats stop` returns on signal
+  delivery, not exit, so a new `onoats bot` launched during the old recorder's
+  drain could overwrite the draining recorder's pid file — and the drainer would
+  then unlink the *new* recorder's file, leaving it invisible to
+  `status`/`stop`/`flush`. Two guards close this: (1) start refuses to launch
+  over an identity-verified live recorder (`RecorderAlreadyRunningError`, same
+  identity gate as stop/flush — a stale/recycled/foreign pid never blocks a
+  legitimate start); (2) pid-file removal is ownership-checked, so a recorder
+  never deletes a pid file a newer recorder has since overwritten.
 
 ## [1.1.0] - 2026-06-12
 
