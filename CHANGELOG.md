@@ -37,10 +37,15 @@ Annotated tags exist from `v0.9.0` forward.
   drain could overwrite the draining recorder's pid file — and the drainer would
   then unlink the *new* recorder's file, leaving it invisible to
   `status`/`stop`/`flush`. Two guards close this: (1) start refuses to launch
-  over an identity-verified live recorder (`RecorderAlreadyRunningError`, same
-  identity gate as stop/flush — a stale/recycled/foreign pid never blocks a
-  legitimate start); (2) pid-file removal is ownership-checked, so a recorder
-  never deletes a pid file a newer recorder has since overwritten.
+  over a live recorder (`RecorderAlreadyRunningError`) — both the identity-verified
+  case AND the indeterminate-but-live case (marker-valid pid file, process alive,
+  but the `ps` identity probe failed or the file is legacy/fingerprint-less),
+  matching how stop/flush refuse that same state; only a positively stale (dead or
+  recycled-to-foreign) pid is overwritten; (2) pid-file removal is
+  ownership-checked, so a recorder never deletes a pid file a newer recorder has
+  since overwritten. The menu's external Stop also re-enables itself if the
+  `onoats stop` subprocess fails or exits non-zero (e.g. a stale installed CLI),
+  rather than wedging the only Stop control until app restart.
 
 ## [1.1.0] - 2026-06-12
 

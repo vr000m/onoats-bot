@@ -155,6 +155,40 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Findings
 
+### Codex re-review round 2 (2026-06-20) — degraded-path fixes
+
+The re-run Codex adversarial review (after the round-1 fixes) returned a fresh
+NO-SHIP with two degraded-path findings; both fixed.
+
+- **[high] Start could overwrite a live recorder when identity probing is
+  indeterminate** (`runtime.py`). The round-1 start guard only refused on a
+  *verified* live recorder; if the existing recorder was live but the `ps` probe
+  failed (`resolve_flush_target` → `pid=None, stale=False`) it fell through to
+  warn-and-overwrite — the same indeterminate state `flush`/`stop` refuse to act
+  on. Fixed: `_write_pid_file` now also raises `RecorderAlreadyRunningError` when
+  a marker-valid pid file names a **live** process (`_pid_alive`, fail-safe) that
+  the resolver could neither verify nor declare stale (ps-probe-fail / legacy
+  fingerprint-less). Only `stale=True` (dead or recycled-to-foreign) is
+  overwritten. Regression tests (`test_status_file.py`):
+  `…_refuses_live_recorder_with_indeterminate_probe` (kill(0) ok + `_live_ps_cmdline`
+  → None) and `…_refuses_live_legacy_fingerprintless_pid`.
+
+- **[medium] Failed external stop wedged the GUI in "stopping"** (`RecorderModel.swift`).
+  `stopExternal()` cleared `stopRequested` only on a spawn *throw*, not on a
+  non-zero CLI *exit* — so a stale installed CLI lacking `stop` (argparse rc 2),
+  or an identity refusal while the process stays alive, left the sole Stop button
+  disabled until app restart. Fixed: the `terminationHandler` now clears
+  `stopRequested` on any non-zero exit (SIGTERM not delivered → re-enable); a
+  delivered SIGTERM (rc 0) still leaves it set, cleared by `refresh()` on `!alive`.
+  - *Honest gap:* Codex asked for a menu-model regression with a fake non-zero
+    `stop`. There is **no Swift unit-test harness** in this repo (no
+    `Package.swift`/XCTest; the menu app is built with a bare `swiftc` line) — the
+    project's standing decision is "native Swift = manual smoke only." So this is
+    covered by **manual smoke**, not an automated test: point `cliPath` at a CLI
+    without `stop` (or an `onoats` stub returning rc≠0) on a live external session,
+    click Stop, confirm the button re-enables and the menu leaves "stopping…".
+    Code compiles (`make build/Onoats`).
+
 ### Phase 2 + pid-race hardening (2026-06-19) — Codex adversarial-review follow-up
 
 A Codex adversarial review of the Phase-1 branch returned **NO-SHIP** with two
