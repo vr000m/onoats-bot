@@ -241,7 +241,9 @@ def test_dual_wires_producers_at_start_rotation_stop():
     # Write ordering: status-stopped MUST precede pid removal so the pid backstop
     # and the status file never disagree about a live recorder.
     stop_idx = src.index("_write_status_stopped(")
-    pid_rm_idx = src.index("_remove_pid_file(pid_path)")
+    # Match the call prefix only — the pid removal is ownership-checked
+    # (`_remove_pid_file(pid_path, owner_pid=...)`), so don't pin the closing paren.
+    pid_rm_idx = src.index("_remove_pid_file(pid_path")
     assert stop_idx < pid_rm_idx, "status-stopped must be written before pid removal"
 
     # And the start producer runs AFTER the pid file is written (pid first).
@@ -501,3 +503,93 @@ def test_write_prestart_waiting_is_fresh_running_with_warning(tmp_path: Path):
     write_running(tmp_path, pid=2, audio_source="socket", stt_label="mlx")
     st = read_status(tmp_path)
     assert st.warning is None and st.pid == 2
+
+
+# ---------------------------------------------------------------------------
+# (g) stop-then-immediate-start race: pid-file single-instance guard +
+# ownership-checked removal. `onoats stop` returns on signal delivery, not exit,
+# so a new `onoats bot` can launch while the old recorder is still draining.
+# Without these guards the new start would overwrite the draining recorder's pid
+# file, and the drainer would later unlink the NEW recorder's file (leaving it
+# invisible to status/stop/flush). See runtime._write_pid_file / _remove_pid_file.
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+
+from onoats._vendor.pid import PID_FILENAME  # noqa: E402
+from onoats.runtime import (  # noqa: E402
+    RecorderAlreadyRunningError,
+    _remove_pid_file,
+    _write_pid_file,
+)
+
+
+def _seed_pid_file(data_dir: Path, pid: int, *, cmdline: str = "onoats bot") -> Path:
+    pid_path = data_dir / ".active" / PID_FILENAME
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(f"{pid}\nonoats-bot\n{cmdline}\n0.0\n", encoding="utf-8")
+    return pid_path
+
+
+def test_write_pid_file_refuses_verified_live_recorder(tmp_path, monkeypatch):
+    """Start guard: a second start over an identity-verified LIVE recorder is
+    refused (RecorderAlreadyRunningError), and the existing pid file is left
+    intact — never overwritten."""
+    if not shutil.which("sleep"):
+        pytest.skip("requires a real live process for the liveness check")
+    # A real, unrelated live process stands in for the still-draining recorder.
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = _seed_pid_file(tmp_path, proc.pid)
+        # Make the identity readback match the stored fingerprint → verified live.
+        monkeypatch.setattr(
+            "onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot"
+        )
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)
+        # The draining recorder's pid file MUST survive the refused start.
+        assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_write_pid_file_overwrites_stale_dead_recorder(tmp_path):
+    """A stale pid file for a DEAD recorder does not block a legitimate start —
+    it is overwritten with the current process's pid (no false single-instance
+    refusal on a crashed predecessor)."""
+    import os as _os
+
+    if not shutil.which("sleep"):
+        pytest.skip("requires spawning a process to obtain a real dead pid")
+    # Spawn then reap a process so its pid is genuinely dead (kill(0) raises
+    # ProcessLookupError) — a realistic crashed-predecessor pid, no mocking.
+    proc = subprocess.Popen(["sleep", "30"])
+    proc.terminate()
+    proc.wait(timeout=5)
+    _seed_pid_file(tmp_path, proc.pid)
+
+    pid_path = _write_pid_file(tmp_path)
+    # Overwritten with OUR pid — start proceeds.
+    assert pid_path.read_text(encoding="utf-8").startswith(f"{_os.getpid()}\n")
+
+
+def test_remove_pid_file_skips_when_owned_by_newer_recorder(tmp_path):
+    """Ownership-checked removal: a draining recorder must NOT delete a pid file a
+    newer recorder has since overwritten with its own pid."""
+    pid_path = _seed_pid_file(tmp_path, 55555)  # the NEW recorder owns it now
+    # The OLD (draining) recorder, pid 12345, tears down and tries to remove.
+    _remove_pid_file(pid_path, owner_pid=12345)
+    assert pid_path.exists(), "new recorder's pid file must survive the old drainer"
+    # The rightful owner can remove it.
+    _remove_pid_file(pid_path, owner_pid=55555)
+    assert not pid_path.exists()
+
+
+def test_remove_pid_file_unconditional_without_owner(tmp_path):
+    """Back-compat: with no owner_pid the removal is unconditional (the prior
+    best-effort behaviour for callers that don't pass ownership)."""
+    pid_path = _seed_pid_file(tmp_path, 999)
+    _remove_pid_file(pid_path)
+    assert not pid_path.exists()

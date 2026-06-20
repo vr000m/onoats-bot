@@ -487,12 +487,12 @@ def _run_socket_supervisor(rest: list[str]) -> int:
 
     from loguru import logger
 
-    from onoats.runtime import SttPreflightError
+    from onoats.runtime import RecorderAlreadyRunningError, SttPreflightError
     from onoats.transports import SocketHandshakeError
 
     try:
         return _asyncio.run(_supervise_socket_session(rest))
-    except SttPreflightError as exc:
+    except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
         return 1

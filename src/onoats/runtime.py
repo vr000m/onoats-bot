@@ -56,6 +56,21 @@ class SttPreflightError(RuntimeError):
     """
 
 
+class RecorderAlreadyRunningError(RuntimeError):
+    """Raised at startup when an identity-verified live recorder already owns the
+    pid file.
+
+    Caught at the same CLI entrypoints as ``SttPreflightError`` so the user sees
+    an actionable hint, not a traceback. The existing recorder's pid file is left
+    intact — we refuse BEFORE overwriting it — which closes the
+    stop-then-immediate-start race: a second start can no longer clobber a
+    draining recorder's pid file (and the drainer can no longer later unlink the
+    second start's file). The flagged recorder is verified via the same identity
+    gate as ``onoats stop``/``flush`` (marker + cmdline fingerprint + liveness),
+    so a stale/recycled/foreign pid never blocks a legitimate start.
+    """
+
+
 PIPELINE_SAMPLE_RATE = 16000  # Silero VAD requires 8kHz or 16kHz; 16kHz is standard
 
 
@@ -1021,10 +1036,29 @@ def _own_ps_cmdline() -> str:
 
 
 def _write_pid_file(data_dir: Path) -> Path:
-    """Write the current process PID, identity marker, and cmdline fingerprint."""
+    """Write the current process PID, identity marker, and cmdline fingerprint.
+
+    Single-instance guard: refuses to start over a still-live, identity-verified
+    recorder (raising ``RecorderAlreadyRunningError``). The check reuses the same
+    identity gate as ``onoats stop``/``flush`` (``resolve_flush_target``: marker +
+    cmdline fingerprint + liveness), so a stale, recycled, or foreign pid does NOT
+    block a legitimate start — only a genuine live recorder does. This closes the
+    stop-then-immediate-start race: without it, a second start would overwrite a
+    draining recorder's pid file, and the drainer would later unlink THIS start's
+    file (see also the ownership check in ``_remove_pid_file``).
+    """
     active_dir = data_dir / ".active"
     active_dir.mkdir(parents=True, exist_ok=True)
     pid_path = active_dir / PID_FILENAME
+
+    from onoats._vendor.pid import resolve_flush_target
+
+    verified = resolve_flush_target(pid_path)
+    if verified.pid is not None and verified.pid != os.getpid():
+        raise RecorderAlreadyRunningError(
+            f"An onoats recorder is already running (pid {verified.pid}). "
+            "Stop it first with `onoats stop`, then retry."
+        )
 
     existing = _read_pid_file(pid_path)
     if existing is not None:
@@ -1054,8 +1088,25 @@ def _write_pid_file(data_dir: Path) -> Path:
     return pid_path
 
 
-def _remove_pid_file(pid_path: Path) -> None:
-    """Remove the PID file on shutdown."""
+def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
+    """Remove the PID file on shutdown.
+
+    When ``owner_pid`` is given, only unlink if the file STILL records that pid.
+    A recorder tearing down must never delete a pid file a NEWER recorder has
+    since overwritten with its own pid (the stop-then-immediate-start race) — that
+    would leave the new session running with no pid file, invisible to
+    ``status``/``stop``/``flush``. A file we can no longer read as a valid record
+    (``None`` — already gone, or foreign marker) falls through to the unlink,
+    preserving the prior best-effort cleanup for the non-race cases.
+    """
+    if owner_pid is not None:
+        current = _read_pid_file(pid_path)
+        if current is not None and current != owner_pid:
+            logger.warning(
+                f"PID file {pid_path} now records pid {current}, not ours "
+                f"({owner_pid}) — a newer recorder owns it; not removing."
+            )
+            return
     try:
         pid_path.unlink()
         logger.debug(f"PID file removed: {pid_path}")

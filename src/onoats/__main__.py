@@ -57,6 +57,7 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
+    RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     _create_stt_service,
@@ -385,7 +386,7 @@ async def run_onoats(
     finally:
         await _on_shutdown()
         _restore_terminal(_old_terminal_settings)
-        _remove_pid_file(pid_path)
+        _remove_pid_file(pid_path, owner_pid=os.getpid())
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(
             run_onoats(interactive=args.interactive, locked_category=args.category)
         )
-    except SttPreflightError as exc:
+    except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
     return 0

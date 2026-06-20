@@ -2017,11 +2017,11 @@ def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
     observed: dict = {}
     real_remove = dual._remove_pid_file
 
-    def _spy_remove(p):
+    def _spy_remove(p, **kwargs):
         rec = status_file.read_status(data_dir)
         observed["running_at_unlink"] = None if rec is None else rec.running
         observed["pid_file_present_at_unlink"] = p.exists()
-        return real_remove(p)
+        return real_remove(p, **kwargs)
 
     monkeypatch.setattr(dual, "_remove_pid_file", _spy_remove)
 

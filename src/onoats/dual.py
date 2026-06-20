@@ -42,6 +42,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=Fals
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
+    RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     stop_pipeline_for_shutdown,
@@ -99,7 +100,7 @@ def _finalize_shutdown_status(
     else:
         _write_status_stopped(data_dir, exit_reason="graceful")
     _restore_terminal(old_terminal_settings)
-    _remove_pid_file(pid_path)
+    _remove_pid_file(pid_path, owner_pid=os.getpid())
 
 
 async def _shutdown_stt_service(stt_service, label: str) -> None:
@@ -758,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
                 live_terminal=args.live_terminal, locked_category=args.category
             )
         )
-    except SttPreflightError as exc:
+    except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
     return rc
