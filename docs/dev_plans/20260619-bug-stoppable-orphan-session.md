@@ -223,6 +223,54 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 - **Solution**: Drive external-stop convergence through `refresh()` polling on `processAlive` → false (process exit; not pid-file removal specifically); use a level-triggered cosmetic `stopRequested` flag (set synchronously in the button action, cleared in `refresh()` on `!alive`) instead of the enum state.
 - **Files affected**: `native/onoats-menubar/Sources/RecorderModel.swift`
 
+### Recommended orphan-recovery flows (UX decision, 2026-06-19 design discussion)
+
+Captured from a post-Phase-1 design discussion so Phase 2 (and any docs) pick a
+sound flow rather than re-deriving it. Verified against current code
+(`RecorderModel.refresh()`, `OnoatsMenuBarApp` button gating, `_write_pid_file`,
+`_remove_pid_file`, `_rotate_flush`).
+
+- **Recommended flow — flush to checkpoint, keep recording, stop at the end.**
+  `onoats flush` (SIGUSR1) is a *continuation* flush (`_flush_continuation` →
+  `_rotate_flush(reason, continue_session=True)`, `dual.py:424-431`): it rotates
+  the current `.active/` buffer into `pending/` **and opens a fresh `.active/`
+  session in the same process** — capture never stops. So the orphan-recovery UX
+  is: Flush now (salvage everything so far as a clean segment, recording
+  continues), then Stop at the end of the call (graceful SIGTERM → final rotate →
+  exit). Nothing is lost; the live call is uninterrupted.
+  - *Ownership does NOT transfer on flush.* The orphan stays the orphan
+    (`.running(ours:false)`); flush opens a new **file**, not a new **process** or
+    a GUI-owned session. The only way to a GUI-owned session is stop → (wait for
+    exit) → start.
+
+### Issue (anticipated): external stop→start must not be chained immediately
+
+- **Problem**: `onoats stop` returns on **signal delivery, not exit**; the
+  graceful drain (STT drain → terminal flush → rotate → `_remove_pid_file`) takes
+  seconds. A `start` issued during that window makes the new recorder's
+  `_write_pid_file` **overwrite** the orphan's still-live pid (warn-and-overwrite,
+  `runtime.py:1029-1050`); the draining orphan then calls `_remove_pid_file`,
+  which **unlinks unconditionally** (`runtime.py:1057-1065`) — deleting the *new*
+  recorder's pid file. Net result: the new session runs with no pid file (invisible
+  to `onoats status`/`stop`/`flush` — a fresh uncontrollable orphan), plus two
+  processes capture the same mic/system audio concurrently during the overlap.
+- **Why the menu is safe today**: the GUI cannot trigger this — `Start` is
+  rendered only in `.stopped`/`.failed` (`OnoatsMenuBarApp.swift:69-78`), and
+  `refresh()` keeps an alive handle-less orphan in `.running(ours:false)` until it
+  observes `processAlive` → false (`RecorderModel.swift:243-258`). So `Start` does
+  not exist during the drain; the state machine gates it behind real process exit.
+  The "no early flip" invariant (recorder shares the pid-owner's process, exits
+  only after teardown) is what keeps `kill(0)` true through the whole drain.
+- **Constraint for Phase 2 / future work**: never chain `stop()` then `start()`
+  back-to-back (e.g. a "Restart" button) without first waiting for the
+  `.running → .stopped` transition (`processAlive` → false). A `flock`-style hard
+  single-instance lock on the pid file (refuse the second start until the first is
+  fully gone) is the durable fix and would make even the racy CLI sequence
+  (`onoats stop && onoats bot`) safe. **Out of scope for Phases 1–2** — separate,
+  start-path-touching change; recorded here so it is not lost.
+- **Files affected (future)**: `src/onoats/runtime.py` (`_write_pid_file` /
+  `_remove_pid_file`), `native/onoats-menubar/Sources/RecorderModel.swift`.
+
 ## Final Results
 
 [Fill when complete]
