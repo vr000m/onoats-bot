@@ -1120,6 +1120,10 @@ def _cmd_flush(rest: list[str]) -> int:
     This is the seam an integrating consumer's ``flush`` pass-through execs. It
     resolves the pid from ``<data_dir>/.active/onoats.pid`` (marker
     ``onoats-bot``) under the forwarded ``ONOATS_DATA_DIR`` root.
+
+    Near-clone: ``_cmd_stop`` mirrors this verbatim except for the signal
+    (SIGTERM vs SIGUSR1). Keep the two in sync — a new error branch here must be
+    copied there (parity is pinned by tests, not a shared helper).
     """
     parser = argparse.ArgumentParser(prog="onoats flush")
     parser.add_argument(

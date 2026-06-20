@@ -335,6 +335,10 @@ final class RecorderModel: ObservableObject {
     /// like everything else). Deliberately works for EXTERNAL sessions too:
     /// the CLI does its own identity-checked pid signalling (marker +
     /// fingerprint), so flushing a terminal-started session from here is safe.
+    ///
+    /// Near-clone: `stopExternal()` mirrors this (it execs `onoats stop` instead
+    /// of `flush`, plus the `stopRequested` flag). Keep the two in sync — e.g. a
+    /// future `--data-dir` argument must be added to both.
     func flush() {
         flushNote = nil
         let p = Process()

@@ -85,8 +85,10 @@ def _finalize_shutdown_status(
     Extracted module-level (rather than left inline in ``_run_shutdown``) so the
     write ordering is exercisable at runtime without booting the recorder stack —
     see ``test_socket_supervisor.py``. Terminal restore + pid removal live here
-    too so the two shutdown call sites (``_shutdown_watcher`` and the outer
-    ``finally`` block) stay idempotent regardless of ordering.
+    too; this runs exactly once per session (the ``_on_shutdown`` de-dup guard
+    via ``shutdown_started``/``shutdown_complete`` serialises the two call sites —
+    ``_shutdown_watcher`` and the outer ``finally`` block), so it does not need to
+    be internally idempotent.
     """
     if ended_by_error:
         _write_status_stopped(

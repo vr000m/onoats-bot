@@ -150,7 +150,8 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 ## Progress
 
 - [x] Phase 1: `onoats stop` CLI subcommand (Python)
-- [x] Phase 2: Menu-bar Stop rewiring (Swift) — impl complete + compiles clean (`make build/Onoats`); **manual orphan-then-stop smoke matrix still pending on the user's machine**
+- [x] Phase 2 (code): Menu-bar Stop rewiring (Swift) — impl complete + compiles clean (`make build/Onoats`)
+- [ ] Phase 2 (manual smoke): orphan-then-stop matrix on the user's machine — **still pending** (requires running/crashing/relaunching the signed app with real TCC + audio)
 - [ ] Phase 3: Zero-sample watchdog escalation (separable)
 
 ## Findings

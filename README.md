@@ -108,8 +108,9 @@ Other subcommands:
 ```bash
 onoats bot-single   # legacy mic-only recorder
 onoats flush        # tell the running recorder to rotate its buffer now
-onoats stop         # signal the running recorder to stop gracefully (drain +
-                    # final flush); identity-checked like flush, so it only ever
+onoats stop         # stop the running recorder gracefully: SIGTERM → drain +
+                    # final flush, then EXIT (unlike flush, which keeps
+                    # recording). Identity-checked like flush, so it only ever
                     # signals the verified recorder — never a recycled pid
 onoats devices      # list audio input/output devices (PortAudio's view; under
                     # the socket path it adds a note — the native capturer binds
