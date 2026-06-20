@@ -46,11 +46,11 @@ from onoats.runtime import (  # noqa: E402
     SttPreflightError,
     stop_pipeline_for_shutdown,
     wait_or_force,
-    _remove_pid_file,
     _create_stt_service,
     log_stt_server_rss,
     _install_signal_handlers,
     _mark_status_rotation,
+    _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
     _topic_pipeline_tasks,
@@ -61,6 +61,45 @@ from onoats.runtime import (  # noqa: E402
     run_crash_recovery,
     stt_banner,
 )
+
+
+def _finalize_shutdown_status(
+    data_dir: Path,
+    pid_path: Path,
+    *,
+    ended_by_error: bool,
+    old_terminal_settings: object | None = None,
+) -> None:
+    """Single-writer shutdown tail: write status-stopped BEFORE removing the pid.
+
+    Write ordering (status-file contract): status-stopped FIRST, then the pid is
+    removed — so ``onoats status`` (the pid backstop) never observes pid-gone
+    while the status file still claims running, and the menu bar's external-stop
+    polling never sees an inconsistent half-torn-down state. ``ended_by_error``
+    (set in ``run_onoats_dual``'s outer run body) distinguishes a fatal-ErrorFrame
+    self-end from a graceful shutdown; the specific cause (capturer-crash vs the
+    recorder's own ErrorFrame, mic/system-audio denial) is enriched by the socket
+    supervisor, which alone knows the final rc.
+
+    Extracted module-level (rather than left inline in ``_run_shutdown``) so the
+    write ordering is exercisable at runtime without booting the recorder stack —
+    see ``test_socket_supervisor.py``. Terminal restore + pid removal live here
+    too so the two shutdown call sites (``_shutdown_watcher`` and the outer
+    ``finally`` block) stay idempotent regardless of ordering.
+    """
+    if ended_by_error:
+        _write_status_stopped(
+            data_dir,
+            exit_reason="fatal_error_frame",
+            last_error=(
+                "dual pipeline ended on a fatal ErrorFrame (capture branch "
+                "EOF / read-idle / framing failure)"
+            ),
+        )
+    else:
+        _write_status_stopped(data_dir, exit_reason="graceful")
+    _restore_terminal(old_terminal_settings)
+    _remove_pid_file(pid_path)
 
 
 async def _shutdown_stt_service(stt_service, label: str) -> None:
@@ -558,30 +597,17 @@ async def run_onoats_dual(
         await _shutdown_stt_service(system_stt, "system")
         await log_stt_server_rss("shutdown")
 
-        # Status file: record stop + failure reason BEFORE removing the pid file.
-        # Write ordering (status-file contract): status-stopped FIRST, then the
-        # pid is removed — so `onoats status` (pid backstop) never observes
-        # pid-gone while the status file still claims running. ``ended_by_error``
-        # (set in the outer run body) distinguishes a fatal-ErrorFrame self-end
-        # from a graceful shutdown; the specific cause (capturer-crash vs the
-        # recorder's own ErrorFrame, mic/system-audio denial) is enriched by the
-        # socket supervisor, which alone knows the final rc.
-        if ended_by_error:
-            _write_status_stopped(
-                data_dir,
-                exit_reason="fatal_error_frame",
-                last_error=(
-                    "dual pipeline ended on a fatal ErrorFrame (capture branch "
-                    "EOF / read-idle / framing failure)"
-                ),
-            )
-        else:
-            _write_status_stopped(data_dir, exit_reason="graceful")
-        # Restore terminal and remove PID file inside the single-writer
-        # shutdown path so the two call sites (_shutdown_watcher and the
-        # outer ``finally`` block) are truly idempotent regardless of ordering.
-        _restore_terminal(old_terminal_settings)
-        _remove_pid_file(pid_path)
+        # Single-writer shutdown tail: status-stopped BEFORE pid removal, plus
+        # terminal restore. Extracted to a module-level helper so the write
+        # ordering is exercisable at runtime without booting the recorder stack
+        # (see test_socket_supervisor.py); ``ended_by_error`` (set in the outer
+        # run body) selects the failure detail.
+        _finalize_shutdown_status(
+            data_dir,
+            pid_path,
+            ended_by_error=ended_by_error,
+            old_terminal_settings=old_terminal_settings,
+        )
         logger.info("Shutdown: complete")
 
     async def _shutdown_watcher() -> None:

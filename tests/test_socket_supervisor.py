@@ -1967,29 +1967,35 @@ async def test_wait_for_sockets_extension_writes_waiting_record(
 
 
 # ---------------------------------------------------------------------------
-# Graceful-teardown write ordering (RUNTIME): status-stopped lands on disk
-# BEFORE the pid file is unlinked.
+# Shutdown write ordering (RUNTIME): status-stopped lands on disk BEFORE the pid
+# file is unlinked.
 #
 # This is the contract `onoats stop` (and the menu bar's external-stop polling)
 # rely on indirectly: the GUI keys "stopped" off the supervisor PROCESS exiting,
 # but `onoats status` (and any pid-backstop reader) must never observe pid-gone
 # while the status file still claims running. The producer call order is asserted
 # STATICALLY in test_status_file.py (source-text index check). This test is the
-# RUNTIME complement: it drives the real teardown producers
-# (`onoats.runtime._write_pid_file` / `_write_status_running` /
-# `_write_status_stopped` / `_remove_pid_file` — the exact symbols dual.py's
-# `_run_shutdown` imports and calls) against a real filesystem and observes, AT
-# THE INSTANT the pid file is unlinked, that the on-disk status already reads
-# running=False. A producer whose status write lagged (non-durable / async) or a
-# reorder at the producer-call level would flip the observed value and fail here
-# — neither of which the static index check nor test_shutdown_drain.py (which
-# drives a FakeTask and never exercises _remove_pid_file) can catch.
+# RUNTIME complement: it drives dual.py's real shutdown tail
+# (`dual._finalize_shutdown_status` — the exact helper `run_onoats_dual`'s
+# `_run_shutdown` calls, factored out of the closure precisely so it is
+# runtime-reachable without booting the STT/VAD stack) against a real filesystem.
+# It spies the pid-unlink boundary and observes, AT THE INSTANT the pid file is
+# unlinked, that the on-disk status already reads running=False. A reorder of the
+# status-stopped / pid-removal pair inside the helper, or a status write that
+# lagged (non-durable / async), flips the observed value and fails here — neither
+# of which the static index check nor test_shutdown_drain.py (which drives a
+# FakeTask and never exercises _remove_pid_file) can catch.
 # ---------------------------------------------------------------------------
 
 
-def test_graceful_teardown_writes_status_stopped_before_pid_unlink(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("ended_by_error", "expected_reason"),
+    [(False, "graceful"), (True, "fatal_error_frame")],
+)
+def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
+    tmp_path, monkeypatch, ended_by_error, expected_reason
 ):
+    from onoats import dual
     from onoats import runtime
     from onoats import status as status_file
 
@@ -2005,10 +2011,11 @@ def test_graceful_teardown_writes_status_stopped_before_pid_unlink(
     assert start_rec is not None and start_rec.running is True
 
     # Instrument the unlink boundary: snapshot the on-disk status at the exact
-    # instant the pid file is removed. dual.py calls `_remove_pid_file` (this
-    # symbol) as the final teardown step; spying here observes the real order.
+    # instant the pid file is removed. `_finalize_shutdown_status` calls
+    # `_remove_pid_file` (resolved in dual.py's namespace) as its final step, so
+    # patching the name there observes the helper's REAL ordering.
     observed: dict = {}
-    real_remove = runtime._remove_pid_file
+    real_remove = dual._remove_pid_file
 
     def _spy_remove(p):
         rec = status_file.read_status(data_dir)
@@ -2016,18 +2023,15 @@ def test_graceful_teardown_writes_status_stopped_before_pid_unlink(
         observed["pid_file_present_at_unlink"] = p.exists()
         return real_remove(p)
 
-    monkeypatch.setattr(runtime, "_remove_pid_file", _spy_remove)
+    monkeypatch.setattr(dual, "_remove_pid_file", _spy_remove)
 
-    # Graceful teardown, in dual.py `_run_shutdown` order: status-stopped FIRST…
-    runtime._write_status_stopped(data_dir, exit_reason="graceful")
-    # …status-stopped must be durably on disk (synchronous atomic write) the
-    # moment it returns, before the pid is touched.
-    mid_rec = status_file.read_status(data_dir)
-    assert mid_rec is not None and mid_rec.running is False, (
-        "status-stopped must be durable on disk before the pid file is unlinked"
+    # Drive dual.py's actual shutdown tail (not a hand-sequenced copy of it).
+    dual._finalize_shutdown_status(
+        data_dir,
+        pid_path,
+        ended_by_error=ended_by_error,
+        old_terminal_settings=None,
     )
-    # …then remove the pid file (instrumented).
-    runtime._remove_pid_file(pid_path)
 
     # The unlink spy observed status already running=False — no window where a
     # reader sees pid-gone while the status file still claims a live recorder.
@@ -2040,11 +2044,12 @@ def test_graceful_teardown_writes_status_stopped_before_pid_unlink(
         "the pid file should still exist at the moment _remove_pid_file is entered"
     )
 
-    # Final on-disk state: pid gone, status durably stopped, start detail kept.
+    # Final on-disk state: pid gone, status durably stopped with the branch's
+    # exit reason, start-of-session detail preserved.
     assert not pid_path.exists()
     end_rec = status_file.read_status(data_dir)
     assert end_rec is not None and end_rec.running is False
-    assert end_rec.exit_reason == "graceful"
+    assert end_rec.exit_reason == expected_reason
     assert end_rec.audio_source == "socket", (
         "stop must preserve start-of-session detail"
     )

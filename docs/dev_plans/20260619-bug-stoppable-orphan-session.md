@@ -176,24 +176,25 @@ Make any identity-verified live recorder session stoppable from the menu bar —
   copy-paste signal swap fails. Plus dispatch-table + `--help`-without-boot.
 
 - **Runtime write-order regression** (`tests/test_socket_supervisor.py`:
-  `test_graceful_teardown_writes_status_stopped_before_pid_unlink`). Drives the
-  real teardown producers (`runtime._write_pid_file` / `_write_status_running` /
-  `_write_status_stopped` / `_remove_pid_file` — the exact symbols dual.py's
-  `_run_shutdown` imports and calls) against a real filesystem and spies on the
-  pid-unlink boundary, observing that the on-disk status already reads
-  `running=False` at the instant the pid file is removed. This is the
-  **runtime** complement the plan asked for — distinct from the **static**
-  source-text index check in `test_status_file.py:243-245`.
-  - *Scope note (named, not hidden):* the producer **call order** inside
-    `dual._run_shutdown` is a nested closure unreachable without booting the heavy
-    STT/VAD stack, so it remains guarded by the static index check; this runtime
-    test proves the producers' on-disk effects are **synchronous + durable +
-    consistent** (status-stopped lands before pid removal, no async lag / no
-    pid-gone-while-status-running window). The plan's pointer to
-    "test_socket_supervisor.py's real-teardown harness" refers to that file's
-    teardown-timing harness; note its supervisor lifecycle tests substitute a
-    *fake* `run_onoats_dual`, so they do not themselves exercise the recorder's
-    pid/status writes — hence this dedicated producer-level runtime test.
+  `test_shutdown_tail_writes_status_stopped_before_pid_unlink`, parametrized over
+  graceful + fatal-ErrorFrame branches). The shutdown tail that was inline in
+  `dual._run_shutdown` (a nested closure, unreachable without booting the STT/VAD
+  stack) was extracted to a module-level helper `dual._finalize_shutdown_status`
+  — a test-induced refactor done precisely so the **actual ordering logic** is
+  runtime-reachable. The test seeds a real pid file + running status, spies on
+  `dual._remove_pid_file`, drives the real helper, and asserts the on-disk status
+  already reads `running=False` at the instant the pid file is unlinked. Because
+  it now exercises dual.py's real call order (not a hand-sequenced copy), a
+  reorder of the status-stopped / pid-removal pair fails here at runtime.
+  - The **static** source-text index check (`test_status_file.py:243-245`) is now
+    redundant with this runtime test but kept (cheap, and still guards the
+    start-half `pid-write < status-running` order). The literals it greps
+    (`_write_status_stopped(`, `_remove_pid_file(pid_path)`,
+    `_write_pid_file(data_dir)`, `_write_status_running(`) all survive the
+    refactor in the correct source order, so it stays green.
+  - *Note:* the supervisor lifecycle tests in this file substitute a *fake*
+    `run_onoats_dual`, so they do not themselves exercise the recorder's
+    pid/status writes — hence this dedicated helper-level runtime test.
 
 - **Content-bearing final flush on SIGTERM — WAIVER (per acceptance criteria).**
   Not adding a new content-bearing unit assertion in Phase 1: the SIGTERM path
