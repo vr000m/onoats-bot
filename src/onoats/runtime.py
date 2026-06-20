@@ -1035,23 +1035,41 @@ def _own_ps_cmdline() -> str:
     return ""
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if ``pid`` exists. ``ProcessLookupError`` is the only positive proof
+    of death; any other error (``EPERM`` — owned by another user — or an odd
+    ``OSError``) is treated as alive, so a liveness guard fails *safe*."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _write_pid_file(data_dir: Path) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint.
 
-    Single-instance guard: refuses to start over a still-live, identity-verified
-    recorder (raising ``RecorderAlreadyRunningError``). The check reuses the same
-    identity gate as ``onoats stop``/``flush`` (``resolve_flush_target``: marker +
-    cmdline fingerprint + liveness), so a stale, recycled, or foreign pid does NOT
-    block a legitimate start — only a genuine live recorder does. This closes the
-    stop-then-immediate-start race: without it, a second start would overwrite a
-    draining recorder's pid file, and the drainer would later unlink THIS start's
-    file (see also the ownership check in ``_remove_pid_file``).
+    Single-instance guard: refuses to start over a still-live recorder (raising
+    ``RecorderAlreadyRunningError``). The check reuses the same identity gate as
+    ``onoats stop``/``flush`` (``resolve_flush_target``: marker + cmdline
+    fingerprint + liveness), so a *positively stale* pid — dead, or recycled to a
+    foreign process (identity mismatch) — does NOT block a legitimate start. But a
+    marker-valid pid file naming a LIVE process whose identity cannot be verified
+    (``ps`` probe failed, or a legacy fingerprint-less file) is treated the same
+    way ``flush``/``stop`` treat that indeterminate state — refuse, never
+    overwrite — so a transient probe failure can't spawn a second recorder over a
+    live one. This closes the stop-then-immediate-start race (and its degraded
+    variants): without it, a second start would overwrite a draining recorder's
+    pid file, and the drainer would later unlink THIS start's file (see also the
+    ownership check in ``_remove_pid_file``).
     """
     active_dir = data_dir / ".active"
     active_dir.mkdir(parents=True, exist_ok=True)
     pid_path = active_dir / PID_FILENAME
 
-    from onoats._vendor.pid import resolve_flush_target
+    from onoats._vendor.pid import read_pid_record, resolve_flush_target
 
     verified = resolve_flush_target(pid_path)
     if verified.pid is not None and verified.pid != os.getpid():
@@ -1059,6 +1077,21 @@ def _write_pid_file(data_dir: Path) -> Path:
             f"An onoats recorder is already running (pid {verified.pid}). "
             "Stop it first with `onoats stop`, then retry."
         )
+    # Indeterminate-but-live: the resolver refused (pid is None) WITHOUT declaring
+    # the file stale — i.e. it is neither a verified recorder nor a proven-dead /
+    # recycled-foreign pid, but a marker-valid file whose process is still alive
+    # and merely unverifiable (ps probe failed / legacy fingerprint-less). Refuse,
+    # exactly as flush/stop do for the same state; only ``stale=True`` is safe to
+    # clobber.
+    if verified.pid is None and not verified.stale:
+        rec = read_pid_record(pid_path)
+        if rec is not None and rec.pid != os.getpid() and _pid_alive(rec.pid):
+            raise RecorderAlreadyRunningError(
+                f"A recorder pid file names a live process (pid {rec.pid}) whose "
+                "identity could not be verified (ps probe failed / legacy pid "
+                "file) — refusing to start over a possibly-live recorder. Stop it "
+                "(`onoats stop`) or remove the stale pid file, then retry."
+            )
 
     existing = _read_pid_file(pid_path)
     if existing is not None:

@@ -593,3 +593,45 @@ def test_remove_pid_file_unconditional_without_owner(tmp_path):
     pid_path = _seed_pid_file(tmp_path, 999)
     _remove_pid_file(pid_path)
     assert not pid_path.exists()
+
+
+def test_write_pid_file_refuses_live_recorder_with_indeterminate_probe(
+    tmp_path, monkeypatch
+):
+    """[high] regression (Codex re-review): a marker-valid pid file naming a LIVE
+    process whose identity can't be verified (ps probe returns None) must REFUSE
+    startup, not overwrite — the same indeterminate state flush/stop refuse to act
+    on. Without the guard a transient `ps` failure spawns a second recorder over a
+    live one."""
+    if not shutil.which("sleep"):
+        pytest.skip("requires a real live process for the liveness check")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = _seed_pid_file(tmp_path, proc.pid)
+        # kill(0) succeeds (process alive) but the identity readback fails.
+        monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)
+        # The live recorder's pid file MUST survive — never overwritten.
+        assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_write_pid_file_refuses_live_legacy_fingerprintless_pid(tmp_path):
+    """A legacy (2-line, fingerprint-less) pid file naming a LIVE process is
+    unverifiable → refuse startup rather than overwrite a possibly-live recorder."""
+    if not shutil.which("sleep"):
+        pytest.skip("requires a real live process for the liveness check")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = tmp_path / ".active" / PID_FILENAME
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(f"{proc.pid}\nonoats-bot\n", encoding="utf-8")  # no line 3
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)
+        assert pid_path.exists()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
