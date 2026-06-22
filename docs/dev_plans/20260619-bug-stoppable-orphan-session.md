@@ -151,7 +151,7 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 - [x] Phase 1: `onoats stop` CLI subcommand (Python)
 - [x] Phase 2 (code): Menu-bar Stop rewiring (Swift) — impl complete + compiles clean (`make build/Onoats`)
-- [ ] Phase 2 (manual smoke): orphan-then-stop matrix on the user's machine — **still pending** (requires running/crashing/relaunching the signed app with real TCC + audio)
+- [x] Phase 2 (manual smoke): orphan-then-stop **headline case verified live** on the user's machine (2026-06-22) — see Findings. Remaining matrix items (owned Stop, double-click guard, Flush mid-session, CLI-failure re-enable) not yet exercised.
 - [ ] Phase 3: Zero-sample watchdog escalation (separable)
 
 ## Findings
@@ -294,10 +294,35 @@ the deferred pid-race fix forward in response).
   test_native_contract_parity.py`): 112 passed. `uv run onoats stop --help`
   resolves without booting a service. `ruff format` + `ruff check` clean.
 
-- **Remaining:** Phase 2 (Swift menu-bar Stop rewiring) requires building the
-  menu-bar app and a manual orphan-then-stop smoke on the user's machine — not
-  autonomously runnable; deferred. Phase 3 is separable/optional and sequenced
-  after P2.
+- **Remaining:** Phase 3 is separable/optional and sequenced after P2.
+
+### On-device smoke — headline orphan-then-stop verified (2026-06-22)
+
+The core bug (a crash-orphaned GUI session is unstoppable from the menu) is
+**fixed and verified live** on the signed app with real TCC + audio.
+
+- **Smoke-procedure gotcha — Force Quit reaps the bundle capturer; it does NOT
+  produce an orphan.** First attempt force-quit `Onoats.app`; the capturer
+  (`Contents/MacOS/onoats-capturer`, a binary *inside* the bundle) was SIGKILL'd
+  (`rc=-9`) while the external supervisor (`~/.local/bin/onoats bot`) survived and
+  fail-loud-exited — so no orphan remained to Stop. Inferred mechanism:
+  LaunchServices reaps bundle-resident executables on app termination; the
+  out-of-bundle CLI supervisor is spared. A *genuine* GUI crash (segfault of only
+  the GUI process) leaves both supervisor and capturer alive. **To reproduce the
+  orphan, kill only the GUI process** (`kill -9 $(pgrep -f "MacOS/Onoats$")`),
+  never Force Quit.
+- **Headline case PASS.** With the surgical kill, `onoats status` showed
+  `RUNNING` with a live capturer (orphan survived). Relaunch rendered
+  `running(ours:false)` with **Stop enabled** ("started outside the menu bar").
+  Clicking Stop drove `stopExternal()` → `onoats stop` → identity-checked
+  **SIGTERM** → graceful drain. Live log confirmed the runtime invariant: STT
+  graceful close → **flush/rotate → pid-file removed → `Shutdown: complete`** (in
+  order), then `recorder exited; stopping capturer` — recorder-first, capturer
+  second, no `rc=-9`/`capturer-crash`/fail-loud. Final status: `not running` with
+  no exit-reason/last-error/supervisor-rc fields (clean graceful stop).
+- **Not yet exercised (lower-risk matrix tail):** owned Start→Stop (unchanged
+  `p.terminate()` path, relabel only), double-click `stopRequested` guard, Flush
+  mid-session, and the CLI-failure re-enable (`cliPath`→non-zero exec).
 
 ## Issues & Solutions
 
