@@ -39,8 +39,9 @@ Annotated tags exist from `v0.9.0` forward.
   `status`/`stop`/`flush`. Guards close this: (1) an **atomic `flock`
   single-instance lock** acquired before any capture side effect — the socket
   supervisor takes an exclusive `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`
-  *before spawning the capturer*, and `run_onoats_dual` *before opening PortAudio*,
-  so of N racing starts exactly one wins and the rest raise
+  *before spawning the capturer*, `run_onoats_dual` *before opening PortAudio*, and
+  `run_onoats` (`bot-single` / `python -m onoats`) *before importing the native
+  deps*, so of N racing starts exactly one wins and the rest raise
   `RecorderAlreadyRunningError` **before touching CoreAudio/TCC/a device**; held
   for the whole process lifetime and released by the kernel on exit (graceful or
   crash), so there is no stale lock to reclaim, and a chained `onoats stop &&
@@ -52,7 +53,9 @@ Annotated tags exist from `v0.9.0` forward.
   empty/partial file; (4) pid-file removal is ownership-checked and fails closed —
   a recorder unlinks only a file that still records *its own* pid, and leaves an
   unreadable/foreign record in place rather than deleting a newer recorder's
-  (possibly in-progress) file. The menu's external Stop also re-enables itself if
+  (possibly in-progress) file; (5) `stop`/`flush` stale cleanup is
+  **compare-and-unlink** (not a blind `unlink`) so a fresh recorder that won the
+  lock and wrote its pid in the resolve→cleanup window is never deleted. The menu's external Stop also re-enables itself if
   the `onoats stop` subprocess fails or exits non-zero (e.g. a stale installed
   CLI), rather than wedging the only Stop control until app restart.
 

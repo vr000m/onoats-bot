@@ -156,6 +156,37 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Findings
 
+### Codex re-review round 6 (2026-06-22) — entrypoint parity + stale-cleanup TOCTOU
+
+A sixth pass confirmed the main socket/dual lifecycle was sound but found two more
+process-control holes; both fixed.
+
+- **[high] `bot-single` / `python -m onoats` still set up capture before claiming
+  the lock** (`__main__.py`). `run_onoats()` imported native deps (pyaudio via
+  `LocalAudioTransport` / `audio_devices`), resolved the data dir, then did
+  `select_input_device()` + crash recovery + pipeline build — all *before*
+  `_write_pid_file` (its only lock acquisition). Hoisted: `run_onoats()` now
+  resolves `data_dir` and calls `_acquire_instance_lock` **first, before even the
+  heavy imports**, so a losing start refuses having touched nothing.
+  `_cmd_bot_single` routes through this same `run_onoats`, so both entrypoints are
+  now gated consistently with socket mode. Regression
+  (`test_cli.py::test_bot_single_held_lock_fails_before_device_selection`): a held
+  lock → rc=1 with `select_input_device` never called.
+- **[high] `stop`/`flush` stale cleanup could delete a newer live recorder's pid
+  file** (`cli.py`). When `resolve_flush_target` returned `stale=True`, the command
+  **blindly** `unlink`ed the pid file. Race: `stop` resolves an old dead/recycled
+  pid as stale; before the unlink a fresh recorder wins the lock and writes its
+  pid; `stop` then deletes that fresh file, orphaning the live recorder from
+  `status`/`stop`/`flush`. Pre-existing (cloned from the shipped `flush`), now
+  fixed in the shared path: a new `_compare_and_unlink_stale_pid` helper captures
+  the pid the file recorded *before* resolution and reuses the round-3 fail-closed
+  `_remove_pid_file(owner_pid=…)` — unlink only on an exact match; a fresh/foreign
+  pid is left in place. Applied to all four stale/dead-pid unlink sites (`stop`
+  and `flush`, the `stale` and `ProcessLookupError` branches). Regression
+  (`test_cli.py::test_stop_stale_cleanup_preserves_freshly_written_pid`): a fresh
+  pid written during resolution survives. Full suite: 294 passed; ruff + marker
+  green.
+
 ### Codex re-review round 5 (2026-06-22) — lock acquired too late (before-capture hoist)
 
 A fifth pass acknowledged the round-4 atomic lock closed the pid-overwrite race

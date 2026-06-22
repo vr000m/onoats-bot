@@ -60,6 +60,7 @@ from onoats.runtime import (  # noqa: E402
     RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
+    _acquire_instance_lock,
     _create_stt_service,
     stop_pipeline_for_shutdown,
     wait_or_force,
@@ -122,6 +123,20 @@ async def run_onoats(
                          The classifier still extracts summary/tags/action_items
                          but the category is overridden.
     """
+    # ----------------------------------------------------------------
+    # Step 1: Resolve the data dir + claim the single-instance slot FIRST —
+    # before importing native deps (pyaudio via LocalAudioTransport /
+    # audio_devices) or ANY capture setup. A losing concurrent `onoats bot-single`
+    # (or `python -m onoats`) raises RecorderAlreadyRunningError here having
+    # touched nothing — the same before-capture gate the socket supervisor and
+    # run_onoats_dual apply. Idempotent; held for the process lifetime (kernel
+    # releases on exit).
+    # ----------------------------------------------------------------
+    from onoats._vendor.store import onoats_data_dir
+
+    data_dir = onoats_data_dir()
+    _acquire_instance_lock(data_dir / ".active")
+
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
@@ -131,15 +146,9 @@ async def run_onoats(
         LocalAudioTransportParams,
     )
 
-    from onoats._vendor.store import onoats_data_dir
     from onoats.config.audio_devices import select_input_device
     from onoats.processors.silence_detector import SilenceDetector
     from onoats.processors.transcript_buffer import TranscriptBuffer
-
-    # ----------------------------------------------------------------
-    # Step 1: Resolve the data dir (XDG-aware; ONOATS_DATA_DIR wins)
-    # ----------------------------------------------------------------
-    data_dir = onoats_data_dir()
 
     # ----------------------------------------------------------------
     # Step 2: Select audio device (input only — silent recorder)

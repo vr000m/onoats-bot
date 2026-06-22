@@ -121,7 +121,10 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
 - **Never signal an unverified or recycled pid.** The resolver validates the
   marker, requires a cmdline fingerprint, probes liveness (`kill(0)`), and
   compares the live `ps` cmdline against the stored one. Only a fully-verified
-  pid is signalled; unlink **only** when `stale=True`; treat `ProcessLookupError`
+  pid is signalled; unlink **only** when `stale=True`, and even then
+  **compare-and-unlink** (`_compare_and_unlink_stale_pid` → `_remove_pid_file`
+  ownership check) — never blindly, or a fresh recorder that won the lock and wrote
+  its pid in the resolve→cleanup window would be deleted; treat `ProcessLookupError`
   at signal time (TOCTOU) as stale. This matters **more** for `stop` than `flush`
   — SIGTERM kills by default, so a blind signal to a recycled foreign pid would
   terminate an unrelated process. A differential test asserts `stop` sends
@@ -142,11 +145,12 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`. It is hoisted to the EARLIEST
   point in each entrypoint — the socket supervisor takes it *before spawning the
   capturer* (`_supervise_socket_session`), `run_onoats_dual` *before opening
-  PortAudio* — so a losing concurrent start raises `RecorderAlreadyRunningError`
-  (clean rc=1 at all CLI boundaries) **before** it touches CoreAudio/TCC/a device,
-  never after. Acquisition is **idempotent** (already-held → no-op), so the later
-  `_write_pid_file` call (the universal backstop for `python -m onoats`) is a no-op
-  in the hoisted paths. This is the primary gate and the only *atomic* one: of N
+  PortAudio*, and `run_onoats` (`bot-single` / `python -m onoats`) *before even
+  importing the native deps* — so a losing concurrent start raises
+  `RecorderAlreadyRunningError` (clean rc=1 at all CLI boundaries) **before** it
+  touches CoreAudio/TCC/a device, never after. Acquisition is **idempotent**
+  (already-held → no-op), so the later `_write_pid_file` call (a backstop) is a
+  no-op in the hoisted paths. This is the primary gate and the only *atomic* one: of N
   racing starts exactly one wins. The lock is held for the **whole process
   lifetime**; the kernel releases it on exit (graceful OR crash/SIGKILL) — there is
   no stale lock to reclaim and **no teardown release call** (releasing during

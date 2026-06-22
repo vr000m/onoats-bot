@@ -656,3 +656,71 @@ def test_stop_help_resolves_without_booting(capsys):
     out = capsys.readouterr().out.lower()
     assert "usage" in out
     assert "onoats stop" in out
+
+
+def test_stop_stale_cleanup_preserves_freshly_written_pid(monkeypatch, _isolate_env):
+    """[high] regression (Codex adversarial review round 6): stale cleanup must
+    COMPARE-and-unlink. A blind unlink would delete a NEWER recorder's pid file
+    written in the window between stale resolution and cleanup (the new recorder
+    won the single-instance lock and published its pid). Simulate that racing
+    write inside resolve_flush_target; the stale cleanup must NOT delete it."""
+    import os as _os
+
+    from onoats._vendor.pid import FlushTarget
+
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    # The old, dead pid `stop` resolves first (valid marker → parseable).
+    pid_path.write_text("999999\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+
+    fresh_pid = _os.getpid()  # a live pid standing in for the new recorder
+
+    def _racing_resolve(p):
+        # The new recorder won the lock and published its pid in the window
+        # between our prior-read and the stale cleanup.
+        p.write_text(f"{fresh_pid}\nonoats-bot\nonoats bot\n123.0\n", encoding="utf-8")
+        return FlushTarget(pid=None, reason="stale (dead pid)", stale=True)
+
+    monkeypatch.setattr("onoats._vendor.pid.resolve_flush_target", _racing_resolve)
+    rc = cli.main(["stop"])
+    assert rc == 1
+    # The freshly-written pid file MUST survive — never deleted by stale cleanup.
+    assert pid_path.exists(), "stale cleanup must not delete a newer recorder's file"
+    assert pid_path.read_text(encoding="utf-8").startswith(f"{fresh_pid}\n")
+
+
+def test_bot_single_held_lock_fails_before_device_selection(monkeypatch, _isolate_env):
+    """[high] regression (Codex adversarial review round 6): `bot-single` must
+    claim the single-instance lock BEFORE any capture setup. With the slot already
+    held, run_onoats must fail (rc=1) without ever calling select_input_device —
+    a losing start must not enumerate/touch audio before discovering it lost."""
+    import fcntl as _fcntl
+    import os as _os
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+
+    from onoats.runtime import LOCK_FILENAME
+
+    active = _isolate_env / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    holder = _os.open(str(active / LOCK_FILENAME), _os.O_RDWR | _os.O_CREAT, 0o644)
+    _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+    selected = {"n": 0}
+    monkeypatch.setattr(
+        "onoats.config.audio_devices.select_input_device",
+        lambda **k: selected.__setitem__("n", selected["n"] + 1),
+    )
+    try:
+        from onoats.__main__ import main as single_main
+
+        rc = single_main([])
+        assert rc == 1, "a losing bot-single start must exit rc=1"
+        assert selected["n"] == 0, (
+            "device selection must not run when the instance lock is already held"
+        )
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        _os.close(holder)
