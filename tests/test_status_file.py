@@ -516,13 +516,28 @@ def test_write_prestart_waiting_is_fresh_running_with_warning(tmp_path: Path):
 
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import sys  # noqa: E402
 
 from onoats._vendor.pid import PID_FILENAME  # noqa: E402
 from onoats.runtime import (  # noqa: E402
+    LOCK_FILENAME,
     RecorderAlreadyRunningError,
+    _acquire_instance_lock,
+    _release_instance_lock,
     _remove_pid_file,
     _write_pid_file,
 )
+
+
+@pytest.fixture(autouse=True)
+def _release_instance_lock_after_each():
+    """Keep the module-global single-instance lock from leaking between tests.
+
+    A test that calls ``_write_pid_file``/``_acquire_instance_lock`` holds an
+    flock on its own ``tmp_path`` lock file; release it on teardown so the global
+    fd is reset (process-exit would release it anyway, but tests share a process)."""
+    yield
+    _release_instance_lock()
 
 
 def _seed_pid_file(data_dir: Path, pid: int, *, cmdline: str = "onoats bot") -> Path:
@@ -690,3 +705,58 @@ def test_write_pid_file_is_atomic_via_os_replace(tmp_path, monkeypatch):
     # No leaked temp files in the active dir.
     leftovers = list((tmp_path / ".active").glob("*.tmp"))
     assert not leftovers, f"atomic writer leaked temp residue: {leftovers}"
+
+
+def test_write_pid_file_refuses_concurrent_start_holding_instance_lock(tmp_path):
+    """[high] regression (Codex adversarial review round 4): the single-instance
+    guard must be ATOMIC, not check-then-replace. Two `onoats bot` starts racing
+    with no valid pid file both pass the best-effort identity check; the flock is
+    the gate that lets exactly ONE proceed. Simulate the race winner by holding
+    the flock (a separate open file description — POSIX flock conflicts even
+    within one process), then assert a second `_write_pid_file` refuses and does
+    NOT publish a pid file (so the loser can't run unrepresented)."""
+    import os as _os
+
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    import fcntl as _fcntl
+
+    active = tmp_path / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    lock_path = active / LOCK_FILENAME
+    holder = _os.open(str(lock_path), _os.O_RDWR | _os.O_CREAT, 0o644)
+    _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # instance 1 holds the slot
+    try:
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)  # instance 2 loses the race
+        assert not (active / PID_FILENAME).exists(), (
+            "the start that lost the instance-lock race must not publish a pid file"
+        )
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        _os.close(holder)
+
+
+def test_instance_lock_blocks_then_frees_on_release(tmp_path):
+    """The lock is exclusive while held and freed on release — so a post-drain
+    start can re-acquire the slot (the stop→start handoff)."""
+    import os as _os
+
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    import fcntl as _fcntl
+
+    active = tmp_path / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    _acquire_instance_lock(active)  # we now hold the slot
+    # A concurrent acquirer (separate fd) is blocked while we hold it.
+    other = _os.open(str(active / LOCK_FILENAME), _os.O_RDWR)
+    try:
+        with pytest.raises(OSError):
+            _fcntl.flock(other, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        # Release; the slot is now free for the next start.
+        _release_instance_lock()
+        _fcntl.flock(other, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # must succeed now
+        _fcntl.flock(other, _fcntl.LOCK_UN)
+    finally:
+        _os.close(other)

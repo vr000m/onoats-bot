@@ -34,8 +34,9 @@ from onoats._vendor.pid import (  # noqa: F401
     read_pid_file as _read_pid_file,
 )
 
-# termios/tty are Unix-only — guard for Windows compatibility
+# termios/tty/fcntl are Unix-only — guard for Windows compatibility
 if sys.platform != "win32":
+    import fcntl
     import termios
     import tty
 
@@ -1049,6 +1050,80 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# Single-instance lock — an advisory ``flock`` held for the recorder's process
+# lifetime. This is the ATOMIC instance-slot gate the pid file cannot be: the pid
+# file is a readable data record written check-then-replace, but ``flock`` either
+# acquires or fails with no window, and the kernel releases it automatically when
+# the holder exits — graceful OR crash/SIGKILL — so there is never a stale lock to
+# reclaim. The fd is kept open (module-global) for the whole process; closing it
+# or process exit releases the lock. The lock file itself is never unlinked.
+LOCK_FILENAME = "onoats.lock"
+_instance_lock_fd: int | None = None
+
+
+def _acquire_instance_lock(active_dir: Path) -> None:
+    """Atomically claim the single-instance slot; raise if another holds it.
+
+    This is the gate that makes concurrent starts safe. ``_write_pid_file``'s
+    identity check is best-effort — it reads a possibly-absent pid file, so two
+    simultaneous starts with no valid pid file BOTH pass it. The ``flock`` here
+    lets exactly one win; the loser gets ``RecorderAlreadyRunningError`` before it
+    publishes a pid file or starts capturing. Held for the process lifetime via
+    the module-global fd; the kernel releases it on exit. As a bonus this enforces
+    the "no immediate stop→start" rule — ``stop`` returns on signal delivery, so a
+    chained start cleanly refuses until the draining recorder's process exits and
+    the kernel frees the lock.
+
+    No-op on Windows (``flock`` unavailable); the pid-identity check remains the
+    only guard there. onoats is macOS-only in practice.
+    """
+    global _instance_lock_fd
+    if sys.platform == "win32":
+        return
+    # One lock per process: drop any prior fd (e.g. a re-init inside a long-lived
+    # test process) before claiming a fresh slot.
+    if _instance_lock_fd is not None:
+        _release_instance_lock()
+    lock_path = active_dir / LOCK_FILENAME
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        # EWOULDBLOCK/EAGAIN → a live recorder already holds the slot. Read the
+        # pid file (if any) only to name it in the error — never to gate on.
+        from onoats._vendor.pid import read_pid_record
+
+        rec = read_pid_record(active_dir / PID_FILENAME)
+        who = f" (pid {rec.pid})" if rec is not None else ""
+        raise RecorderAlreadyRunningError(
+            f"An onoats recorder is already running{who} and holds the "
+            "single-instance lock. Stop it first with `onoats stop`, then retry."
+        ) from exc
+    _instance_lock_fd = fd
+
+
+def _release_instance_lock() -> None:
+    """Release the single-instance lock if held (no-op otherwise).
+
+    Called on the teardown path for prompt release (so a post-drain start can
+    re-acquire the slot the instant we finish); process exit is the
+    kernel-guaranteed backstop for crash paths.
+    """
+    global _instance_lock_fd
+    if _instance_lock_fd is None:
+        return
+    try:
+        fcntl.flock(_instance_lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(_instance_lock_fd)
+    except OSError:
+        pass
+    _instance_lock_fd = None
+
+
 def _write_pid_file(data_dir: Path) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint.
 
@@ -1106,6 +1181,13 @@ def _write_pid_file(data_dir: Path) -> Path:
             logger.info("Removing stale PID file (process gone)")
         except PermissionError:
             logger.warning("PID file exists, process may be running as different user")
+
+    # Atomic single-instance acquisition. The identity checks above are
+    # best-effort (they read a possibly-absent pid file); this flock is the gate
+    # that closes the concurrent-start race — two starts that both passed the
+    # checks above contend here, and exactly one proceeds to publish a pid file.
+    # Held until process exit (released on teardown / by the kernel on crash).
+    _acquire_instance_lock(active_dir)
 
     cmdline = _own_ps_cmdline()
     # Wall-clock start_epoch is included as the 4th line so live-view

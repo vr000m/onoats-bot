@@ -51,6 +51,7 @@ from onoats.runtime import (  # noqa: E402
     log_stt_server_rss,
     _install_signal_handlers,
     _mark_status_rotation,
+    _release_instance_lock,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -103,6 +104,9 @@ def _finalize_shutdown_status(
         _write_status_stopped(data_dir, exit_reason="graceful")
     _restore_terminal(old_terminal_settings)
     _remove_pid_file(pid_path, owner_pid=os.getpid())
+    # Release the single-instance lock so a post-drain start can re-acquire the
+    # slot immediately; process exit is the kernel-guaranteed backstop.
+    _release_instance_lock()
 
 
 async def _shutdown_stt_service(stt_service, label: str) -> None:

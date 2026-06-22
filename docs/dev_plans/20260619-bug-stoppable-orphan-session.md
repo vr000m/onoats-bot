@@ -156,6 +156,37 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Findings
 
+### Codex re-review round 4 (2026-06-22) — atomic single-instance acquisition
+
+A fourth Codex adversarial pass returned NO-SHIP with one [high]: the pid guard
+was still **check-then-replace**, so two concurrent starts could both launch.
+
+- **[high] Concurrent starts could both pass the guard and run** (`runtime.py`).
+  `_write_pid_file` resolved the existing pid file (best-effort identity check),
+  then later published via `os.replace` — with no atomic step tying the liveness
+  check to ownership of the instance slot. Two `onoats bot` starts racing with no
+  valid pid file present both pass `resolve_flush_target`, both proceed, and the
+  later `os.replace` wins; the loser keeps running but is unrepresented by the pid
+  file (invisible to status/stop/flush, double capture). A pre-existing TOCTOU in
+  the single-instance model (not introduced by this branch), but the branch's
+  single-instance invariant claims to prevent exactly this. Fixed with the
+  durable lock the plan had deferred:
+  - **`flock` single-instance lock.** `_acquire_instance_lock` takes an exclusive
+    `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock` **before** publishing the pid
+    file; exactly one of N racing starts wins, the rest get
+    `RecorderAlreadyRunningError`. Held for the process lifetime via a
+    module-global fd; the kernel releases it on exit (graceful OR crash/SIGKILL),
+    so there is **no stale lock to reclaim** (the advantage over an `O_EXCL`
+    lockfile). Released explicitly on teardown (`dual._finalize_shutdown_status`,
+    `__main__`) for prompt handoff. No-op on Windows (POSIX-only; macOS product).
+  - The resolver-identity check stays as the **secondary** guard (catches a
+    legacy/cross-version recorder that predates the lock); the `flock` is the
+    primary atomic gate. This also enforces the plan's "no immediate stop→start"
+    rule — a chained start refuses until the drainer's process exits.
+  - **Regressions** (`test_status_file.py`): a held flock makes a second
+    `_write_pid_file` refuse and publish no pid file; the lock is exclusive while
+    held and frees on release. Full suite: 291 passed; ruff clean; marker green.
+
 ### Codex re-review round 3 (2026-06-22) — pid-file race residual
 
 A post-smoke Codex adversarial review returned NO-SHIP with one [high]: the
@@ -256,10 +287,10 @@ the deferred pid-race fix forward in response).
   deletes a pid file a newer recorder has overwritten. Recorder call sites
   (`dual._finalize_shutdown_status`, `__main__`) pass `owner_pid=os.getpid()`.
   Regression tests in `test_status_file.py` (refuse-live, overwrite-stale-dead,
-  ownership-skip, back-compat-unconditional). This supersedes the "out of scope
-  for Phases 1–2" note under *Issues & Solutions* — the guard landed here rather
-  than as a separate `flock` change; the resolver-identity guard is equivalent
-  protection without a new lock file.
+  ownership-skip, back-compat-unconditional). **Superseded by round 4** — an
+  actual `flock` single-instance lock landed (see round-4 finding); the
+  resolver-identity guard is now the *secondary* (legacy/cross-version) check
+  behind the atomic lock, not the only guard.
 
 - **Verification:** full `uv run pytest` suite **283 passed**; `ruff format` +
   `ruff check` clean; `make build/Onoats` compiles. Codex re-review not re-run.
@@ -395,15 +426,18 @@ sound flow rather than re-deriving it. Verified against current code
   not exist during the drain; the state machine gates it behind real process exit.
   The "no early flip" invariant (recorder shares the pid-owner's process, exits
   only after teardown) is what keeps `kill(0)` true through the whole drain.
-- **Constraint for Phase 2 / future work**: never chain `stop()` then `start()`
-  back-to-back (e.g. a "Restart" button) without first waiting for the
-  `.running → .stopped` transition (`processAlive` → false). A `flock`-style hard
-  single-instance lock on the pid file (refuse the second start until the first is
-  fully gone) is the durable fix and would make even the racy CLI sequence
-  (`onoats stop && onoats bot`) safe. **Out of scope for Phases 1–2** — separate,
-  start-path-touching change; recorded here so it is not lost.
-- **Files affected (future)**: `src/onoats/runtime.py` (`_write_pid_file` /
-  `_remove_pid_file`), `native/onoats-menubar/Sources/RecorderModel.swift`.
+- **RESOLVED in round 4** — the `flock`-style hard single-instance lock landed.
+  `_write_pid_file` now acquires an exclusive `flock` (held until process exit)
+  before publishing the pid file, so the racy CLI sequence (`onoats stop &&
+  onoats bot`) is now **safe**: the chained start cleanly refuses with
+  `RecorderAlreadyRunningError` until the draining recorder's process exits and the
+  kernel frees the lock (rather than clobbering the pid file). The GUI gating
+  (`Start` only in `.stopped`/`.failed`) remains as defence in depth, but is no
+  longer the *only* thing preventing the race. A future "Restart" button could now
+  retry-with-backoff against the lock instead of needing a hard wait.
+- **Files affected**: `src/onoats/runtime.py` (`_acquire_instance_lock` /
+  `_release_instance_lock` / `_write_pid_file`), `src/onoats/dual.py` +
+  `src/onoats/__main__.py` (release on teardown).
 
 ## Final Results
 

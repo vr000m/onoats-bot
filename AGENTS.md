@@ -136,12 +136,21 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
 
 Single-instance + pid-file ownership (`runtime.py`, pinned by `tests/test_status_file.py`):
 
-- **Start refuses to launch over a live recorder.** `_write_pid_file` runs the
-  same identity gate (`resolve_flush_target`) and raises
-  `RecorderAlreadyRunningError` (clean rc=1 at all CLI boundaries) when an
-  identity-verified recorder is already alive — a stale/recycled/foreign pid does
-  NOT block a legitimate start. This is the single-instance lock; there is no
-  separate `flock` file.
+- **Start is gated by an atomic `flock` single-instance lock.** `_write_pid_file`
+  acquires an exclusive `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`
+  (`_acquire_instance_lock`) **before** publishing the pid file, held for the
+  process lifetime. This is the primary gate and the only *atomic* one: of N
+  racing `onoats bot` starts exactly one wins, the rest raise
+  `RecorderAlreadyRunningError` (clean rc=1 at all CLI boundaries). The kernel
+  releases the lock when the holder exits — graceful OR crash/SIGKILL — so there is
+  no stale lock to reclaim; teardown also releases it explicitly
+  (`_release_instance_lock` in `dual._finalize_shutdown_status` / `__main__`) for a
+  prompt stop→start handoff. POSIX-only (no-op on Windows; macOS product).
+- **Identity check is the secondary guard.** `_write_pid_file` still runs
+  `resolve_flush_target` and refuses an identity-verified (or indeterminate-but-
+  live) recorder — a stale/recycled/foreign pid does NOT block a legitimate start.
+  This catches a legacy/cross-version recorder that predates the lock; the `flock`
+  catches concurrent same-version starts the read-then-act identity check cannot.
 - **Pid writes are atomic.** `_write_pid_file` writes to a temp file and
   `os.replace`s it into place (same dir → atomic rename), never truncating in
   place — mirrors `onoats.status.write_status`. A concurrent reader (a draining

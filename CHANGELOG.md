@@ -36,19 +36,23 @@ Annotated tags exist from `v0.9.0` forward.
   delivery, not exit, so a new `onoats bot` launched during the old recorder's
   drain could overwrite the draining recorder's pid file — and the drainer would
   then unlink the *new* recorder's file, leaving it invisible to
-  `status`/`stop`/`flush`. Two guards close this: (1) start refuses to launch
-  over a live recorder (`RecorderAlreadyRunningError`) — both the identity-verified
-  case AND the indeterminate-but-live case (marker-valid pid file, process alive,
-  but the `ps` identity probe failed or the file is legacy/fingerprint-less),
-  matching how stop/flush refuse that same state; only a positively stale (dead or
-  recycled-to-foreign) pid is overwritten; (2) pid-file writes are atomic
-  (temp + `os.replace`, never a truncating in-place write) so a concurrent reader
-  never sees an empty/partial file; (3) pid-file removal is ownership-checked and
-  fails closed — a recorder unlinks only a file that still records *its own* pid,
-  and leaves an unreadable/foreign record in place rather than deleting a newer
-  recorder's (possibly in-progress) file. The menu's external Stop also re-enables itself if the
-  `onoats stop` subprocess fails or exits non-zero (e.g. a stale installed CLI),
-  rather than wedging the only Stop control until app restart.
+  `status`/`stop`/`flush`. Guards close this: (1) an **atomic `flock`
+  single-instance lock** — `_write_pid_file` takes an exclusive
+  `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock` before publishing the pid file,
+  so of N racing starts exactly one wins and the rest raise
+  `RecorderAlreadyRunningError`; the kernel releases it on exit (graceful or
+  crash), so there is no stale lock to reclaim, and a chained `onoats stop &&
+  onoats bot` cleanly refuses until the drainer's process exits; (2) the identity
+  check (`resolve_flush_target`) remains as a secondary guard refusing a verified
+  or indeterminate-but-live recorder (legacy/cross-version), never blocking on a
+  stale/recycled/foreign pid; (3) pid-file writes are atomic (temp + `os.replace`,
+  never a truncating in-place write) so a concurrent reader never sees an
+  empty/partial file; (4) pid-file removal is ownership-checked and fails closed —
+  a recorder unlinks only a file that still records *its own* pid, and leaves an
+  unreadable/foreign record in place rather than deleting a newer recorder's
+  (possibly in-progress) file. The menu's external Stop also re-enables itself if
+  the `onoats stop` subprocess fails or exits non-zero (e.g. a stale installed
+  CLI), rather than wedging the only Stop control until app restart.
 
 ## [1.1.0] - 2026-06-12
 
