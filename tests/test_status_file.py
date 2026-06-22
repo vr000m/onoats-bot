@@ -635,3 +635,58 @@ def test_write_pid_file_refuses_live_legacy_fingerprintless_pid(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        "",  # empty — a newer recorder mid-write (truncated)
+        "garbage-not-an-int\n",  # unparseable first line
+        "12345\nWRONG-MARKER\nonoats bot\n0.0\n",  # foreign / invalid marker
+    ],
+)
+def test_remove_pid_file_fail_closed_when_unreadable(tmp_path, corrupt):
+    """[high] regression (Codex adversarial review): owner-checked removal must
+    fail CLOSED. If the pid file reads back as None — an empty/partial file (a
+    newer recorder mid-write) or a foreign/invalid record — a draining recorder
+    must NOT unlink it. Pre-fix this fell through to ``pid_path.unlink()``, which
+    (paired with the old in-place truncating writer) could delete a newer
+    recorder's in-progress pid file, orphaning it (invisible to
+    status/stop/flush). Even with the atomic writer closing the truncation window,
+    removal stays fail-closed: a None read is never our own benign mid-write."""
+    pid_path = tmp_path / ".active" / PID_FILENAME
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(corrupt, encoding="utf-8")
+    _remove_pid_file(pid_path, owner_pid=12345)
+    assert pid_path.exists(), (
+        "fail-closed: a draining recorder must not delete an unreadable/foreign "
+        "pid file (it may be a newer recorder's in-progress record)"
+    )
+
+
+def test_write_pid_file_is_atomic_via_os_replace(tmp_path, monkeypatch):
+    """[high] regression (Codex adversarial review): the pid file is written via
+    temp + ``os.replace`` (atomic rename), never truncated in place. An in-place
+    ``write_text`` exposes an empty/partial file mid-write; a concurrent
+    owner-checked ``_remove_pid_file`` would then read None and delete the newer
+    recorder's file. Pin the atomic-replace contract and assert no temp residue."""
+    import os as _os
+
+    from onoats import runtime as _runtime
+
+    replace_dests = []
+    real_replace = _os.replace
+
+    def _spy_replace(src, dst):
+        replace_dests.append(Path(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_runtime.os, "replace", _spy_replace)
+    pid_path = _write_pid_file(tmp_path)
+
+    # Final record landed via os.replace into the real path — not written in place.
+    assert pid_path in replace_dests, "pid file must be published via os.replace"
+    assert pid_path.read_text(encoding="utf-8").startswith(f"{_os.getpid()}\n")
+    # No leaked temp files in the active dir.
+    leftovers = list((tmp_path / ".active").glob("*.tmp"))
+    assert not leftovers, f"atomic writer leaked temp residue: {leftovers}"

@@ -156,6 +156,32 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Findings
 
+### Codex re-review round 3 (2026-06-22) — pid-file race residual
+
+A post-smoke Codex adversarial review returned NO-SHIP with one [high]: the
+round-1/2 ownership-checked removal still had a deletion window.
+
+- **[high] Owner-checked pid cleanup could still delete a newer recorder's pid
+  file** (`runtime.py`). Two compounding gaps: (a) `_write_pid_file` wrote the pid
+  file **in place** with `write_text`, which truncates before writing — a reader
+  during that window sees an empty/partial file; (b) `_remove_pid_file(owner_pid=…)`
+  treated a `None` read (unparseable/empty) as "fall through to `unlink()`". So a
+  draining recorder reading a newer recorder's mid-write file as `None` would
+  delete it — re-opening the exact orphan-the-new-recorder failure the round-1 fix
+  targeted. Verified from the code (in-place writer + `current is None` unlink); the
+  round-1/2 tests only covered a *fully written* newer pid file. Fixed:
+  - **Atomic write.** `_write_pid_file` now writes a temp file + `os.replace`
+    (same-dir atomic rename, `fsync` first), mirroring `onoats.status.write_status`
+    — no truncation window; a reader sees the complete old or complete new record.
+  - **Fail-closed removal.** `_remove_pid_file(owner_pid=…)` unlinks **only** when
+    the file still records exactly `owner_pid`; a `None`/foreign read is left in
+    place (logged), never deleted. A leftover invalid file is self-healing
+    (`status` → no valid recorder; next start atomically replaces it).
+  - **Regressions** (`test_status_file.py`): `_remove_pid_file` fail-closed on
+    empty/garbage/foreign-marker content (×3, parametrized) → file survives; and
+    `_write_pid_file` publishes via `os.replace` with no `*.tmp` residue. Full
+    suite: 289 passed; `ruff format`/`check` clean; static source-order check green.
+
 ### Codex re-review round 2 (2026-06-20) — degraded-path fixes
 
 The re-run Codex adversarial review (after the round-1 fixes) returned a fresh

@@ -41,9 +41,12 @@ Annotated tags exist from `v0.9.0` forward.
   case AND the indeterminate-but-live case (marker-valid pid file, process alive,
   but the `ps` identity probe failed or the file is legacy/fingerprint-less),
   matching how stop/flush refuse that same state; only a positively stale (dead or
-  recycled-to-foreign) pid is overwritten; (2) pid-file removal is
-  ownership-checked, so a recorder never deletes a pid file a newer recorder has
-  since overwritten. The menu's external Stop also re-enables itself if the
+  recycled-to-foreign) pid is overwritten; (2) pid-file writes are atomic
+  (temp + `os.replace`, never a truncating in-place write) so a concurrent reader
+  never sees an empty/partial file; (3) pid-file removal is ownership-checked and
+  fails closed — a recorder unlinks only a file that still records *its own* pid,
+  and leaves an unreadable/foreign record in place rather than deleting a newer
+  recorder's (possibly in-progress) file. The menu's external Stop also re-enables itself if the
   `onoats stop` subprocess fails or exits non-zero (e.g. a stale installed CLI),
   rather than wedging the only Stop control until app restart.
 

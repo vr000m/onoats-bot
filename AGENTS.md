@@ -142,12 +142,22 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by `tests/test_status
   identity-verified recorder is already alive — a stale/recycled/foreign pid does
   NOT block a legitimate start. This is the single-instance lock; there is no
   separate `flock` file.
-- **Pid removal is ownership-checked.** `_remove_pid_file(pid_path, owner_pid=…)`
-  unlinks only when the file still records that pid. Because `stop` returns on
-  signal delivery (not exit), a `stop`-then-immediate-`bot` could otherwise let a
-  draining recorder delete a NEWER recorder's pid file. Recorder teardown passes
-  `owner_pid=os.getpid()`; the GUI's menu gating (Start only in `.stopped`)
-  already prevents this from the app, so the guard protects the CLI/scripted path.
+- **Pid writes are atomic.** `_write_pid_file` writes to a temp file and
+  `os.replace`s it into place (same dir → atomic rename), never truncating in
+  place — mirrors `onoats.status.write_status`. A concurrent reader (a draining
+  recorder's owner-checked removal) sees either the complete old record or the
+  complete new one, never an empty/partial file mid-write.
+- **Pid removal is ownership-checked and fails closed.**
+  `_remove_pid_file(pid_path, owner_pid=…)` unlinks **only** when the file still
+  records exactly that pid. If it reads back as `None` (unreadable/foreign/already
+  gone) it is left in place — it must never be assumed to be our own benign
+  mid-write. Because `stop` returns on signal delivery (not exit), a
+  `stop`-then-immediate-`bot` could otherwise let a draining recorder delete a
+  NEWER recorder's pid file. Recorder teardown passes `owner_pid=os.getpid()`; the
+  GUI's menu gating (Start only in `.stopped`) already prevents this from the app,
+  so the guard protects the CLI/scripted path. A leftover invalid pid file is
+  self-healing: `status` reports no valid recorder and the next start atomically
+  replaces it.
 
 ## Reviewing a subprocess / process-boundary change
 

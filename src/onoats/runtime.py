@@ -21,6 +21,7 @@ import os
 import platform
 import signal
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1111,10 +1112,30 @@ def _write_pid_file(data_dir: Path) -> Path:
     # readers can distinguish a freshly-started bot from one that
     # happens to have inherited a recycled pid (see onoats._vendor.pid).
     start_epoch = time.time()
-    pid_path.write_text(
-        f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n",
-        encoding="utf-8",
+    payload = f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n"
+    # Atomic replace (temp + os.replace in the SAME dir) — never truncate the pid
+    # file in place. A draining recorder's owner-checked `_remove_pid_file` reads
+    # this path concurrently; an in-place write_text would expose an empty/partial
+    # file mid-write, `read_pid_file` would return None, and the drainer would then
+    # delete this (newer) recorder's pid file. os.replace makes a concurrent reader
+    # see either the complete old record or the complete new one — never a partial.
+    # Mirrors the status-file writer idiom (onoats.status.write_status).
+    fd, tmp = tempfile.mkstemp(
+        dir=str(active_dir), prefix=".onoats-pid-", suffix=".tmp"
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, pid_path)
+    except BaseException:
+        # Never leak a temp file on failure.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
     logger.debug(
         f"PID file written: {pid_path} (PID {os.getpid()}, cmdline={cmdline!r})"
     )
@@ -1124,21 +1145,31 @@ def _write_pid_file(data_dir: Path) -> Path:
 def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
     """Remove the PID file on shutdown.
 
-    When ``owner_pid`` is given, only unlink if the file STILL records that pid.
-    A recorder tearing down must never delete a pid file a NEWER recorder has
-    since overwritten with its own pid (the stop-then-immediate-start race) — that
-    would leave the new session running with no pid file, invisible to
-    ``status``/``stop``/``flush``. A file we can no longer read as a valid record
-    (``None`` — already gone, or foreign marker) falls through to the unlink,
-    preserving the prior best-effort cleanup for the non-race cases.
+    When ``owner_pid`` is given, unlink ONLY if the file still records exactly that
+    pid — fail closed. A recorder tearing down must never delete a pid file a NEWER
+    recorder has since taken over (the stop-then-immediate-start race), which would
+    leave the new session running with no pid file, invisible to
+    ``status``/``stop``/``flush``. We must also refuse to delete when the file reads
+    back as ``None``: paired with the atomic writer (``_write_pid_file`` uses
+    ``os.replace``, never a truncating in-place write) a ``None`` here is no longer
+    a benign mid-write of *our own* file, but either (a) a foreign/invalid record we
+    have no business removing, or (b) a file already gone — in both cases leaving it
+    is correct. A leftover invalid pid file is self-healing: ``status`` reports no
+    valid recorder and the next ``_write_pid_file`` atomically replaces it.
     """
     if owner_pid is not None:
         current = _read_pid_file(pid_path)
-        if current is not None and current != owner_pid:
-            logger.warning(
-                f"PID file {pid_path} now records pid {current}, not ours "
-                f"({owner_pid}) — a newer recorder owns it; not removing."
-            )
+        if current != owner_pid:
+            if current is None:
+                logger.debug(
+                    f"PID file {pid_path} is unreadable/absent during owner-checked "
+                    f"removal (owner {owner_pid}) — leaving in place (fail-closed)."
+                )
+            else:
+                logger.warning(
+                    f"PID file {pid_path} now records pid {current}, not ours "
+                    f"({owner_pid}) — a newer recorder owns it; not removing."
+                )
             return
     try:
         pid_path.unlink()
