@@ -47,11 +47,11 @@ from onoats.runtime import (  # noqa: E402
     SttPreflightError,
     stop_pipeline_for_shutdown,
     wait_or_force,
+    _acquire_instance_lock,
     _create_stt_service,
     log_stt_server_rss,
     _install_signal_handlers,
     _mark_status_rotation,
-    _release_instance_lock,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -104,9 +104,10 @@ def _finalize_shutdown_status(
         _write_status_stopped(data_dir, exit_reason="graceful")
     _restore_terminal(old_terminal_settings)
     _remove_pid_file(pid_path, owner_pid=os.getpid())
-    # Release the single-instance lock so a post-drain start can re-acquire the
-    # slot immediately; process exit is the kernel-guaranteed backstop.
-    _release_instance_lock()
+    # The single-instance lock is intentionally NOT released here: it is held for
+    # the whole process lifetime and the kernel frees it on exit. Releasing now
+    # would free the slot while the socket supervisor is still tearing down its
+    # capturer (see runtime._release_instance_lock).
 
 
 async def _shutdown_stt_service(stt_service, label: str) -> None:
@@ -398,6 +399,14 @@ async def run_onoats_dual(
     # own status/pid writes can never target different directories. Standalone
     # callers (the PortAudio path) resolve here as before.
     data_dir = data_dir if data_dir is not None else onoats_data_dir()
+
+    # Claim the single-instance slot BEFORE any capture side effect (PortAudio
+    # device open below / socket-transport build). In socket mode the supervisor
+    # already holds it (acquired before spawning the capturer), so this is an
+    # idempotent no-op; in the PortAudio path this is the early gate. A losing
+    # concurrent start raises RecorderAlreadyRunningError here, before it touches
+    # an audio device. Held for the process lifetime (kernel releases on exit).
+    _acquire_instance_lock(data_dir / ".active")
 
     from onoats.config import load_config
 

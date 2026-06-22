@@ -37,10 +37,12 @@ Annotated tags exist from `v0.9.0` forward.
   drain could overwrite the draining recorder's pid file — and the drainer would
   then unlink the *new* recorder's file, leaving it invisible to
   `status`/`stop`/`flush`. Guards close this: (1) an **atomic `flock`
-  single-instance lock** — `_write_pid_file` takes an exclusive
-  `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock` before publishing the pid file,
+  single-instance lock** acquired before any capture side effect — the socket
+  supervisor takes an exclusive `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`
+  *before spawning the capturer*, and `run_onoats_dual` *before opening PortAudio*,
   so of N racing starts exactly one wins and the rest raise
-  `RecorderAlreadyRunningError`; the kernel releases it on exit (graceful or
+  `RecorderAlreadyRunningError` **before touching CoreAudio/TCC/a device**; held
+  for the whole process lifetime and released by the kernel on exit (graceful or
   crash), so there is no stale lock to reclaim, and a chained `onoats stop &&
   onoats bot` cleanly refuses until the drainer's process exits; (2) the identity
   check (`resolve_flush_target`) remains as a secondary guard refusing a verified

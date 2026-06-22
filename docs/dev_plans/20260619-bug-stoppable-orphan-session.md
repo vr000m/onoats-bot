@@ -156,6 +156,36 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Findings
 
+### Codex re-review round 5 (2026-06-22) — lock acquired too late (before-capture hoist)
+
+A fifth pass acknowledged the round-4 atomic lock closed the pid-overwrite race
+but returned NO-SHIP: the lock was acquired **too late** to be the advertised
+single-instance *start* gate.
+
+- **[high] Socket starts could spawn a second capturer before losing the lock**
+  (`cli.py`). The lock lived inside `_write_pid_file`, but socket mode reaches that
+  only *after* `_supervise_socket_session` has already spawned the native capturer
+  (CoreAudio process tap, TCC prompt, device acquisition) and waited for its
+  sockets. So two concurrent socket starts could both spawn capturers and touch
+  hardware; the loser failed only *after* those side effects (duplicate permission
+  prompts, device contention, transient double capture). Fixed by **hoisting
+  acquisition before any capture side effect**:
+  - `_acquire_instance_lock` is now called in `_supervise_socket_session` *before*
+    `create_subprocess_exec` spawns the capturer, and at the top of
+    `run_onoats_dual` *before* PortAudio device open. Acquisition is **idempotent**
+    (already-held → no-op), so the nested acquires (supervisor → recorder →
+    `_write_pid_file` backstop, all same `data_dir`) never release-then-reacquire.
+  - **Removed the explicit teardown release** (`_finalize_shutdown_status`,
+    `__main__`) added in round 4. The lock is now held for the whole process
+    lifetime and freed by the kernel on exit. Releasing during shutdown was itself
+    a latent bug: it would free the slot while the socket supervisor is still
+    tearing down its capturer, letting a chained start spawn a second capturer into
+    a not-yet-released device. An autouse fixture (`tests/conftest.py`) resets the
+    process-global lock between tests (pytest shares one process).
+  - **Regression** (`test_socket_supervisor.py`): with the lock held, the
+    supervisor refuses rc=1 and `create_subprocess_exec` is **never called** — the
+    capturer is not spawned. Full suite: 292 passed; ruff clean; marker green.
+
 ### Codex re-review round 4 (2026-06-22) — atomic single-instance acquisition
 
 A fourth Codex adversarial pass returned NO-SHIP with one [high]: the pid guard

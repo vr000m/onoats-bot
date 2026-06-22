@@ -1080,10 +1080,13 @@ def _acquire_instance_lock(active_dir: Path) -> None:
     global _instance_lock_fd
     if sys.platform == "win32":
         return
-    # One lock per process: drop any prior fd (e.g. a re-init inside a long-lived
-    # test process) before claiming a fresh slot.
+    # Idempotent: one lock per process. If we already hold it, this is a nested
+    # acquire (the socket supervisor takes it before spawning the capturer, then
+    # the recorder's _write_pid_file/run_onoats_dual call it again) — return
+    # without re-acquiring, so there is never a release-then-reacquire gap.
     if _instance_lock_fd is not None:
-        _release_instance_lock()
+        return
+    active_dir.mkdir(parents=True, exist_ok=True)
     lock_path = active_dir / LOCK_FILENAME
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -1106,9 +1109,13 @@ def _acquire_instance_lock(active_dir: Path) -> None:
 def _release_instance_lock() -> None:
     """Release the single-instance lock if held (no-op otherwise).
 
-    Called on the teardown path for prompt release (so a post-drain start can
-    re-acquire the slot the instant we finish); process exit is the
-    kernel-guaranteed backstop for crash paths.
+    Deliberately NOT called on the normal recorder teardown path: the lock is held
+    for the whole process lifetime and the kernel releases it on exit (graceful OR
+    crash). Releasing during shutdown would free the slot while the socket
+    supervisor is still tearing down its capturer — letting a chained start spawn a
+    second capturer into a device the old one hasn't finished releasing. Provided
+    for explicit lifecycle control in tests (and any future caller that genuinely
+    owns the whole start→stop span).
     """
     global _instance_lock_fd
     if _instance_lock_fd is None:
@@ -1182,11 +1189,12 @@ def _write_pid_file(data_dir: Path) -> Path:
         except PermissionError:
             logger.warning("PID file exists, process may be running as different user")
 
-    # Atomic single-instance acquisition. The identity checks above are
-    # best-effort (they read a possibly-absent pid file); this flock is the gate
-    # that closes the concurrent-start race — two starts that both passed the
-    # checks above contend here, and exactly one proceeds to publish a pid file.
-    # Held until process exit (released on teardown / by the kernel on crash).
+    # Single-instance acquisition (universal backstop). The capture entrypoints
+    # acquire this EARLY — the socket supervisor before spawning the capturer,
+    # run_onoats_dual before opening PortAudio — so by the time we publish a pid
+    # file the lock is already held and this call is an idempotent no-op. It stays
+    # here so any entrypoint that reaches pid publication without an earlier
+    # acquire (e.g. `python -m onoats`) is still gated. Held until process exit.
     _acquire_instance_lock(active_dir)
 
     cmdline = _own_ps_cmdline()

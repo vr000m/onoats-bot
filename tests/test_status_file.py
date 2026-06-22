@@ -528,16 +528,10 @@ from onoats.runtime import (  # noqa: E402
     _write_pid_file,
 )
 
-
-@pytest.fixture(autouse=True)
-def _release_instance_lock_after_each():
-    """Keep the module-global single-instance lock from leaking between tests.
-
-    A test that calls ``_write_pid_file``/``_acquire_instance_lock`` holds an
-    flock on its own ``tmp_path`` lock file; release it on teardown so the global
-    fd is reset (process-exit would release it anyway, but tests share a process)."""
-    yield
-    _release_instance_lock()
+# The single-instance lock is released after every test by an autouse fixture in
+# tests/conftest.py (the lock is process-lifetime in production; pytest shares one
+# process, so tests must reset it). `_release_instance_lock` is imported above for
+# the explicit acquire/release-cycle test below.
 
 
 def _seed_pid_file(data_dir: Path, pid: int, *, cmdline: str = "onoats bot") -> Path:

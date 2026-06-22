@@ -626,6 +626,52 @@ def test_unspawnable_capturer_bin_fails_loud(sup_env, log_sink, monkeypatch):
     assert log_sink.warned()
 
 
+def test_held_instance_lock_blocks_capturer_spawn(sup_env, monkeypatch):
+    """[high] regression (Codex adversarial review round 5): the single-instance
+    lock is acquired BEFORE the capturer is spawned. With the slot already held,
+    the supervisor must refuse (rc=1) WITHOUT ever calling
+    ``create_subprocess_exec`` — a start that lost the race must not spawn a second
+    CoreAudio process tap / trigger a TCC prompt / contend for the device and only
+    fail afterwards. Acquiring inside ``_write_pid_file`` (post capturer-spawn) was
+    too late; this pins the hoisted acquisition."""
+    import asyncio as _asyncio
+    import fcntl as _fcntl
+    import os as _os
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+
+    from onoats.runtime import LOCK_FILENAME
+
+    data_dir, _pending = sup_env
+    active = data_dir / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    # Instance 1 holds the slot (separate open file description → flock conflicts
+    # even within this one process).
+    holder = _os.open(str(active / LOCK_FILENAME), _os.O_RDWR | _os.O_CREAT, 0o644)
+    _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+    spawned = {"n": 0}
+    real_exec = _asyncio.create_subprocess_exec
+
+    async def _spy_exec(*a, **k):
+        spawned["n"] += 1
+        return await real_exec(*a, **k)
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spy_exec)
+
+    try:
+        rc = _run_supervisor_bounded([])
+        assert rc == 1, "a start that lost the instance-lock race must exit rc=1"
+        assert spawned["n"] == 0, (
+            "the capturer must NOT be spawned when the instance lock is already held"
+        )
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        _os.close(holder)
+
+
 def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch):
     """A controlled recorder launch failure must be rc=1, not a traceback.
 

@@ -64,7 +64,6 @@ from onoats.runtime import (  # noqa: E402
     stop_pipeline_for_shutdown,
     wait_or_force,
     _install_signal_handlers,
-    _release_instance_lock,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -388,8 +387,8 @@ async def run_onoats(
         await _on_shutdown()
         _restore_terminal(_old_terminal_settings)
         _remove_pid_file(pid_path, owner_pid=os.getpid())
-        # Release the single-instance lock (process-exit is the kernel backstop).
-        _release_instance_lock()
+        # The single-instance lock is held for the process lifetime; the kernel
+        # releases it on exit (see runtime._release_instance_lock).
 
 
 # ---------------------------------------------------------------------------

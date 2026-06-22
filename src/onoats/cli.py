@@ -528,6 +528,8 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
     from loguru import logger
 
+    from onoats.runtime import _acquire_instance_lock
+
     # 0. One canonical data-dir resolution per session. Every status write in
     # this supervisor — the early-failure records below AND the recorder's own
     # stamps (passed down through _run_recorder_with_capturer → run_onoats_dual)
@@ -543,6 +545,16 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             "unset; refusing to start. See docs/audio-socket-contract.md."
         )
         return 1
+
+    # Claim the single-instance slot BEFORE spawning the capturer. The capturer is
+    # the expensive, externally-visible side effect (a CoreAudio process tap, a TCC
+    # prompt, device acquisition); a losing concurrent start must refuse here —
+    # raising RecorderAlreadyRunningError (caught by _run_socket_supervisor → rc=1)
+    # — rather than spawn a second capturer and only fail after touching hardware.
+    # Idempotent + held for the process lifetime; the recorder's later acquires
+    # (run_onoats_dual / _write_pid_file) are no-ops, and the kernel frees the lock
+    # on exit (so the slot stays ours through the capturer teardown in `finally`).
+    _acquire_instance_lock(data_dir / ".active")
 
     # 1. Private, supervisor-owned socket dir (0700). mkdtemp already creates the
     # dir 0700 and owner-only; a fresh per-generation dir means any stale socket

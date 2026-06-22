@@ -134,18 +134,24 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
 - **`onoats stop --help` resolves without booting a service** (local argparse +
   lazy resolver import), like `flush`.
 
-Single-instance + pid-file ownership (`runtime.py`, pinned by `tests/test_status_file.py`):
+Single-instance + pid-file ownership (`runtime.py`, pinned by
+`tests/test_status_file.py` + `tests/test_socket_supervisor.py`):
 
-- **Start is gated by an atomic `flock` single-instance lock.** `_write_pid_file`
-  acquires an exclusive `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`
-  (`_acquire_instance_lock`) **before** publishing the pid file, held for the
-  process lifetime. This is the primary gate and the only *atomic* one: of N
-  racing `onoats bot` starts exactly one wins, the rest raise
-  `RecorderAlreadyRunningError` (clean rc=1 at all CLI boundaries). The kernel
-  releases the lock when the holder exits — graceful OR crash/SIGKILL — so there is
-  no stale lock to reclaim; teardown also releases it explicitly
-  (`_release_instance_lock` in `dual._finalize_shutdown_status` / `__main__`) for a
-  prompt stop→start handoff. POSIX-only (no-op on Windows; macOS product).
+- **Start is gated by an atomic `flock` single-instance lock, acquired before any
+  capture side effect.** `_acquire_instance_lock` takes an exclusive
+  `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`. It is hoisted to the EARLIEST
+  point in each entrypoint — the socket supervisor takes it *before spawning the
+  capturer* (`_supervise_socket_session`), `run_onoats_dual` *before opening
+  PortAudio* — so a losing concurrent start raises `RecorderAlreadyRunningError`
+  (clean rc=1 at all CLI boundaries) **before** it touches CoreAudio/TCC/a device,
+  never after. Acquisition is **idempotent** (already-held → no-op), so the later
+  `_write_pid_file` call (the universal backstop for `python -m onoats`) is a no-op
+  in the hoisted paths. This is the primary gate and the only *atomic* one: of N
+  racing starts exactly one wins. The lock is held for the **whole process
+  lifetime**; the kernel releases it on exit (graceful OR crash/SIGKILL) — there is
+  no stale lock to reclaim and **no teardown release call** (releasing during
+  shutdown would free the slot while the supervisor is still tearing down its
+  capturer). POSIX-only (no-op on Windows; macOS product).
 - **Identity check is the secondary guard.** `_write_pid_file` still runs
   `resolve_flush_target` and refuses an identity-verified (or indeterminate-but-
   live) recorder — a stale/recycled/foreign pid does NOT block a legitimate start.
