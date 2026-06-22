@@ -80,6 +80,13 @@ final class RecorderModel: ObservableObject {
     /// use the `.stopping` enum case for external stops: `.stopping` is cleared
     /// by `handleExit`, which never fires without a `Process` handle.
     @Published var stopRequested = false
+    // The recorder pid `stopExternal()` asked to stop. `refresh()` clears
+    // `stopRequested` once THAT pid is gone — OR once a DIFFERENT pid is live (a
+    // new session replaced the one we stopped before we observed its exit), so a
+    // fresh session never inherits a stuck-disabled Stop button. nil when no
+    // external stop is in flight, or when the pid couldn't be read at stop time
+    // (then refresh falls back to the plain `!alive` clear).
+    private var stopRequestedForPid: Int32?
 
     /// Valid `[stt].service` values — mirror of runtime.py
     /// `VALID_STT_SERVICES` (parity-checked by
@@ -264,11 +271,19 @@ final class RecorderModel: ObservableObject {
             return
         }
         // External-stop convergence (handle-less session): clear the cosmetic
-        // stopRequested flag once the supervisor is actually GONE — process exit
-        // (kill(0) false), NOT pid-file removal. Placed AFTER the owned-proc
-        // early-return above so an owned session's `.stopping` drain never
-        // touches it. Sole clearing site (see the `stopRequested` invariant).
-        if !alive { stopRequested = false }
+        // stopRequested flag once the supervisor we asked to stop is GONE —
+        // process exit (kill(0) false), NOT pid-file removal — OR once a DIFFERENT
+        // pid is live (a new session started before we observed the stopped one's
+        // exit; without this the new session's Stop button stays wedged disabled).
+        // Placed AFTER the owned-proc early-return above so an owned session's
+        // `.stopping` drain never touches it. Sole clearing site for the success
+        // path (see the `stopRequested` invariant).
+        let stoppedTargetGone =
+            stopRequestedForPid != nil && pid?.pid != stopRequestedForPid
+        if !alive || stoppedTargetGone {
+            stopRequested = false
+            stopRequestedForPid = nil
+        }
         if alive {
             state = .running(ours: false)
         } else if case .failed = state {
@@ -378,6 +393,10 @@ final class RecorderModel: ObservableObject {
     /// button is `.disabled(stopRequested)`).
     func stopExternal() {
         stopRequested = true
+        // Remember which recorder we're stopping so refresh() can clear the flag
+        // if a DIFFERENT session appears (see `stopRequestedForPid`). nil-safe: if
+        // the pid can't be read, refresh falls back to the plain `!alive` clear.
+        stopRequestedForPid = readPid(under: Self.resolveDataDir())?.pid
         flushNote = nil
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cliPath)
@@ -398,6 +417,7 @@ final class RecorderModel: ObservableObject {
                     // A delivered SIGTERM (rc 0) leaves the flag set; refresh()
                     // clears it when the supervisor actually exits.
                     self?.stopRequested = false
+                    self?.stopRequestedForPid = nil
                     self?.flushNote =
                         "Stop failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
                 }
@@ -410,6 +430,7 @@ final class RecorderModel: ObservableObject {
             // the button (the one writer other than refresh(), guarded to the
             // spawn-failure path) so a missing/!executable CLI can be retried.
             stopRequested = false
+            stopRequestedForPid = nil
             flushNote = "Stop spawn failed: \(error.localizedDescription)"
         }
     }

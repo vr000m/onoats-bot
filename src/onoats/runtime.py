@@ -1061,48 +1061,93 @@ LOCK_FILENAME = "onoats.lock"
 _instance_lock_fd: int | None = None
 
 
+def _refuse_if_live_recorder(pid_path: Path) -> None:
+    """Raise ``RecorderAlreadyRunningError`` if the pid file names a live recorder.
+
+    The ``flock`` catches a concurrent SAME-version start, but a recorder from an
+    OLDER build holds no flock — so this no-write identity preflight (the same gate
+    ``flush``/``stop`` use: ``resolve_flush_target`` + the indeterminate-but-live
+    refusal) catches a live legacy/cross-version recorder the flock cannot. Run it
+    right after acquiring the flock and BEFORE any capture side effect, so a start
+    over a live orphan refuses before spawning the capturer / opening a device.
+    """
+    from onoats._vendor.pid import read_pid_record, resolve_flush_target
+
+    verified = resolve_flush_target(pid_path)
+    if verified.pid is not None and verified.pid != os.getpid():
+        raise RecorderAlreadyRunningError(
+            f"An onoats recorder is already running (pid {verified.pid}). "
+            "Stop it first with `onoats stop`, then retry."
+        )
+    # Indeterminate-but-live: a marker-valid file whose process is still alive but
+    # unverifiable (ps probe failed / legacy fingerprint-less). Refuse, exactly as
+    # flush/stop do; only ``stale=True`` is safe to clobber.
+    if verified.pid is None and not verified.stale:
+        rec = read_pid_record(pid_path)
+        if rec is not None and rec.pid != os.getpid() and _pid_alive(rec.pid):
+            raise RecorderAlreadyRunningError(
+                f"A recorder pid file names a live process (pid {rec.pid}) whose "
+                "identity could not be verified (ps probe failed / legacy pid "
+                "file) — refusing to start over a possibly-live recorder. Stop it "
+                "(`onoats stop`) or remove the stale pid file, then retry."
+            )
+
+
 def _acquire_instance_lock(active_dir: Path) -> None:
     """Atomically claim the single-instance slot; raise if another holds it.
 
-    This is the gate that makes concurrent starts safe. ``_write_pid_file``'s
-    identity check is best-effort — it reads a possibly-absent pid file, so two
-    simultaneous starts with no valid pid file BOTH pass it. The ``flock`` here
-    lets exactly one win; the loser gets ``RecorderAlreadyRunningError`` before it
-    publishes a pid file or starts capturing. Held for the process lifetime via
-    the module-global fd; the kernel releases it on exit. As a bonus this enforces
-    the "no immediate stop→start" rule — ``stop`` returns on signal delivery, so a
-    chained start cleanly refuses until the draining recorder's process exits and
-    the kernel frees the lock.
+    Two layered guards, BOTH run here so a losing start refuses before any capture
+    side effect (the call sites hoist this ahead of capturer spawn / device open):
 
-    No-op on Windows (``flock`` unavailable); the pid-identity check remains the
-    only guard there. onoats is macOS-only in practice.
+    1. ``flock(LOCK_EX|LOCK_NB)`` — the atomic gate. Of N concurrent SAME-version
+       starts exactly one wins; the rest raise ``RecorderAlreadyRunningError``.
+    2. ``_refuse_if_live_recorder`` — a no-write identity preflight that catches a
+       live LEGACY/cross-version recorder (which holds no flock). Without this, a
+       start over a live legacy orphan would acquire the flock and proceed to spawn
+       the capturer, only refusing later in ``_write_pid_file``.
+
+    Held for the process lifetime via the module-global fd; the kernel releases it
+    on exit (so there is no stale lock, and a chained ``stop`` then ``start``
+    refuses until the draining recorder's process exits). On Windows ``flock`` is
+    unavailable, so the identity preflight is the only guard (onoats is macOS-only
+    in practice).
     """
     global _instance_lock_fd
-    if sys.platform == "win32":
-        return
-    # Idempotent: one lock per process. If we already hold it, this is a nested
-    # acquire (the socket supervisor takes it before spawning the capturer, then
-    # the recorder's _write_pid_file/run_onoats_dual call it again) — return
-    # without re-acquiring, so there is never a release-then-reacquire gap.
+    # Idempotent: one lock per process. A nested acquire (the socket supervisor
+    # takes it before spawning the capturer, then the recorder's
+    # run_onoats_dual/_write_pid_file call it again) returns without re-acquiring —
+    # no release-then-reacquire gap, and the identity preflight runs exactly once.
     if _instance_lock_fd is not None:
         return
     active_dir.mkdir(parents=True, exist_ok=True)
+    pid_path = active_dir / PID_FILENAME
+    if sys.platform == "win32":
+        # No flock available — the identity preflight is the only guard.
+        _refuse_if_live_recorder(pid_path)
+        return
     lock_path = active_dir / LOCK_FILENAME
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         os.close(fd)
-        # EWOULDBLOCK/EAGAIN → a live recorder already holds the slot. Read the
-        # pid file (if any) only to name it in the error — never to gate on.
+        # EWOULDBLOCK/EAGAIN → a live SAME-version recorder holds the slot. Read
+        # the pid file (if any) only to name it in the error — never to gate on.
         from onoats._vendor.pid import read_pid_record
 
-        rec = read_pid_record(active_dir / PID_FILENAME)
+        rec = read_pid_record(pid_path)
         who = f" (pid {rec.pid})" if rec is not None else ""
         raise RecorderAlreadyRunningError(
             f"An onoats recorder is already running{who} and holds the "
             "single-instance lock. Stop it first with `onoats stop`, then retry."
         ) from exc
+    # We hold the flock. Now refuse a live LEGACY recorder (no flock) before any
+    # capture side effect — releasing the flock we just took if we must refuse.
+    try:
+        _refuse_if_live_recorder(pid_path)
+    except BaseException:
+        os.close(fd)
+        raise
     _instance_lock_fd = fd
 
 
@@ -1134,47 +1179,29 @@ def _release_instance_lock() -> None:
 def _write_pid_file(data_dir: Path) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint.
 
-    Single-instance guard: refuses to start over a still-live recorder (raising
-    ``RecorderAlreadyRunningError``). The check reuses the same identity gate as
-    ``onoats stop``/``flush`` (``resolve_flush_target``: marker + cmdline
-    fingerprint + liveness), so a *positively stale* pid — dead, or recycled to a
-    foreign process (identity mismatch) — does NOT block a legitimate start. But a
-    marker-valid pid file naming a LIVE process whose identity cannot be verified
-    (``ps`` probe failed, or a legacy fingerprint-less file) is treated the same
-    way ``flush``/``stop`` treat that indeterminate state — refuse, never
-    overwrite — so a transient probe failure can't spawn a second recorder over a
-    live one. This closes the stop-then-immediate-start race (and its degraded
-    variants): without it, a second start would overwrite a draining recorder's
-    pid file, and the drainer would later unlink THIS start's file (see also the
-    ownership check in ``_remove_pid_file``).
+    Single-instance enforcement lives in ``_acquire_instance_lock`` (the flock +
+    ``_refuse_if_live_recorder`` identity preflight), which the capture entrypoints
+    call EARLY — before any capture side effect — and which this function also
+    calls as a backstop. By the time we publish a pid file we are the sole
+    instance and any pid file on disk is stale/dead, so the atomic replace below is
+    safe. The write itself is atomic (temp + ``os.replace``) and paired with the
+    ownership-checked ``_remove_pid_file`` so a draining recorder never deletes a
+    newer recorder's file.
     """
     active_dir = data_dir / ".active"
     active_dir.mkdir(parents=True, exist_ok=True)
     pid_path = active_dir / PID_FILENAME
 
-    from onoats._vendor.pid import read_pid_record, resolve_flush_target
-
-    verified = resolve_flush_target(pid_path)
-    if verified.pid is not None and verified.pid != os.getpid():
-        raise RecorderAlreadyRunningError(
-            f"An onoats recorder is already running (pid {verified.pid}). "
-            "Stop it first with `onoats stop`, then retry."
-        )
-    # Indeterminate-but-live: the resolver refused (pid is None) WITHOUT declaring
-    # the file stale — i.e. it is neither a verified recorder nor a proven-dead /
-    # recycled-foreign pid, but a marker-valid file whose process is still alive
-    # and merely unverifiable (ps probe failed / legacy fingerprint-less). Refuse,
-    # exactly as flush/stop do for the same state; only ``stale=True`` is safe to
-    # clobber.
-    if verified.pid is None and not verified.stale:
-        rec = read_pid_record(pid_path)
-        if rec is not None and rec.pid != os.getpid() and _pid_alive(rec.pid):
-            raise RecorderAlreadyRunningError(
-                f"A recorder pid file names a live process (pid {rec.pid}) whose "
-                "identity could not be verified (ps probe failed / legacy pid "
-                "file) — refusing to start over a possibly-live recorder. Stop it "
-                "(`onoats stop`) or remove the stale pid file, then retry."
-            )
+    # Single-instance acquisition + identity preflight (universal backstop). The
+    # capture entrypoints acquire this EARLY — the socket supervisor before
+    # spawning the capturer, run_onoats_dual / run_onoats before opening a device —
+    # so by the time we publish a pid file the lock is already held and this call
+    # is an idempotent no-op. It stays here so any entrypoint that reaches pid
+    # publication without an earlier acquire is still gated. ``_acquire_instance_lock``
+    # raises ``RecorderAlreadyRunningError`` for a concurrent (flock) OR live legacy
+    # (identity) recorder, so by here we are the sole instance and any pid file on
+    # disk is stale/dead — safe to atomically replace. Held until process exit.
+    _acquire_instance_lock(active_dir)
 
     existing = _read_pid_file(pid_path)
     if existing is not None:
@@ -1188,14 +1215,6 @@ def _write_pid_file(data_dir: Path) -> Path:
             logger.info("Removing stale PID file (process gone)")
         except PermissionError:
             logger.warning("PID file exists, process may be running as different user")
-
-    # Single-instance acquisition (universal backstop). The capture entrypoints
-    # acquire this EARLY — the socket supervisor before spawning the capturer,
-    # run_onoats_dual before opening PortAudio — so by the time we publish a pid
-    # file the lock is already held and this call is an idempotent no-op. It stays
-    # here so any entrypoint that reaches pid publication without an earlier
-    # acquire (e.g. `python -m onoats`) is still gated. Held until process exit.
-    _acquire_instance_lock(active_dir)
 
     cmdline = _own_ps_cmdline()
     # Wall-clock start_epoch is included as the 4th line so live-view

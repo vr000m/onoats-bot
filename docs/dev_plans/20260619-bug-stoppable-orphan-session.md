@@ -156,6 +156,40 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 
 ## Findings
 
+### Codex round 7 + `/code-review` (2026-06-22) — legacy-recorder preflight + Stop-button wedge
+
+Codex round 7 (NO-SHIP) and a parallel multi-angle `/code-review --fix` converged
+on two issues; both fixed.
+
+- **[high] A live LEGACY/cross-version recorder was detected only after capturer
+  spawn** (`runtime.py` / `cli.py`). The early `flock` blocks a concurrent
+  *same-version* start, but a recorder from an older build holds no `flock` — so
+  the socket supervisor acquired the `flock` and spawned the capturer, refusing
+  only later inside `_write_pid_file`'s identity check (after CoreAudio/TCC). Fixed
+  by **moving the identity preflight into the lock**: extracted
+  `_refuse_if_live_recorder` and call it inside `_acquire_instance_lock` right
+  after the `flock` (releasing the `flock` if it must refuse). Now both guards
+  (atomic `flock` + identity preflight) fire at the same hoisted, before-capture
+  point in every entrypoint; `_write_pid_file`'s duplicate check was removed (it
+  now relies on the lock it already calls). This also resolves the review's
+  "identity guard scattered across call sites" altitude finding — the lock owns
+  both guards. Regression (`test_socket_supervisor.py`): a marker-valid LIVE pid
+  file with no held `flock` → supervisor refuses rc=1, `create_subprocess_exec`
+  never called.
+- **[medium] The menu-bar Stop button could wedge disabled**
+  (`RecorderModel.swift`). `stopRequested` cleared only on `!alive`; if a NEW
+  external session started before `refresh()` observed the stopped one exit, the
+  new session inherited a stuck-disabled Stop. Fixed by tracking
+  `stopRequestedForPid` (the pid we asked to stop) and clearing `stopRequested`
+  when that pid is gone OR a *different* pid is live. Compiles clean
+  (`make build/Onoats`); manual-smoke as usual for Swift.
+- **Skipped (documented, not bugs):** atomic-write duplication with
+  `status.py::write_status` (extracting a shared helper would modify shipped,
+  out-of-scope code); `_cmd_stop`/`_cmd_flush` near-clone (a deliberate convention
+  — AGENTS.md: "near-clone, not a refactor", parity pinned by tests);
+  `_pid_alive`/`_compare_and_unlink_stale_pid` thin-wrapper nits (intentional
+  clarity). Full suite: 295 passed; ruff + marker green.
+
 ### Codex re-review round 6 (2026-06-22) — entrypoint parity + stale-cleanup TOCTOU
 
 A sixth pass confirmed the main socket/dual lifecycle was sound but found two more

@@ -156,11 +156,17 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   no stale lock to reclaim and **no teardown release call** (releasing during
   shutdown would free the slot while the supervisor is still tearing down its
   capturer). POSIX-only (no-op on Windows; macOS product).
-- **Identity check is the secondary guard.** `_write_pid_file` still runs
-  `resolve_flush_target` and refuses an identity-verified (or indeterminate-but-
-  live) recorder — a stale/recycled/foreign pid does NOT block a legitimate start.
-  This catches a legacy/cross-version recorder that predates the lock; the `flock`
-  catches concurrent same-version starts the read-then-act identity check cannot.
+- **Identity preflight is the secondary guard, and it runs INSIDE the lock.**
+  `_acquire_instance_lock` calls `_refuse_if_live_recorder` (`resolve_flush_target`
+  + the indeterminate-but-live refusal) immediately after taking the `flock`, so
+  both guards fire at the same hoisted, before-capture point. This catches a live
+  legacy/cross-version recorder that holds no `flock` (an older build) — without
+  it, such a start would acquire the `flock` and spawn the capturer before
+  refusing late in `_write_pid_file`. A stale/recycled/foreign pid does NOT block a
+  legitimate start. The `flock` catches concurrent same-version starts the
+  read-then-act identity check cannot; the identity preflight catches the legacy
+  recorder the `flock` cannot. On Windows (no `flock`) the preflight is the only
+  guard.
 - **Pid writes are atomic.** `_write_pid_file` writes to a temp file and
   `os.replace`s it into place (same dir → atomic rename), never truncating in
   place — mirrors `onoats.status.write_status`. A concurrent reader (a draining

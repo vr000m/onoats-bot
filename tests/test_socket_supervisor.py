@@ -672,6 +672,57 @@ def test_held_instance_lock_blocks_capturer_spawn(sup_env, monkeypatch):
         _os.close(holder)
 
 
+def test_live_legacy_recorder_blocks_capturer_spawn(sup_env, monkeypatch):
+    """[high] regression (Codex round 7 / code-review): a LIVE recorder that holds
+    no flock (e.g. an older build that predates the lock) must still be refused
+    BEFORE the capturer is spawned. The identity preflight now runs inside
+    `_acquire_instance_lock` (`_refuse_if_live_recorder`), not late in
+    `_write_pid_file` after the capturer has touched CoreAudio/TCC. Seed a
+    marker-valid pid file naming a live process (no flock held); the supervisor
+    must refuse (rc=1) without calling `create_subprocess_exec`."""
+    import asyncio as _asyncio
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    if not _shutil.which("sleep"):
+        pytest.skip("requires a real live process")
+
+    from onoats._vendor.pid import PID_FILENAME
+
+    data_dir, _pending = sup_env
+    active = data_dir / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    proc = _subprocess.Popen(["sleep", "30"])  # a live process to name in the file
+    try:
+        (active / PID_FILENAME).write_text(
+            f"{proc.pid}\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8"
+        )
+        # Identity readback matches the stored fingerprint → resolves as verified
+        # live (no flock held, so only the identity preflight can refuse).
+        monkeypatch.setattr(
+            "onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot"
+        )
+        spawned = {"n": 0}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def _spy_exec(*a, **k):
+            spawned["n"] += 1
+            return await real_exec(*a, **k)
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spy_exec)
+        rc = _run_supervisor_bounded([])
+        assert rc == 1, "a start over a live legacy recorder must exit rc=1"
+        assert spawned["n"] == 0, (
+            "the capturer must NOT be spawned when a live recorder already exists"
+        )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch):
     """A controlled recorder launch failure must be rc=1, not a traceback.
 
