@@ -80,13 +80,16 @@ final class RecorderModel: ObservableObject {
     /// use the `.stopping` enum case for external stops: `.stopping` is cleared
     /// by `handleExit`, which never fires without a `Process` handle.
     @Published var stopRequested = false
-    // The recorder pid `stopExternal()` asked to stop. `refresh()` clears
-    // `stopRequested` once THAT pid is gone — OR once a DIFFERENT pid is live (a
-    // new session replaced the one we stopped before we observed its exit), so a
-    // fresh session never inherits a stuck-disabled Stop button. nil when no
-    // external stop is in flight, or when the pid couldn't be read at stop time
-    // (then refresh falls back to the plain `!alive` clear).
+    // The recorder pid `stopExternal()` asked to stop, paired with that
+    // recorder's start epoch (pid-file line 4). `refresh()` clears `stopRequested`
+    // once THAT recorder is gone — its pid is no longer live — OR once a DIFFERENT
+    // recorder is live: a different pid, OR the SAME pid number with a different
+    // start epoch (a same-pid recycle — without the epoch check the new session
+    // would inherit a stuck-disabled Stop button). nil when no external stop is in
+    // flight, or when the pid couldn't be read at stop time (then refresh falls
+    // back to the plain `!alive` clear).
     private var stopRequestedForPid: Int32?
+    private var stopRequestedForStartEpoch: Double?
 
     /// Valid `[stt].service` values — mirror of runtime.py
     /// `VALID_STT_SERVICES` (parity-checked by
@@ -169,7 +172,7 @@ final class RecorderModel: ObservableObject {
 
     /// Pid-file read, mirroring `_vendor/pid.py`: line 1 pid, line 2 must be
     /// the "onoats-bot" identity marker, else the file is ignored.
-    private func readPid(under dataDir: URL) -> (pid: Int32, cmdline: String)? {
+    private func readPid(under dataDir: URL) -> (pid: Int32, cmdline: String, startEpoch: Double)? {
         let path = dataDir.appendingPathComponent(".active/onoats.pid")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -177,9 +180,17 @@ final class RecorderModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
         guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0])
         else { return nil }
-        // Line 3 is the recorder's `ps -o command=` self-fingerprint (empty
-        // for legacy pid files) — mirror of _vendor/pid.py PidRecord.
-        return (pid, lines.count >= 3 ? lines[2] : "")
+        // Line 3 is the recorder's `ps -o command=` self-fingerprint (empty for
+        // legacy pid files) — mirror of _vendor/pid.py PidRecord. Line 4 is the
+        // wall-clock start epoch: the ONLY on-disk discriminator between two
+        // same-version recorders that land on the SAME pid number (identical
+        // cmdline), used by refresh() to clear `stopRequested` on a same-pid
+        // recycle. 0 for legacy/incomplete files.
+        return (
+            pid,
+            lines.count >= 3 ? lines[2] : "",
+            lines.count >= 4 ? (Double(lines[3]) ?? 0) : 0
+        )
     }
 
     /// Cached fingerprint verdicts so the 1 s poll doesn't spawn `ps` every
@@ -278,11 +289,19 @@ final class RecorderModel: ObservableObject {
         // Placed AFTER the owned-proc early-return above so an owned session's
         // `.stopping` drain never touches it. Sole clearing site for the success
         // path (see the `stopRequested` invariant).
+        // A DIFFERENT recorder is live: a different pid, OR the same pid number
+        // recycled onto a new session (distinguished by start epoch — two
+        // same-version recorders share a cmdline, so the epoch is the only
+        // discriminator). Either way the recorder we stopped is gone and the new
+        // one must not inherit a stuck-disabled Stop button.
         let stoppedTargetGone =
-            stopRequestedForPid != nil && pid?.pid != stopRequestedForPid
+            stopRequestedForPid != nil
+            && (pid?.pid != stopRequestedForPid
+                || pid?.startEpoch != stopRequestedForStartEpoch)
         if !alive || stoppedTargetGone {
             stopRequested = false
             stopRequestedForPid = nil
+            stopRequestedForStartEpoch = nil
         }
         if alive {
             state = .running(ours: false)
@@ -393,10 +412,13 @@ final class RecorderModel: ObservableObject {
     /// button is `.disabled(stopRequested)`).
     func stopExternal() {
         stopRequested = true
-        // Remember which recorder we're stopping so refresh() can clear the flag
-        // if a DIFFERENT session appears (see `stopRequestedForPid`). nil-safe: if
-        // the pid can't be read, refresh falls back to the plain `!alive` clear.
-        stopRequestedForPid = readPid(under: Self.resolveDataDir())?.pid
+        // Remember which recorder we're stopping (pid + start epoch) so refresh()
+        // can clear the flag if a DIFFERENT session appears — including a same-pid
+        // recycle (see `stopRequestedForPid`). nil-safe: if the pid can't be read,
+        // refresh falls back to the plain `!alive` clear.
+        let stopping = readPid(under: Self.resolveDataDir())
+        stopRequestedForPid = stopping?.pid
+        stopRequestedForStartEpoch = stopping?.startEpoch
         flushNote = nil
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cliPath)
@@ -418,6 +440,7 @@ final class RecorderModel: ObservableObject {
                     // clears it when the supervisor actually exits.
                     self?.stopRequested = false
                     self?.stopRequestedForPid = nil
+                    self?.stopRequestedForStartEpoch = nil
                     self?.flushNote =
                         "Stop failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
                 }
@@ -431,6 +454,7 @@ final class RecorderModel: ObservableObject {
             // spawn-failure path) so a missing/!executable CLI can be retried.
             stopRequested = false
             stopRequestedForPid = nil
+            stopRequestedForStartEpoch = nil
             flushNote = "Stop spawn failed: \(error.localizedDescription)"
         }
     }
