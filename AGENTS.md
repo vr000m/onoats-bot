@@ -107,6 +107,83 @@ registry dep, not a git pin).
   `dual.main` and the supervisor route through it, so interactive/category
   handling can't drift.
 
+## Identity-checked signalling (`onoats flush` / `onoats stop`)
+
+Both CLI signal subcommands share **one** identity gate — `resolve_flush_target`
+(`_vendor/pid.py`) — and differ **only** in the signal sent:
+
+- `onoats flush` → **SIGUSR1** (continuation flush: rotate buffer, keep recording).
+- `onoats stop` → **SIGTERM** (graceful shutdown: drain + final flush, then exit;
+  same trigger as a single Ctrl-C and the menu bar's owned `Process.terminate()`).
+
+Load-bearing invariants (pinned by `tests/test_cli.py`):
+
+- **Never signal an unverified or recycled pid.** The resolver validates the
+  marker, requires a cmdline fingerprint, probes liveness (`kill(0)`), and
+  compares the live `ps` cmdline against the stored one. Only a fully-verified
+  pid is signalled; unlink **only** when `stale=True`, and even then
+  **compare-and-unlink** (`_compare_and_unlink_stale_pid` → `_remove_pid_file`
+  ownership check) — never blindly, or a fresh recorder that won the lock and wrote
+  its pid in the resolve→cleanup window would be deleted; treat `ProcessLookupError`
+  at signal time (TOCTOU) as stale. This matters **more** for `stop` than `flush`
+  — SIGTERM kills by default, so a blind signal to a recycled foreign pid would
+  terminate an unrelated process. A differential test asserts `stop` sends
+  SIGTERM-not-SIGUSR1 and `flush` sends SIGUSR1-not-SIGTERM, so a copy-paste
+  signal swap fails.
+- **`stop` is a near-clone of `flush`, not a refactor.** Drift is pinned by tests
+  rather than a shared helper, keeping the shipped `flush` path untouched.
+- Both return on **signal delivery**, not confirmed exit — a consumer must derive
+  "stopped" from the process actually exiting, never from the CLI exit code.
+- **`onoats stop --help` resolves without booting a service** (local argparse +
+  lazy resolver import), like `flush`.
+
+Single-instance + pid-file ownership (`runtime.py`, pinned by
+`tests/test_status_file.py` + `tests/test_socket_supervisor.py`):
+
+- **Start is gated by an atomic `flock` single-instance lock, acquired before any
+  capture side effect.** `_acquire_instance_lock` takes an exclusive
+  `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`. It is hoisted to the EARLIEST
+  point in each entrypoint — the socket supervisor takes it *before spawning the
+  capturer* (`_supervise_socket_session`), `run_onoats_dual` *before opening
+  PortAudio*, and `run_onoats` (`bot-single` / `python -m onoats`) *before even
+  importing the native deps* — so a losing concurrent start raises
+  `RecorderAlreadyRunningError` (clean rc=1 at all CLI boundaries) **before** it
+  touches CoreAudio/TCC/a device, never after. Acquisition is **idempotent**
+  (already-held → no-op), so the later `_write_pid_file` call (a backstop) is a
+  no-op in the hoisted paths. This is the primary gate and the only *atomic* one: of N
+  racing starts exactly one wins. The lock is held for the **whole process
+  lifetime**; the kernel releases it on exit (graceful OR crash/SIGKILL) — there is
+  no stale lock to reclaim and **no teardown release call** (releasing during
+  shutdown would free the slot while the supervisor is still tearing down its
+  capturer). POSIX-only (no-op on Windows; macOS product).
+- **Identity preflight is the secondary guard, and it runs INSIDE the lock.**
+  `_acquire_instance_lock` calls `_refuse_if_live_recorder` (`resolve_flush_target`
+  + the indeterminate-but-live refusal) immediately after taking the `flock`, so
+  both guards fire at the same hoisted, before-capture point. This catches a live
+  legacy/cross-version recorder that holds no `flock` (an older build) — without
+  it, such a start would acquire the `flock` and spawn the capturer before
+  refusing late in `_write_pid_file`. A stale/recycled/foreign pid does NOT block a
+  legitimate start. The `flock` catches concurrent same-version starts the
+  read-then-act identity check cannot; the identity preflight catches the legacy
+  recorder the `flock` cannot. On Windows (no `flock`) the preflight is the only
+  guard.
+- **Pid writes are atomic.** `_write_pid_file` writes to a temp file and
+  `os.replace`s it into place (same dir → atomic rename), never truncating in
+  place — mirrors `onoats.status.write_status`. A concurrent reader (a draining
+  recorder's owner-checked removal) sees either the complete old record or the
+  complete new one, never an empty/partial file mid-write.
+- **Pid removal is ownership-checked and fails closed.**
+  `_remove_pid_file(pid_path, owner_pid=…)` unlinks **only** when the file still
+  records exactly that pid. If it reads back as `None` (unreadable/foreign/already
+  gone) it is left in place — it must never be assumed to be our own benign
+  mid-write. Because `stop` returns on signal delivery (not exit), a
+  `stop`-then-immediate-`bot` could otherwise let a draining recorder delete a
+  NEWER recorder's pid file. Recorder teardown passes `owner_pid=os.getpid()`; the
+  GUI's menu gating (Start only in `.stopped`) already prevents this from the app,
+  so the guard protects the CLI/scripted path. A leftover invalid pid file is
+  self-healing: `status` reports no valid recorder and the next start atomically
+  replaces it.
+
 ## Reviewing a subprocess / process-boundary change
 
 When a change spawns a child process (`create_subprocess_*` / `Popen` / `exec`)

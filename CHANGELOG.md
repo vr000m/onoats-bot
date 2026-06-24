@@ -13,6 +13,52 @@ no backdated tags exist). PR numbers `#1`–`#7` refer to this repository;
 older history predates the extraction and is cited by merge-commit SHA.
 Annotated tags exist from `v0.9.0` forward.
 
+## [Unreleased]
+
+### Added
+- `onoats stop` subcommand: signal the running recorder to stop gracefully
+  (SIGTERM → drain + final flush, then exit). It is a behavioural twin of
+  `onoats flush` and reuses the same identity gate (`resolve_flush_target`:
+  marker + cmdline-fingerprint + liveness), so it only ever signals the verified
+  recorder and never a recycled pid — which matters more than for flush because
+  SIGTERM kills by default. Returns on signal delivery, not confirmed exit; like
+  flush, `onoats stop --help` resolves without booting a service.
+- Menu-bar **Stop now works for orphaned/external sessions**: a GUI-started
+  recorder orphaned by an app crash (seen as `running(ours: false)` on relaunch),
+  or any terminal-started session, can be stopped from the menu. Owned sessions
+  keep the in-handle `Process.terminate()`; verified external sessions route
+  through `onoats stop`. The menu shows "stopping (draining)…" for the whole
+  drain and flips to Stopped only when the supervisor actually exits (polled),
+  never faking a terminal state. (Completes the stoppable-orphan-session fix.)
+
+### Fixed
+- **Stop→immediate-start pid-file race.** `onoats stop` returns on signal
+  delivery, not exit, so a new `onoats bot` launched during the old recorder's
+  drain could overwrite the draining recorder's pid file — and the drainer would
+  then unlink the *new* recorder's file, leaving it invisible to
+  `status`/`stop`/`flush`. Guards close this: (1) an **atomic `flock`
+  single-instance lock** acquired before any capture side effect — the socket
+  supervisor takes an exclusive `flock(LOCK_EX|LOCK_NB)` on `.active/onoats.lock`
+  *before spawning the capturer*, `run_onoats_dual` *before opening PortAudio*, and
+  `run_onoats` (`bot-single` / `python -m onoats`) *before importing the native
+  deps*, so of N racing starts exactly one wins and the rest raise
+  `RecorderAlreadyRunningError` **before touching CoreAudio/TCC/a device**; held
+  for the whole process lifetime and released by the kernel on exit (graceful or
+  crash), so there is no stale lock to reclaim, and a chained `onoats stop &&
+  onoats bot` cleanly refuses until the drainer's process exits; (2) the identity
+  check (`resolve_flush_target`) remains as a secondary guard refusing a verified
+  or indeterminate-but-live recorder (legacy/cross-version), never blocking on a
+  stale/recycled/foreign pid; (3) pid-file writes are atomic (temp + `os.replace`,
+  never a truncating in-place write) so a concurrent reader never sees an
+  empty/partial file; (4) pid-file removal is ownership-checked and fails closed —
+  a recorder unlinks only a file that still records *its own* pid, and leaves an
+  unreadable/foreign record in place rather than deleting a newer recorder's
+  (possibly in-progress) file; (5) `stop`/`flush` stale cleanup is
+  **compare-and-unlink** (not a blind `unlink`) so a fresh recorder that won the
+  lock and wrote its pid in the resolve→cleanup window is never deleted. The menu's external Stop also re-enables itself if
+  the `onoats stop` subprocess fails or exits non-zero (e.g. a stale installed
+  CLI), rather than wedging the only Stop control until app restart.
+
 ## [1.1.0] - 2026-06-12
 
 First PyPI release (`pip install onoats` / `uv tool install onoats`).

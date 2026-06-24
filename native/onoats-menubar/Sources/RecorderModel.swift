@@ -68,6 +68,29 @@ final class RecorderModel: ObservableObject {
     /// next Flush or Start.
     @Published var flushNote: String?
 
+    /// Cosmetic "external stop in flight" flag for a handle-less session. Set
+    /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
+    /// spawn, and the direct argument to the Stop button's `.disabled(...)` — so
+    /// a verified external/orphaned session can't be double-stopped while it
+    /// drains. Writers: `stopExternal()` sets it on entry and clears it on either
+    /// error path (spawn threw, OR the CLI exited non-zero = SIGTERM not
+    /// delivered) so a failed/stale-CLI stop can't wedge the sole Stop button;
+    /// `refresh()` clears it level-triggered once the supervisor is actually gone
+    /// (`!alive`) on the SUCCESS path. No other writer. We deliberately do NOT
+    /// use the `.stopping` enum case for external stops: `.stopping` is cleared
+    /// by `handleExit`, which never fires without a `Process` handle.
+    @Published var stopRequested = false
+    // The recorder pid `stopExternal()` asked to stop, paired with that
+    // recorder's start epoch (pid-file line 4). `refresh()` clears `stopRequested`
+    // once THAT recorder is gone — its pid is no longer live — OR once a DIFFERENT
+    // recorder is live: a different pid, OR the SAME pid number with a different
+    // start epoch (a same-pid recycle — without the epoch check the new session
+    // would inherit a stuck-disabled Stop button). nil when no external stop is in
+    // flight, or when the pid couldn't be read at stop time (then refresh falls
+    // back to the plain `!alive` clear).
+    private var stopRequestedForPid: Int32?
+    private var stopRequestedForStartEpoch: Double?
+
     /// Valid `[stt].service` values — mirror of runtime.py
     /// `VALID_STT_SERVICES` (parity-checked by
     /// tests/test_native_contract_parity.py).
@@ -149,7 +172,7 @@ final class RecorderModel: ObservableObject {
 
     /// Pid-file read, mirroring `_vendor/pid.py`: line 1 pid, line 2 must be
     /// the "onoats-bot" identity marker, else the file is ignored.
-    private func readPid(under dataDir: URL) -> (pid: Int32, cmdline: String)? {
+    private func readPid(under dataDir: URL) -> (pid: Int32, cmdline: String, startEpoch: Double)? {
         let path = dataDir.appendingPathComponent(".active/onoats.pid")
         guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -157,9 +180,17 @@ final class RecorderModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
         guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0])
         else { return nil }
-        // Line 3 is the recorder's `ps -o command=` self-fingerprint (empty
-        // for legacy pid files) — mirror of _vendor/pid.py PidRecord.
-        return (pid, lines.count >= 3 ? lines[2] : "")
+        // Line 3 is the recorder's `ps -o command=` self-fingerprint (empty for
+        // legacy pid files) — mirror of _vendor/pid.py PidRecord. Line 4 is the
+        // wall-clock start epoch: the ONLY on-disk discriminator between two
+        // same-version recorders that land on the SAME pid number (identical
+        // cmdline), used by refresh() to clear `stopRequested` on a same-pid
+        // recycle. 0 for legacy/incomplete files.
+        return (
+            pid,
+            lines.count >= 3 ? lines[2] : "",
+            lines.count >= 4 ? (Double(lines[3]) ?? 0) : 0
+        )
     }
 
     /// Cached fingerprint verdicts so the 1 s poll doesn't spawn `ps` every
@@ -250,6 +281,28 @@ final class RecorderModel: ObservableObject {
             // can't clobber an imminent .failed with .stopped.
             return
         }
+        // External-stop convergence (handle-less session): clear the cosmetic
+        // stopRequested flag once the supervisor we asked to stop is GONE —
+        // process exit (kill(0) false), NOT pid-file removal — OR once a DIFFERENT
+        // pid is live (a new session started before we observed the stopped one's
+        // exit; without this the new session's Stop button stays wedged disabled).
+        // Placed AFTER the owned-proc early-return above so an owned session's
+        // `.stopping` drain never touches it. Sole clearing site for the success
+        // path (see the `stopRequested` invariant).
+        // A DIFFERENT recorder is live: a different pid, OR the same pid number
+        // recycled onto a new session (distinguished by start epoch — two
+        // same-version recorders share a cmdline, so the epoch is the only
+        // discriminator). Either way the recorder we stopped is gone and the new
+        // one must not inherit a stuck-disabled Stop button.
+        let stoppedTargetGone =
+            stopRequestedForPid != nil
+            && (pid?.pid != stopRequestedForPid
+                || pid?.startEpoch != stopRequestedForStartEpoch)
+        if !alive || stoppedTargetGone {
+            stopRequested = false
+            stopRequestedForPid = nil
+            stopRequestedForStartEpoch = nil
+        }
         if alive {
             state = .running(ours: false)
         } else if case .failed = state {
@@ -316,6 +369,10 @@ final class RecorderModel: ObservableObject {
     /// like everything else). Deliberately works for EXTERNAL sessions too:
     /// the CLI does its own identity-checked pid signalling (marker +
     /// fingerprint), so flushing a terminal-started session from here is safe.
+    ///
+    /// Near-clone: `stopExternal()` mirrors this (it execs `onoats stop` instead
+    /// of `flush`, plus the `stopRequested` flag). Keep the two in sync — e.g. a
+    /// future `--data-dir` argument must be added to both.
     func flush() {
         flushNote = nil
         let p = Process()
@@ -337,6 +394,68 @@ final class RecorderModel: ObservableObject {
             try p.run()
         } catch {
             flushNote = "Flush spawn failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Runs `onoats stop` for a session this app does NOT own — one started from
+    /// a terminal, or (the motivating case) a GUI-started session orphaned by an
+    /// app crash and seen as `running(ours: false)` on relaunch. Mirrors
+    /// `flush()`: the CLI does the identity-checked pid signalling (marker +
+    /// fingerprint + liveness → SIGTERM), so stopping a session we have no
+    /// `Process` handle for is safe and never signals a recycled pid.
+    ///
+    /// We do NOT block on exit and do NOT set the `.stopping` enum case (no
+    /// `handleExit` fires without a handle); convergence to `.stopped` is driven
+    /// by `refresh()` observing the supervisor exit (`processAlive` → false). The
+    /// cosmetic `stopRequested` flag is set HERE, synchronously, BEFORE the spawn
+    /// so a second `onoats stop` subprocess can't be launched mid-drain (the
+    /// button is `.disabled(stopRequested)`).
+    func stopExternal() {
+        stopRequested = true
+        // Remember which recorder we're stopping (pid + start epoch) so refresh()
+        // can clear the flag if a DIFFERENT session appears — including a same-pid
+        // recycle (see `stopRequestedForPid`). nil-safe: if the pid can't be read,
+        // refresh falls back to the plain `!alive` clear.
+        let stopping = readPid(under: Self.resolveDataDir())
+        stopRequestedForPid = stopping?.pid
+        stopRequestedForStartEpoch = stopping?.startEpoch
+        flushNote = nil
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cliPath)
+        p.arguments = ["stop"]
+        if let log = openLog() {
+            p.standardOutput = log
+            p.standardError = log
+        }
+        p.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                if proc.terminationStatus != 0 {
+                    // Non-zero rc means the CLI did NOT deliver SIGTERM — it
+                    // refused (stale / identity mismatch), errored, or is a stale
+                    // installed CLI lacking the `stop` subcommand (argparse rc 2).
+                    // The supervisor may still be ALIVE, so re-enable the button:
+                    // `refresh()` only clears stopRequested on `!alive`, and would
+                    // otherwise leave the sole Stop control wedged until restart.
+                    // A delivered SIGTERM (rc 0) leaves the flag set; refresh()
+                    // clears it when the supervisor actually exits.
+                    self?.stopRequested = false
+                    self?.stopRequestedForPid = nil
+                    self?.stopRequestedForStartEpoch = nil
+                    self?.flushNote =
+                        "Stop failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
+                }
+            }
+        }
+        do {
+            try p.run()
+        } catch {
+            // The subprocess never launched, so nothing is in flight — re-enable
+            // the button (the one writer other than refresh(), guarded to the
+            // spawn-failure path) so a missing/!executable CLI can be retried.
+            stopRequested = false
+            stopRequestedForPid = nil
+            stopRequestedForStartEpoch = nil
+            flushNote = "Stop spawn failed: \(error.localizedDescription)"
         }
     }
 

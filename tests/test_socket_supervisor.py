@@ -626,6 +626,103 @@ def test_unspawnable_capturer_bin_fails_loud(sup_env, log_sink, monkeypatch):
     assert log_sink.warned()
 
 
+def test_held_instance_lock_blocks_capturer_spawn(sup_env, monkeypatch):
+    """[high] regression (Codex adversarial review round 5): the single-instance
+    lock is acquired BEFORE the capturer is spawned. With the slot already held,
+    the supervisor must refuse (rc=1) WITHOUT ever calling
+    ``create_subprocess_exec`` — a start that lost the race must not spawn a second
+    CoreAudio process tap / trigger a TCC prompt / contend for the device and only
+    fail afterwards. Acquiring inside ``_write_pid_file`` (post capturer-spawn) was
+    too late; this pins the hoisted acquisition."""
+    import asyncio as _asyncio
+    import fcntl as _fcntl
+    import os as _os
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+
+    from onoats.runtime import LOCK_FILENAME
+
+    data_dir, _pending = sup_env
+    active = data_dir / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    # Instance 1 holds the slot (separate open file description → flock conflicts
+    # even within this one process).
+    holder = _os.open(str(active / LOCK_FILENAME), _os.O_RDWR | _os.O_CREAT, 0o644)
+    _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+    spawned = {"n": 0}
+    real_exec = _asyncio.create_subprocess_exec
+
+    async def _spy_exec(*a, **k):
+        spawned["n"] += 1
+        return await real_exec(*a, **k)
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spy_exec)
+
+    try:
+        rc = _run_supervisor_bounded([])
+        assert rc == 1, "a start that lost the instance-lock race must exit rc=1"
+        assert spawned["n"] == 0, (
+            "the capturer must NOT be spawned when the instance lock is already held"
+        )
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        _os.close(holder)
+
+
+def test_live_legacy_recorder_blocks_capturer_spawn(sup_env, monkeypatch):
+    """[high] regression (Codex round 7 / code-review): a LIVE recorder that holds
+    no flock (e.g. an older build that predates the lock) must still be refused
+    BEFORE the capturer is spawned. The identity preflight now runs inside
+    `_acquire_instance_lock` (`_refuse_if_live_recorder`), not late in
+    `_write_pid_file` after the capturer has touched CoreAudio/TCC. Seed a
+    marker-valid pid file naming a live process (no flock held); the supervisor
+    must refuse (rc=1) without calling `create_subprocess_exec`."""
+    import asyncio as _asyncio
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    if not _shutil.which("sleep"):
+        pytest.skip("requires a real live process")
+
+    from onoats._vendor.pid import PID_FILENAME
+
+    data_dir, _pending = sup_env
+    active = data_dir / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    proc = _subprocess.Popen(["sleep", "30"])  # a live process to name in the file
+    try:
+        (active / PID_FILENAME).write_text(
+            f"{proc.pid}\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8"
+        )
+        # Identity readback matches the stored fingerprint → resolves as verified
+        # live (no flock held, so only the identity preflight can refuse).
+        monkeypatch.setattr(
+            "onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot"
+        )
+        spawned = {"n": 0}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def _spy_exec(*a, **k):
+            spawned["n"] += 1
+            return await real_exec(*a, **k)
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spy_exec)
+        rc = _run_supervisor_bounded([])
+        assert rc == 1, "a start over a live legacy recorder must exit rc=1"
+        assert spawned["n"] == 0, (
+            "the capturer must NOT be spawned when a live recorder already exists"
+        )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch):
     """A controlled recorder launch failure must be rc=1, not a traceback.
 
@@ -1964,3 +2061,92 @@ async def test_wait_for_sockets_extension_writes_waiting_record(
     assert rec is not None, "the extension must write the prestart waiting record"
     assert rec.running is True
     assert rec.warning and "permission prompt" in rec.warning
+
+
+# ---------------------------------------------------------------------------
+# Shutdown write ordering (RUNTIME): status-stopped lands on disk BEFORE the pid
+# file is unlinked.
+#
+# This is the contract `onoats stop` (and the menu bar's external-stop polling)
+# rely on indirectly: the GUI keys "stopped" off the supervisor PROCESS exiting,
+# but `onoats status` (and any pid-backstop reader) must never observe pid-gone
+# while the status file still claims running. The producer call order is asserted
+# STATICALLY in test_status_file.py (source-text index check). This test is the
+# RUNTIME complement: it drives dual.py's real shutdown tail
+# (`dual._finalize_shutdown_status` — the exact helper `run_onoats_dual`'s
+# `_run_shutdown` calls, factored out of the closure precisely so it is
+# runtime-reachable without booting the STT/VAD stack) against a real filesystem.
+# It spies the pid-unlink boundary and observes, AT THE INSTANT the pid file is
+# unlinked, that the on-disk status already reads running=False. A reorder of the
+# status-stopped / pid-removal pair inside the helper, or a status write that
+# lagged (non-durable / async), flips the observed value and fails here — neither
+# of which the static index check nor test_shutdown_drain.py (which drives a
+# FakeTask and never exercises _remove_pid_file) can catch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ended_by_error", "expected_reason"),
+    [(False, "graceful"), (True, "fatal_error_frame")],
+)
+def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
+    tmp_path, monkeypatch, ended_by_error, expected_reason
+):
+    from onoats import dual
+    from onoats import runtime
+    from onoats import status as status_file
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Start-of-session: real pid file + real running status (pid FIRST, then
+    # status — the start half of the same ordering contract).
+    pid_path = runtime._write_pid_file(data_dir)
+    runtime._write_status_running(data_dir, audio_source="socket", stt_label="fake-stt")
+    assert pid_path.exists()
+    start_rec = status_file.read_status(data_dir)
+    assert start_rec is not None and start_rec.running is True
+
+    # Instrument the unlink boundary: snapshot the on-disk status at the exact
+    # instant the pid file is removed. `_finalize_shutdown_status` calls
+    # `_remove_pid_file` (resolved in dual.py's namespace) as its final step, so
+    # patching the name there observes the helper's REAL ordering.
+    observed: dict = {}
+    real_remove = dual._remove_pid_file
+
+    def _spy_remove(p, **kwargs):
+        rec = status_file.read_status(data_dir)
+        observed["running_at_unlink"] = None if rec is None else rec.running
+        observed["pid_file_present_at_unlink"] = p.exists()
+        return real_remove(p, **kwargs)
+
+    monkeypatch.setattr(dual, "_remove_pid_file", _spy_remove)
+
+    # Drive dual.py's actual shutdown tail (not a hand-sequenced copy of it).
+    dual._finalize_shutdown_status(
+        data_dir,
+        pid_path,
+        ended_by_error=ended_by_error,
+        old_terminal_settings=None,
+    )
+
+    # The unlink spy observed status already running=False — no window where a
+    # reader sees pid-gone while the status file still claims a live recorder.
+    assert observed["running_at_unlink"] is False, (
+        "pid file was unlinked while the on-disk status still claimed running — "
+        "a reader could observe pid-gone + status-running (the exact disagreement "
+        "the ordering contract forbids)"
+    )
+    assert observed["pid_file_present_at_unlink"] is True, (
+        "the pid file should still exist at the moment _remove_pid_file is entered"
+    )
+
+    # Final on-disk state: pid gone, status durably stopped with the branch's
+    # exit reason, start-of-session detail preserved.
+    assert not pid_path.exists()
+    end_rec = status_file.read_status(data_dir)
+    assert end_rec is not None and end_rec.running is False
+    assert end_rec.exit_reason == expected_reason
+    assert end_rec.audio_source == "socket", (
+        "stop must preserve start-of-session detail"
+    )

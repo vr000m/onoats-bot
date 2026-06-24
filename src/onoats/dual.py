@@ -42,15 +42,17 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=Fals
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
+    RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
     SttPreflightError,
     stop_pipeline_for_shutdown,
     wait_or_force,
-    _remove_pid_file,
+    _acquire_instance_lock,
     _create_stt_service,
     log_stt_server_rss,
     _install_signal_handlers,
     _mark_status_rotation,
+    _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
     _topic_pipeline_tasks,
@@ -61,6 +63,51 @@ from onoats.runtime import (  # noqa: E402
     run_crash_recovery,
     stt_banner,
 )
+
+
+def _finalize_shutdown_status(
+    data_dir: Path,
+    pid_path: Path,
+    *,
+    ended_by_error: bool,
+    old_terminal_settings: object | None = None,
+) -> None:
+    """Single-writer shutdown tail: write status-stopped BEFORE removing the pid.
+
+    Write ordering (status-file contract): status-stopped FIRST, then the pid is
+    removed — so ``onoats status`` (the pid backstop) never observes pid-gone
+    while the status file still claims running, and the menu bar's external-stop
+    polling never sees an inconsistent half-torn-down state. ``ended_by_error``
+    (set in ``run_onoats_dual``'s outer run body) distinguishes a fatal-ErrorFrame
+    self-end from a graceful shutdown; the specific cause (capturer-crash vs the
+    recorder's own ErrorFrame, mic/system-audio denial) is enriched by the socket
+    supervisor, which alone knows the final rc.
+
+    Extracted module-level (rather than left inline in ``_run_shutdown``) so the
+    write ordering is exercisable at runtime without booting the recorder stack —
+    see ``test_socket_supervisor.py``. Terminal restore + pid removal live here
+    too; this runs exactly once per session (the ``_on_shutdown`` de-dup guard
+    via ``shutdown_started``/``shutdown_complete`` serialises the two call sites —
+    ``_shutdown_watcher`` and the outer ``finally`` block), so it does not need to
+    be internally idempotent.
+    """
+    if ended_by_error:
+        _write_status_stopped(
+            data_dir,
+            exit_reason="fatal_error_frame",
+            last_error=(
+                "dual pipeline ended on a fatal ErrorFrame (capture branch "
+                "EOF / read-idle / framing failure)"
+            ),
+        )
+    else:
+        _write_status_stopped(data_dir, exit_reason="graceful")
+    _restore_terminal(old_terminal_settings)
+    _remove_pid_file(pid_path, owner_pid=os.getpid())
+    # The single-instance lock is intentionally NOT released here: it is held for
+    # the whole process lifetime and the kernel frees it on exit. Releasing now
+    # would free the slot while the socket supervisor is still tearing down its
+    # capturer (see runtime._release_instance_lock).
 
 
 async def _shutdown_stt_service(stt_service, label: str) -> None:
@@ -353,6 +400,14 @@ async def run_onoats_dual(
     # callers (the PortAudio path) resolve here as before.
     data_dir = data_dir if data_dir is not None else onoats_data_dir()
 
+    # Claim the single-instance slot BEFORE any capture side effect (PortAudio
+    # device open below / socket-transport build). In socket mode the supervisor
+    # already holds it (acquired before spawning the capturer), so this is an
+    # idempotent no-op; in the PortAudio path this is the early gate. A losing
+    # concurrent start raises RecorderAlreadyRunningError here, before it touches
+    # an audio device. Held for the process lifetime (kernel releases on exit).
+    _acquire_instance_lock(data_dir / ".active")
+
     from onoats.config import load_config
 
     cfg = load_config()
@@ -558,30 +613,17 @@ async def run_onoats_dual(
         await _shutdown_stt_service(system_stt, "system")
         await log_stt_server_rss("shutdown")
 
-        # Status file: record stop + failure reason BEFORE removing the pid file.
-        # Write ordering (status-file contract): status-stopped FIRST, then the
-        # pid is removed — so `onoats status` (pid backstop) never observes
-        # pid-gone while the status file still claims running. ``ended_by_error``
-        # (set in the outer run body) distinguishes a fatal-ErrorFrame self-end
-        # from a graceful shutdown; the specific cause (capturer-crash vs the
-        # recorder's own ErrorFrame, mic/system-audio denial) is enriched by the
-        # socket supervisor, which alone knows the final rc.
-        if ended_by_error:
-            _write_status_stopped(
-                data_dir,
-                exit_reason="fatal_error_frame",
-                last_error=(
-                    "dual pipeline ended on a fatal ErrorFrame (capture branch "
-                    "EOF / read-idle / framing failure)"
-                ),
-            )
-        else:
-            _write_status_stopped(data_dir, exit_reason="graceful")
-        # Restore terminal and remove PID file inside the single-writer
-        # shutdown path so the two call sites (_shutdown_watcher and the
-        # outer ``finally`` block) are truly idempotent regardless of ordering.
-        _restore_terminal(old_terminal_settings)
-        _remove_pid_file(pid_path)
+        # Single-writer shutdown tail: status-stopped BEFORE pid removal, plus
+        # terminal restore. Extracted to a module-level helper so the write
+        # ordering is exercisable at runtime without booting the recorder stack
+        # (see test_socket_supervisor.py); ``ended_by_error`` (set in the outer
+        # run body) selects the failure detail.
+        _finalize_shutdown_status(
+            data_dir,
+            pid_path,
+            ended_by_error=ended_by_error,
+            old_terminal_settings=old_terminal_settings,
+        )
         logger.info("Shutdown: complete")
 
     async def _shutdown_watcher() -> None:
@@ -732,7 +774,7 @@ def main(argv: list[str] | None = None) -> int:
                 live_terminal=args.live_terminal, locked_category=args.category
             )
         )
-    except SttPreflightError as exc:
+    except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
     return rc

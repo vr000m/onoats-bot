@@ -487,12 +487,12 @@ def _run_socket_supervisor(rest: list[str]) -> int:
 
     from loguru import logger
 
-    from onoats.runtime import SttPreflightError
+    from onoats.runtime import RecorderAlreadyRunningError, SttPreflightError
     from onoats.transports import SocketHandshakeError
 
     try:
         return _asyncio.run(_supervise_socket_session(rest))
-    except SttPreflightError as exc:
+    except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
@@ -528,6 +528,8 @@ async def _supervise_socket_session(rest: list[str]) -> int:
 
     from loguru import logger
 
+    from onoats.runtime import _acquire_instance_lock
+
     # 0. One canonical data-dir resolution per session. Every status write in
     # this supervisor — the early-failure records below AND the recorder's own
     # stamps (passed down through _run_recorder_with_capturer → run_onoats_dual)
@@ -543,6 +545,16 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             "unset; refusing to start. See docs/audio-socket-contract.md."
         )
         return 1
+
+    # Claim the single-instance slot BEFORE spawning the capturer. The capturer is
+    # the expensive, externally-visible side effect (a CoreAudio process tap, a TCC
+    # prompt, device acquisition); a losing concurrent start must refuse here —
+    # raising RecorderAlreadyRunningError (caught by _run_socket_supervisor → rc=1)
+    # — rather than spawn a second capturer and only fail after touching hardware.
+    # Idempotent + held for the process lifetime; the recorder's later acquires
+    # (run_onoats_dual / _write_pid_file) are no-ops, and the kernel frees the lock
+    # on exit (so the slot stays ours through the capturer teardown in `finally`).
+    _acquire_instance_lock(data_dir / ".active")
 
     # 1. Private, supervisor-owned socket dir (0700). mkdtemp already creates the
     # dir 0700 and owner-only; a fresh per-generation dir means any stale socket
@@ -1114,12 +1126,36 @@ def _cmd_convert(rest: list[str]) -> int:
     return convert_main(rest)
 
 
+def _compare_and_unlink_stale_pid(pid_path: Path, expected_pid: int | None) -> None:
+    """Remove a stale/dead pid file ONLY if it still records ``expected_pid``.
+
+    A blind ``unlink`` during stale cleanup can delete a NEWER recorder's pid
+    file: ``stop``/``flush`` resolve an old dead/recycled pid as stale, but in the
+    window before the unlink a fresh recorder may have won the single-instance
+    lock and written its own pid file — a blind unlink would then orphan that live
+    recorder from ``status``/``stop``/``flush``. Reuse the recorder's own
+    fail-closed ownership check (``_remove_pid_file`` unlinks only on an exact pid
+    match; a ``None``/foreign read is left in place). ``expected_pid is None`` (the
+    file was unparseable when we resolved it) → skip entirely; a future start
+    atomically replaces it (self-healing).
+    """
+    if expected_pid is None:
+        return
+    from onoats.runtime import _remove_pid_file
+
+    _remove_pid_file(pid_path, owner_pid=expected_pid)
+
+
 def _cmd_flush(rest: list[str]) -> int:
     """Send SIGUSR1 to the running recorder so it rotates its buffer.
 
     This is the seam an integrating consumer's ``flush`` pass-through execs. It
     resolves the pid from ``<data_dir>/.active/onoats.pid`` (marker
     ``onoats-bot``) under the forwarded ``ONOATS_DATA_DIR`` root.
+
+    Near-clone: ``_cmd_stop`` mirrors this verbatim except for the signal
+    (SIGTERM vs SIGUSR1). Keep the two in sync — a new error branch here must be
+    copied there (parity is pinned by tests, not a shared helper).
     """
     parser = argparse.ArgumentParser(prog="onoats flush")
     parser.add_argument(
@@ -1130,18 +1166,21 @@ def _cmd_flush(rest: list[str]) -> int:
     args = parser.parse_args(rest)
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import resolve_flush_target
+    from onoats._vendor.pid import read_pid_record, resolve_flush_target
 
     pid_path = _pid_path(data_dir)
+    # Capture the pid the file records BEFORE resolving, so stale cleanup can
+    # compare-and-unlink (never delete a newer recorder's freshly-written file).
+    prior_rec = read_pid_record(pid_path)
     target = resolve_flush_target(pid_path)
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so
-        # the next run starts clean, but never signal an unverified pid.
+        # the next run starts clean, but never signal an unverified pid — and only
+        # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
-            try:
-                pid_path.unlink()
-            except OSError:
-                pass
+            _compare_and_unlink_stale_pid(
+                pid_path, prior_rec.pid if prior_rec else None
+            )
         print(f"onoats flush: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
     pid = target.pid
@@ -1150,10 +1189,7 @@ def _cmd_flush(rest: list[str]) -> int:
     except ProcessLookupError:
         # Raced: the verified recorder exited between the identity check and
         # the signal. Treat as stale rather than signalling a recycled pid.
-        try:
-            pid_path.unlink()
-        except OSError:
-            pass
+        _compare_and_unlink_stale_pid(pid_path, pid)
         print(
             f"onoats flush: recorder pid {pid} is not running (stale pid file)",
             file=sys.stderr,
@@ -1163,6 +1199,65 @@ def _cmd_flush(rest: list[str]) -> int:
         print(f"onoats flush: could not signal pid {pid}: {exc}", file=sys.stderr)
         return 1
     print(f"onoats flush: sent SIGUSR1 to recorder pid {pid}")
+    return 0
+
+
+def _cmd_stop(rest: list[str]) -> int:
+    """Send SIGTERM to the running recorder so it shuts down gracefully.
+
+    Near-clone of ``_cmd_flush``: the safe identity-checked signalling
+    (``resolve_flush_target`` → marker + cmdline fingerprint) is reused verbatim,
+    so a recycled foreign pid is never signalled. The PID-recycling guard matters
+    *more* here than for flush — SIGTERM's default disposition kills, so
+    signalling an unrelated pid would terminate it. The only behavioural change
+    from flush is the signal: SIGTERM (the graceful-shutdown trigger,
+    ``runtime.py`` — same as a single Ctrl-C / the GUI's owned
+    ``Process.terminate()``) instead of SIGUSR1. The recorder drains and writes a
+    final flush before exiting; the command returns on signal delivery, NOT on
+    confirmed exit.
+    """
+    parser = argparse.ArgumentParser(prog="onoats stop")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
+    )
+    args = parser.parse_args(rest)
+    data_dir = Path(args.data_dir) if args.data_dir else None
+
+    from onoats._vendor.pid import read_pid_record, resolve_flush_target
+
+    pid_path = _pid_path(data_dir)
+    # Capture the pid the file records BEFORE resolving, so stale cleanup can
+    # compare-and-unlink (never delete a newer recorder's freshly-written file).
+    prior_rec = read_pid_record(pid_path)
+    target = resolve_flush_target(pid_path)
+    if target.pid is None:
+        # Identity could not be confirmed. Drop a now-untrustworthy pid file so
+        # the next run starts clean, but never signal an unverified pid — and only
+        # if it STILL records the stale pid we resolved (compare-and-unlink).
+        if target.stale:
+            _compare_and_unlink_stale_pid(
+                pid_path, prior_rec.pid if prior_rec else None
+            )
+        print(f"onoats stop: {target.reason} (pid file {pid_path})", file=sys.stderr)
+        return 1
+    pid = target.pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # Raced: the verified recorder exited between the identity check and
+        # the signal. Treat as stale rather than signalling a recycled pid.
+        _compare_and_unlink_stale_pid(pid_path, pid)
+        print(
+            f"onoats stop: recorder pid {pid} is not running (stale pid file)",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(f"onoats stop: could not signal pid {pid}: {exc}", file=sys.stderr)
+        return 1
+    print(f"onoats stop: sent SIGTERM to recorder pid {pid} (graceful shutdown)")
     return 0
 
 
@@ -1302,6 +1397,7 @@ _HANDLERS = {
     "bot": _cmd_bot,
     "bot-single": _cmd_bot_single,
     "flush": _cmd_flush,
+    "stop": _cmd_stop,
     "convert": _cmd_convert,
     "devices": _cmd_devices,
     "status": _cmd_status,
@@ -1321,6 +1417,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("bot", help="Dual-input recorder (mic + system loopback).")
     sub.add_parser("bot-single", help="Legacy single-input (mic-only) recorder.")
     sub.add_parser("flush", help="Signal the running recorder to rotate its buffer.")
+    sub.add_parser(
+        "stop",
+        help="Signal the running recorder to stop gracefully (drain + final flush).",
+    )
     sub.add_parser("convert", help="Render pending/*.jsonl into markdown transcripts.")
     sub.add_parser("devices", help="List audio input/output devices.")
     sub.add_parser("status", help="Report recorder pid / running state + data dir.")

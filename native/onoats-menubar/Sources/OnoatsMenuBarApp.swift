@@ -23,8 +23,12 @@ struct OnoatsMenuBarApp: App {
         // A live capture warning (all-zero input — likely a denied grant or a
         // muted mic) changes the icon so the anomaly is visible without
         // opening the menu. Warning, not failure: the session keeps running.
-        case .running: return model.warning == nil
-            ? "waveform.circle.fill" : "waveform.badge.exclamationmark"
+        case .running:
+            // An external stop in flight reuses the draining glyph so the icon
+            // tracks the menu's "stopping…" affordance.
+            if model.stopRequested { return "ellipsis.circle" }
+            return model.warning == nil
+                ? "waveform.circle.fill" : "waveform.badge.exclamationmark"
         case .starting, .stopping: return "ellipsis.circle"
         case .failed: return "exclamationmark.triangle.fill"
         case .stopped: return "waveform.circle"
@@ -68,8 +72,17 @@ struct MenuContent: View {
 
         switch model.state {
         case .running(let ours):
-            Button(ours ? "Stop" : "Stop (external session)") { model.stop() }
-                .disabled(!ours)
+            // Stop is enabled for ALL identity-verified live sessions (parity
+            // with Flush, which already reaches external sessions). Route on the
+            // `ours` value the enum already carries — owned sessions keep the
+            // in-handle `p.terminate()`; verified external/orphaned sessions go
+            // through `onoats stop` (the CLI's identity-checked SIGTERM). The
+            // cosmetic `stopRequested` flag (set synchronously inside
+            // `stopExternal`) disables the button for the external drain window.
+            Button("Stop") {
+                if ours { model.stop() } else { model.stopExternal() }
+            }
+            .disabled(model.stopRequested)
             Button("Flush") { model.flush() }
         case .starting, .stopping:
             Button("Start") {}.disabled(true)
@@ -158,6 +171,12 @@ struct MenuContent: View {
         case .failed:
             return "Onoats: stopped"
         case .running(let ours):
+            // External stop in flight: show "stopping…" (not "Stopped") for the
+            // whole drain window — `refresh()` flips to `.stopped` only once the
+            // supervisor actually exits, so this never fakes a terminal state.
+            if model.stopRequested {
+                return "Onoats: stopping (draining)…"
+            }
             var line = "Onoats: recording"
             if let since = model.startTime {
                 line += " since \(since.formatted(date: .omitted, time: .shortened))"

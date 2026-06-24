@@ -241,7 +241,9 @@ def test_dual_wires_producers_at_start_rotation_stop():
     # Write ordering: status-stopped MUST precede pid removal so the pid backstop
     # and the status file never disagree about a live recorder.
     stop_idx = src.index("_write_status_stopped(")
-    pid_rm_idx = src.index("_remove_pid_file(pid_path)")
+    # Match the call prefix only — the pid removal is ownership-checked
+    # (`_remove_pid_file(pid_path, owner_pid=...)`), so don't pin the closing paren.
+    pid_rm_idx = src.index("_remove_pid_file(pid_path")
     assert stop_idx < pid_rm_idx, "status-stopped must be written before pid removal"
 
     # And the start producer runs AFTER the pid file is written (pid first).
@@ -501,3 +503,254 @@ def test_write_prestart_waiting_is_fresh_running_with_warning(tmp_path: Path):
     write_running(tmp_path, pid=2, audio_source="socket", stt_label="mlx")
     st = read_status(tmp_path)
     assert st.warning is None and st.pid == 2
+
+
+# ---------------------------------------------------------------------------
+# (g) stop-then-immediate-start race: pid-file single-instance guard +
+# ownership-checked removal. `onoats stop` returns on signal delivery, not exit,
+# so a new `onoats bot` can launch while the old recorder is still draining.
+# Without these guards the new start would overwrite the draining recorder's pid
+# file, and the drainer would later unlink the NEW recorder's file (leaving it
+# invisible to status/stop/flush). See runtime._write_pid_file / _remove_pid_file.
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+from onoats._vendor.pid import PID_FILENAME  # noqa: E402
+from onoats.runtime import (  # noqa: E402
+    LOCK_FILENAME,
+    RecorderAlreadyRunningError,
+    _acquire_instance_lock,
+    _release_instance_lock,
+    _remove_pid_file,
+    _write_pid_file,
+)
+
+# The single-instance lock is released after every test by an autouse fixture in
+# tests/conftest.py (the lock is process-lifetime in production; pytest shares one
+# process, so tests must reset it). `_release_instance_lock` is imported above for
+# the explicit acquire/release-cycle test below.
+
+
+def _seed_pid_file(data_dir: Path, pid: int, *, cmdline: str = "onoats bot") -> Path:
+    pid_path = data_dir / ".active" / PID_FILENAME
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(f"{pid}\nonoats-bot\n{cmdline}\n0.0\n", encoding="utf-8")
+    return pid_path
+
+
+def test_write_pid_file_refuses_verified_live_recorder(tmp_path, monkeypatch):
+    """Start guard: a second start over an identity-verified LIVE recorder is
+    refused (RecorderAlreadyRunningError), and the existing pid file is left
+    intact — never overwritten."""
+    if not shutil.which("sleep"):
+        pytest.skip("requires a real live process for the liveness check")
+    # A real, unrelated live process stands in for the still-draining recorder.
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = _seed_pid_file(tmp_path, proc.pid)
+        # Make the identity readback match the stored fingerprint → verified live.
+        monkeypatch.setattr(
+            "onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot"
+        )
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)
+        # The draining recorder's pid file MUST survive the refused start.
+        assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_write_pid_file_overwrites_stale_dead_recorder(tmp_path):
+    """A stale pid file for a DEAD recorder does not block a legitimate start —
+    it is overwritten with the current process's pid (no false single-instance
+    refusal on a crashed predecessor)."""
+    import os as _os
+
+    if not shutil.which("sleep"):
+        pytest.skip("requires spawning a process to obtain a real dead pid")
+    # Spawn then reap a process so its pid is genuinely dead (kill(0) raises
+    # ProcessLookupError) — a realistic crashed-predecessor pid, no mocking.
+    proc = subprocess.Popen(["sleep", "30"])
+    proc.terminate()
+    proc.wait(timeout=5)
+    _seed_pid_file(tmp_path, proc.pid)
+
+    pid_path = _write_pid_file(tmp_path)
+    # Overwritten with OUR pid — start proceeds.
+    assert pid_path.read_text(encoding="utf-8").startswith(f"{_os.getpid()}\n")
+
+
+def test_remove_pid_file_skips_when_owned_by_newer_recorder(tmp_path):
+    """Ownership-checked removal: a draining recorder must NOT delete a pid file a
+    newer recorder has since overwritten with its own pid."""
+    pid_path = _seed_pid_file(tmp_path, 55555)  # the NEW recorder owns it now
+    # The OLD (draining) recorder, pid 12345, tears down and tries to remove.
+    _remove_pid_file(pid_path, owner_pid=12345)
+    assert pid_path.exists(), "new recorder's pid file must survive the old drainer"
+    # The rightful owner can remove it.
+    _remove_pid_file(pid_path, owner_pid=55555)
+    assert not pid_path.exists()
+
+
+def test_remove_pid_file_unconditional_without_owner(tmp_path):
+    """Back-compat: with no owner_pid the removal is unconditional (the prior
+    best-effort behaviour for callers that don't pass ownership)."""
+    pid_path = _seed_pid_file(tmp_path, 999)
+    _remove_pid_file(pid_path)
+    assert not pid_path.exists()
+
+
+def test_write_pid_file_refuses_live_recorder_with_indeterminate_probe(
+    tmp_path, monkeypatch
+):
+    """[high] regression (Codex re-review): a marker-valid pid file naming a LIVE
+    process whose identity can't be verified (ps probe returns None) must REFUSE
+    startup, not overwrite — the same indeterminate state flush/stop refuse to act
+    on. Without the guard a transient `ps` failure spawns a second recorder over a
+    live one."""
+    if not shutil.which("sleep"):
+        pytest.skip("requires a real live process for the liveness check")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = _seed_pid_file(tmp_path, proc.pid)
+        # kill(0) succeeds (process alive) but the identity readback fails.
+        monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)
+        # The live recorder's pid file MUST survive — never overwritten.
+        assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_write_pid_file_refuses_live_legacy_fingerprintless_pid(tmp_path):
+    """A legacy (2-line, fingerprint-less) pid file naming a LIVE process is
+    unverifiable → refuse startup rather than overwrite a possibly-live recorder."""
+    if not shutil.which("sleep"):
+        pytest.skip("requires a real live process for the liveness check")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_path = tmp_path / ".active" / PID_FILENAME
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(f"{proc.pid}\nonoats-bot\n", encoding="utf-8")  # no line 3
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)
+        assert pid_path.exists()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        "",  # empty — a newer recorder mid-write (truncated)
+        "garbage-not-an-int\n",  # unparseable first line
+        "12345\nWRONG-MARKER\nonoats bot\n0.0\n",  # foreign / invalid marker
+    ],
+)
+def test_remove_pid_file_fail_closed_when_unreadable(tmp_path, corrupt):
+    """[high] regression (Codex adversarial review): owner-checked removal must
+    fail CLOSED. If the pid file reads back as None — an empty/partial file (a
+    newer recorder mid-write) or a foreign/invalid record — a draining recorder
+    must NOT unlink it. Pre-fix this fell through to ``pid_path.unlink()``, which
+    (paired with the old in-place truncating writer) could delete a newer
+    recorder's in-progress pid file, orphaning it (invisible to
+    status/stop/flush). Even with the atomic writer closing the truncation window,
+    removal stays fail-closed: a None read is never our own benign mid-write."""
+    pid_path = tmp_path / ".active" / PID_FILENAME
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(corrupt, encoding="utf-8")
+    _remove_pid_file(pid_path, owner_pid=12345)
+    assert pid_path.exists(), (
+        "fail-closed: a draining recorder must not delete an unreadable/foreign "
+        "pid file (it may be a newer recorder's in-progress record)"
+    )
+
+
+def test_write_pid_file_is_atomic_via_os_replace(tmp_path, monkeypatch):
+    """[high] regression (Codex adversarial review): the pid file is written via
+    temp + ``os.replace`` (atomic rename), never truncated in place. An in-place
+    ``write_text`` exposes an empty/partial file mid-write; a concurrent
+    owner-checked ``_remove_pid_file`` would then read None and delete the newer
+    recorder's file. Pin the atomic-replace contract and assert no temp residue."""
+    import os as _os
+
+    from onoats import runtime as _runtime
+
+    replace_dests = []
+    real_replace = _os.replace
+
+    def _spy_replace(src, dst):
+        replace_dests.append(Path(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_runtime.os, "replace", _spy_replace)
+    pid_path = _write_pid_file(tmp_path)
+
+    # Final record landed via os.replace into the real path — not written in place.
+    assert pid_path in replace_dests, "pid file must be published via os.replace"
+    assert pid_path.read_text(encoding="utf-8").startswith(f"{_os.getpid()}\n")
+    # No leaked temp files in the active dir.
+    leftovers = list((tmp_path / ".active").glob("*.tmp"))
+    assert not leftovers, f"atomic writer leaked temp residue: {leftovers}"
+
+
+def test_write_pid_file_refuses_concurrent_start_holding_instance_lock(tmp_path):
+    """[high] regression (Codex adversarial review round 4): the single-instance
+    guard must be ATOMIC, not check-then-replace. Two `onoats bot` starts racing
+    with no valid pid file both pass the best-effort identity check; the flock is
+    the gate that lets exactly ONE proceed. Simulate the race winner by holding
+    the flock (a separate open file description — POSIX flock conflicts even
+    within one process), then assert a second `_write_pid_file` refuses and does
+    NOT publish a pid file (so the loser can't run unrepresented)."""
+    import os as _os
+
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    import fcntl as _fcntl
+
+    active = tmp_path / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    lock_path = active / LOCK_FILENAME
+    holder = _os.open(str(lock_path), _os.O_RDWR | _os.O_CREAT, 0o644)
+    _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # instance 1 holds the slot
+    try:
+        with pytest.raises(RecorderAlreadyRunningError):
+            _write_pid_file(tmp_path)  # instance 2 loses the race
+        assert not (active / PID_FILENAME).exists(), (
+            "the start that lost the instance-lock race must not publish a pid file"
+        )
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        _os.close(holder)
+
+
+def test_instance_lock_blocks_then_frees_on_release(tmp_path):
+    """The lock is exclusive while held and freed on release — so a post-drain
+    start can re-acquire the slot (the stop→start handoff)."""
+    import os as _os
+
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    import fcntl as _fcntl
+
+    active = tmp_path / ".active"
+    active.mkdir(parents=True, exist_ok=True)
+    _acquire_instance_lock(active)  # we now hold the slot
+    # A concurrent acquirer (separate fd) is blocked while we hold it.
+    other = _os.open(str(active / LOCK_FILENAME), _os.O_RDWR)
+    try:
+        with pytest.raises(OSError):
+            _fcntl.flock(other, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        # Release; the slot is now free for the next start.
+        _release_instance_lock()
+        _fcntl.flock(other, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # must succeed now
+        _fcntl.flock(other, _fcntl.LOCK_UN)
+    finally:
+        _os.close(other)
