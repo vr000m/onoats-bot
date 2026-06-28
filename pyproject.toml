@@ -10,7 +10,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "onoats"
-version = "1.1.0"
+version = "1.2.0"
 description = "Standalone onoats voice recorder (extracted from koda)."
 readme = "README.md"
 license = "BSD-2-Clause"
