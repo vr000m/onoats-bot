@@ -15,6 +15,20 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-28
+
+### Changed
+- Bumped `pipecat-local-stt-server` from `>=0.1.2,<0.2` to `>=0.3.3,<0.4`,
+  keeping the bundled client library in lockstep with the running server
+  generation. 0.3.3 adds server-side UDS trust-boundary hardening (0700
+  socket-directory enforcement + peer-credential `403` for cross-uid
+  connections); the wire protocol stays `"0.1"`, so the recorder's client
+  code is unchanged. `websockets` now resolves to 16.0 (satisfies onoats's
+  `>=13` and the server's new `>=16,<17`). **Operator note:** the 0.3.3
+  server refuses to start on a legacy `0755` socket dir — re-run the
+  server installer (don't `git pull` + bare `launchctl kickstart`) so it
+  self-heals `0755`→`0700` and restarts in one step.
+
 ### Added
 - `onoats stop` subcommand: signal the running recorder to stop gracefully
   (SIGTERM → drain + final flush, then exit). It is a behavioural twin of
