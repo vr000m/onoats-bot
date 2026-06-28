@@ -77,7 +77,7 @@ the GitHub `pypi` environment. One-time prerequisites: a PyPI trusted
 publisher (project `onoats`, repo `vr000m/onoats-bot`, workflow
 `release.yml`, environment `pypi`) and the GitHub `pypi` environment itself.
 PyPI rejects direct-URL `Requires-Dist` entries — dependencies must come
-from PyPI (this is why `pipecat-local-stt-server` is a `>=0.1.2,<0.2`
+from PyPI (this is why `pipecat-local-stt-server` is a `>=0.3.3,<0.4`
 registry dep, not a git pin).
 
 ## Supervisor ↔ capturer lifecycle (`cli._run_socket_supervisor`)

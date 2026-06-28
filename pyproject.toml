@@ -28,10 +28,11 @@ classifiers = [
 ]
 dependencies = [
     "pipecat-ai[deepgram,google,local,runner,silero,soundfile,webrtc,whisper]>=1.0.0,<2.0.0",
-    # 0.1.2 is the PyPI release of the exact commit previously pinned by git
-    # URL (5062b98 == tag v0.1.2). <0.2 until the 0.2/0.3 wire protocol is
-    # smoke-tested live against the recorder.
-    "pipecat-local-stt-server>=0.1.2,<0.2",
+    # Kept in lockstep with the running server generation. 0.3.3 added UDS
+    # trust-boundary hardening (0700 socket-dir enforcement + peer-cred 403);
+    # wire protocol stays "0.1", so the recorder's client code is unchanged.
+    # <0.4 until the next minor is smoke-tested live against the recorder.
+    "pipecat-local-stt-server>=0.3.3,<0.4",
     "websockets>=13.0",
     "python-dotenv>=1.2.1",
     "loguru>=0.7.0",
