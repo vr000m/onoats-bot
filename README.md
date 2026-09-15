@@ -192,8 +192,12 @@ the terminal instead). It lives in the menu bar with no Dock icon.
 
 - `$XDG_CONFIG_HOME/onoats/config.toml` — `[storage]` (`data_dir`), `[devices]`
   (by name), `[stt]` (`service`, `model`, `language` — `"en"` default, `"auto"`
-  = detect; whisper + websocket backends only), `[speakers]` (render-only
-  display labels), `[categories]`, `[tuning]`.
+  = detect; whisper + websocket backends only; `launchd_label` — optional,
+  the `launchctl` label to kickstart when the websocket STT server is
+  unreachable at startup or drops mid-session; absent by default, in which
+  case self-healing is skipped and today's plain-failure behavior is
+  unchanged), `[speakers]` (render-only display labels), `[categories]`,
+  `[tuning]`.
 - `$XDG_CONFIG_HOME/onoats/secrets.env` — `0600`, STT secrets only
   (`DEEPGRAM_API_KEY` / `STT_WS_TOKEN`). **No LLM keys.**
 - `$XDG_CONFIG_HOME/onoats/dictionary.txt` — `wrong: correct` substitutions

@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from dotenv import dotenv_values
 from loguru import logger
@@ -262,6 +263,26 @@ class OnoatsConfig:
     @property
     def stt_ws_uri(self) -> str | None:
         return _env_or("STT_WS_URI", self.raw.get("stt", {}).get("ws_uri"))
+
+    @property
+    def stt_launchd_label(self) -> str | None:
+        """launchd label to kickstart on preflight/reconnect failure.
+
+        env ``STT_LAUNCHD_LABEL`` > config.toml ``[stt].launchd_label`` >
+        ``None``. Absent, or an empty/whitespace-only value from either
+        source, normalizes to ``None`` (chosen behavior — unlike
+        ``stt_ws_socket``, callers treat "no label configured" as an exact
+        ``is None`` skip condition, so a stray `launchd_label = ""` in
+        config.toml must not be mistaken for a configured-but-empty label).
+        Absent means self-healing kickstart is skipped entirely — today's
+        plain-failure behavior is unchanged. No inference from socket path
+        or backend name: the two shipped plists
+        (``pipecat.stt-server.nemotron`` vs. ``pipecat.stt-server`` for a
+        bare ``mlx`` backend) prove no reliable derivation rule exists.
+        """
+        val = _env_or("STT_LAUNCHD_LABEL", self.raw.get("stt", {}).get("launchd_label"))
+        val = str(val).strip() if val is not None else ""
+        return val or None
 
     # ---- speakers (render-only display labels) ----
     @property

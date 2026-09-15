@@ -17,7 +17,6 @@ import os
 from onoats import runtime
 from onoats.config import OnoatsConfig
 
-
 # --- A. STT selection + ws endpoint come from config.toml -------------------
 
 
@@ -209,3 +208,51 @@ def test_env_overrides_config_devices(monkeypatch):
     monkeypatch.setenv("MIC_INPUT_DEVICE", "Opal C1 Audio Mic")
     cfg = OnoatsConfig(raw={"devices": {"mic": "Scarlett Solo USB"}})
     assert cfg.mic_device == "Opal C1 Audio Mic"
+
+
+# --- D. stt_launchd_label: fully optional, defaults to today's behavior -----
+#
+# Design intent (dev plan Phase 1): the new key is opt-in only. Absent means
+# self-healing kickstart is skipped entirely and today's plain
+# SttPreflightError / silent reconnect-failure behavior is preserved exactly
+# -- no existing config.toml should observe any change from this property
+# existing at all.
+
+
+def test_stt_launchd_label_absent_is_none(monkeypatch):
+    """No config, no env -> None (today's exact behavior: no kickstart)."""
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    assert OnoatsConfig(raw={}).stt_launchd_label is None
+
+
+def test_stt_launchd_label_from_config_toml(monkeypatch):
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    cfg = OnoatsConfig(raw={"stt": {"launchd_label": "pipecat.stt-server.nemotron"}})
+    assert cfg.stt_launchd_label == "pipecat.stt-server.nemotron"
+
+
+def test_stt_launchd_label_from_env_only(monkeypatch):
+    monkeypatch.setenv("STT_LAUNCHD_LABEL", "pipecat.stt-server")
+    cfg = OnoatsConfig(raw={})
+    assert cfg.stt_launchd_label == "pipecat.stt-server"
+
+
+def test_stt_launchd_label_env_overrides_config(monkeypatch):
+    monkeypatch.setenv("STT_LAUNCHD_LABEL", "pipecat.stt-server")
+    cfg = OnoatsConfig(raw={"stt": {"launchd_label": "pipecat.stt-server.nemotron"}})
+    assert cfg.stt_launchd_label == "pipecat.stt-server"
+
+
+def test_stt_launchd_label_empty_string_config_is_absent(monkeypatch):
+    """An empty-string file value must resolve to None, not "" -- kickstart
+    call sites treat "no label configured" as the skip condition, so a
+    stray `launchd_label = ""` in config.toml must not be mistaken for a
+    configured (but empty) label.
+    """
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    assert OnoatsConfig(raw={"stt": {"launchd_label": ""}}).stt_launchd_label is None
+
+
+def test_stt_launchd_label_whitespace_only_config_is_absent(monkeypatch):
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    assert OnoatsConfig(raw={"stt": {"launchd_label": "   "}}).stt_launchd_label is None
