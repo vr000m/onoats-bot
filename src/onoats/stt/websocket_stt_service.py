@@ -27,12 +27,28 @@ early-return once ``self._client is None``.
 The MLX V1 backend is commit-oriented, so we emit a single finalised
 ``TranscriptionFrame`` per segment. ``InterimTranscriptionFrame`` is a
 no-op in this path.
+
+**Live-session self-healing kickstart** (``launchd_label``/``on_recovery``
+constructor params): when the reconnect backoff in ``_ensure_connected`` is
+fully exhausted, and a label is configured, and the shared process-wide
+cooldown (``onoats.stt.launchd`` — the same registry the startup preflight
+path stamps) has elapsed for it, this fires ``kickstart_stt_server`` once
+and stamps the cooldown, then lets the normal reconnect schedule continue
+on the caller's next attempt — no extra blocking wait here. Two instances
+racing the same exhaustion only ever produce one kickstart because the
+cooldown check-then-stamp happens synchronously on the event loop (no
+``await`` between the two). ``on_recovery(<message>)`` fires only once a
+post-kickstart connect actually succeeds (never merely because
+``kickstart_stt_server`` returned ``True``); the cooldown itself is reset
+— and ``on_recovery(None)`` fired to clear the warning — only once that
+reconnected session sees its first ``transcript.completed``/
+``transcript.failed`` event, not on the bare connect.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncGenerator, Optional
+from collections.abc import AsyncGenerator, Callable
 
 from loguru import logger
 from pipecat.frames.frames import (
@@ -46,7 +62,6 @@ from pipecat.frames.frames import (
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
-
 from stt_server import TranscriptionClient
 from stt_server import protocol as P
 
@@ -92,6 +107,8 @@ class WebSocketSTTService(SegmentedSTTService):
         uri: str | None = None,
         auth_token: str | None = None,
         language: str | None = "en",
+        launchd_label: str | None = None,
+        on_recovery: Callable[[str | None], None] | None = None,
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
@@ -116,28 +133,45 @@ class WebSocketSTTService(SegmentedSTTService):
             auth_token=auth_token,
         )
         self._language = language
-        self._client: Optional[TranscriptionClient] = None
-        self._reader_task: Optional[asyncio.Task] = None
-        self._pending: Optional[asyncio.Future[str]] = None
+        self._client: TranscriptionClient | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._pending: asyncio.Future[str] | None = None
         # Resolved by the reader when a session.updated or error event arrives
         # after session.update; _ensure_connected awaits this before returning
         # so the first commit cannot race the language config.
-        self._session_ready: Optional[asyncio.Future[None]] = None
+        self._session_ready: asyncio.Future[None] | None = None
         self._run_stt_lock = asyncio.Lock()
         self._connected = False
         # Backend identity from the most recent server.hello. The model is
         # pinned server-side (launchd env), so the client cannot know it
         # until the handshake completes — these stay None until the first
         # successful connect, then reflect whatever ASR is actually serving.
-        self._backend_name: Optional[str] = None
-        self._backend_model: Optional[str] = None
+        self._backend_name: str | None = None
+        self._backend_model: str | None = None
+        # Self-healing kickstart (live-session path). ``launchd_label``/
+        # ``on_recovery`` mirror the preflight path's constructor-injected
+        # seam (never read from kwargs). Per-instance state tracks where in
+        # the "kickstarted, awaiting confirmation" sequence this instance is
+        # so each instance fires its own ``on_recovery`` independently even
+        # though the cooldown registry itself is process-wide/shared.
+        self._launchd_label = launchd_label
+        self._on_recovery = on_recovery
+        # True from the moment this instance's own reconnect exhaustion
+        # triggers a kickstart until that instance's *next* successful
+        # connect — gates the one-time "server restarted automatically"
+        # on_recovery call.
+        self._kickstart_awaiting_connect = False
+        # True from that successful post-kickstart connect until the first
+        # transcript.completed/transcript.failed event on it — gates the
+        # cooldown reset + on_recovery(None) clear.
+        self._kickstart_awaiting_transcript = False
 
     # ------------------------------------------------------------------
     # Backend identity (populated on connect from server.hello)
     # ------------------------------------------------------------------
 
     @property
-    def backend_name(self) -> Optional[str]:
+    def backend_name(self) -> str | None:
         """ASR backend the server reported on connect (e.g. ``parakeet``).
 
         ``None`` until the first successful handshake — the model is pinned
@@ -146,7 +180,7 @@ class WebSocketSTTService(SegmentedSTTService):
         return self._backend_name
 
     @property
-    def backend_model(self) -> Optional[str]:
+    def backend_model(self) -> str | None:
         """Model id the server reported on connect (e.g.
         ``mlx-community/parakeet-tdt-0.6b-v3``). ``None`` until connected."""
         return self._backend_model
@@ -237,7 +271,7 @@ class WebSocketSTTService(SegmentedSTTService):
                 await self._client.commit()
                 try:
                     text = await asyncio.wait_for(self._pending, timeout=decode_timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # The server is still decoding; a late completed would
                     # otherwise resolve the NEXT segment's pending future with
                     # stale text (no item_id correlation in V1). Drop the
@@ -306,7 +340,7 @@ class WebSocketSTTService(SegmentedSTTService):
                     await asyncio.wait_for(
                         self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     raise RuntimeError("stt_server did not ack session.update")
                 # Backend identity from server.hello — surfaces an operational
                 # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
@@ -327,6 +361,20 @@ class WebSocketSTTService(SegmentedSTTService):
                     )
                 else:
                     logger.info(f"{self.name}: connected to {endpoint}{backend_desc}")
+                # A kickstart this instance itself triggered (on a prior
+                # exhaustion) is confirmed live only once we reach here —
+                # fire on_recovery's "restarted" message now, and arm the
+                # transcript-event gate that will actually reset the shared
+                # cooldown. A bare successful connect never resets the
+                # cooldown by itself (Requirements: no time-based fallback).
+                if self._kickstart_awaiting_connect:
+                    self._kickstart_awaiting_connect = False
+                    self._kickstart_awaiting_transcript = True
+                    if self._on_recovery is not None:
+                        self._on_recovery(
+                            "stt: server restarted automatically "
+                            f"(kickstarted {self._launchd_label})"
+                        )
                 return
             except Exception as exc:
                 last_exc = exc
@@ -345,7 +393,52 @@ class WebSocketSTTService(SegmentedSTTService):
         logger.error(
             f"{self.name}: giving up after {total_attempts} connect attempts to {endpoint}"
         )
+        await self._maybe_kickstart()
         raise last_exc
+
+    async def _maybe_kickstart(self) -> None:
+        """Best-effort self-heal after the reconnect backoff is exhausted.
+
+        Fires at most once per process-wide cooldown window across every
+        ``WebSocketSTTService`` instance sharing ``launchd_label`` (and
+        across the startup preflight path, which stamps the same shared
+        registry in ``onoats.stt.launchd``) — never once-per-attempt, never
+        once-per-instance. The cooldown check and stamp happen back-to-back
+        with no ``await`` between them, so two instances exhausting
+        concurrently on the same event loop can't both pass the check
+        before either stamps.
+
+        Never blocks the caller's own reconnect schedule: this only asks
+        launchd to restart the job and stamps the cooldown, then returns.
+        The next ``_ensure_connected`` call (triggered by the caller's next
+        ``run_stt``) does the actual reconnecting on its normal backoff.
+        """
+        if self._launchd_label is None:
+            return
+        # Local import (not module-top-level): matches the call-time lookup
+        # discipline `runtime.py`'s `_kickstart_and_retry`/`_preflight_stt_ws`
+        # already use for this same module — tests monkeypatch
+        # `onoats.stt.launchd._cooldown_elapsed` directly, which only takes
+        # effect if this reads the module attribute fresh on each call.
+        from onoats.stt.launchd import (
+            _cooldown_elapsed,
+            _stamp_cooldown,
+            kickstart_stt_server,
+        )
+
+        if not _cooldown_elapsed(self._launchd_label):
+            return
+        # Stamp immediately after the check, before the `await` below —
+        # mirrors the preflight path (runtime.py `_kickstart_and_retry`) in
+        # counting a failed kickstart against the window, but here the stamp
+        # must also happen with no `await` between check and stamp: this
+        # path can be entered concurrently by multiple instances sharing a
+        # label, and asyncio's cooperative scheduling only keeps the
+        # check-then-stamp atomic if nothing yields control in between.
+        _stamp_cooldown(self._launchd_label)
+        kicked = await asyncio.to_thread(kickstart_stt_server, self._launchd_label)
+        if kicked:
+            self._kickstart_awaiting_connect = True
 
     def _endpoint_label(self) -> str:
         kw = self._connect_kwargs
@@ -374,6 +467,21 @@ class WebSocketSTTService(SegmentedSTTService):
         self._client = None
         self._connected = False
 
+    def _maybe_confirm_kickstart_recovery(self) -> None:
+        """First transcript.completed/transcript.failed event following a
+        kickstart-triggered reconnect: reset the shared cooldown and clear
+        the warning via ``on_recovery(None)``. Never fires on a bare
+        successful connect — only here, on confirmed sustained health."""
+        if not self._kickstart_awaiting_transcript:
+            return
+        self._kickstart_awaiting_transcript = False
+        if self._launchd_label is not None:
+            from onoats.stt.launchd import _reset_cooldown
+
+            _reset_cooldown(self._launchd_label)
+        if self._on_recovery is not None:
+            self._on_recovery(None)
+
     async def _read_events(self, client: TranscriptionClient) -> None:
         saw_session_closed = False
         try:
@@ -384,9 +492,11 @@ class WebSocketSTTService(SegmentedSTTService):
                     continue
                 etype = ev.get("type")
                 if etype == P.EVT_TRANSCRIPT_COMPLETED:
+                    self._maybe_confirm_kickstart_recovery()
                     if self._pending and not self._pending.done():
                         self._pending.set_result(ev.get("transcript", ""))
                 elif etype == P.EVT_TRANSCRIPT_FAILED:
+                    self._maybe_confirm_kickstart_recovery()
                     err = ev.get("error") or {}
                     msg = (
                         err.get("message")
@@ -484,7 +594,7 @@ class WebSocketSTTService(SegmentedSTTService):
                     await asyncio.wait_for(
                         self._reader_task, timeout=_CLOSE_TIMEOUT_SECONDS
                     )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except (TimeoutError, asyncio.CancelledError):
                     self._reader_task.cancel()
         finally:
             await client.close()

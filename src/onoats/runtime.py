@@ -845,7 +845,12 @@ async def _create_stt_service(*, data_dir: Path | None = None):
         # ``_resolve_stt_ws_target`` because that dict also feeds
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
         return (
-            WebSocketSTTService(language=language, **kwargs),
+            WebSocketSTTService(
+                language=language,
+                launchd_label=launchd_label,
+                on_recovery=on_recovery,
+                **kwargs,
+            ),
             recovery_holder.get("message"),
         )
 
