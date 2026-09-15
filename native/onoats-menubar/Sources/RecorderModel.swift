@@ -67,6 +67,11 @@ final class RecorderModel: ObservableObject {
     /// Non-nil when the last Flush failed — shown in the menu, cleared on the
     /// next Flush or Start.
     @Published var flushNote: String?
+    /// Login-item registration hint (dev plan Phase 5) — set once at launch
+    /// by `LoginItemManager.sync()` in `init()` below, e.g. `.requiresApproval`
+    /// or a registration failure. nil once launch_at_login is absent, matches
+    /// the registered state already, or was never configured.
+    @Published var loginItemHint: String?
 
     /// Cosmetic "external stop in flight" flag for a handle-less session. Set
     /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
@@ -141,6 +146,10 @@ final class RecorderModel: ObservableObject {
     // ------------------------------------------------------------------ init
 
     init() {
+        // RecorderModel is constructed once, at OnoatsMenuBarApp startup —
+        // the "every launch" checkpoint the login-item sync is specified
+        // against (dev plan Phase 5).
+        loginItemHint = LoginItemManager.sync()
         refresh()
         // .common so the poll keeps firing during menu tracking.
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in

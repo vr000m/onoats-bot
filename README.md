@@ -198,6 +198,17 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   case self-healing is skipped and today's plain-failure behavior is
   unchanged), `[speakers]` (render-only display labels), `[categories]`,
   `[tuning]`.
+- `[app].launch_at_login` (Onoats.app only — Python never reads this key) —
+  bare TOML `true`/`false` (a quoted `"true"`/`"false"` normalizes to the
+  same value, since `ConfigStore`'s reader strips surrounding quotes; any
+  other spelling, e.g. Python-style `True`, is treated the same as absent).
+  Checked once at every Onoats.app launch: absent means **no action at
+  all** — it will never silently opt you in, and it will never touch a
+  login item you registered out-of-band (e.g. directly in System Settings
+  ▸ Login Items). Explicit `false` unregisters. There is no menu toggle for
+  this — edit `config.toml` directly, then relaunch Onoats.app (or approve
+  it in System Settings ▸ Login Items if macOS holds it in
+  `.requiresApproval`) for the change to take effect.
 - `$XDG_CONFIG_HOME/onoats/secrets.env` — `0600`, STT secrets only
   (`DEEPGRAM_API_KEY` / `STT_WS_TOKEN`). **No LLM keys.**
 - `$XDG_CONFIG_HOME/onoats/dictionary.txt` — `wrong: correct` substitutions

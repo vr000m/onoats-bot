@@ -67,6 +67,9 @@ struct MenuContent: View {
         if let note = model.flushNote {
             Text("⚠ \(note)")
         }
+        if let hint = model.loginItemHint {
+            Text("⚠ \(hint)")
+        }
 
         Divider()
 
