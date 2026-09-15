@@ -264,6 +264,57 @@ def set_warning(data_dir: Path, warning: str | None) -> Path | None:
     return write_status(data_dir, replace(current, warning=warning))
 
 
+def _parse_warning_branches(warning: str | None) -> dict[str, str]:
+    """Parse a merged ``warning`` string back into ``{branch: message}``.
+
+    Mirrors the join convention in :func:`set_warning_branch` /
+    ``cli.py``'s (former) ``active_warnings`` rebuild: entries are separated
+    by ``"; "`` and each entry is ``f"{branch}: {message}"``. A malformed or
+    legacy entry (no ``": "`` separator — e.g. a warning written before
+    branch-keying existed) is dropped rather than raising: it can't be
+    attributed to a branch, so it degrades to "no prior warning for that
+    slot" instead of corrupting the merge.
+    """
+    if not warning:
+        return {}
+    branches: dict[str, str] = {}
+    for part in warning.split("; "):
+        branch, sep, message = part.partition(": ")
+        if not sep:
+            continue
+        branches[branch] = message
+    return branches
+
+
+def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path | None:
+    """Set (or clear, with ``None``) one branch's slice of the ``warning`` field.
+
+    Unlike :func:`set_warning` (kept as the low-level whole-field writer),
+    this reads the current merged ``warning``, parses it into per-branch
+    entries (:func:`_parse_warning_branches`), replaces or removes only
+    ``branch``'s entry, and rewrites the merge in **sorted branch-name
+    order** (matching ``cli.py``'s pre-existing ``sorted(active_warnings)``
+    convention) — so concurrent branches (``mic``/``system``/``stt``) never
+    clobber each other's entries the way a whole-field overwrite would.
+
+    A ``message`` containing ``"; "`` is a known pre-existing limitation of
+    the split-based parser (unchanged by this helper): callers must not put
+    ``"; "`` inside a branch's message, or the merge will mis-parse on the
+    next read. Best-effort like :func:`set_warning`: returns ``None`` when
+    there is no readable record to annotate.
+    """
+    current = read_status(data_dir)
+    if current is None:
+        return None
+    branches = _parse_warning_branches(current.warning)
+    if message is None:
+        branches.pop(branch, None)
+    else:
+        branches[branch] = message
+    merged = "; ".join(f"{b}: {branches[b]}" for b in sorted(branches)) or None
+    return write_status(data_dir, replace(current, warning=merged))
+
+
 def set_devices(
     data_dir: Path,
     *,

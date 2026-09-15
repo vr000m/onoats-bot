@@ -276,7 +276,7 @@ _CAPTURER_ENV_POLICY = _CapturerEnvPolicy(
 
 
 def _build_capturer_env(
-    base_env: "os._Environ[str] | dict[str, str]",
+    base_env: os._Environ[str] | dict[str, str],
     *,
     mic_sock: str,
     system_sock: str,
@@ -373,7 +373,6 @@ async def _drain_capturer_stderr(
     """
     from onoats import status as status_file
 
-    active_warnings: dict[str, str] = {}
     while True:
         try:
             line = await stderr.readline()
@@ -402,17 +401,9 @@ async def _drain_capturer_stderr(
         try:
             if event_type == "zero-run-warning":
                 hint = fields.get("hint", "no detail provided")
-                active_warnings[branch] = f"{branch}: {hint}"
-                status_file.set_warning(
-                    data_dir,
-                    "; ".join(active_warnings[b] for b in sorted(active_warnings)),
-                )
+                status_file.set_warning_branch(data_dir, branch, hint)
             elif event_type == "zero-run-clear":
-                if active_warnings.pop(branch, None) is not None:
-                    merged = "; ".join(
-                        active_warnings[b] for b in sorted(active_warnings)
-                    )
-                    status_file.set_warning(data_dir, merged or None)
+                status_file.set_warning_branch(data_dir, branch, None)
             elif event_type == "device":
                 desc = fields.get("hint", "")
                 if branch in ("mic", "system") and desc:
@@ -589,7 +580,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     os.environ["ONOATS_CAPTURER_NONCE"] = nonce
 
     capturer_proc: asyncio.subprocess.Process | None = None
-    stderr_task: "asyncio.Task[None] | None" = None
+    stderr_task: asyncio.Task[None] | None = None
     # Latest device description per branch ("mic"/"system"), written by the
     # stderr reader and applied to this session's status record by the
     # deferred task in _run_recorder_with_capturer (the events outrun the
@@ -738,7 +729,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             try:
                 # wait_for cancels (and awaits) the task itself on timeout.
                 await asyncio.wait_for(stderr_task, timeout=_STDERR_READER_GRACE_SEC)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         # Remove the private socket dir. Best-effort: a leftover here is harmless
         # (next generation mints a new one), but tidy up so private dirs don't
@@ -969,7 +960,7 @@ async def _run_recorder_with_capturer(
         )
         try:
             await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Socket supervisor: recorder did not finish draining within "
                 f"{_RECORDER_DRAIN_GRACE_SEC}s after capturer death — force-cancelling."
@@ -1089,7 +1080,7 @@ async def _stop_capturer(capturer_proc, logger) -> None:
                     drained = True
                     break
                 await asyncio.sleep(0.05)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
     if drained:
         return

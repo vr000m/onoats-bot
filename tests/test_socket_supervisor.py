@@ -67,7 +67,7 @@ from test_socket_audio_transport import (  # noqa: E402
     pcm_from_samples,
 )
 
-import onoats.cli as cli
+from onoats import cli
 
 # Bounded ceiling for blocking (subprocess / loop) waits in this suite. The
 # supervisor's own internal timeouts (socket-wait, drain grace) are larger, so
@@ -396,8 +396,8 @@ def _install_fake_recorder(
     async def _fake_run_onoats_dual(
         *, live_terminal=False, locked_category=None, data_dir=None
     ):
-        from onoats._vendor.store import onoats_data_dir
         from onoats._vendor import session_queue
+        from onoats._vendor.store import onoats_data_dir
 
         data_dir = onoats_data_dir()
         if write_running:
@@ -424,7 +424,7 @@ def _install_fake_recorder(
                         chunk = await asyncio.wait_for(
                             reader.read(4096), timeout=idle_end
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Read-idle: emulate the transport's watchdog ending the
                         # branch (hung-but-alive capturer).
                         return
@@ -1424,12 +1424,12 @@ async def test_stale_generation_socket_is_rejected_by_nonce(short_root):
     from pipecat.frames.frames import EndFrame, StartFrame
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_transport import TransportParams
+    from test_socket_audio_transport import _ManualHarness, _SocketWriterServer
 
     from onoats.transports.socket_audio import (
         SocketHandshakeError,
         UnixSocketAudioInputTransport,
     )
-    from test_socket_audio_transport import _ManualHarness, _SocketWriterServer
 
     sock_dir = short_root / "sg"
     sock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1492,13 +1492,13 @@ async def test_fresh_generation_nonce_is_accepted(short_root):
     from pipecat.frames.frames import EndFrame, StartFrame
     from pipecat.processors.frame_processor import FrameDirection
     from pipecat.transports.base_transport import TransportParams
-
-    from onoats.transports.socket_audio import UnixSocketAudioInputTransport
     from test_socket_audio_transport import (
         _ManualHarness,
         _SocketWriterServer,
         _wait_until,
     )
+
+    from onoats.transports.socket_audio import UnixSocketAudioInputTransport
 
     sock_dir = short_root / "sf"
     sock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1647,6 +1647,37 @@ async def test_stderr_reader_clear_event_clears_warning(short_root):
     await cli._drain_capturer_stderr(reader, data_dir, logger)
     got = status_file.read_status(data_dir)
     assert got is not None and got.warning is None
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_preserves_concurrent_stt_branch_warning(short_root):
+    """Phase 2 (self-healing plan) supervisor-level regression: an `stt`
+    branch warning set concurrently with the capturer's mic zero-run-warning
+    and zero-run-clear events must survive the migration to
+    `set_warning_branch()` — no whole-field overwrite clobbers it in either
+    direction."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    # Simulates a concurrent STT kickstart recovery warning landing on the
+    # "stt" branch before the mic events below are drained.
+    status_file.set_warning_branch(data_dir, "stt", "server restarted automatically")
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=mic hint=check hardware mute\n"
+    )
+    reader.feed_data(b"ONOATS-EVENT zero-run-clear branch=mic\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+
+    got = status_file.read_status(data_dir)
+    assert got is not None
+    # mic warned then cleared → gone; stt untouched by either mic event.
+    assert got.warning == "stt: server restarted automatically"
 
 
 @pytest.mark.anyio
@@ -2092,8 +2123,7 @@ async def test_wait_for_sockets_extension_writes_waiting_record(
 def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
     tmp_path, monkeypatch, ended_by_error, expected_reason
 ):
-    from onoats import dual
-    from onoats import runtime
+    from onoats import dual, runtime
     from onoats import status as status_file
 
     data_dir = tmp_path / "data"

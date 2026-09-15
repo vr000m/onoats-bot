@@ -27,6 +27,7 @@ from onoats.status import (
     resolve_liveness,
     set_devices,
     set_warning,
+    set_warning_branch,
     stamp_supervisor_failure,
     status_path,
     write_prestart_waiting,
@@ -110,6 +111,129 @@ def test_set_warning_sets_and_clears(tmp_path: Path):
     set_warning(tmp_path, None)
     got = read_status(tmp_path)
     assert got is not None and got.warning is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (self-healing plan): set_warning_branch — per-branch merge/replace
+# against the same `warning` field, sorted by branch name, so mic/system/stt
+# can be set and cleared independently without a whole-field overwrite.
+# ---------------------------------------------------------------------------
+
+
+def test_set_warning_branch_noop_without_record(tmp_path: Path):
+    # Same best-effort contract as set_warning: no record yet → no-op, no crash.
+    assert set_warning_branch(tmp_path, "stt", "server unreachable") is None
+    assert read_status(tmp_path) is None
+
+
+def test_set_warning_branch_sets_independently_in_sorted_order(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "mic: check hardware mute"
+
+    set_warning_branch(tmp_path, "system", "check the grant")
+    got = read_status(tmp_path)
+    assert got is not None
+    # Sorted branch-name order regardless of write order (matches
+    # cli.py's existing `sorted(active_warnings)` convention).
+    assert got.warning == "mic: check hardware mute; system: check the grant"
+
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == (
+        "mic: check hardware mute; stt: server unreachable; system: check the grant"
+    )
+
+
+def test_set_warning_branch_clear_preserves_other_branches(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    set_warning_branch(tmp_path, "system", "check the grant")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == (
+        "mic: check hardware mute; stt: server unreachable; system: check the grant"
+    )
+
+    # Clearing mic must not touch stt or system.
+    set_warning_branch(tmp_path, "mic", None)
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == "stt: server unreachable; system: check the grant"
+
+    # Clearing stt must not touch system.
+    set_warning_branch(tmp_path, "stt", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "system: check the grant"
+
+    # Clearing the last remaining branch empties the field entirely.
+    set_warning_branch(tmp_path, "system", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+def test_set_warning_branch_clear_unset_branch_is_a_noop(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    # Clearing a branch that was never set must leave the existing branch alone.
+    set_warning_branch(tmp_path, "stt", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "mic: check hardware mute"
+
+
+def test_set_warning_branch_replaces_existing_branch_message(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    # A second set on the same branch replaces (not appends) its own message.
+    set_warning_branch(tmp_path, "stt", "server restarted automatically")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == (
+        "mic: check hardware mute; stt: server restarted automatically"
+    )
+
+
+def test_set_warning_branch_malformed_legacy_value_degrades_gracefully(
+    tmp_path: Path,
+):
+    """A pre-migration, non-branch-prefixed `warning` value (or any string the
+    `f"{branch}: "` parser can't cleanly split) must not raise — it degrades
+    gracefully rather than crashing the caller."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning(tmp_path, "legacy free-form warning with no branch prefix")
+
+    # Must not raise, and the new branch's message must still land.
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert "stt: server unreachable" in got.warning
+
+
+def test_set_warning_branch_message_with_delimiter_is_a_known_limitation(
+    tmp_path: Path,
+):
+    """A message containing the `"; "` delimiter is NOT sanitized against by
+    this helper (documented pre-existing limitation, unchanged by this
+    migration) — callers remain responsible for not putting `"; "` inside a
+    branch's message. This test pins today's (imperfect) behavior rather than
+    asserting correctness: the delimiter-bearing message round-trips into the
+    merged string as-is, so a later parse of the merged string can misparse
+    branch boundaries."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "stt", "server unreachable; retrying")
+    got = read_status(tmp_path)
+    assert got is not None
+    # The raw message text survives, delimiter and all — no crash, no
+    # silent truncation — but this is a known parsing hazard, not a guarantee
+    # that a subsequent set_warning_branch call on another branch parses
+    # cleanly around it.
+    assert got.warning is not None
+    assert "server unreachable; retrying" in got.warning
 
 
 def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):
