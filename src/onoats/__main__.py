@@ -31,7 +31,6 @@ import argparse
 import asyncio
 import os
 import sys
-from typing import Optional
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -57,13 +56,11 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
-    RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
+    RecorderAlreadyRunningError,
     SttPreflightError,
     _acquire_instance_lock,
     _create_stt_service,
-    stop_pipeline_for_shutdown,
-    wait_or_force,
     _install_signal_handlers,
     _remove_pid_file,
     _restore_terminal,
@@ -72,11 +69,13 @@ from onoats.runtime import (  # noqa: E402
     _write_pid_file,
     flush_and_rotate,
     run_crash_recovery,
+    stop_pipeline_for_shutdown,
     stt_banner,
+    wait_or_force,
 )
 
 _input_dev_env = os.getenv("INPUT_DEVICE", "").strip()
-INPUT_DEVICE: Optional[int] = int(_input_dev_env) if _input_dev_env else None
+INPUT_DEVICE: int | None = int(_input_dev_env) if _input_dev_env else None
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +137,9 @@ async def run_onoats(
     _acquire_instance_lock(data_dir / ".active")
 
     from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.transports.local.audio import (
         LocalAudioTransport,
         LocalAudioTransportParams,
@@ -221,7 +220,11 @@ async def run_onoats(
     # ----------------------------------------------------------------
     # Step 6: Build transport (input-only for silent mode)
     # ----------------------------------------------------------------
-    stt = await _create_stt_service()
+    # `data_dir` enables the same preflight self-healing kickstart as the
+    # dual (mic+system) path. The single-pipeline path never writes a
+    # status record at all, so the recovery message has nothing to thread
+    # into — discarded here, unlike dual.py.
+    stt, _stt_preflight_recovery = await _create_stt_service(data_dir=data_dir)
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(

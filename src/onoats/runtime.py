@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from loguru import logger
@@ -31,6 +32,8 @@ from loguru import logger
 from onoats._vendor.pid import (  # noqa: F401
     PID_FILENAME,
     PID_MARKER,
+)
+from onoats._vendor.pid import (
     read_pid_file as _read_pid_file,
 )
 
@@ -420,9 +423,10 @@ async def log_stt_server_rss(phase: str) -> None:
     unreachable server never fails bot lifecycle.
     """
     try:
-        from onoats.config import load_config
         from stt_server import protocol as P
         from stt_server.client import TranscriptionClient
+
+        from onoats.config import load_config
 
         # The primary STT service path already logged any cleartext-token
         # warning at session start; suppress here so startup+shutdown
@@ -496,7 +500,63 @@ def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
     )
 
 
-async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
+async def _kickstart_and_retry(
+    client: object,
+    label: str,
+    on_recovery: Callable[[str | None], None] | None,
+) -> str:
+    """Best-effort kickstart + bounded post-kickstart connect retry.
+
+    Called only from ``_preflight_stt_ws``'s final-attempt exhaustion, only
+    for handshake-unreachable exceptions (``TimeoutError``/``OSError``),
+    and only after the caller has confirmed a cooldown-elapsed label is
+    configured. Always stamps the shared cooldown once
+    ``kickstart_stt_server`` is invoked, regardless of outcome — a failed
+    kickstart still counts against the window so a wedged label isn't
+    hammered every preflight call.
+
+    Returns one of:
+      ``"recovered"``        — kickstart succeeded AND a post-kickstart
+                                handshake succeeded; ``on_recovery`` already
+                                fired.
+      ``"kickstart_failed"`` — ``launchctl kickstart`` itself failed
+                                (non-zero exit / exception) — caller falls
+                                through to today's unchanged
+                                ``SttPreflightError``.
+      ``"retry_exhausted"``  — kickstart succeeded but the bounded connect
+                                retry loop still could not reach the
+                                server — caller raises a kickstart-noting
+                                error.
+    """
+    from onoats.stt.launchd import _stamp_cooldown, kickstart_stt_server
+
+    kicked = await asyncio.to_thread(kickstart_stt_server, label)
+    _stamp_cooldown(label)
+    if not kicked:
+        return "kickstart_failed"
+
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(_PREFLIGHT_RETRY_DELAY_SEC)
+        try:
+            await asyncio.wait_for(
+                client.connect(), timeout=_PREFLIGHT_RETRY_TIMEOUT_SEC
+            )
+        except Exception:
+            continue
+        if on_recovery is not None:
+            on_recovery(f"stt: server restarted automatically (kickstarted {label})")
+        return "recovered"
+    return "retry_exhausted"
+
+
+async def _preflight_stt_ws(
+    kwargs: dict,
+    target: str,
+    *,
+    launchd_label: str | None = None,
+    on_recovery: Callable[[str | None], None] | None = None,
+) -> None:
     """Fail fast if the stt_server endpoint is not reachable at startup.
 
     Runs a real websocket handshake (``TranscriptionClient.connect()`` —
@@ -514,12 +574,31 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
     Runtime reconnect during a live session is still handled by
     ``WebSocketSTTService._ensure_connected`` — this check only runs once
     before the pipeline starts.
+
+    ``launchd_label``/``on_recovery`` gate the self-healing kickstart:
+    never read from ``kwargs`` (which stays exactly the
+    ``uri``/``socket_path``/``host``/``port``/``auth_token`` shape
+    ``WebSocketSTTService(**kwargs)`` expects). Kickstart is attempted only
+    on final-attempt exhaustion of a handshake-unreachable exception
+    (``TimeoutError``/``OSError``) — never for ``ValueError``/other
+    protocol errors, which continue to raise immediately, unchanged — and
+    only when ``launchd_label`` is set and the shared cooldown
+    (``onoats.stt.launchd``) has elapsed for it. With no label configured,
+    or an active cooldown, or a failed kickstart, this reproduces today's
+    ``SttPreflightError`` byte-for-byte.
     """
     key = _preflight_key(kwargs)
     if key in _preflight_cache:
         return
 
+    # Local import (not module-top-level): keeps the same call-time lookup
+    # discipline as `_kickstart_and_retry`'s own import of
+    # `kickstart_stt_server`/`_stamp_cooldown` — tests monkeypatch
+    # `onoats.stt.launchd._cooldown_elapsed` directly, which only takes
+    # effect if this reads the module attribute fresh on each call.
     from stt_server.client import TranscriptionClient
+
+    from onoats.stt.launchd import _cooldown_elapsed
 
     hint = (
         "Start the local STT server (pipecat-local-stt-server) and verify it "
@@ -566,9 +645,23 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
             try:
                 await asyncio.wait_for(client.connect(), timeout=timeout_s)
                 break
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 if not is_last:
                     continue
+                if launchd_label is not None and _cooldown_elapsed(launchd_label):
+                    outcome = await _kickstart_and_retry(
+                        client, launchd_label, on_recovery
+                    )
+                    if outcome == "recovered":
+                        break
+                    if outcome == "retry_exhausted":
+                        raise SttPreflightError(
+                            f"STT: stt_server did not complete handshake within "
+                            f"{total_budget:.1f}s at {target} (kickstarted "
+                            f"{launchd_label!r}, still unreachable after retry). "
+                            f"{hint}"
+                        ) from exc
+                    # "kickstart_failed" -> fall through, unchanged message.
                 raise SttPreflightError(
                     f"STT: stt_server did not complete handshake within "
                     f"{total_budget:.1f}s at {target}. {hint}"
@@ -588,6 +681,19 @@ async def _preflight_stt_ws(kwargs: dict, target: str) -> None:
                 # mlx_whisper`.
                 if not is_last:
                     continue
+                if launchd_label is not None and _cooldown_elapsed(launchd_label):
+                    outcome = await _kickstart_and_retry(
+                        client, launchd_label, on_recovery
+                    )
+                    if outcome == "recovered":
+                        break
+                    if outcome == "retry_exhausted":
+                        raise SttPreflightError(
+                            f"STT: stt_server not reachable at {target} ({exc}) "
+                            f"(kickstarted {launchd_label!r}, still unreachable "
+                            f"after retry). {hint}"
+                        ) from exc
+                    # "kickstart_failed" -> fall through, unchanged message.
                 raise SttPreflightError(
                     f"STT: stt_server not reachable at {target} ({exc}). {hint}"
                 ) from exc
@@ -655,11 +761,18 @@ def _resolve_stt_language(cfg) -> str | None:
 VALID_STT_SERVICES = ("whisper", "websocket", "deepgram")
 
 
-async def _create_stt_service():
+async def _create_stt_service(*, data_dir: Path | None = None):
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
-    Returns a pipecat STT service instance. Prefers Whisper MLX on Apple Silicon,
-    falls back to CPU Whisper, or uses Deepgram when STT_SERVICE=deepgram.
+    Returns a ``(service, preflight_recovery_message)`` tuple.
+    ``preflight_recovery_message`` is the ``"stt: server restarted
+    automatically ..."`` string when this call's own preflight
+    kickstart-recovered, else ``None`` — only the ``websocket`` backend can
+    populate it; every other backend always returns ``None`` here. Callers
+    that only need the service instance can ignore the second element.
+
+    Prefers Whisper MLX on Apple Silicon, falls back to CPU Whisper, or uses
+    Deepgram when STT_SERVICE=deepgram.
 
     Dictionary vocabulary terms (if any) are fed to the backend as recognition
     bias (Deepgram ``keywords`` / Whisper ``initial_prompt``).
@@ -672,6 +785,13 @@ async def _create_stt_service():
     MLX / Whisper imports are kept lazy (inside the backend branch) so a plain
     ``import onoats.runtime`` with no ``STT_SERVICE`` set never imports
     ``mlx_whisper`` — the off-mac baseline ships MLX-free.
+
+    ``data_dir``, when given, resolves ``cfg.stt_launchd_label`` and builds
+    an ``on_recovery`` callback (``status.set_warning_branch(data_dir,
+    "stt", msg)``) wired into the websocket preflight, enabling both
+    self-healing kickstart and status-warning surfacing. ``None`` (the
+    default) means "build no callback" — kickstart still functions with a
+    configured label alone; only the status-surfacing seam is skipped.
     """
     from onoats.config import load_config
 
@@ -697,17 +817,37 @@ async def _create_stt_service():
                 f"to repair the environment. Original error: {exc}"
             ) from exc
 
+        launchd_label = cfg.stt_launchd_label
+        # Captures the same message the on_recovery callback receives, so
+        # the caller (dual.py) can thread it into `write_running(warning=
+        # ...)` — a plain callback-only seam is overwritten the moment
+        # `_write_status_running` next builds a fresh record, since no
+        # running record exists yet at preflight time.
+        recovery_holder: dict[str, str | None] = {}
+        on_recovery: Callable[[str | None], None] | None = None
+        if data_dir is not None:
+            from onoats import status as _status
+
+            def on_recovery(msg: str | None) -> None:
+                recovery_holder["message"] = msg
+                _status.set_warning_branch(data_dir, "stt", msg)
+
         kwargs = _resolve_stt_ws_target(_ws_env(cfg))
         target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
-        await _preflight_stt_ws(kwargs, target)
+        await _preflight_stt_ws(
+            kwargs, target, launchd_label=launchd_label, on_recovery=on_recovery
+        )
         # The language is forwarded to the server's decoder via
         # ``update_session`` (see ``WebSocketSTTService``). Resolved from
         # ``cfg.stt_language`` above (env STT_LANGUAGE > legacy STT_WS_LANGUAGE
         # > config.toml [stt].language > "en"). Not threaded through
         # ``_resolve_stt_ws_target`` because that dict also feeds
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
-        return WebSocketSTTService(language=language, **kwargs)
+        return (
+            WebSocketSTTService(language=language, **kwargs),
+            recovery_holder.get("message"),
+        )
 
     if service == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -735,7 +875,7 @@ async def _create_stt_service():
             f"STT: deepgram (model={model_name or 'default'}, "
             f"vocabulary_bias={len(vocabulary)} term(s))"
         )
-        return DeepgramSTTService(**dg_kwargs)
+        return DeepgramSTTService(**dg_kwargs), None
 
     # Whisper recognition bias would be supplied via an initial_prompt seed,
     # but pipecat 1.3.0's Whisper wrapper exposes no such field (Settings =
@@ -771,10 +911,13 @@ async def _create_stt_service():
         )
         # language=None reaches mlx_whisper.transcribe unchanged, which then
         # auto-detects per segment.
-        return WhisperSTTServiceMLX(
-            settings=WhisperSTTServiceMLX.Settings(
-                model=mlx_model.value, language=language
-            )
+        return (
+            WhisperSTTServiceMLX(
+                settings=WhisperSTTServiceMLX.Settings(
+                    model=mlx_model.value, language=language
+                )
+            ),
+            None,
         )
     else:
         from pipecat.services.whisper.stt import WhisperSTTService
@@ -783,9 +926,12 @@ async def _create_stt_service():
         logger.info(f"STT: whisper-cpu (model={model}, language={language or 'auto'})")
         # device/compute_type are WhisperSTTService constructor kwargs, NOT
         # Settings fields — passing device into Settings raises TypeError.
-        return WhisperSTTService(
-            device="cpu",
-            settings=WhisperSTTService.Settings(model=model, language=language),
+        return (
+            WhisperSTTService(
+                device="cpu",
+                settings=WhisperSTTService.Settings(model=model, language=language),
+            ),
+            None,
         )
 
 
@@ -1300,8 +1446,19 @@ def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _write_status_running(data_dir: Path, *, audio_source: str, stt_label: str) -> None:
-    """Write the start-of-session status (``running=true``). Best-effort."""
+def _write_status_running(
+    data_dir: Path,
+    *,
+    audio_source: str,
+    stt_label: str,
+    warning: str | None = None,
+) -> None:
+    """Write the start-of-session status (``running=true``). Best-effort.
+
+    ``warning`` threads a preflight-path kickstart-recovery message straight
+    into the fresh record (see ``status.write_running``'s docstring) — the
+    live-path equivalent still goes through ``status.set_warning_branch``.
+    """
     from onoats import status as _status
 
     try:
@@ -1310,6 +1467,7 @@ def _write_status_running(data_dir: Path, *, audio_source: str, stt_label: str) 
             pid=os.getpid(),
             audio_source=audio_source,
             stt_label=stt_label,
+            warning=warning,
         )
     except OSError as exc:
         logger.warning(f"Could not write status file (start): {exc}")

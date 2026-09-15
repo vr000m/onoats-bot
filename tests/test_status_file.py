@@ -114,6 +114,43 @@ def test_set_warning_sets_and_clears(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# (a1) write_running's `warning` kwarg — Phase 3 recovery-warning race fix
+#
+# Dev plan Phase 3: the preflight kickstart's on_recovery message fires
+# BEFORE any running record exists (dual.py's preflight runs ahead of
+# _write_status_running), so set_warning_branch (which requires an existing
+# record) can't carry it — the message must be threaded straight into the
+# start-of-session write instead.
+# ---------------------------------------------------------------------------
+
+
+def test_write_running_accepts_warning_kwarg(tmp_path: Path):
+    write_running(
+        tmp_path,
+        pid=4242,
+        audio_source="socket",
+        stt_label="websocket",
+        warning="stt: server restarted automatically (kickstarted pipecat.stt-server)",
+    )
+    got = read_status(tmp_path)
+    assert got is not None
+    assert (
+        got.warning
+        == "stt: server restarted automatically (kickstarted pipecat.stt-server)"
+    )
+    # Session detail must be intact alongside the warning.
+    assert got.running is True and got.pid == 4242 and got.stt_label == "websocket"
+
+
+def test_write_running_warning_defaults_to_none(tmp_path: Path):
+    """No regression for the common (no kickstart) case: omitting `warning`
+    must produce the exact same record as before this kwarg existed."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+# ---------------------------------------------------------------------------
 # Phase 2 (self-healing plan): set_warning_branch — per-branch merge/replace
 # against the same `warning` field, sorted by branch name, so mic/system/stt
 # can be set and cleared independently without a whole-field overwrite.
@@ -374,6 +411,23 @@ def test_dual_wires_producers_at_start_rotation_stop():
     pid_write_idx = src.index("_write_pid_file(data_dir)")
     start_idx = src.index("_write_status_running(")
     assert pid_write_idx < start_idx, "pid file must be written before status (start)"
+
+
+def test_dual_threads_captured_recovery_warning_into_status_running():
+    """Phase 3 race fix: the preflight's on_recovery message fires before any
+    running record exists, so dual.py must capture it into a local variable
+    and pass it as `_write_status_running(..., warning=<captured>)` rather
+    than routing it through `set_warning_branch` (which requires a prior
+    record — see test_set_warning_branch_noop_without_record)."""
+    src = (Path(__file__).resolve().parents[1] / "src/onoats/dual.py").read_text()
+    start_idx = src.index("_write_status_running(")
+    # The call site passing the recovery message must be the one right
+    # before pipeline construction, not merely present anywhere in the file.
+    call_site = src[start_idx : start_idx + 400]
+    assert "warning=" in call_site, (
+        "dual.py's _write_status_running call site must thread the captured "
+        "recovery message via a `warning=` kwarg"
+    )
 
 
 # ---------------------------------------------------------------------------

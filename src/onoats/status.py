@@ -217,8 +217,18 @@ def write_running(
     audio_source: str,
     stt_label: str,
     start_time: float | None = None,
+    warning: str | None = None,
 ) -> Path:
-    """Write the start-of-session record (``running=true``)."""
+    """Write the start-of-session record (``running=true``).
+
+    ``warning`` threads a message straight into this freshly-built record —
+    used by the preflight-path kickstart-recovery seam (``dual.py``), where
+    no running record exists yet for ``set_warning_branch()`` to annotate.
+    A callback fired *during* preflight would otherwise be silently
+    overwritten the moment this function next runs; passing the captured
+    message here avoids that race. ``None`` (the default) preserves today's
+    behavior exactly.
+    """
     return write_status(
         data_dir,
         StatusRecord(
@@ -228,6 +238,7 @@ def write_running(
             audio_source=audio_source,
             stt_label=stt_label,
             running=True,
+            warning=warning,
         ),
     )
 
