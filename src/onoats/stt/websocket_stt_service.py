@@ -32,12 +32,13 @@ no-op in this path.
 constructor params): when the reconnect backoff in ``_ensure_connected`` is
 fully exhausted, and a label is configured, and the shared process-wide
 cooldown (``onoats.stt.launchd`` — the same registry the startup preflight
-path stamps) has elapsed for it, this fires ``kickstart_stt_server`` once
-and stamps the cooldown, then lets the normal reconnect schedule continue
-on the caller's next attempt — no extra blocking wait here. Two instances
-racing the same exhaustion only ever produce one kickstart because the
-cooldown check-then-stamp happens synchronously on the event loop (no
-``await`` between the two). ``on_recovery(<message>)`` fires only once a
+path stamps) has elapsed for it, this fires one kickstart via that module's
+``try_kickstart`` primitive (the single owner of check-then-stamp-then-kick,
+shared with the preflight path), then lets the normal reconnect schedule
+continue on the caller's next attempt — no extra blocking wait here. Two
+instances racing the same exhaustion only ever produce one kickstart because
+``try_kickstart``'s check and stamp happen with no ``await`` between them.
+``on_recovery(<message>)`` fires only once a
 post-kickstart connect actually succeeds (never merely because
 ``kickstart_stt_server`` returned ``True``); the cooldown itself is reset
 — and ``on_recovery(None)`` fired to clear the warning — only once that
@@ -48,6 +49,7 @@ reconnected session sees its first ``transcript.completed``/
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator, Callable
 
 from loguru import logger
@@ -64,6 +66,24 @@ from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
 from stt_server import TranscriptionClient
 from stt_server import protocol as P
+
+# Module reference, not `from ... import <names>`: attribute access through
+# the module object is what makes the registry monkeypatch-transparent
+# (tests patch `launchd.kickstart_stt_server`, `launchd._cooldown_elapsed`,
+# ... and every read below goes through `launchd.<name>` at call time), which
+# is exactly what the four function-local imports this replaced were written
+# to achieve — they were never necessary. A top-level import is safe and
+# cycle-free: `launchd` is a leaf module that imports nothing from `onoats`.
+#
+# `safe_exc_text` used to be `onoats.runtime._safe_exc_text` — a private
+# symbol reached across a module boundary, inverting this codebase's
+# dependency direction (`runtime.py` only ever imports this `stt`
+# subpackage lazily, to avoid a cycle). It now lives in `onoats._redact`,
+# a leaf module with no `onoats` imports, so this stays a top-level,
+# cycle-free import of a *public* name instead (round 9 architecture fix).
+from onoats._redact import redact_uri
+from onoats._redact import safe_exc_text as _safe_exc_text
+from onoats.stt import launchd
 
 # Wait at most this long for a decode round trip before surfacing an
 # error frame and giving up on the segment. Covers the 16 kHz / 60 s
@@ -108,7 +128,9 @@ class WebSocketSTTService(SegmentedSTTService):
         auth_token: str | None = None,
         language: str | None = "en",
         launchd_label: str | None = None,
+        branch_instance: str | None = None,
         on_recovery: Callable[[str | None], None] | None = None,
+        on_preflight_confirmed: Callable[[], None] | None = None,
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
@@ -156,15 +178,54 @@ class WebSocketSTTService(SegmentedSTTService):
         # though the cooldown registry itself is process-wide/shared.
         self._launchd_label = launchd_label
         self._on_recovery = on_recovery
+        # Identifies this instance in the process-wide unhealthy registry
+        # (`onoats.stt.launchd._unhealthy`), which gates the early cooldown
+        # reset so one instance's confirmed transcript is not mistaken for
+        # its sibling's health.
+        #
+        # Deliberately NOT `id(self)`: CPython reuses a freed object's memory
+        # address, so a token from an instance that leaked a registration
+        # (torn down without `cleanup()`) could be inherited wholesale by a
+        # later instance — silently either stealing or resurrecting an
+        # unhealthy mark. `branch_instance` ("mic"/"system") is the stable
+        # identity the call site (`runtime._create_stt_service`) already has;
+        # `self.name` (Pipecat's `<Class>#<monotonic counter>`) is the
+        # single-pipeline fallback and is never reused within a process.
+        self._instance_token = branch_instance or self.name
         # True from the moment this instance's own reconnect exhaustion
         # triggers a kickstart until that instance's *next* successful
         # connect — gates the one-time "server restarted automatically"
         # on_recovery call.
         self._kickstart_awaiting_connect = False
+        # Monotonic deadline for the flag above. Without it, a kickstart that
+        # launchd accepted but that never actually brought the server back
+        # leaves the flag armed indefinitely — a much later, wholly unrelated
+        # reconnect would then emit a stale "server restarted automatically"
+        # warning. The window is `KICKSTART_CONFIRM_WINDOW_SEC`, deliberately
+        # NOT the 30s cooldown: the confirming reconnect is demand-driven (the
+        # next VAD-triggered segment) and can itself burn ~15.5s of backoff, so
+        # a cooldown-sized window silently dropped genuine recoveries — and
+        # with them the arming of `_kickstart_awaiting_transcript`, so the
+        # cooldown never reset either.
+        self._kickstart_awaiting_connect_until = 0.0
         # True from that successful post-kickstart connect until the first
         # transcript.completed/transcript.failed event on it — gates the
         # cooldown reset + on_recovery(None) clear.
         self._kickstart_awaiting_transcript = False
+        # Separate gate for a recovery that happened during the STARTUP
+        # PREFLIGHT, against a throwaway ``TranscriptionClient`` before this
+        # instance existed — so this instance's own connect-triggered path
+        # above never runs for it. Without it, the warning the preflight
+        # recovery threads into the session's initial status record
+        # (``_create_stt_service`` / ``dual.py``) would linger in ``onoats
+        # status``/the menu bar for the whole session even once STT is
+        # healthy. It is a distinct gate (not a seed of the live one) because
+        # it clears a DIFFERENT status branch: the preflight recovery is one
+        # probe of one shared server, so it lands on the shared ``stt``
+        # branch, while this instance's own live recoveries land on its
+        # instance-scoped ``stt-mic``/``stt-system`` branch.
+        self._on_preflight_confirmed = on_preflight_confirmed
+        self._preflight_confirm_pending = on_preflight_confirmed is not None
 
     # ------------------------------------------------------------------
     # Backend identity (populated on connect from server.hello)
@@ -228,6 +289,11 @@ class WebSocketSTTService(SegmentedSTTService):
             else:
                 await self._graceful_close()
         finally:
+            # Drop this instance's unhealthy registration so a stopped
+            # instance cannot hold its sibling's early cooldown reset hostage
+            # for the rest of the process's life.
+            if self._launchd_label is not None:
+                launchd.clear_unhealthy(self._launchd_label, self._instance_token)
             await super().cleanup()
 
     # ------------------------------------------------------------------
@@ -246,8 +312,17 @@ class WebSocketSTTService(SegmentedSTTService):
             try:
                 await self._ensure_connected()
             except Exception as exc:
-                logger.warning(f"WebSocketSTTService: connect failed: {exc}")
-                yield ErrorFrame(error=f"stt_server connect failed: {exc}")
+                # `_ensure_connected` can raise straight from
+                # `TranscriptionClient.connect()` (e.g. a malformed
+                # STT_WS_URI raises `websockets.exceptions.InvalidURI`,
+                # whose own message embeds the raw URI including userinfo)
+                # before any of runtime's own redaction ever sees it —
+                # sanitize before this reaches the log or a user-visible
+                # ErrorFrame. Same leak class as runtime.py's preflight
+                # error messages.
+                safe_exc = _safe_exc_text(exc)
+                logger.warning(f"WebSocketSTTService: connect failed: {safe_exc}")
+                yield ErrorFrame(error=f"stt_server connect failed: {safe_exc}")
                 return
 
             assert self._client is not None
@@ -369,15 +444,31 @@ class WebSocketSTTService(SegmentedSTTService):
                 # cooldown by itself (Requirements: no time-based fallback).
                 if self._kickstart_awaiting_connect:
                     self._kickstart_awaiting_connect = False
-                    self._kickstart_awaiting_transcript = True
-                    if self._on_recovery is not None:
-                        self._on_recovery(
-                            "stt: server restarted automatically "
-                            f"(kickstarted {self._launchd_label})"
+                    # A kickstart launchd accepted but that never actually
+                    # restored service leaves this pending; past the cooldown
+                    # window this connect is no longer attributable to it, so
+                    # drop the claim rather than emit a stale "restarted
+                    # automatically" message.
+                    if time.monotonic() <= self._kickstart_awaiting_connect_until:
+                        self._kickstart_awaiting_transcript = True
+                        self._fire_recovery(
+                            launchd.recovery_message(self._launchd_label)
                         )
                 return
             except Exception as exc:
                 last_exc = exc
+                # Register this instance as unhealthy on its FIRST failed
+                # attempt, not at full-backoff exhaustion. The registration
+                # blocks a *sibling* instance's confirmed transcript from
+                # clearing the shared cooldown stamp early; registering only
+                # at exhaustion left a ~15.5s hole in which a sibling that
+                # had just started failing was invisible, so its own
+                # exhaustion moments later was free to SIGKILL the server the
+                # healthy instance was using (see `launchd.mark_unhealthy`).
+                # Idempotent (set add); cleared by this instance's next
+                # confirmed transcript or by `cleanup()`.
+                if self._launchd_label is not None:
+                    launchd.mark_unhealthy(self._launchd_label, self._instance_token)
                 # Tear down this attempt's client + reader before retrying so
                 # late events from the superseded socket can't poison the
                 # next attempt's _session_ready / _pending futures.
@@ -385,19 +476,50 @@ class WebSocketSTTService(SegmentedSTTService):
                 if attempt + 1 < total_attempts:
                     delay = _RECONNECT_BACKOFF_SECONDS[attempt]
                     logger.warning(
-                        f"{self.name}: connect attempt {attempt + 1} failed ({exc}) "
-                        f"[endpoint={endpoint}], retrying in {delay}s"
+                        f"{self.name}: connect attempt {attempt + 1} failed "
+                        f"({_safe_exc_text(exc)}) [endpoint={endpoint}], "
+                        f"retrying in {delay}s"
                     )
                     await asyncio.sleep(delay)
         assert last_exc is not None
         logger.error(
             f"{self.name}: giving up after {total_attempts} connect attempts to {endpoint}"
         )
-        await self._maybe_kickstart()
+        # Only a *reachability* failure can plausibly be fixed by restarting
+        # the server. A protocol/auth failure (a 401 from a server that is
+        # demonstrably up and answering, a TLS error, an unexpected first
+        # frame) means the config is wrong, and SIGKILLing a healthy server
+        # neither fixes it nor is harmless. This mirrors the contract the
+        # preflight path already enforces (`runtime._preflight_stt_ws` only
+        # calls `_kickstart_and_retry` from its `TimeoutError`/`OSError`
+        # handlers, and `_kickstart_and_retry` only retries those shapes).
+        if isinstance(last_exc, (TimeoutError, OSError)):
+            await self._maybe_kickstart()
         raise last_exc
+
+    def _fire_recovery(self, message: str | None) -> None:
+        """Invoke ``on_recovery`` without ever letting it escape.
+
+        The callback is a status-file writer supplied by the caller. It is
+        invoked from inside ``_ensure_connected``'s ``try`` (right after a
+        connect that *succeeded*) and from the reader task — in both places a
+        raising callback would be misattributed: ``_ensure_connected`` would
+        treat an already-established connection as a failed attempt and
+        discard the live client, and the reader would log a "reader crashed".
+        Recovery reporting is best-effort; the connection is not.
+        """
+        if self._on_recovery is None:
+            return
+        try:
+            self._on_recovery(message)
+        except Exception as exc:
+            logger.warning(f"{self.name}: on_recovery callback failed: {exc}")
 
     async def _maybe_kickstart(self) -> None:
         """Best-effort self-heal after the reconnect backoff is exhausted.
+
+        Called only for reachability exhaustion (``TimeoutError``/``OSError``)
+        — the caller filters; a protocol/auth failure never reaches here.
 
         Fires at most once per process-wide cooldown window across every
         ``WebSocketSTTService`` instance sharing ``launchd_label`` (and
@@ -415,37 +537,31 @@ class WebSocketSTTService(SegmentedSTTService):
         """
         if self._launchd_label is None:
             return
-        # Local import (not module-top-level): matches the call-time lookup
-        # discipline `runtime.py`'s `_kickstart_and_retry`/`_preflight_stt_ws`
-        # already use for this same module — tests monkeypatch
-        # `onoats.stt.launchd._cooldown_elapsed` directly, which only takes
-        # effect if this reads the module attribute fresh on each call.
-        from onoats.stt.launchd import (
-            _cooldown_elapsed,
-            _stamp_cooldown,
-            kickstart_stt_server,
-        )
-
-        if not _cooldown_elapsed(self._launchd_label):
-            return
-        # Stamp immediately after the check, before the `await` below —
-        # mirrors the preflight path (runtime.py `_kickstart_and_retry`) in
-        # counting a failed kickstart against the window, but here the stamp
-        # must also happen with no `await` between check and stamp: this
-        # path can be entered concurrently by multiple instances sharing a
-        # label, and asyncio's cooperative scheduling only keeps the
-        # check-then-stamp atomic if nothing yields control in between.
-        _stamp_cooldown(self._launchd_label)
-        kicked = await asyncio.to_thread(kickstart_stt_server, self._launchd_label)
-        if kicked:
+        # `mark_unhealthy` is NOT called here: `_ensure_connected` already
+        # registered this instance on its first failed attempt, ~15.5s before
+        # this point (see `launchd.mark_unhealthy` for why the earlier
+        # registration matters).
+        if await launchd.try_kickstart(self._launchd_label):
             self._kickstart_awaiting_connect = True
+            self._kickstart_awaiting_connect_until = (
+                time.monotonic() + launchd.KICKSTART_CONFIRM_WINDOW_SEC
+            )
 
     def _endpoint_label(self) -> str:
+        """Human-readable connect target for logs — never the raw `uri`.
+
+        Round 10 finding: this returned `kw["uri"]` verbatim, re-leaking
+        `user:pass@` userinfo into the `[endpoint=...]` log field that
+        `safe_exc_text(exc)` was added to protect — including on the
+        happy-path "connected to {endpoint}" log line, not just on error.
+        Routed through the same `onoats._redact.redact_uri` `_display_target`
+        uses, so there is one redaction owner, not two.
+        """
         kw = self._connect_kwargs
         if kw.get("socket_path"):
             return f"unix:{kw['socket_path']}"
         if kw.get("uri"):
-            return kw["uri"]
+            return redact_uri(kw["uri"])
         host = kw.get("host") or "127.0.0.1"
         port = kw.get("port")
         return f"ws://{host}:{port}" if port else f"ws://{host}"
@@ -470,17 +586,44 @@ class WebSocketSTTService(SegmentedSTTService):
     def _maybe_confirm_kickstart_recovery(self) -> None:
         """First transcript.completed/transcript.failed event following a
         kickstart-triggered reconnect: reset the shared cooldown and clear
-        the warning via ``on_recovery(None)``. Never fires on a bare
-        successful connect — only here, on confirmed sustained health."""
-        if not self._kickstart_awaiting_transcript:
-            return
-        self._kickstart_awaiting_transcript = False
-        if self._launchd_label is not None:
-            from onoats.stt.launchd import _reset_cooldown
+        the warning. Never fires on a bare successful connect — only here, on
+        confirmed sustained health.
 
-            _reset_cooldown(self._launchd_label)
-        if self._on_recovery is not None:
-            self._on_recovery(None)
+        Two independent gates, because they clear two different status
+        branches: ``_preflight_confirm_pending`` clears the SHARED ``stt``
+        branch a startup-preflight recovery wrote (every instance is armed
+        for it, so whichever sees a transcript first clears it — a
+        system-audio-only session must not leave it pinned), while
+        ``_kickstart_awaiting_transcript`` clears this instance's own
+        ``stt-mic``/``stt-system`` branch.
+
+        The cooldown reset is attempted on EVERY confirmed transcript event,
+        not only behind those gates: only the instance that actually won the
+        kickstart arms them, so gating the reset on them left a sibling's
+        unhealthy registration (and with it the shared stamp) held until the
+        cooldown expired on its own. ``reset_cooldown`` is token-scoped and
+        drops the stamp only once no instance sharing the label is still
+        exhausted-and-unconfirmed, so this stays strictly stronger than the
+        plan's "confirmed transcript, never a bare connect" rule."""
+        if self._launchd_label is not None:
+            # Token-scoped: the cooldown is process-wide but confirmation is
+            # per-instance, so the stamp only drops once no sibling instance
+            # sharing this label is still exhausted-and-unconfirmed.
+            launchd.reset_cooldown(self._launchd_label, self._instance_token)
+        if not (self._preflight_confirm_pending or self._kickstart_awaiting_transcript):
+            return
+        if self._preflight_confirm_pending:
+            self._preflight_confirm_pending = False
+            if self._on_preflight_confirmed is not None:
+                try:
+                    self._on_preflight_confirmed()
+                except Exception as exc:
+                    logger.warning(
+                        f"{self.name}: on_preflight_confirmed callback failed: {exc}"
+                    )
+        if self._kickstart_awaiting_transcript:
+            self._kickstart_awaiting_transcript = False
+            self._fire_recovery(None)
 
     async def _read_events(self, client: TranscriptionClient) -> None:
         saw_session_closed = False

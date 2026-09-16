@@ -37,8 +37,10 @@ def _clear_cooldown_registry():
     and module-level, shared with the Phase 3 preflight path; must not leak
     between tests (or between this file and other test modules)."""
     launchd._last_kickstart.clear()
+    launchd._unhealthy.clear()
     yield
     launchd._last_kickstart.clear()
+    launchd._unhealthy.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -402,4 +404,406 @@ def test_no_launchd_label_never_kickstarts(monkeypatch):
         asyncio.run(svc._ensure_connected())
 
     assert kickstart_calls == []
+
+
+def test_preflight_confirm_callback_clears_on_first_transcript_event(monkeypatch):
+    """`on_preflight_confirmed` (wired by `_create_stt_service` when the
+    STARTUP preflight itself kickstart-recovered, against a throwaway client
+    this instance never saw) must behave like a live-path kickstart for the
+    purpose of clearing the warning — the instance's own first confirmed
+    transcript event resets the shared cooldown and fires the callback, even
+    though THIS instance never called `kickstart_stt_server` itself.
+
+    It is a SEPARATE callback from `on_recovery` because it clears a
+    different status branch: the preflight recovery is one probe of one
+    shared server (branch `stt`), while this instance's own live recoveries
+    are instance-scoped (`stt-mic`/`stt-system`)."""
+    kickstart_calls = []
+    monkeypatch.setattr(
+        launchd,
+        "kickstart_stt_server",
+        lambda label, **kw: kickstart_calls.append(label) or True,
+    )
+    _install_fake_client_factory(monkeypatch, lambda: None)  # connects cleanly
+
+    recovered = []
+    confirmed = []
+    svc = _make_service(
+        launchd_label="label-preflight",
+        on_recovery=lambda msg: recovered.append(msg),
+        on_preflight_confirmed=lambda: confirmed.append(True),
+    )
+
+    async def _connect_then_complete():
+        await svc._ensure_connected()
+        client = _FakeClient.instances[-1]
+        await client.push_event(
+            {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
+        )
+        # Give the reader task a beat to observe the pushed event and run
+        # _maybe_confirm_kickstart_recovery (the label was never stamped by
+        # THIS instance, so polling on _last_kickstart's membership — as
+        # the sibling reset test does — can't distinguish "not yet
+        # processed" from "nothing to reset"; poll on the callback instead).
+        for _ in range(50):
+            if confirmed:
+                break
+            await asyncio.sleep(0.01)
+
+    # A plain successful connect must NOT itself fire on_recovery (that
+    # would misreport "kickstarted" for a connection this instance never
+    # kickstarted) — only the transcript-confirmed clear below should fire.
+    asyncio.run(_connect_then_complete())
+
+    assert kickstart_calls == []  # this instance never called kickstart itself
+    assert confirmed == [True]
+    # `on_recovery` belongs to this instance's OWN live branch, which never
+    # recovered — it must stay untouched.
+    assert recovered == []
+    assert "label-preflight" not in launchd._last_kickstart
     assert launchd._last_kickstart == {}
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review-gauntlet fixes
+# ---------------------------------------------------------------------------
+
+
+def test_raising_on_recovery_does_not_discard_a_successful_connection(monkeypatch):
+    """Finding 14: `on_recovery` was called INSIDE `_ensure_connected`'s try
+    block, so a raising callback (it is a status-file writer supplied by the
+    caller) made the exception handler treat an already-successful connection
+    as a failed attempt — tearing down a live client and discarding real
+    state. Recovery reporting is best-effort; the connection is not."""
+    monkeypatch.setattr(launchd, "kickstart_stt_server", lambda label, **kw: True)
+
+    exc_holder = {"exc": _always_refused}
+    _install_fake_client_factory(monkeypatch, lambda: exc_holder["exc"]())
+
+    def boom(msg):
+        raise RuntimeError("status backend exploded")
+
+    svc = _make_service(launchd_label="label-raise", on_recovery=boom)
+
+    with pytest.raises(Exception):
+        asyncio.run(svc._ensure_connected())
+
+    # The post-kickstart connect succeeds; the callback then raises.
+    exc_holder["exc"] = lambda: None
+
+    async def _connect_and_snapshot():
+        await svc._ensure_connected()
+        # Snapshot INSIDE the loop: tearing the loop down cancels the reader
+        # task, whose finally clause flips `_connected` back to False.
+        return svc._connected, svc._client is not None
+
+    connected, has_client = asyncio.run(_connect_and_snapshot())
+
+    # Connection must have survived the callback's failure.
+    assert connected is True
+    assert has_client is True
+    # And the gate must have advanced, so the confirm path still works.
+    assert svc._kickstart_awaiting_connect is False
+    assert svc._kickstart_awaiting_transcript is True
+
+
+def test_stale_kickstart_confirmation_expires_after_the_cooldown_window(monkeypatch):
+    """Finding 15: a kickstart launchd accepted but that never actually
+    restored service left `_kickstart_awaiting_connect` armed forever, so a
+    much later, wholly unrelated reconnect emitted a stale "server restarted
+    automatically" warning. The claim expires with
+    `KICKSTART_CONFIRM_WINDOW_SEC` — round-2 finding 17 decoupled that window
+    from `KICKSTART_COOLDOWN_SEC`, because the confirming reconnect is
+    demand-driven and can itself burn ~15.5s of backoff, so a cooldown-sized
+    window dropped genuine recoveries."""
+    monkeypatch.setattr(launchd, "kickstart_stt_server", lambda label, **kw: True)
+
+    exc_holder = {"exc": _always_refused}
+    _install_fake_client_factory(monkeypatch, lambda: exc_holder["exc"]())
+
+    recovered: list = []
+    svc = _make_service(
+        launchd_label="label-stale", on_recovery=lambda msg: recovered.append(msg)
+    )
+
+    with pytest.raises(Exception):
+        asyncio.run(svc._ensure_connected())
+    assert svc._kickstart_awaiting_connect is True
+
+    # Jump well past the cooldown window without the server ever returning.
+    real_monotonic = wss_module.time.monotonic
+    monkeypatch.setattr(
+        wss_module.time,
+        "monotonic",
+        lambda: real_monotonic() + launchd.KICKSTART_CONFIRM_WINDOW_SEC + 1.0,
+    )
+
+    exc_holder["exc"] = lambda: None
+
+    async def _connect_and_snapshot():
+        await svc._ensure_connected()
+        return svc._connected
+
+    assert asyncio.run(_connect_and_snapshot()) is True
+    assert recovered == []  # no stale "restarted automatically" message
+    assert svc._kickstart_awaiting_connect is False
+    assert svc._kickstart_awaiting_transcript is False
+
+
+def test_sibling_instance_still_failing_blocks_the_shared_cooldown_reset(monkeypatch):
+    """Round-2 finding 18: the cooldown is PROCESS-WIDE but confirmation is
+    per-instance. mic confirming a transcript used to clear the shared stamp
+    outright, so system's very next exhaustion could kickstart — SIGKILL and
+    restart the server mic was actively, successfully using."""
+    kickstart_calls = []
+    monkeypatch.setattr(
+        launchd,
+        "kickstart_stt_server",
+        lambda label, **kw: kickstart_calls.append(label) or True,
+    )
+
+    exc_holder = {"exc": _always_refused}
+    _install_fake_client_factory(monkeypatch, lambda: exc_holder["exc"]())
+
+    mic = _make_service(launchd_label="shared-label")
+    system = _make_service(launchd_label="shared-label")
+
+    async def _both_exhaust():
+        await asyncio.gather(
+            mic._ensure_connected(),
+            system._ensure_connected(),
+            return_exceptions=True,
+        )
+
+    asyncio.run(_both_exhaust())
+    assert len(kickstart_calls) == 1
+    assert "shared-label" in launchd._last_kickstart
+
+    # mic reconnects and sees a real transcript; system is still down.
+    exc_holder["exc"] = lambda: None
+
+    async def _mic_confirms():
+        await mic._ensure_connected()
+        client = _FakeClient.instances[-1]
+        await client.push_event(
+            {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
+        )
+        for _ in range(50):
+            if mic._instance_token not in launchd._unhealthy.get("shared-label", set()):
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_mic_confirms())
+
+    # The shared stamp must SURVIVE: system has not confirmed health, so
+    # its next exhaustion must not be free to restart the server mic is on.
+    assert "shared-label" in launchd._last_kickstart
+
+    # And once system confirms too, the stamp drops as before.
+    async def _system_confirms():
+        await system._ensure_connected()
+        client = _FakeClient.instances[-1]
+        await client.push_event(
+            {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
+        )
+        for _ in range(50):
+            if "shared-label" not in launchd._last_kickstart:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_system_confirms())
+    assert "shared-label" not in launchd._last_kickstart
+
+
+# ---------------------------------------------------------------------------
+# Round-3 review-gauntlet fixes
+# ---------------------------------------------------------------------------
+
+
+def test_protocol_error_exhaustion_never_kickstarts(monkeypatch):
+    """Round-3 finding 3: the live-path kickstart fired on ANY final reconnect
+    failure, including a protocol/auth rejection (a 401 from a server that is
+    demonstrably up and answering). Restarting a healthy server neither fixes
+    a misconfiguration nor is harmless — it SIGKILLs a working process. Only
+    reachability failures (`TimeoutError`/`OSError`) qualify, matching the
+    filter the preflight path already enforces."""
+    kickstart_calls = []
+    monkeypatch.setattr(
+        launchd,
+        "kickstart_stt_server",
+        lambda label, **kw: kickstart_calls.append(label) or True,
+    )
+    _install_fake_client_factory(
+        monkeypatch, lambda: RuntimeError("server rejected connection: HTTP 401")
+    )
+
+    svc = _make_service(launchd_label="label-auth")
+    with pytest.raises(Exception):
+        asyncio.run(svc._ensure_connected())
+
+    assert kickstart_calls == []
+    assert "label-auth" not in launchd._last_kickstart
+
+    # A reachability failure on the same service still kickstarts — the
+    # filter narrows the trigger, it does not disable it.
+    _install_fake_client_factory(monkeypatch, _always_refused)
+    with pytest.raises(Exception):
+        asyncio.run(svc._ensure_connected())
+    assert kickstart_calls == ["label-auth"]
+
+
+def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monkeypatch):
+    """Round-3 finding 2: round 2's `_unhealthy` guard registered an instance
+    only when it EXHAUSTED its ~15.5s backoff, so an instance that had just
+    begun failing was invisible to the guard. Concrete race: mic exhausts and
+    kickstarts; system's socket dies a second later and it starts its own
+    backoff (unregistered); mic reconnects and confirms, clearing the shared
+    stamp outright; system then exhausts and kickstarts AGAIN, SIGKILLing the
+    server mic is actively using — the exact storm the guard exists to stop,
+    with the timing merely shifted. Registration now happens on the FIRST
+    failed connect attempt."""
+    kickstart_calls = []
+    monkeypatch.setattr(
+        launchd,
+        "kickstart_stt_server",
+        lambda label, **kw: kickstart_calls.append(label) or True,
+    )
+
+    exc_holder = {"exc": _always_refused}
+    _install_fake_client_factory(monkeypatch, lambda: exc_holder["exc"]())
+
+    mic = _make_service(launchd_label="shared-label", branch_instance="mic")
+    system = _make_service(launchd_label="shared-label", branch_instance="system")
+
+    # T0: mic exhausts and wins the kickstart.
+    with pytest.raises(Exception):
+        asyncio.run(mic._ensure_connected())
+    assert kickstart_calls == ["shared-label"]
+    assert "shared-label" in launchd._last_kickstart
+
+    # T0+1: system's socket dies too. It fails its first attempt and then
+    # reconnects — so it NEVER exhausts its backoff, and under the old
+    # registration point it was never registered as unhealthy at all. It has
+    # not produced a transcript, so its health is still unconfirmed.
+    attempts = {"n": 0}
+
+    def fail_once_then_connect():
+        attempts["n"] += 1
+        return ConnectionRefusedError("refused") if attempts["n"] == 1 else None
+
+    _install_fake_client_factory(monkeypatch, fail_once_then_connect)
+    asyncio.run(system._ensure_connected())
+    assert system._instance_token in launchd._unhealthy.get("shared-label", set())
+
+    # T0+3: mic reconnects and sees a real transcript.
+    _install_fake_client_factory(monkeypatch, lambda: None)
+
+    async def _mic_confirms():
+        await mic._ensure_connected()
+        client = _FakeClient.instances[-1]
+        await client.push_event(
+            {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
+        )
+        for _ in range(50):
+            if mic._instance_token not in launchd._unhealthy.get("shared-label", set()):
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_mic_confirms())
+
+    # The shared stamp must SURVIVE: system is still unconfirmed, so its next
+    # exhaustion must not be free to restart the server mic is running on.
+    assert "shared-label" in launchd._last_kickstart
+
+    _install_fake_client_factory(monkeypatch, _always_refused)
+    with pytest.raises(Exception):
+        asyncio.run(system._ensure_connected())
+    assert kickstart_calls == ["shared-label"]  # no second kickstart
+
+
+def test_instance_token_is_the_branch_name_not_a_memory_address():
+    """Round-3 findings 5 + 12 (one fix): `id(self)` is reused by CPython
+    after GC, so a leaked `_unhealthy` registration could be inherited by an
+    unrelated later instance. The call site already has the stable
+    `"mic"`/`"system"` identity; `self.name` (Pipecat's monotonic
+    `<Class>#<n>`) is the single-pipeline fallback and is never reused."""
+    mic = _make_service(launchd_label="l", branch_instance="mic")
+    assert mic._instance_token == "mic"
+    assert mic._instance_token != f"{id(mic):x}"
+
+    # No branch name (single-pipeline path): still unique, still not an
+    # address.
+    a = _make_service(launchd_label="l")
+    b = _make_service(launchd_label="l")
+    assert a._instance_token != b._instance_token
+    assert a._instance_token != f"{id(a):x}"
+
+
+def test_launchd_registry_is_imported_once_at_module_top_level(monkeypatch):
+    """Round-3 finding 6: four function-local `import onoats.stt.launchd`
+    calls were justified by a "tests monkeypatch attributes, must re-import
+    fresh" rationale that does not hold — attribute access through a
+    module reference bound at import time is monkeypatch-transparent, which
+    is what the repo's own tests already rely on."""
+    from pathlib import Path
+
+    source = Path(wss_module.__file__).read_text(encoding="utf-8")
+    assert "from onoats.stt import launchd" in source
+    assert "from onoats.stt.launchd import" not in source
+    assert "import onoats.stt.launchd" not in source
+
+    # Behavioural half: patching the module attribute still takes effect
+    # through the top-level module reference.
+    seen = []
+
+    async def fake_try_kickstart(label):
+        seen.append(label)
+        return False
+
+    monkeypatch.setattr(launchd, "try_kickstart", fake_try_kickstart)
+    _install_fake_client_factory(monkeypatch, _always_refused)
+
+    svc = _make_service(launchd_label="label-patched")
+    with pytest.raises(Exception):
+        asyncio.run(svc._ensure_connected())
+
+    assert seen == ["label-patched"]
+
+
+# ---------------------------------------------------------------------------
+# Round 10 — `_endpoint_label` returned the raw, unredacted connect `uri`
+# verbatim, re-leaking `user:pass@` userinfo into the `[endpoint=...]` log
+# field `safe_exc_text(exc)` was added to protect — including on the
+# happy-path "connected to {endpoint}" log line, not just on error.
+# ---------------------------------------------------------------------------
+
+
+def test_endpoint_label_redacts_uri_credentials():
+    svc = _make_service(
+        socket_path=None, uri="ws://secretuser:hunter2@stt.example.internal:2020/"
+    )
+    label = svc._endpoint_label()
+    assert "secretuser" not in label
+    assert "hunter2" not in label
+    assert label == "ws://stt.example.internal:2020/"
+
+
+def test_endpoint_label_redacts_uri_credentials_with_special_char_password():
+    """Same class of bug as `_display_target`'s: a password containing an
+    unencoded `/`, `?`, or `#` must still be redacted, not silently pass
+    through because a naive `urlsplit`-based check missed it."""
+    svc = _make_service(
+        socket_path=None, uri="ws://secretuser:hunt/er2@stt.example.internal:2020/"
+    )
+    label = svc._endpoint_label()
+    assert "secretuser" not in label
+    assert "hunt" not in label
+    assert label == "ws://stt.example.internal:2020/"
+
+
+def test_endpoint_label_socket_path_and_host_port_shapes_unaffected():
+    assert (
+        _make_service(socket_path="/tmp/x.sock")._endpoint_label() == "unix:/tmp/x.sock"
+    )
+    svc = _make_service(socket_path=None, host="127.0.0.1", port=1234)
+    assert svc._endpoint_label() == "ws://127.0.0.1:1234"
