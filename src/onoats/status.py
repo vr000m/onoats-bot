@@ -365,15 +365,31 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     :func:`format_warning_branch` is the sole owner of that lead-in and is
     applied here, so a caller that prefixes too would double it.
 
-    Like :func:`set_devices`, this is also a no-op on a NON-running record:
-    a branch event (an stt kickstart-recovery confirm/clear, a capturer
-    zero-run event) can race ahead of the next session's :func:`write_running`
-    and land while the record on disk still belongs to the *previous*,
-    already-stopped session — annotating that record would mislabel history
-    (the same reasoning :func:`set_devices` documents for device fields).
+    Like :func:`set_devices`, this is a no-op on a non-running record that
+    belongs to a *different* process: a branch event (an stt kickstart-
+    recovery confirm/clear, a capturer zero-run event) can race ahead of the
+    next session's :func:`write_running` and land while the record on disk
+    already belongs to a new, different session — annotating that record
+    would mislabel history (the same reasoning :func:`set_devices` documents
+    for device fields).
+
+    That race is about a *different* session's record, not this one's: a
+    stopped record whose ``pid`` still matches the caller's own process is
+    still this same session's terminal record (e.g. ``cli.py``'s bounded
+    stderr-drain grace period, which keeps consuming trailing capturer
+    diagnostics — including zero-run-warning/-clear — for a short window
+    *after* :func:`write_stopped` has already run for this same session).
+    Gating on ``running`` alone would silently drop those trailing
+    diagnostics, which :func:`set_warning` (the function this replaced) did
+    not do. Gating on ``pid`` instead of ``running`` distinguishes "a new
+    session already started" (block) from "my own session, already marked
+    stopped, still draining" (allow) — PID reuse within the same shutdown
+    window is not a realistic concern on any platform this runs on.
     """
     current = read_status(data_dir)
-    if current is None or not current.running:
+    if current is None:
+        return None
+    if not current.running and current.pid != os.getpid():
         return None
     branches = _parse_warning_branches(current.warning)
     if message is None:

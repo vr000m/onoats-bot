@@ -728,9 +728,16 @@ async def _kickstart_and_retry(
         except BaseException:
             # asyncio.CancelledError is a BaseException: without this the
             # in-flight candidate's socket/FD leaks on shutdown cancellation.
+            # `deadline=deadline` matches the TimeoutError/OSError/Exception
+            # branches above: without it this teardown falls back to the full
+            # fixed `_CLOSE_TIMEOUT_SEC` per closer (up to 10s combined)
+            # instead of being capped by this loop's own strict budget,
+            # so a shutdown/CancelledError arriving mid-attempt could hang
+            # process exit far longer than the rest of the self-healing
+            # design's shutdown-responsiveness budget promises.
             if candidate is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await _close_client_quietly(candidate)
+                    await _close_client_quietly(candidate, deadline=deadline)
             raise
         if on_recovery is not None:
             # Swallow-and-log, like every other recovery-callback site

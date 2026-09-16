@@ -1371,6 +1371,55 @@ def test_close_client_quietly_honours_a_caller_deadline(monkeypatch):
     assert spent_budgeted < 1.0
 
 
+def test_kickstart_and_retry_cancellation_teardown_honours_the_deadline(monkeypatch):
+    """The ``except BaseException:`` branch (shutdown/``CancelledError``
+    arriving mid post-kickstart connect attempt) used to close the in-flight
+    candidate via ``_close_client_quietly(candidate)`` with no ``deadline=``,
+    unlike this same function's ``TimeoutError``/``OSError``/``Exception``
+    branches, which all pass ``deadline=deadline``. Without it, a
+    cancellation landing here could burn the full, undeadlined
+    ``2 * _CLOSE_TIMEOUT_SEC`` instead of being capped by this loop's own
+    strict ``_POST_KICKSTART_DEADLINE_SEC`` budget — exactly the overrun
+    ``_close_client_quietly``'s own docstring says ``deadline`` exists to
+    prevent."""
+    _allow_kickstart(monkeypatch)
+    # Already-expired by the time the candidate's close runs: forces the
+    # deadline-bound teardown down to the floor
+    # (`_MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`) per closer instead of the full fixed
+    # `_CLOSE_TIMEOUT_SEC` a missing `deadline=` would fall back to.
+    monkeypatch.setattr(runtime, "_POST_KICKSTART_DEADLINE_SEC", 0.0)
+    monkeypatch.setattr(runtime, "_CLOSE_TIMEOUT_SEC", 30.0)
+
+    class _CancelOnConnect:
+        async def connect(self):
+            raise asyncio.CancelledError()
+
+        async def close_session(self):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            await asyncio.sleep(3600)
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(asyncio.CancelledError):
+            await runtime._kickstart_and_retry(
+                _CancelOnConnect,
+                "pipecat.stt-server",
+                None,
+                target="unix:/tmp/stt.sock",
+                hint="",
+            )
+        return loop.time() - started
+
+    # Pre-fix (no `deadline=` threaded through), the hanging closers would
+    # burn up to 30s + 30s here and this outer `wait_for` would itself time
+    # out instead of ever returning an elapsed duration to assert on.
+    elapsed = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+    assert elapsed < 1.0
+
+
 def test_post_kickstart_teardown_cannot_itself_blow_the_deadline(monkeypatch):
     """Round-3 findings 1 + 10: the retry loop tore down each failed attempt's
     client with a fixed-timeout close BEFORE rechecking its monotonic

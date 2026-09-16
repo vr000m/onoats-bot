@@ -13,6 +13,7 @@ Covers the five slices the dev plan calls for:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -261,8 +262,7 @@ def test_recovery_message_is_prefixed_exactly_once_on_both_paths(
     (`status.format_warning_branch`), so the merge path and the raw
     `write_running(warning=...)` preflight path produce byte-identical
     text with exactly one prefix."""
-    from onoats.status import format_warning_branch
-    from onoats.status import stt_branch
+    from onoats.status import format_warning_branch, stt_branch
     from onoats.stt.launchd import recovery_message
 
     bare = recovery_message("pipecat.stt-server")
@@ -283,12 +283,16 @@ def test_recovery_message_is_prefixed_exactly_once_on_both_paths(
     assert format_warning_branch(stt_branch(None), bare) == got.warning
 
 
-def test_set_warning_branch_noop_on_stopped_record(tmp_path: Path):
-    """Mirrors set_devices's existing `not current.running` guard: a branch
-    event can race ahead of the NEXT session's write_running and land while
-    the on-disk record still belongs to the previous, already-stopped
-    session — annotating it would mislabel history, so this must no-op
-    exactly like set_devices does, not silently mutate the stale record."""
+def test_set_warning_branch_noop_on_stopped_record_from_a_different_pid(
+    tmp_path: Path,
+):
+    """A branch event can race ahead of the NEXT session's write_running and
+    land while the on-disk record still belongs to a *different, previous*
+    session (a different pid) that has already stopped — annotating it would
+    mislabel history, so this must no-op exactly like set_devices does, not
+    silently mutate the stale record. `pid=1` here stands in for "some other
+    process" — real init/launchd pids notwithstanding, it can never equal
+    this test process's own `os.getpid()`."""
     write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
     write_stopped(tmp_path, exit_reason="graceful")
     before = read_status(tmp_path)
@@ -298,6 +302,30 @@ def test_set_warning_branch_noop_on_stopped_record(tmp_path: Path):
 
     after = read_status(tmp_path)
     assert after == before
+
+
+def test_set_warning_branch_still_annotates_own_stopped_record(tmp_path: Path):
+    """A stopped record that still belongs to THIS process (pid matches) is
+    not a different session's history — it is this same session's terminal
+    record, and a trailing capturer/STT diagnostic arriving during the
+    shutdown grace-drain window (after write_stopped already ran) must still
+    land on it, exactly like the pre-branch-keying `set_warning` did. Gating
+    only on `running` (not `pid`) would silently drop that trailing
+    diagnostic — see cli.py's `_STDERR_READER_GRACE_SEC` drain, which keeps
+    consuming capturer stderr for a bounded window after the recorder
+    session has already been marked stopped."""
+    write_running(tmp_path, pid=os.getpid(), audio_source="socket", stt_label="mlx")
+    write_stopped(tmp_path, exit_reason="graceful")
+    before = read_status(tmp_path)
+    assert before is not None and before.running is False
+
+    got = set_warning_branch(tmp_path, "mic", "no audio detected")
+    assert got is not None
+
+    after = read_status(tmp_path)
+    assert after is not None
+    assert after.running is False
+    assert after.warning == "mic: no audio detected"
 
 
 def test_set_warning_branch_message_with_delimiter_is_a_known_limitation(
