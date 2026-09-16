@@ -20,8 +20,20 @@ enum LoginItemManager {
     /// registration failure, `.requiresApproval`, or an unrecognized
     /// value), or nil when there's nothing to show.
     static func sync() -> String? {
-        guard let raw = ConfigStore.readValue(section: "app", key: "launch_at_login") else {
+        let raw: String
+        switch ConfigStore.readValuePresence(section: "app", key: "launch_at_login") {
+        case .absent:
             return nil  // absent: no action, ever — see file header
+        case .malformed:
+            // Round-10 finding: a present-but-empty or unterminated-quote
+            // value (e.g. `launch_at_login = ""` or a dangling `"`) used to
+            // read back as plain `nil` via `readValue`, identical to the
+            // key being absent — so it silently no-opped instead of
+            // surfacing the same warning an unrecognized value gets below.
+            return
+                "launch_at_login: empty or malformed value in config.toml (expected true/false) — ignored"
+        case .value(let v):
+            raw = v
         }
         // Only bare-spelled TOML booleans are meaningful (ConfigStore's
         // quote-stripping means `"true"` reads back identically to `true` —
@@ -39,11 +51,21 @@ enum LoginItemManager {
 
         let service = SMAppService.mainApp
         do {
+            // `.requiresApproval` means a registration EXISTS but the user
+            // has not approved it in System Settings yet. It counts as
+            // registered for both branches:
+            //   * enabling: re-`register()`ing it changes nothing (the
+            //     pending item is already there) — skip the XPC round trip;
+            //   * disabling: NOT unregistering it would leave a pending item
+            //     that a later user approval silently turns on, re-enabling
+            //     exactly what `launch_at_login = false` asked us to disable.
+            let isRegistered =
+                service.status == .enabled || service.status == .requiresApproval
             if wantsEnabled {
-                if service.status != .enabled {
+                if !isRegistered {
                     try service.register()
                 }
-            } else if service.status == .enabled {
+            } else if isRegistered {
                 try service.unregister()
             }
         } catch {
