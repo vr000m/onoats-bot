@@ -218,6 +218,56 @@ Each item should map to a regression test that fails against the pre-fix code
 teardown: a spawned child PID is gone after stop). The supervisor's tests in
 `tests/test_socket_supervisor.py` are the worked example.
 
+## STT self-healing (`launchctl kickstart`) invariants
+
+`[stt].launchd_label` (absent by default) turns on self-healing: when the STT
+server is unreachable, onoats asks `launchd` to restart the *managed* job. These
+invariants are load-bearing — breaking any of them silently degrades the
+feature rather than failing a test you'd notice:
+
+- **The kickstart cooldown is process-wide and label-keyed**, not
+  per-`WebSocketSTTService`-instance. It lives in `src/onoats/stt/launchd.py`
+  (a leaf module: no `runtime`/`status`/`dual` imports) so both the startup
+  preflight (`runtime._preflight_stt_ws`) and the live reconnect path
+  (`websocket_stt_service._ensure_connected`) stamp the *same* registry.
+  `dual.py` builds two instances (mic + system) against one physical server,
+  so a per-instance cooldown cannot cap total kickstarts. `launchd.try_kickstart`
+  is the single owner of check-then-stamp-then-kickstart; the stamp lands with
+  no `await` between check and stamp, which is what makes "two instances
+  exhausting concurrently produce one kickstart" true.
+- **Two status-`warning` branch-key schemes, deliberately.** The startup
+  preflight recovery uses the shared `stt` branch (`status.stt_branch(None)`) —
+  one probe of one shared server, before either instance exists, so it cannot
+  clobber anything. Live-session recoveries are per-instance
+  (`stt-mic`/`stt-system`, `status.stt_branch("mic")`) because the two
+  instances recover independently and a shared key let one's clear erase the
+  other's still-unconfirmed warning. Branch keys are owned by `status.py`, not
+  `launchd.py`.
+- **"Recovered" means a confirmed handshake, never `launchctl`'s exit code.**
+  `kickstart_stt_server` returning `True` only means launchd accepted the
+  restart request. `on_recovery(<message>)` fires only after a post-kickstart
+  connect actually succeeds — and the claim expires after
+  `KICKSTART_CONFIRM_WINDOW_SEC` (deliberately larger than the cooldown: the
+  confirming reconnect is demand-driven and can burn the full ~15.5s backoff).
+- **The cooldown resets only on a confirmed `transcript.*` event**, never on a
+  bare successful connect and never on a timer. Because confirmation is
+  per-instance while the cooldown is shared, the reset is token-scoped: the
+  stamp drops only once *no* instance sharing the label is still
+  exhausted-and-unconfirmed (`launchd._unhealthy`). Otherwise mic confirming
+  health would re-arm system to SIGKILL the server mic is using. An instance
+  registers itself unhealthy on its **first failed connect attempt**, not at
+  backoff exhaustion — registering only at exhaustion left a ~15.5s hole in
+  which a sibling that had just started failing was invisible to the guard.
+  The **preflight** path deliberately never registers: it has no lifecycle on
+  which to clear a token, and is already gated by the cooldown itself.
+- **Kickstart triggers on reachability failures only** (`TimeoutError` /
+  `OSError`), on both paths. A protocol/auth failure (a 401 from a server that
+  is demonstrably up) means the config is wrong; SIGKILLing a healthy server
+  neither fixes it nor is harmless.
+
+Regression tests: `tests/test_stt_launchd.py`, `tests/test_runtime_preflight.py`,
+`tests/test_websocket_stt_reconnect.py`.
+
 ## Wire-format contract
 
 `docs/audio-socket-contract.md` is the versioned (`v1`) capturer↔recorder

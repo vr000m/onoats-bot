@@ -15,6 +15,35 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **STT server self-healing.** New optional `[stt].launchd_label` (env
+  `STT_LAUNCHD_LABEL`) names the `launchctl` job onoats may restart when the
+  STT server is unreachable. When set, both the startup preflight and a live
+  session's exhausted reconnect backoff fire one
+  `launchctl kickstart -k gui/$UID/<label>`, capped by a process-wide,
+  label-keyed cooldown shared by the mic and system pipelines. Recovery is
+  reported only after a handshake actually succeeds (never on `launchctl`'s
+  exit code) and surfaces in `onoats status` / the menu bar via the `stt`,
+  `stt-mic` and `stt-system` warning branches. Absent by default — today's
+  behaviour is unchanged for existing installs.
+- **Onoats.app launch at login.** New optional `[app].launch_at_login` (Swift
+  side only; the Python config reader never reads it) registers or unregisters
+  the menu-bar app with `SMAppService` at launch. Absent means *no action at
+  all* — an out-of-band login-item registration is never touched; an explicit
+  `false` unregisters. A malformed config value or a failed register/unregister
+  call surfaces as a `⚠` login-item warning line in the menu bar (does not
+  block Start/Stop).
+
+### Changed
+
+- `status.warning` is now written per branch (`set_warning_branch`) instead of
+  whole-field, so the capturer's `mic`/`system` warnings and the new `stt*`
+  warnings coexist and clear independently. On-disk format and
+  `STATUS_SCHEMA_VERSION` are unchanged.
+- `onoats init` no longer drops `[stt].launchd_label` or the `[app]` section
+  when regenerating `config.toml` on a re-run.
+
 ## [1.2.0] - 2026-06-28
 
 ### Changed
