@@ -42,15 +42,26 @@ struct MenuContent: View {
     var body: some View {
         Text(statusLine)
         // Live capture warning (schema-v2 `warning`): the branch-specific hint
-        // from the capturer's all-zero-input detector. Cleared automatically
-        // when real audio re-arms the detector. Native menu items render one
-        // line and never wrap, and the full hint is ~200 chars — rendered as
-        // ONE item it stretches the whole menu to its width (observed live,
-        // 2026-06-11). Split on the hint's em-dash clause breaks into stacked
-        // caption lines instead; the unsplit text stays in `onoats status`
-        // and the log.
+        // from the capturer's all-zero-input detector, or an STT
+        // kickstart-recovery message. Cleared automatically when the branch
+        // clears. Native menu items render one line and never wrap, and a
+        // single hint can be ~200 chars — rendered as ONE item it stretches
+        // the whole menu to its width (observed live, 2026-06-11). Split on
+        // the hint's em-dash clause breaks into stacked caption lines
+        // instead; the unsplit text stays in `onoats status` and the log.
+        //
+        // `status.set_warning_branch` can also merge SEVERAL branches
+        // (mic/system/stt/stt-mic/stt-system) into one `warning` string,
+        // "; "-joined per `status.format_warning_branch`. Splitting only on
+        // the em-dash misses that outer join: a capturer warning and an STT
+        // recovery message active at once would render as one unbroken line
+        // again. Split on "; " first to break into per-branch entries, then
+        // on the em-dash within each entry, so every branch's own hint still
+        // gets its own stacked caption line(s).
         if let warning = model.warning {
-            let lines = warning.components(separatedBy: " — ")
+            let lines = warning
+                .components(separatedBy: "; ")
+                .flatMap { $0.components(separatedBy: " — ") }
             ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
                 Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
             }
