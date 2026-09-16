@@ -69,6 +69,18 @@ _LAUNCHCTL = "/bin/launchctl"
 # see websocket_stt_service.py's `_RECONNECT_BACKOFF_SECONDS` comment) plus
 # margin, so a kickstart's own retry window can never itself trigger a
 # second kickstart.
+#
+# Deep-review finding: this window does NOT uniformly hold for the full 30s
+# across the preflight/live handoff. `mark_unhealthy` is deliberately never
+# called from the preflight path (see its docstring), so after a *preflight*
+# kickstart no instance is ever registered `_unhealthy` for the label — the
+# live instances' very first `transcript.*` event then retires the stamp via
+# `reset_cooldown` immediately (potentially ~1s in), not after the full
+# window. This is accepted as correct, not a bug: a confirmed transcript
+# does prove the restarted server works, which is exactly the condition
+# `reset_cooldown` exists to detect. Only a *live-path* kickstart (which does
+# register the kickstarting instance as unhealthy) is actually held to the
+# full window until every registered instance confirms.
 KICKSTART_COOLDOWN_SEC = 30
 
 # How long after a kickstart a subsequent successful connect may still be

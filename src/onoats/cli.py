@@ -400,10 +400,20 @@ async def _drain_capturer_stderr(
         branch = fields.get("branch", "?")
         try:
             if event_type == "zero-run-warning":
+                # `branch` and `hint` come straight from the capturer's
+                # stderr, unlike the launchd label (allowlist-validated at
+                # resolution). Validate here the same way the `device`
+                # branch below already does: only "mic"/"system" are
+                # produced by the capturer's own `Resampler` labels, and a
+                # `hint` containing the "; " the on-disk `warning` grammar
+                # splits entries on would otherwise forge an unclearable
+                # pseudo-branch entry (see status.set_warning_branch).
                 hint = fields.get("hint", "no detail provided")
-                status_file.set_warning_branch(data_dir, branch, hint)
+                if branch in ("mic", "system") and "; " not in hint:
+                    status_file.set_warning_branch(data_dir, branch, hint)
             elif event_type == "zero-run-clear":
-                status_file.set_warning_branch(data_dir, branch, None)
+                if branch in ("mic", "system"):
+                    status_file.set_warning_branch(data_dir, branch, None)
             elif event_type == "device":
                 desc = fields.get("hint", "")
                 if branch in ("mic", "system") and desc:

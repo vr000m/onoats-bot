@@ -349,15 +349,18 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     convention) — so concurrent branches (``mic``/``system``/``stt``) never
     clobber each other's entries the way a whole-field overwrite would.
 
-    A ``message`` containing ``"; "`` is a known pre-existing limitation of
-    the split-based parser (unchanged by this helper): callers must not put
-    ``"; "`` inside a branch's message, or the merge will mis-parse on the
-    next read. Accepted as a documented tradeoff by the dev plan (escaping
-    would change the on-disk ``warning`` grammar the Swift menu-bar reader
-    shares under ``STATUS_SCHEMA_VERSION``); the only value that could carry
-    a delimiter from outside the process — the launchd label — is
-    allowlist-validated at resolution instead
-    (``onoats.config.validate_launchd_label``). Best-effort like
+    ``"; "`` is the split-based parser's entry delimiter, so a ``branch`` or
+    ``message`` containing it would otherwise forge a second, unclearable
+    pseudo-branch entry on the next read (a stray delimiter in
+    caller-controlled text used to be merely cosmetic, back when ``cli.py``
+    kept its own in-process ``active_warnings`` dict as the authority — it
+    is not cosmetic now that this helper round-trips through the on-disk
+    string). Sanitized here, at the single choke point, rather than left as
+    a rule every caller must independently uphold: this helper strips any
+    ``"; "`` occurring inside ``branch`` or ``message`` before merging.
+    Changing the on-disk ``warning`` grammar itself (e.g. escaping) would
+    also change what the Swift menu-bar reader shares under
+    ``STATUS_SCHEMA_VERSION`` and is out of scope here. Best-effort like
     :func:`set_warning`: returns ``None`` when there is no readable record to
     annotate.
 
@@ -391,11 +394,15 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
         return None
     if not current.running and current.pid != os.getpid():
         return None
+    # Strip the parser's own entry delimiter so neither `branch` nor
+    # `message` can forge a second pseudo-branch entry on the next read —
+    # see the docstring above.
+    branch = branch.replace("; ", ",")
     branches = _parse_warning_branches(current.warning)
     if message is None:
         branches.pop(branch, None)
     else:
-        branches[branch] = message
+        branches[branch] = message.replace("; ", ", ")
     merged = (
         "; ".join(format_warning_branch(b, branches[b]) for b in sorted(branches))
         or None

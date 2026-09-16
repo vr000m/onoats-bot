@@ -652,6 +652,96 @@ def test_protocol_error_exhaustion_never_kickstarts(monkeypatch):
     assert kickstart_calls == ["label-auth"]
 
 
+def test_wedged_connect_times_out_and_still_kickstarts(monkeypatch):
+    """Deep-review finding: `client.connect()` inside the reconnect loop had
+    no timeout, so a server that accepts the socket but never emits
+    server.hello/session.created hung `_ensure_connected` forever — no
+    attempt advanced, `_maybe_kickstart()` was never reached. `connect()`
+    must be bounded, and the resulting `TimeoutError` must still flow into
+    the reachability-failure kickstart gate like any other `TimeoutError`."""
+    monkeypatch.setattr(wss_module, "_CONNECT_TIMEOUT_SECONDS", 0.01)
+    kickstart_calls = []
+    monkeypatch.setattr(
+        launchd,
+        "kickstart_stt_server",
+        lambda label, **kw: kickstart_calls.append(label) or True,
+    )
+
+    class _HangingClient(_FakeClient):
+        async def connect(self):
+            self.connect_calls += 1
+            await asyncio.sleep(999)
+
+    monkeypatch.setattr(wss_module, "TranscriptionClient", _HangingClient)
+
+    svc = _make_service(launchd_label="label-wedged")
+    with pytest.raises(TimeoutError):
+        asyncio.run(svc._ensure_connected())
+
+    assert kickstart_calls == ["label-wedged"]
+
+
+def test_session_update_ack_timeout_is_classified_as_reachability(monkeypatch):
+    """Deep-review finding: the `session.update` ack timeout was re-raised
+    as a bare `RuntimeError`, which matches neither `TimeoutError` nor
+    `OSError` in `_ensure_connected`'s kickstart gate — so a server that
+    completes the websocket handshake but never acks `session.update` (a
+    live-but-wedged server, exactly the reachability failure kickstart
+    exists for) exhausted every attempt without ever self-healing. The
+    re-raise must preserve the `TimeoutError` classification."""
+    monkeypatch.setattr(wss_module, "_SESSION_READY_TIMEOUT_SECONDS", 0.01)
+    kickstart_calls = []
+    monkeypatch.setattr(
+        launchd,
+        "kickstart_stt_server",
+        lambda label, **kw: kickstart_calls.append(label) or True,
+    )
+
+    class _NoAckClient(_FakeClient):
+        async def update_session(self, **kwargs):
+            pass  # never pushes EVT_SESSION_UPDATED — _session_ready hangs
+
+    monkeypatch.setattr(wss_module, "TranscriptionClient", _NoAckClient)
+
+    svc = _make_service(launchd_label="label-no-ack")
+    with pytest.raises(TimeoutError, match="did not ack session.update"):
+        asyncio.run(svc._ensure_connected())
+
+    assert kickstart_calls == ["label-no-ack"]
+
+
+def test_discard_stale_does_not_swallow_external_cancellation():
+    """Deep-review finding: `_discard_stale` used to await the reader task
+    under `except (asyncio.CancelledError, Exception): pass`, which cannot
+    tell "the reader task I just cancelled finished as cancelled" (benign)
+    from "someone cancelled ME while awaiting it" (must propagate) — both
+    surface identically as `CancelledError` from that `await`. The old form
+    swallowed BOTH, letting execution silently continue past a genuine
+    external cancellation of the calling coroutine. The
+    `asyncio.gather(..., return_exceptions=True)` fix must let a real
+    external cancellation of the caller still propagate."""
+
+    async def scenario():
+        svc = _make_service()
+        # A reader task that never finishes on its own, standing in for a
+        # live reader awaiting the next websocket frame.
+        svc._reader_task = asyncio.create_task(asyncio.sleep(999))
+        marker = {"reached_past_discard": False}
+
+        async def runner():
+            await svc._discard_stale()
+            marker["reached_past_discard"] = True
+
+        task = asyncio.ensure_future(runner())
+        await asyncio.sleep(0)  # let it start and reach the cancel+await
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not marker["reached_past_discard"]
+
+    asyncio.run(scenario())
+
+
 def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monkeypatch):
     """Round-3 finding 2: round 2's `_unhealthy` guard registered an instance
     only when it EXHAUSTED its ~15.5s backoff, so an instance that had just

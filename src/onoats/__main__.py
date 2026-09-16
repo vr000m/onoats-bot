@@ -232,7 +232,7 @@ async def run_onoats(
     # whatever record happens to already be on disk (e.g. a stale, stopped
     # record left by an earlier dual/socket-mode session on the same
     # data_dir), misattributing an `stt:` warning to an unrelated session.
-    stt, _stt_preflight_recovery = await _create_stt_service(data_dir=None)
+    stt = (await _create_stt_service(data_dir=None)).service
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(

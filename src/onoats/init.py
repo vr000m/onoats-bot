@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -314,6 +315,42 @@ def _toml_escape(value: str) -> str:
     )
 
 
+_SECTION_HEADER_RE = re.compile(r"^\[[^\]]+\]\s*$")
+
+
+def _extract_raw_section(text: str, section: str) -> str | None:
+    """Return ``[section]``'s literal source lines from ``text`` verbatim
+    (header through the line before the next ``[...]`` header, or EOF), or
+    ``None`` if the section is absent.
+
+    Used for ``[app]`` (deep-review finding): it is Swift-only, and Python
+    re-rendering it from the parsed dict had to reason about
+    ``ConfigStore.readValue``'s (the Swift reader) exact quote- and
+    whitespace-trimming semantics to avoid corrupting a value Python does
+    not own — two independent parsers sharing an unversioned contract with
+    no shared schema. Round-tripping the original text instead removes that
+    cross-language coupling entirely: whatever the user's file said, byte
+    for byte (including any key besides ``launch_at_login`` a future Swift
+    version adds), survives every ``onoats init`` regeneration.
+    """
+    lines = text.splitlines()
+    header = f"[{section}]"
+    start = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if _SECTION_HEADER_RE.match(lines[j].strip()):
+            end = j
+            break
+    # Trailing blank lines are re-added by the caller's own section spacing
+    # convention (one `lines.append("")` after every section) — stripping
+    # them here avoids doubling up.
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
 def _render_config_toml(
     *,
     mic: str | None,
@@ -323,7 +360,7 @@ def _render_config_toml(
     categories: list[str],
     tuning: dict,
     data_dir: str | None = None,
-    app: dict | None = None,
+    app_raw_block: str | None = None,
 ) -> str:
     lines: list[str] = [
         "# onoats configuration — written by `onoats init`.",
@@ -350,42 +387,19 @@ def _render_config_toml(
         lines.append(f'launchd_label = "{_toml_escape(stt["launchd_label"])}"')
     lines.append("")
     # `[app]` is Swift-only (the Python config reader never reads it), but it
-    # still has to survive a regeneration — see the carry-over in `main()`.
-    #
-    # Detect more than the bare-boolean form. `ConfigStore.readValue` (the
-    # Swift reader) strips surrounding quotes, so `launch_at_login = "false"`
-    # is a spelling the Swift side accepts and users do write — but `tomllib`
-    # hands it back as the *string* `"false"`, which an `isinstance(..., bool)`
-    # test rejects. The whole `[app]` section was then dropped on every
-    # `onoats init` re-run, silently RE-ENABLING a login item the user had
-    # explicitly disabled (absent means "take no action", which leaves an
-    # existing registration in place). Any other value is preserved verbatim
-    # as a quoted string rather than dropped: the Swift reader already treats
-    # an unrecognized spelling as absent, so round-tripping it is strictly
-    # safer than deleting the user's line.
-    app_login = app.get("launch_at_login") if isinstance(app, dict) else None
-    rendered_login: str | None = None
-    if isinstance(app_login, bool):
-        rendered_login = "true" if app_login else "false"
-    elif isinstance(app_login, str) and app_login in ("true", "false"):
-        # Exact match only — NOT `.strip()`ed. `ConfigStore.readValue` (Swift)
-        # trims outer whitespace only for a *bare* value; for a *quoted*
-        # string it preserves internal padding verbatim (only the
-        # surrounding quotes are stripped), so a stored `" false "` reads
-        # back on the Swift side as the literal string " false ", which the
-        # exact "true"/"false" check there treats as an unrecognized
-        # spelling — i.e. absent, no action taken. Normalizing it here to
-        # bare `false` would make it Swift-recognized where it wasn't
-        # before, turning a previously-inert value into an actual
-        # unregister on next app launch. Anything not already spelled
-        # exactly "true"/"false" falls through to the verbatim-preserved
-        # branch below instead, keeping it exactly as inert as it was.
-        rendered_login = app_login
-    elif app_login is not None:
-        rendered_login = f'"{_toml_escape(str(app_login))}"'
-    if rendered_login is not None:
-        lines.append("[app]")
-        lines.append(f"launch_at_login = {rendered_login}")
+    # still has to survive a regeneration — see the carry-over in `main()`,
+    # which extracts it via `_extract_raw_section`. Preserved as the
+    # original source text verbatim rather than re-rendered from a parsed
+    # dict: re-rendering used to require Python to model
+    # `ConfigStore.readValue`'s (the Swift reader) exact quote- and
+    # whitespace-trimming semantics, which is exactly the two-parsers-one-
+    # unversioned-contract coupling that once silently RE-ENABLED a login
+    # item the user had explicitly disabled (a `launch_at_login = "false"`
+    # spelling `tomllib` hands back as the string `"false"`, which an
+    # `isinstance(..., bool)` check rejected, dropping the whole section).
+    # Round-tripping the literal text needs no such model at all.
+    if app_raw_block is not None:
+        lines.extend(app_raw_block.split("\n"))
         lines.append("")
     lines.append("[speakers]")
     lines.append(f'me = "{_toml_escape(speakers.get("me", "Me"))}"')
@@ -647,7 +661,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"{carried_label!r} — it is already inert at runtime and is "
                 "not carried into the regenerated config.toml."
             )
-    existing_app = existing.raw.get("app", {})
+    # Verbatim, not re-rendered from `existing.raw["app"]` — see
+    # `_extract_raw_section`'s docstring and `_render_config_toml`'s
+    # `[app]` handling for why.
+    app_raw_block: str | None = None
+    if config_path.exists():
+        try:
+            app_raw_block = _extract_raw_section(
+                config_path.read_text(encoding="utf-8"), "app"
+            )
+        except OSError:
+            pass
 
     if not args.no_preflight:
         _run_preflight(stt, secrets)
@@ -710,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
         categories=categories,
         tuning=tuning,
         data_dir=data_dir,
-        app=existing_app,
+        app_raw_block=app_raw_block,
     )
     _write_config_toml(config_path, content)
     _write_secrets_env(secrets_path, secrets, merge_existing=True)

@@ -178,12 +178,16 @@ def test_rerun_preserves_launchd_label_and_app_section(_isolate_env, monkeypatch
 
 
 def test_rerun_preserves_a_quoted_launch_at_login_value(_isolate_env, monkeypatch):
-    """Round-3 finding 7: only the BARE-boolean form was detected, so a
-    `launch_at_login = "false"` (a spelling `ConfigStore.readValue` accepts,
-    since it strips surrounding quotes, and which `tomllib` hands back as a
-    string) caused the whole `[app]` section to be dropped on rerun —
+    """Round-3 finding 7 (superseded by the deep-review verbatim-preservation
+    fix): a `launch_at_login = "false"` (a spelling `ConfigStore.readValue`
+    accepts, since it strips surrounding quotes, and which `tomllib` hands
+    back as a string) must survive a rerun rather than being dropped —
     silently RE-ENABLING a login item the user had explicitly disabled, since
     absent means "take no action" and leaves an existing registration alone.
+    `[app]` is now round-tripped as the original source text verbatim (see
+    `_extract_raw_section`), so the quoted spelling is preserved exactly
+    rather than normalized to a bare boolean — Python never reads this
+    section at runtime, so there is nothing to normalize it FOR.
     """
     assert init_mod.main(["--no-preflight"]) == 0
 
@@ -196,9 +200,38 @@ def test_rerun_preserves_a_quoted_launch_at_login_value(_isolate_env, monkeypatc
     assert init_mod.main(["--no-preflight"]) == 0
 
     cfg = _load_toml(config_toml_path())
-    # Normalized to the bare boolean form both readers accept — but, crucially,
-    # still present and still FALSE.
-    assert cfg["app"]["launch_at_login"] is False
+    # Preserved verbatim, quotes and all — still present, still resolves to
+    # the same (Swift-side) meaning of FALSE either way.
+    assert cfg["app"]["launch_at_login"] == "false"
+
+
+def test_rerun_preserves_the_app_section_byte_for_byte(_isolate_env, monkeypatch):
+    """Deep-review finding: Python re-rendering `[app]` from the parsed dict
+    had to model `ConfigStore.readValue`'s (the Swift reader) exact quote-
+    and whitespace-trimming semantics — an unversioned, undocumented
+    contract shared between two independent parsers with no shared schema
+    or cross-language test. `[app]` is now round-tripped as the literal
+    source text (`_extract_raw_section`), so it survives a rerun byte for
+    byte, INCLUDING a key Python's renderer has never heard of — proving
+    the fix no longer needs to know anything about Swift's parsing rules at
+    all."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    app_block = '[app]\nlaunch_at_login = "false"\nsome_future_swift_only_key = 42\n'
+    path.write_text(path.read_text() + "\n" + app_block)
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    raw = path.read_text()
+    assert app_block.strip() in raw
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["app"]["launch_at_login"] == "false"
+    assert cfg["app"]["some_future_swift_only_key"] == 42
 
 
 def test_rerun_preserves_an_unrecognized_launch_at_login_value(

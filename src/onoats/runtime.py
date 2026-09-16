@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger
@@ -306,8 +307,9 @@ def _resolve_stt_ws_target(
         and is_cleartext_remote(effective_uri)
     ):
         logger.warning(
-            f"STT: STT_WS_TOKEN will be sent in cleartext to {effective_uri}. "
-            "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
+            f"STT: STT_WS_TOKEN will be sent in cleartext to "
+            f"{redact_uri(effective_uri)}. Use wss:// for remote hosts, or bind "
+            "to loopback (127.0.0.1 / ::1 / UDS)."
         )
 
     return {
@@ -326,17 +328,14 @@ def _display_target(kwargs: dict) -> str:
     (``ws://user:pass@host/``). Strip it before rendering so a typoed
     secret doesn't echo into stderr or a log line.
 
-    **Round 10 root cause:** this used to hand-roll its own ``urlsplit``-based
-    redaction, gated on ``parsed.username or parsed.password`` being truthy.
-    ``urlsplit`` silently reports NO userinfo at all (rather than raising)
-    when the password contains an unencoded ``/``, ``?``, or ``#`` — so that
-    gate was false for exactly the malformed-but-realistic credentials this
-    function most needs to catch, and the function fell through to
-    returning the raw, credential-bearing ``uri`` unchanged. Delegating to
-    ``onoats._redact.redact_uri`` (the same tiered search ``safe_exc_text``
-    uses, verified against that exact shape — see that module's docstring)
-    fixes this without a second, independently-maintained redaction
-    implementation.
+    Delegates to ``onoats._redact.redact_uri`` (the same tiered search
+    ``safe_exc_text`` uses) rather than ``urlsplit``'s ``username``/
+    ``password`` properties: those silently report NO userinfo at all
+    (rather than raising) when the password contains an unencoded ``/``,
+    ``?``, or ``#`` — exactly the malformed-but-realistic credential shape
+    this function most needs to catch — which would otherwise let the raw,
+    credential-bearing ``uri`` fall through unchanged. One redaction
+    implementation, not two independently-maintained ones.
     """
     uri = kwargs.get("uri")
     if uri:
@@ -344,14 +343,12 @@ def _display_target(kwargs: dict) -> str:
     return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
 
 
-# `_safe_exc_text` used to live here (rounds 7-8's redaction rewrites). It
-# now lives in `onoats._redact` as the public `safe_exc_text` — a leaf
-# module with no `onoats` imports, so both this module and
+# `safe_exc_text` lives in `onoats._redact` — a leaf module with no
+# `onoats` imports — so both this module and
 # `onoats.stt.websocket_stt_service` can import it top-level without either
-# reaching into the other's private symbols (round 9 architecture finding).
-# Re-exported under the old private name so every call site in this module
-# (and any external code that imported `runtime._safe_exc_text`) keeps
-# working unchanged.
+# reaching into the other's private symbols. Re-exported under the old
+# private name so every call site in this module (and any external code
+# that imported `runtime._safe_exc_text`) keeps working unchanged.
 _safe_exc_text = safe_exc_text
 
 
@@ -768,12 +765,23 @@ def _resolve_kickstart_outcome(
 
     Returns the recovered, live client on a ``"recovered"`` outcome — but
     deliberately does NOT perform the caller's ownership-transfer-then-close
-    dance itself. That must stay inline at each call site and happen
-    SYNCHRONOUSLY (``client = _resolve_kickstart_outcome(...)`` with no
-    ``await`` on the right-hand side) before anything is awaited, so a
-    cancellation arriving mid-close can never observe the enclosing
-    function's ``client`` local still pointing at the already-dead stale
-    client — see the call sites' own comments for why that ordering matters.
+    dance itself, and cannot be made to: that dance's ordering requirement
+    (assign the caller's ``client`` local to the new, live client BEFORE
+    awaiting the stale client's close) needs the assignment to happen in the
+    CALLER's own stack frame with no ``await`` boundary in between, so that a
+    cancellation arriving mid-close still leaves the caller's `finally`
+    block (``await _close_client_quietly(client)``) pointing at the live
+    client rather than the already-dead stale one. Moving the swap-then-
+    close pair into an ``await``ed helper was tried and reverted: by the
+    time such a helper returns and its result is assigned, the caller's
+    `client` local has already sat unassigned across the internal
+    `await`, so a cancellation landing inside that internal close would
+    have left `finally` re-closing the dead stale client while the
+    genuinely live, recovered one — reachable only from the now-abandoned
+    helper call — leaked. The swap must stay inline at each call site and
+    happen SYNCHRONOUSLY (``client = _resolve_kickstart_outcome(...)`` with
+    no ``await`` on the right-hand side) before anything is awaited — see
+    the call sites' own comments for why that ordering matters.
     Raises ``SttPreflightError`` (chained from ``exc``) on
     ``"retry_exhausted"``. Returns ``None`` on ``"kickstart_failed"``
     (kickstart itself failed, or the cooldown was still active) — the caller
@@ -965,14 +973,20 @@ async def _preflight_stt_ws(
             except ValueError as exc:
                 # Mis-shaped kwargs slipped past our completeness check
                 # (future callers may build kwargs differently). Still
-                # actionable, still better than a traceback. Round 10
-                # finding: this interpolated {exc} raw while every sibling
-                # branch routed through safe_exc_text — urlsplit's own
-                # port-cast error message can echo a password prefix
-                # verbatim (e.g. "Port could not be cast to integer value
-                # as 'se'" from a malformed `user:se/cret@host` endpoint).
+                # actionable, still better than a traceback. `urlsplit`'s
+                # own port-cast error message can echo a raw fragment of
+                # the password verbatim (e.g. "Port could not be cast to
+                # integer value as 'se'" from a malformed
+                # `user:se/cret@host` endpoint) with no `@` anywhere in
+                # the message for `safe_exc_text`'s tiered search to
+                # anchor on, so routing it through `safe_exc_text` does
+                # not actually redact it. Drop the exception text
+                # entirely instead — it adds little beyond "misconfigured
+                # endpoint" — and report only the already-redacted
+                # `target` plus the exception's type name.
                 raise SttPreflightError(
-                    f"STT: misconfigured endpoint ({safe_exc_text(exc)}). {hint}"
+                    f"STT: misconfigured endpoint at {target} "
+                    f"({type(exc).__name__}). {hint}"
                 ) from exc
             except OSError as exc:  # covers FileNotFoundError + ConnectionRefusedError
                 # Cold-start races live here: socket path doesn't exist
@@ -1009,9 +1023,8 @@ async def _preflight_stt_ws(
                         break
                     # "kickstart_failed" (also: cooldown still active) ->
                     # fall through, unchanged message.
-                # Round 10 finding: this interpolated {exc} raw. A plain
-                # connection-refused OSError doesn't normally carry a
-                # credential, but nothing prevents a future socket/TLS
+                # A plain connection-refused OSError doesn't normally carry
+                # a credential, but nothing prevents a future socket/TLS
                 # error class from echoing the connect target — route
                 # through safe_exc_text uniformly like every sibling branch.
                 raise SttPreflightError(
@@ -1076,20 +1089,34 @@ def _resolve_stt_language(cfg) -> str | None:
 VALID_STT_SERVICES = ("whisper", "websocket", "deepgram")
 
 
+@dataclass(frozen=True)
+class SttServiceResult:
+    """Return value of :func:`_create_stt_service`.
+
+    A named type instead of a bare ``(service, preflight_recovery_message)``
+    tuple (deep-review finding): a tuple forced every non-websocket backend
+    branch to spell out a second element that means nothing to it
+    (``return X, None``), and offered no seam for a future field without
+    re-breaking every caller's unpacking. ``preflight_recovery_message`` is
+    the ``"stt: server restarted automatically ..."`` string when this
+    call's own preflight kickstart-recovered, else ``None`` — only the
+    ``websocket`` backend can ever populate it. Callers that only need the
+    service instance can ignore ``.preflight_recovery_message``.
+    """
+
+    service: object
+    preflight_recovery_message: str | None = None
+
+
 async def _create_stt_service(
     *,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
     preflight_recovered: bool = False,
-):
+) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
-    Returns a ``(service, preflight_recovery_message)`` tuple.
-    ``preflight_recovery_message`` is the ``"stt: server restarted
-    automatically ..."`` string when this call's own preflight
-    kickstart-recovered, else ``None`` — only the ``websocket`` backend can
-    populate it; every other backend always returns ``None`` here. Callers
-    that only need the service instance can ignore the second element.
+    Returns an :class:`SttServiceResult`.
 
     Prefers Whisper MLX on Apple Silicon, falls back to CPU Whisper, or uses
     Deepgram when STT_SERVICE=deepgram.
@@ -1253,7 +1280,7 @@ async def _create_stt_service(
             ),
             **kwargs,
         )
-        return service, recovery_holder.get("message")
+        return SttServiceResult(service, recovery_holder.get("message"))
 
     if service == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -1281,7 +1308,7 @@ async def _create_stt_service(
             f"STT: deepgram (model={model_name or 'default'}, "
             f"vocabulary_bias={len(vocabulary)} term(s))"
         )
-        return DeepgramSTTService(**dg_kwargs), None
+        return SttServiceResult(DeepgramSTTService(**dg_kwargs))
 
     # Whisper recognition bias would be supplied via an initial_prompt seed,
     # but pipecat 1.3.0's Whisper wrapper exposes no such field (Settings =
@@ -1317,13 +1344,12 @@ async def _create_stt_service(
         )
         # language=None reaches mlx_whisper.transcribe unchanged, which then
         # auto-detects per segment.
-        return (
+        return SttServiceResult(
             WhisperSTTServiceMLX(
                 settings=WhisperSTTServiceMLX.Settings(
                     model=mlx_model.value, language=language
                 )
-            ),
-            None,
+            )
         )
     else:
         from pipecat.services.whisper.stt import WhisperSTTService
@@ -1332,12 +1358,11 @@ async def _create_stt_service(
         logger.info(f"STT: whisper-cpu (model={model}, language={language or 'auto'})")
         # device/compute_type are WhisperSTTService constructor kwargs, NOT
         # Settings fields — passing device into Settings raises TypeError.
-        return (
+        return SttServiceResult(
             WhisperSTTService(
                 device="cpu",
                 settings=WhisperSTTService.Settings(model=model, language=language),
-            ),
-            None,
+            )
         )
 
 

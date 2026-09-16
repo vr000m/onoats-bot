@@ -512,15 +512,18 @@ async def run_onoats_dual(
     # told about the first's recovery: it arms that instance's confirm gate
     # too, so a system-audio-only session (no mic transcript ever) still
     # clears the shared warning.
-    mic_stt, mic_preflight_recovery = await _create_stt_service(
-        data_dir=data_dir, branch_instance="mic"
-    )
-    system_stt, system_preflight_recovery = await _create_stt_service(
+    mic_result = await _create_stt_service(data_dir=data_dir, branch_instance="mic")
+    mic_stt = mic_result.service
+    system_result = await _create_stt_service(
         data_dir=data_dir,
         branch_instance="system",
-        preflight_recovered=mic_preflight_recovery is not None,
+        preflight_recovered=mic_result.preflight_recovery_message is not None,
     )
-    preflight_recovery_warning = mic_preflight_recovery or system_preflight_recovery
+    system_stt = system_result.service
+    preflight_recovery_warning = (
+        mic_result.preflight_recovery_message
+        or system_result.preflight_recovery_message
+    )
     # RSS baseline for the stt_server at bot start. Pair with the
     # ``shutdown`` entry logged from `_run_shutdown` to get a free
     # soak datapoint out of every real-world session — no dedicated

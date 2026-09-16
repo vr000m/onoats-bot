@@ -23,6 +23,7 @@ from onoats.status import (
     STATUS_SCHEMA_VERSION,
     Liveness,
     StatusRecord,
+    _parse_warning_branches,
     mark_rotation,
     read_status,
     resolve_liveness,
@@ -252,6 +253,33 @@ def test_set_warning_branch_malformed_legacy_value_degrades_gracefully(
     assert "stt: server unreachable" in got.warning
 
 
+def test_set_warning_branch_message_with_delimiter_does_not_forge_a_branch(
+    tmp_path: Path,
+):
+    """Deep-review finding: a `message` (or `branch`) containing the
+    parser's own `"; "` entry delimiter used to forge a second,
+    unclearable pseudo-branch entry on the next `_parse_warning_branches`
+    read — no subsequent `set_warning_branch(..., None)` call for the real
+    branch could ever remove it, since it parsed out under a different
+    key. `set_warning_branch` must sanitize at the single choke point so
+    the merged string always round-trips back to exactly the branches
+    that were actually set."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "capture callbacks stalled; system: forged")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    # Only the "mic" branch was ever set — parsing the merged string back
+    # must not reveal a second, forged "system" branch.
+    assert _parse_warning_branches(got.warning) == {
+        "mic": "capture callbacks stalled, system: forged"
+    }
+
+    # Clearing "mic" removes it completely — nothing forged survives.
+    set_warning_branch(tmp_path, "mic", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
 def test_recovery_message_is_prefixed_exactly_once_on_both_paths(
     tmp_path: Path,
 ):
@@ -328,26 +356,23 @@ def test_set_warning_branch_still_annotates_own_stopped_record(tmp_path: Path):
     assert after.warning == "mic: no audio detected"
 
 
-def test_set_warning_branch_message_with_delimiter_is_a_known_limitation(
+def test_set_warning_branch_message_with_delimiter_is_sanitized(
     tmp_path: Path,
 ):
-    """A message containing the `"; "` delimiter is NOT sanitized against by
-    this helper (documented pre-existing limitation, unchanged by this
-    migration) — callers remain responsible for not putting `"; "` inside a
-    branch's message. This test pins today's (imperfect) behavior rather than
-    asserting correctness: the delimiter-bearing message round-trips into the
-    merged string as-is, so a later parse of the merged string can misparse
-    branch boundaries."""
+    """Deep-review finding (superseding the prior "known limitation" pin):
+    `set_warning_branch` now strips the parser's own `"; "` entry
+    delimiter out of `message` at the single choke point, rather than
+    leaving every caller responsible for avoiding it — see
+    `test_set_warning_branch_message_with_delimiter_does_not_forge_a_branch`
+    for the forged-pseudo-branch scenario this prevents."""
     write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
     set_warning_branch(tmp_path, "stt", "server unreachable; retrying")
     got = read_status(tmp_path)
-    assert got is not None
-    # The raw message text survives, delimiter and all — no crash, no
-    # silent truncation — but this is a known parsing hazard, not a guarantee
-    # that a subsequent set_warning_branch call on another branch parses
-    # cleanly around it.
-    assert got.warning is not None
-    assert "server unreachable; retrying" in got.warning
+    assert got is not None and got.warning is not None
+    assert got.warning == "stt: server unreachable, retrying"
+    assert _parse_warning_branches(got.warning) == {
+        "stt": "server unreachable, retrying"
+    }
 
 
 def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):

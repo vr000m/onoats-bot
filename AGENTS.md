@@ -264,6 +264,15 @@ feature rather than failing a test you'd notice:
   `OSError`), on both paths. A protocol/auth failure (a 401 from a server that
   is demonstrably up) means the config is wrong; SIGKILLing a healthy server
   neither fixes it nor is harmless.
+- **The cooldown registry is process-scoped, not cross-process.**
+  `launchd._last_kickstart`/`_unhealthy` are plain module-level dicts with no
+  persistence — a crash-restart loop (menu bar / socket supervisor relaunching
+  the recorder) starts each fresh `onoats bot` process with an EMPTY registry,
+  so the 30s cooldown caps kickstarts only *within* one process's lifetime, not
+  across the relaunches that can follow a repeatedly-crashing session. This is
+  accepted, not a gap to silently work around: if cross-process capping is
+  ever needed, persist the stamp next to the status file in `data_dir` — don't
+  add a second, undocumented scope to the in-memory registry.
 
 Regression tests: `tests/test_stt_launchd.py`, `tests/test_runtime_preflight.py`,
 `tests/test_websocket_stt_reconnect.py`.

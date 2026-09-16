@@ -123,6 +123,25 @@ def test_unrelated_query_string_at_sign_still_untouched():
     assert safe_exc_text(Exception(text)) == text
 
 
+def test_unrelated_query_string_with_colon_still_untouched():
+    """Codex-adversarial finding: a `user:pass@host` shape inside an
+    unrelated redirect query string was misclassified as authority
+    credentials by tier 3 (which lacked tier 2's "no '=' in the gap"
+    guard), corrupting the real path and query down to just the host."""
+    text = "ws://host/path?redirect=user:pass@example.org"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_password_with_multiple_spaces_is_still_redacted():
+    """Codex-adversarial finding: tier 3 only tolerated one extra
+    whitespace-delimited word, so a password with two or more embedded
+    spaces reached the log/error text unredacted."""
+    exc = Exception("ws://u:p more words@host/path is invalid")
+    safe = safe_exc_text(exc)
+    assert "p more words" not in safe
+    assert safe == "ws://host/path is invalid"
+
+
 def test_no_credential_shaped_substring_passes_through_unchanged():
     text = "connection refused: host unreachable"
     assert safe_exc_text(Exception(text)) == text

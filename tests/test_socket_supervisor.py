@@ -1617,6 +1617,36 @@ async def test_stderr_reader_merges_warnings_and_tees(short_root, capfd):
 
 
 @pytest.mark.anyio
+async def test_stderr_reader_rejects_unknown_branch_and_delimiter_hint(short_root):
+    """Deep-review finding: `branch`/`hint` on a `zero-run-warning`/
+    `zero-run-clear` event come straight from the capturer's stderr,
+    unvalidated — unlike the `device` branch of the same loop, which
+    already restricts to `("mic", "system")`. An unknown branch, or a
+    `hint` containing the on-disk `warning` grammar's `"; "` entry
+    delimiter, must be dropped rather than reaching
+    `status.set_warning_branch` (status.py now also sanitizes as a second
+    line of defense, but this loop must not rely on that alone)."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    reader = asyncio.StreamReader()
+    # Unknown branch: not "mic"/"system" — must not create a bogus entry.
+    reader.feed_data(b"ONOATS-EVENT zero-run-warning branch=bogus hint=nope\n")
+    # A delimiter-bearing hint on an otherwise-valid branch must be dropped.
+    reader.feed_data(
+        b"ONOATS-EVENT zero-run-warning branch=mic hint=stalled; system: forged\n"
+    )
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+
+    got = status_file.read_status(data_dir)
+    assert got is not None and got.warning is None
+
+
+@pytest.mark.anyio
 async def test_stderr_reader_clear_event_clears_warning(short_root):
     from onoats import status as status_file
 

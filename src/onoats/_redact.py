@@ -63,10 +63,13 @@ territory):
 3. **Tier 3** — only tried when tier 1 AND tier 2 both find no ``@``, and
    only when the text up to the first whitespace already contains a ``:``
    (a `user:` -shaped start — the gate that keeps this tier from firing on
-   arbitrary two-word prose): re-search bounded by the *second* whitespace
-   (or ``outer_stop``) instead of the first. This is what a password
-   containing a raw, un-encoded space needs (case (a) below) — tolerating
-   exactly one extra whitespace-delimited word, never scanning further.
+   arbitrary two-word prose): re-search all the way to ``outer_stop``
+   (ignoring whitespace as a stop entirely, same as tier 2 ignores
+   ``/?#``), subject to the same "no ``=`` in the gap" query-string guard
+   tier 2 uses. This is what a password containing one or more raw,
+   un-encoded spaces needs (case (a) below) — stopping after only one
+   extra whitespace-delimited word would still miss a password embedding
+   two or more spaces.
 
 Each tier reports both the ``@`` position and the window boundary it used,
 so the caller redacts exactly ``[start, @)`` and resumes unmodified output
@@ -81,13 +84,17 @@ tiers' checks.
 
 Traced against the required cases:
 
-    (a) scheme-less, password has a space —
+    (a) scheme-less, password has one or more spaces —
         ``"secretuser:hunter 2@stt.example.internal:2020 isn't a valid URI: ..."``
         tier 1 (up to first space, "secretuser:hunter") has no ``@``; tier 2
         (still bounded by that same first space, since no ``/?#`` appears
         before it) also fails; tier 3 sees ``:`` before the first space and
-        extends to the second space, finding the ``@`` there — redacts to
-        ``"stt.example.internal:2020 isn't a valid URI: ..."``.
+        widens all the way to ``outer_stop``, finding the ``@`` there —
+        redacts to ``"stt.example.internal:2020 isn't a valid URI: ..."``.
+        The same widening also redacts a password with two or more
+        embedded spaces (e.g. ``"ws://u:p more words@host/path is
+        invalid"`` -> ``"ws://host/path is invalid"``), which a
+        second-whitespace-only window would still miss.
     (b) scheme-prefixed, trailing prose with no port-shaped suffix —
         ``"ws://user:pass@host:9999 isn't a valid URI: nonempty path required"``
         tier 1 (up to the first space, before "isn't") finds the ``@``
@@ -112,10 +119,21 @@ Traced against the required cases:
         ``?`` and DOES find the ``@`` in "redirect=user@example.org", but
         the text between tier 1's stop (the ``/``) and that ``@`` is
         ``"api?redirect=user"``, which contains ``=`` — tier 2 refuses the
-        match — tier 3 requires a ``:`` before the first whitespace, and
-        there is no whitespace here at all so tier 3's gate (checked
-        against the first-whitespace-bounded prefix) also fails to engage.
-        The message passes through completely unchanged.
+        match; tier 3 requires a ``:`` before the first whitespace, and
+        there is no whitespace here at all, so its gate never even
+        engages. The message passes through completely unchanged.
+    (e2) unrelated query-string ``user:pass@host`` (colon variant) —
+        ``"ws://host/path?redirect=user:pass@example.org"`` — tier 1 (up
+        to the first ``/``) has no ``@``; tier 2's window is unchanged
+        (still no whitespace before it), and its "no ``=`` in the gap"
+        check rejects the match on the same ``=`` as case (e); tier 3's
+        gate now *does* engage (the ``:`` in "user:pass" is found before
+        the first — nonexistent — whitespace, so the gate scans the whole
+        remainder), but tier 3 carries the identical "no ``=`` in the gap"
+        guard as tier 2, so it refuses the same match for the same
+        reason. The message passes through completely unchanged — without
+        this guard on tier 3, this shape used to be misredacted down to
+        ``"ws://example.org"``, destroying the real path and query.
     (f) password containing ``/``, ``?``, or ``#`` —
         ``"ws://user:pa/ss@host/path"`` — tier 1 (up to the first ``/``,
         right after "pa") has no ``@``; tier 2 widens past that ``/`` and
@@ -203,22 +221,22 @@ def _find_credential_at(
     if at != -1:
         return at, tier1_stop
 
-    tier2_stop = _first_stop(text, start, _WHITESPACE_RE, outer_stop)
-    at = text.rfind("@", start, tier2_stop)
-    if at != -1 and "=" not in text[tier1_stop:at]:
-        return at, tier2_stop
-
     first_ws = _first_stop(text, start, _WHITESPACE_RE, outer_stop)
+    at = text.rfind("@", start, first_ws)
+    if at != -1 and "=" not in text[tier1_stop:at]:
+        return at, first_ws
+
     if ":" not in text[start:first_ws]:
         return None, None
-    tier3_stop = (
-        _first_stop(text, first_ws + 1, _WHITESPACE_RE, outer_stop)
-        if first_ws < outer_stop
-        else outer_stop
-    )
-    at = text.rfind("@", start, tier3_stop)
-    if at != -1:
-        return at, tier3_stop
+    # Tier 3 widens all the way to `outer_stop` (not just a second
+    # whitespace-delimited word) so a password containing more than one
+    # raw space is still redacted — bounded by the same "no '=' in the
+    # gap" query-string guard tier 2 uses, since widening past whitespace
+    # reopens the same query-string ambiguity tier 2 already guards
+    # against.
+    at = text.rfind("@", start, outer_stop)
+    if at != -1 and "=" not in text[tier1_stop:at]:
+        return at, outer_stop
     return None, None
 
 

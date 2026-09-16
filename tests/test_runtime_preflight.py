@@ -900,7 +900,8 @@ def test_preflight_recovery_message_is_bare_and_holder_is_prefixed_once(
 
     monkeypatch.setattr(runtime, "_preflight_stt_ws", fake_preflight)
 
-    _, holder_message = asyncio.run(runtime._create_stt_service(data_dir=tmp_path))
+    result = asyncio.run(runtime._create_stt_service(data_dir=tmp_path))
+    holder_message = result.preflight_recovery_message
 
     assert not seen[0].startswith("stt:")  # bare into set_warning_branch
     assert holder_message == f"stt: {seen[0]}"  # prefixed exactly once
@@ -939,13 +940,13 @@ def test_live_recovery_branch_is_instance_scoped(monkeypatch, tmp_path):
         lambda dd, branch, msg: branches.append((branch, msg)),
     )
 
-    _svc, preflight_msg = asyncio.run(
+    result = asyncio.run(
         runtime._create_stt_service(data_dir=tmp_path, branch_instance="mic")
     )
     # The preflight recovery lands on the SHARED branch — carried out through
     # the returned message (one write path, round-2 finding 10), not through
     # a `set_warning_branch` call.
-    assert preflight_msg == "stt: probe recovered"
+    assert result.preflight_recovery_message == "stt: probe recovered"
     assert branches == []
 
     # The instance's own live recoveries land on its OWN branch.
@@ -1507,6 +1508,31 @@ def test_raising_on_recovery_does_not_abort_a_successful_preflight_recovery(
     assert all(c.closed for c in _FakeClient.instances)
 
 
+def test_cleartext_token_warning_redacts_userinfo_in_uri():
+    """Deep-review finding: `_resolve_stt_ws_target`'s cleartext-token
+    warning interpolated the raw `effective_uri` while every other
+    endpoint-rendering site in this module routes through
+    `redact_uri`/`safe_exc_text` specifically because `STT_WS_URI` is
+    user-controlled and may carry `user:pass@` userinfo — this warning
+    was the one site the diff missed."""
+    from loguru import logger
+
+    records: list[str] = []
+    sink_id = logger.add(lambda msg: records.append(str(msg)), level="WARNING")
+    try:
+        runtime._resolve_stt_ws_target(
+            {
+                "STT_WS_URI": "ws://user:hunter2@remote.example:2020/",
+                "STT_WS_TOKEN": "sekret-token",
+            }
+        )
+    finally:
+        logger.remove(sink_id)
+
+    assert any("cleartext" in r for r in records)
+    assert not any("hunter2" in r or "user:hunter2" in r for r in records)
+
+
 def test_display_target_never_leaks_on_a_malformed_uri():
     """Round-3 finding 13: the old `urlsplit`-based redaction fallback
     returned the RAW uri on `ValueError`, leaking exactly the
@@ -1551,13 +1577,13 @@ def test_create_stt_service_gives_the_instance_a_stable_identity_token(
     _install_fake_client(monkeypatch)
 
     async def _build():
-        mic, _ = await runtime._create_stt_service(
+        mic_result = await runtime._create_stt_service(
             data_dir=tmp_path, branch_instance="mic"
         )
-        system, _ = await runtime._create_stt_service(
+        system_result = await runtime._create_stt_service(
             data_dir=tmp_path, branch_instance="system"
         )
-        return mic, system
+        return mic_result.service, system_result.service
 
     mic, system = asyncio.run(_build())
     assert mic._instance_token == "mic"
@@ -1859,12 +1885,14 @@ def test_characterization_valueerror_redacts_credential_in_exception_text(
     validation error naming the mis-shaped endpoint) must not leak its
     credential into the raised `SttPreflightError`.
 
-    (Not every shape this branch can see is redactable this way — a bare
-    password FRAGMENT with no surrounding `user:pass@host` structure at
-    all, e.g. `urlsplit(...).port`'s "Port could not be cast to integer
-    value as 'se'", has no structural marker for any text-scanning
-    redactor to find; that is a fundamentally different, undetectable
-    case, not something this fix claims to solve.)"""
+    (A bare password FRAGMENT with no surrounding `user:pass@host`
+    structure at all — e.g. `urlsplit(...).port`'s "Port could not be
+    cast to integer value as 'se'" — has no structural marker for any
+    text-scanning redactor to find; `safe_exc_text` alone cannot solve
+    that case. The `ValueError` branch now drops the exception text
+    entirely rather than interpolating it — see
+    `test_characterization_valueerror_omits_exception_text_entirely`
+    below, which covers exactly that fragment-leak shape.)"""
 
     def raiser():
         return ValueError("invalid endpoint kwargs for ws://user:secretpass@host:1234")
@@ -1876,6 +1904,36 @@ def test_characterization_valueerror_redacts_credential_in_exception_text(
         asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
 
     assert "secretpass" not in str(excinfo.value)
+
+
+def test_characterization_valueerror_omits_exception_text_entirely(monkeypatch):
+    """Codex-adversarial finding: `urlsplit`'s own port-cast `ValueError`
+    can echo a raw, un-delimited FRAGMENT of the password (no `@` and no
+    scheme in the message for `safe_exc_text`'s tiered search to anchor
+    on), so routing it through `safe_exc_text` did not actually redact
+    it — `safe_exc_text` returns such a message byte-for-byte unchanged.
+    The `ValueError` branch must not interpolate the exception text at
+    all; the raised message carries only the exception's type name."""
+
+    def raiser():
+        from urllib.parse import urlsplit
+
+        try:
+            urlsplit("ws://user:s3cret/pw@host:20").port
+        except ValueError as e:
+            return e
+        raise AssertionError("expected urlsplit to raise ValueError")
+
+    _install_fake_client(monkeypatch, connect_raises=raiser)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
+
+    with pytest.raises(SttPreflightError) as excinfo:
+        asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
+
+    message = str(excinfo.value)
+    assert "s3cret" not in message
+    assert "Port could not be cast" not in message
+    assert "ValueError" in message
 
 
 def test_characterization_oserror_redacts_credential_in_exception_text(

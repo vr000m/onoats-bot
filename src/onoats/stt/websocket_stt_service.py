@@ -75,12 +75,10 @@ from stt_server import protocol as P
 # to achieve — they were never necessary. A top-level import is safe and
 # cycle-free: `launchd` is a leaf module that imports nothing from `onoats`.
 #
-# `safe_exc_text` used to be `onoats.runtime._safe_exc_text` — a private
-# symbol reached across a module boundary, inverting this codebase's
-# dependency direction (`runtime.py` only ever imports this `stt`
-# subpackage lazily, to avoid a cycle). It now lives in `onoats._redact`,
-# a leaf module with no `onoats` imports, so this stays a top-level,
-# cycle-free import of a *public* name instead (round 9 architecture fix).
+# `safe_exc_text` lives in `onoats._redact`, a leaf module with no `onoats`
+# imports, so this is a top-level, cycle-free import of a *public* name —
+# not a private symbol reached across a module boundary (`runtime.py` only
+# ever imports this `stt` subpackage lazily, to avoid a cycle).
 from onoats._redact import redact_uri
 from onoats._redact import safe_exc_text as _safe_exc_text
 from onoats.stt import launchd
@@ -95,6 +93,18 @@ _CLOSE_TIMEOUT_SECONDS = 5.0
 
 # Bounded wait for session.updated after session.update.
 _SESSION_READY_TIMEOUT_SECONDS = 5.0
+
+# Bounded wait for `client.connect()` (the server.hello + session.created
+# handshake) per reconnect attempt. Without this, a server that accepts the
+# TCP/UDS connection but never emits its handshake frames (the event loop is
+# alive but its decode path is wedged — websockets' own ping/pong keepalive
+# does not catch this) hangs `_ensure_connected` forever: no attempt
+# advances, `_maybe_kickstart()` is never reached, and no ErrorFrame is ever
+# yielded, all while `_run_stt_lock` blocks every queued VAD segment behind
+# it. Mirrors the bound the preflight path already applies to the identical
+# call (`runtime._preflight_stt_ws`'s `asyncio.wait_for(client.connect(),
+# timeout=timeout_s)`).
+_CONNECT_TIMEOUT_SECONDS = 5.0
 
 # Reconnect back-off schedule. Doubles 0.5 → 8.0s before giving up, total
 # ~15.5s of wall clock. Sized to cover the LaunchAgent keepalive window
@@ -397,7 +407,9 @@ class WebSocketSTTService(SegmentedSTTService):
         for attempt in range(total_attempts):
             try:
                 client = TranscriptionClient(**self._connect_kwargs)
-                hello = await client.connect()
+                hello = await asyncio.wait_for(
+                    client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
+                )
                 loop = asyncio.get_running_loop()
                 self._session_ready = loop.create_future()
                 self._client = client
@@ -415,8 +427,17 @@ class WebSocketSTTService(SegmentedSTTService):
                     await asyncio.wait_for(
                         self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
                     )
-                except TimeoutError:
-                    raise RuntimeError("stt_server did not ack session.update")
+                except TimeoutError as exc:
+                    # Re-raise as TimeoutError, not RuntimeError: a server
+                    # that completes the websocket handshake but never acks
+                    # session.update is a live-but-wedged server — exactly
+                    # the reachability failure the `isinstance(last_exc,
+                    # (TimeoutError, OSError))` kickstart gate below exists
+                    # to catch — not the auth/TLS/protocol misconfiguration
+                    # that gate is meant to filter out. A RuntimeError here
+                    # matched neither branch, so this path used to exhaust
+                    # all attempts and raise without ever self-healing.
+                    raise TimeoutError("stt_server did not ack session.update") from exc
                 # Backend identity from server.hello — surfaces an operational
                 # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
                 # and is stashed on the instance so callers (banner, metrics,
@@ -550,12 +571,11 @@ class WebSocketSTTService(SegmentedSTTService):
     def _endpoint_label(self) -> str:
         """Human-readable connect target for logs — never the raw `uri`.
 
-        Round 10 finding: this returned `kw["uri"]` verbatim, re-leaking
-        `user:pass@` userinfo into the `[endpoint=...]` log field that
-        `safe_exc_text(exc)` was added to protect — including on the
-        happy-path "connected to {endpoint}" log line, not just on error.
-        Routed through the same `onoats._redact.redact_uri` `_display_target`
-        uses, so there is one redaction owner, not two.
+        `uri` may carry `user:pass@` userinfo, and this feeds both error
+        logs and the happy-path "connected to {endpoint}" line, so it must
+        never return the raw kwarg verbatim. Routed through the same
+        `onoats._redact.redact_uri` `_display_target` uses, so there is one
+        redaction owner, not two.
         """
         kw = self._connect_kwargs
         if kw.get("socket_path"):
@@ -570,10 +590,18 @@ class WebSocketSTTService(SegmentedSTTService):
         """Drop a dead client + reader without blocking on a broken socket."""
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            # `asyncio.gather(..., return_exceptions=True)`, not a plain
+            # `await self._reader_task` under `except (CancelledError,
+            # Exception): pass`: the plain form cannot distinguish "the
+            # reader task I just cancelled finished as cancelled" (the
+            # expected, benign outcome of the `.cancel()` two lines above)
+            # from "someone cancelled ME while I was awaiting it" — both
+            # surface identically as `CancelledError` from the `await`.
+            # `gather` absorbs the *awaited task's own* `CancelledError`
+            # into its result list without raising, while still letting a
+            # genuine external cancellation of the current coroutine
+            # propagate normally through the `await gather(...)` itself.
+            await asyncio.gather(self._reader_task, return_exceptions=True)
         self._reader_task = None
         if self._client is not None:
             try:
@@ -761,10 +789,12 @@ class WebSocketSTTService(SegmentedSTTService):
                 self._pending.cancel()
             if self._reader_task is not None:
                 self._reader_task.cancel()
-                try:
-                    await self._reader_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                # See `_discard_stale`'s matching comment: `gather(...,
+                # return_exceptions=True)` absorbs the reader task's own
+                # `CancelledError` from the `.cancel()` above without
+                # raising, while a genuine external cancellation of this
+                # coroutine still propagates normally.
+                await asyncio.gather(self._reader_task, return_exceptions=True)
         finally:
             await client.close()
             self._client = None
