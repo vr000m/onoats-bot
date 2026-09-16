@@ -220,11 +220,19 @@ async def run_onoats(
     # ----------------------------------------------------------------
     # Step 6: Build transport (input-only for silent mode)
     # ----------------------------------------------------------------
-    # `data_dir` enables the same preflight self-healing kickstart as the
-    # dual (mic+system) path. The single-pipeline path never writes a
-    # status record at all, so the recovery message has nothing to thread
-    # into — discarded here, unlike dual.py.
-    stt, _stt_preflight_recovery = await _create_stt_service(data_dir=data_dir)
+    # `data_dir=None`: self-healing kickstart itself doesn't need it —
+    # `_create_stt_service` resolves `cfg.stt_launchd_label` unconditionally
+    # (kickstart works from a configured label alone). Passing the real
+    # `data_dir` here would additionally build a live `on_recovery`
+    # callback wired into the STT service for the rest of the session
+    # (`_create_stt_service`'s docstring: "None ... means build no
+    # callback"). This path never calls `write_running`/writes a status
+    # record of its own — unlike dual.py, no fresh record exists to claim
+    # `data_dir`'s status file — so that callback would just annotate
+    # whatever record happens to already be on disk (e.g. a stale, stopped
+    # record left by an earlier dual/socket-mode session on the same
+    # data_dir), misattributing an `stt:` warning to an unrelated session.
+    stt, _stt_preflight_recovery = await _create_stt_service(data_dir=None)
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(

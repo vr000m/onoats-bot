@@ -504,8 +504,22 @@ async def run_onoats_dual(
     # probes the endpoint (the second is a `_preflight_cache` hit for the
     # same resolved kwargs — see `_preflight_stt_ws`'s docstring), so at
     # most one of the two calls returns a non-None message.
-    mic_stt, mic_preflight_recovery = await _create_stt_service(data_dir=data_dir)
-    system_stt, system_preflight_recovery = await _create_stt_service(data_dir=data_dir)
+    # `branch_instance` scopes each instance's LIVE-session status-warning
+    # branch (`stt-mic` / `stt-system`) so mic's and system's independent
+    # kickstart recoveries can't clear each other's still-unconfirmed
+    # warning. The startup preflight's own recovery stays on the shared
+    # `stt` branch (one probe, one server) — which is why the second call is
+    # told about the first's recovery: it arms that instance's confirm gate
+    # too, so a system-audio-only session (no mic transcript ever) still
+    # clears the shared warning.
+    mic_stt, mic_preflight_recovery = await _create_stt_service(
+        data_dir=data_dir, branch_instance="mic"
+    )
+    system_stt, system_preflight_recovery = await _create_stt_service(
+        data_dir=data_dir,
+        branch_instance="system",
+        preflight_recovered=mic_preflight_recovery is not None,
+    )
     preflight_recovery_warning = mic_preflight_recovery or system_preflight_recovery
     # RSS baseline for the stt_server at bot start. Pair with the
     # ``shutdown`` entry logged from `_run_shutdown` to get a free

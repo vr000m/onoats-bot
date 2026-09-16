@@ -275,6 +275,47 @@ def set_warning(data_dir: Path, warning: str | None) -> Path | None:
     return write_status(data_dir, replace(current, warning=warning))
 
 
+# Status-warning branch key for the SHARED startup-preflight STT recovery (one
+# probe against one server, before any WebSocketSTTService instance exists).
+# Live-session recoveries are per-instance and use ``stt_branch(name)`` below,
+# so mic's and system's independent warnings cannot clobber each other.
+STT_WARNING_BRANCH = "stt"
+
+
+def stt_branch(instance: str | None = None) -> str:
+    """Status-warning branch key for an STT warning.
+
+    ``None`` -> the shared ``"stt"`` branch, used for the startup preflight
+    recovery (one probe, one server, no instance exists yet).
+    ``"mic"``/``"system"`` -> ``"stt-mic"``/``"stt-system"``, the per-instance
+    live-session branches. ``dual.py`` constructs two independent
+    ``WebSocketSTTService`` instances against the same server; sharing one
+    branch key let either instance's clear erase the other's still-unconfirmed
+    warning, exactly the way the ``mic``/``system`` capture branches already
+    avoid by being instance-scoped.
+
+    Lives here, not in ``onoats.stt.launchd``: a branch key is a status-layer
+    naming concept, owned alongside :func:`format_warning_branch` /
+    :func:`set_warning_branch`, and ``launchd.py`` is meant to stay a leaf
+    module about ``launchctl`` and the kickstart cooldown. Its only caller
+    (``runtime._create_stt_service``) already imports ``status`` directly.
+    """
+    return STT_WARNING_BRANCH if not instance else f"{STT_WARNING_BRANCH}-{instance}"
+
+
+def format_warning_branch(branch: str, message: str) -> str:
+    """Render one branch's entry exactly as :func:`set_warning_branch` merges it.
+
+    The single owner of the ``"<branch>: <message>"`` lead-in. The preflight
+    kickstart-recovery path writes its message through
+    ``write_running(warning=...)`` (a raw whole-field write — no running record
+    exists yet for :func:`set_warning_branch` to annotate), so without a shared
+    formatter the two paths each own a copy of the prefixing rule and drift.
+    Callers pass a **bare** message; nobody pre-prefixes.
+    """
+    return f"{branch}: {message}"
+
+
 def _parse_warning_branches(warning: str | None) -> dict[str, str]:
     """Parse a merged ``warning`` string back into ``{branch: message}``.
 
@@ -311,18 +352,38 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     A ``message`` containing ``"; "`` is a known pre-existing limitation of
     the split-based parser (unchanged by this helper): callers must not put
     ``"; "`` inside a branch's message, or the merge will mis-parse on the
-    next read. Best-effort like :func:`set_warning`: returns ``None`` when
-    there is no readable record to annotate.
+    next read. Accepted as a documented tradeoff by the dev plan (escaping
+    would change the on-disk ``warning`` grammar the Swift menu-bar reader
+    shares under ``STATUS_SCHEMA_VERSION``); the only value that could carry
+    a delimiter from outside the process — the launchd label — is
+    allowlist-validated at resolution instead
+    (``onoats.config.validate_launchd_label``). Best-effort like
+    :func:`set_warning`: returns ``None`` when there is no readable record to
+    annotate.
+
+    ``message`` must be **bare** — never pre-prefixed with ``"<branch>: "``.
+    :func:`format_warning_branch` is the sole owner of that lead-in and is
+    applied here, so a caller that prefixes too would double it.
+
+    Like :func:`set_devices`, this is also a no-op on a NON-running record:
+    a branch event (an stt kickstart-recovery confirm/clear, a capturer
+    zero-run event) can race ahead of the next session's :func:`write_running`
+    and land while the record on disk still belongs to the *previous*,
+    already-stopped session — annotating that record would mislabel history
+    (the same reasoning :func:`set_devices` documents for device fields).
     """
     current = read_status(data_dir)
-    if current is None:
+    if current is None or not current.running:
         return None
     branches = _parse_warning_branches(current.warning)
     if message is None:
         branches.pop(branch, None)
     else:
         branches[branch] = message
-    merged = "; ".join(f"{b}: {branches[b]}" for b in sorted(branches)) or None
+    merged = (
+        "; ".join(format_warning_branch(b, branches[b]) for b in sorted(branches))
+        or None
+    )
     return write_status(data_dir, replace(current, warning=merged))
 
 

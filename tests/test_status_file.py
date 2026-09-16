@@ -251,6 +251,55 @@ def test_set_warning_branch_malformed_legacy_value_degrades_gracefully(
     assert "stt: server unreachable" in got.warning
 
 
+def test_recovery_message_is_prefixed_exactly_once_on_both_paths(
+    tmp_path: Path,
+):
+    """Round-2 fix (finding 1): the recovery message had three independent
+    owners and `set_warning_branch` defensively stripped a redundant
+    "<branch>: " lead-in as a band-aid. Now there is one message builder
+    (`launchd.recovery_message`, deliberately BARE) and one prefixer
+    (`status.format_warning_branch`), so the merge path and the raw
+    `write_running(warning=...)` preflight path produce byte-identical
+    text with exactly one prefix."""
+    from onoats.status import format_warning_branch
+    from onoats.status import stt_branch
+    from onoats.stt.launchd import recovery_message
+
+    bare = recovery_message("pipecat.stt-server")
+    assert not bare.startswith("stt:")  # the builder never prefixes
+
+    # Path A: the merge path (live-session recovery).
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="websocket")
+    set_warning_branch(tmp_path, stt_branch(None), bare)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert got.warning == (
+        "stt: server restarted automatically (kickstarted pipecat.stt-server)"
+    )
+    assert "stt: stt:" not in got.warning
+
+    # Path B: the raw write_running(warning=...) preflight path, which does
+    # NOT go through the merge — same formatter, same result.
+    assert format_warning_branch(stt_branch(None), bare) == got.warning
+
+
+def test_set_warning_branch_noop_on_stopped_record(tmp_path: Path):
+    """Mirrors set_devices's existing `not current.running` guard: a branch
+    event can race ahead of the NEXT session's write_running and land while
+    the on-disk record still belongs to the previous, already-stopped
+    session — annotating it would mislabel history, so this must no-op
+    exactly like set_devices does, not silently mutate the stale record."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    write_stopped(tmp_path, exit_reason="graceful")
+    before = read_status(tmp_path)
+    assert before is not None and before.running is False
+
+    assert set_warning_branch(tmp_path, "stt", "server unreachable") is None
+
+    after = read_status(tmp_path)
+    assert after == before
+
+
 def test_set_warning_branch_message_with_delimiter_is_a_known_limitation(
     tmp_path: Path,
 ):
@@ -932,3 +981,51 @@ def test_instance_lock_blocks_then_frees_on_release(tmp_path):
         _fcntl.flock(other, _fcntl.LOCK_UN)
     finally:
         _os.close(other)
+
+
+def test_stt_mic_and_system_branches_do_not_clobber_each_other(tmp_path: Path):
+    """Finding 6: `dual.py` constructs two independent WebSocketSTTService
+    instances against one server. Sharing a single "stt" branch key let
+    system's kickstart-recovery clear erase mic's still-unconfirmed warning
+    even though mic's own health was never confirmed — the same hazard the
+    "mic"/"system" capture branches already avoid by being instance-scoped."""
+    from onoats.status import stt_branch
+    from onoats.stt.launchd import recovery_message
+
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="websocket")
+
+    set_warning_branch(tmp_path, stt_branch("mic"), recovery_message("label-a"))
+    set_warning_branch(tmp_path, stt_branch("system"), recovery_message("label-a"))
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert "stt-mic: " in got.warning
+    assert "stt-system: " in got.warning
+
+    # system confirms first; mic's warning must survive.
+    set_warning_branch(tmp_path, stt_branch("system"), None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert "stt-mic: " in got.warning
+    assert "stt-system: " not in got.warning
+
+    # And they coexist with the shared preflight branch and the capture
+    # branches, in sorted order.
+    set_warning_branch(tmp_path, stt_branch(None), recovery_message("label-a"))
+    set_warning_branch(tmp_path, "mic", "no input")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    branches = [part.split(": ", 1)[0] for part in got.warning.split("; ")]
+    assert branches == sorted(branches)
+    assert set(branches) == {"mic", "stt", "stt-mic"}
+
+
+def test_stt_branch_keys_are_instance_scoped():
+    """Finding 6: mic and system are independent instances against one
+    server; a shared branch key let either one's clear erase the other's
+    still-unconfirmed warning."""
+    from onoats.status import stt_branch
+
+    assert stt_branch(None) == "stt"
+    assert stt_branch("mic") == "stt-mic"
+    assert stt_branch("system") == "stt-system"
+    assert stt_branch("mic") != stt_branch("system")

@@ -32,6 +32,7 @@ The ``[speakers]`` labels are consumed ONLY at render time by the converter
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -50,6 +51,54 @@ def looks_like_bearer_token(v: str) -> bool:
     """Validator: value looks like an API key (20+ chars)."""
     # vendored from koda shared/config.py
     return len(v.strip()) >= 20
+
+
+# launchd labels are reverse-DNS-ish identifiers. Validate against an explicit
+# allowlist at resolution time (``OnoatsConfig.stt_launchd_label``) because the
+# value is env/config-sourced and lands in two places where stray characters
+# are load-bearing:
+#   * the ``gui/<uid>/<label>`` service target — a ``/`` would redirect the
+#     kickstart at a different job (or domain) in the same user's session;
+#   * the recovery warning message, which ``status.set_warning_branch`` merges
+#     into a ``"; "``-joined, ``": "``-keyed string — a label containing either
+#     delimiter forges extra pseudo-branch entries on the next parse.
+# A NUL byte would additionally reach ``subprocess.run`` and raise ValueError.
+# Non-conforming values are treated as absent (``None``), i.e. "self-healing
+# not configured", which is the plan's documented no-op default.
+#
+# Lives here, not in ``onoats.stt.launchd``: this is config-value validation
+# and its sole caller is the config resolver below. Importing the STT
+# subsystem from the module that *configures* it inverted the dependency
+# direction for no reason (no cycle ever forced it).
+_LAUNCHD_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def validate_launchd_label(value: str | None) -> str | None:
+    """Return ``value`` if it is a well-formed launchd label, else ``None``.
+
+    Called once at config-resolution time (``OnoatsConfig.stt_launchd_label``)
+    so every downstream consumer — the ``gui/<uid>/<label>`` service target,
+    the recovery warning message merged into the status ``warning`` string —
+    can trust the value. See :data:`_LAUNCHD_LABEL_RE` for why each rejected
+    character class matters. A non-conforming value is logged once and treated
+    as absent (self-healing off) rather than rejected loudly: an unusable
+    label must never be more disruptive than not configuring one at all.
+
+    Uses ``fullmatch``, not ``match`` with a ``$`` anchor: Python's ``$``
+    also matches immediately before a trailing newline, so ``"label\\n"`` would
+    pass an otherwise-identical ``match`` check. This validator documents
+    itself as a self-sufficient trust boundary, so it must not depend on every
+    caller stripping first.
+    """
+    if value is None:
+        return None
+    if _LAUNCHD_LABEL_RE.fullmatch(value):
+        return value
+    logger.warning(
+        f"STT: ignoring malformed launchd label {value!r} — expected "
+        "[A-Za-z0-9][A-Za-z0-9._-]{0,127}; self-healing kickstart disabled"
+    )
+    return None
 
 
 def _config_home() -> Path:
@@ -281,8 +330,25 @@ class OnoatsConfig:
         bare ``mlx`` backend) prove no reliable derivation rule exists.
         """
         val = _env_or("STT_LAUNCHD_LABEL", self.raw.get("stt", {}).get("launchd_label"))
-        val = str(val).strip() if val is not None else ""
-        return val or None
+        if val is not None and not isinstance(val, str):
+            # A typed config.toml value (bool `true`, int `42`, ...) must not
+            # be coerced into a string via `str(val)` — that would turn e.g.
+            # `launchd_label = true` into the string "True", which passes
+            # `_LAUNCHD_LABEL_RE` and silently enables kickstart against a
+            # value the user never intended as a label. Env vars are always
+            # strings already, so this branch only fires for config.toml.
+            logger.warning(
+                f"STT: ignoring non-string [stt].launchd_label {val!r} "
+                "(expected a TOML string); self-healing kickstart disabled"
+            )
+            val = None
+        val = val.strip() if val is not None else ""
+        # Allowlist-validate once, here, at the single resolution point: the
+        # label is interpolated into launchctl's `gui/<uid>/<label>` service
+        # target AND embedded in a status warning message whose merge format
+        # is delimiter-sensitive. A non-conforming value normalizes to None
+        # (self-healing off) — see `validate_launchd_label`.
+        return validate_launchd_label(val or None)
 
     # ---- speakers (render-only display labels) ----
     @property
