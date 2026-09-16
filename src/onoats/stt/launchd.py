@@ -13,6 +13,29 @@ check=False)`` wrapped in a broad, non-raising ``except``. Every async call
 site invokes it via ``asyncio.to_thread`` so a wedged ``launchd`` job never
 blocks the event loop.
 
+**Where the kickstart recovery state machine lives** (it is deliberately
+split across three layers; this is the map, since no single module owns it):
+
+- *Cross-instance, process-wide* — this module: ``_last_kickstart`` (the
+  label-keyed cooldown stamp, via ``try_kickstart``/``reset_cooldown``) and
+  ``_unhealthy`` (label -> instance tokens currently failing, via
+  ``mark_unhealthy``/``clear_unhealthy``), plus the one recovery message
+  text (``recovery_message``).
+- *Per-instance* — ``onoats.stt.websocket_stt_service.WebSocketSTTService``:
+  ``_instance_token``, ``_kickstart_awaiting_connect`` (+ its
+  ``KICKSTART_CONFIRM_WINDOW_SEC`` deadline), ``_kickstart_awaiting_transcript``
+  and ``_preflight_confirm_pending`` — which gate *when* this instance fires
+  its own ``on_recovery``/``on_preflight_confirmed``.
+- *Presentation* — ``onoats.runtime._create_stt_service`` builds the
+  swallow-and-log callbacks, and ``onoats.status`` owns the branch keys
+  (``stt`` shared / ``stt-mic``/``stt-system`` per-instance) and the
+  ``"<branch>: "`` prefix. ``AGENTS.md``'s "STT self-healing invariants"
+  section states the load-bearing rules across all three.
+
+Consolidating these into one owner is a worthwhile refactor but a
+human-sized design call (it crosses the leaf-module boundary this module
+exists to preserve), not a fixer's — see the dev plan's Findings.
+
 **GUI-domain caveat**: ``gui/$UID/<label>`` assumes ``onoats bot`` runs
 inside a GUI (Aqua) session, matching how the shipped LaunchAgents are
 registered today. A non-GUI invocation (ssh session, headless daemon with no
@@ -26,6 +49,7 @@ launchd's GUI-domain model, not something this module can fix.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import time
@@ -35,10 +59,49 @@ from loguru import logger
 
 _KICKSTART_TIMEOUT_SEC = 5
 
+# Absolute path, not a bare ``launchctl`` name resolved through the inherited
+# PATH: this shellout has restart/kill effect on a launchd job, so it must not
+# be redirectable by a PATH entry an unrelated wrapper script happened to
+# prepend. ``/bin/launchctl`` is the shipped location on every supported macOS.
+_LAUNCHCTL = "/bin/launchctl"
+
 # Must exceed WebSocketSTTService's live reconnect backoff total (~15.5s,
-# see runtime.py's `_PREFLIGHT_RETRY_*` comment) plus margin, so a
-# kickstart's own retry window can never itself trigger a second kickstart.
+# see websocket_stt_service.py's `_RECONNECT_BACKOFF_SECONDS` comment) plus
+# margin, so a kickstart's own retry window can never itself trigger a
+# second kickstart.
 KICKSTART_COOLDOWN_SEC = 30
+
+# How long after a kickstart a subsequent successful connect may still be
+# attributed to it ("server restarted automatically" + arm the transcript
+# gate). Deliberately NOT ``KICKSTART_COOLDOWN_SEC``: the confirming reconnect
+# is demand-driven (it only happens on the next VAD-triggered segment) and can
+# itself burn ~15.5s of reconnect backoff before succeeding, so a 30s window
+# silently dropped genuine recoveries — and with them the arming of
+# ``_kickstart_awaiting_transcript``, so ``reset_cooldown`` never fired
+# either. Sized to cover the full backoff schedule plus a realistic gap of
+# silence before the user next speaks, while still expiring a kickstart that
+# launchd accepted but that never restored service (the stale-claim case this
+# deadline exists for).
+KICKSTART_CONFIRM_WINDOW_SEC = 120
+
+# Minimal, deny-by-default environment for the ``launchctl`` shellout. The
+# parent process environment carries STT/Deepgram credentials (``STT_WS_TOKEN``,
+# ``DEEPGRAM_API_KEY``) and can carry loader-control variables
+# (``DYLD_INSERT_LIBRARIES``); ``launchctl kickstart`` needs none of it — it
+# only talks to launchd over XPC. Passing an explicit allowlist keeps secrets
+# out of the child and keeps the child's loader behaviour non-overridable.
+_ENV_PASSTHROUGH_KEYS = ("HOME", "TMPDIR", "USER", "LOGNAME")
+
+
+def _kickstart_env() -> dict[str, str]:
+    """Build the explicit, minimal env for the ``launchctl`` subprocess."""
+    env = {"PATH": "/usr/bin:/bin"}
+    for key in _ENV_PASSTHROUGH_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    return env
+
 
 # label -> last-kickstart monotonic time. Process-wide and label-keyed
 # (not per-WebSocketSTTService-instance): dual.py constructs two
@@ -46,6 +109,18 @@ KICKSTART_COOLDOWN_SEC = 30
 # startup preflight path stamps the same registry, so a preflight kickstart
 # counts against the live-session budget too.
 _last_kickstart: dict[str, float] = {}
+
+# label -> set of instance tokens currently in the "reconnect backoff
+# exhausted, not yet confirmed healthy again" state. Guards the EARLY cooldown
+# reset: the cooldown is process-wide, but confirmation is per-instance, so one
+# instance's confirmed transcript is not evidence that its sibling (the other
+# of dual.py's mic/system pair, against the same physical server) is healthy.
+# Without this, mic confirming recovery would clear the shared cooldown and let
+# system's very next exhaustion SIGKILL + restart the server mic is actively
+# using — the exact storm the shared cooldown exists to prevent. A lingering
+# token can only delay the early reset, never block kickstart forever: the
+# cooldown still expires on its own after ``KICKSTART_COOLDOWN_SEC``.
+_unhealthy: dict[str, set[str]] = {}
 
 
 def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
@@ -63,15 +138,21 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
     request, not that the server is answering again — callers must confirm
     recovery with their own post-kickstart handshake/reconnect.
     """
-    resolved_uid = uid if uid is not None else os.getuid()
-    argv = ["launchctl", "kickstart", "-k", f"gui/{resolved_uid}/{label}"]
     try:
+        # `os.getuid` is POSIX-only and absent on Windows. onoats is a
+        # macOS-only app, so this is defensive rather than a live platform
+        # gap — but the whole contract of this function is "never raises",
+        # and a bare `AttributeError` escaping from the *first* line would
+        # break it before the handled block is ever entered.
+        resolved_uid = uid if uid is not None else os.getuid()
+        argv = [_LAUNCHCTL, "kickstart", "-k", f"gui/{resolved_uid}/{label}"]
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=_KICKSTART_TIMEOUT_SEC,
             check=False,
+            env=_kickstart_env(),
         )
         if result.returncode == 0:
             return True
@@ -80,7 +161,22 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
             f"{result.stderr.strip() or result.stdout.strip()}"
         )
         return False
-    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+    except (
+        FileNotFoundError,
+        subprocess.SubprocessError,
+        OSError,
+        # ``os.getuid`` is absent on non-POSIX platforms; see the comment at
+        # the top of the block. Keeps the "never raises" contract honest even
+        # off the supported platform.
+        AttributeError,
+        # ``subprocess`` raises ValueError (not OSError) for an argv element
+        # containing an embedded NUL. ``label`` is env/config-sourced, so a
+        # NUL can reach here whenever a caller bypasses
+        # ``onoats.config.validate_launchd_label``. Without this clause the "never
+        # raises" contract breaks and preflight aborts instead of falling
+        # through to its normal unreachable-server error.
+        ValueError,
+    ) as exc:
         logger.warning(f"STT: kickstart of {label!r} failed: {exc}")
         return False
 
@@ -99,9 +195,108 @@ def _stamp_cooldown(label: str, clock: Callable[[], float] = time.monotonic) -> 
     _last_kickstart[label] = clock()
 
 
-def _reset_cooldown(label: str) -> None:
-    """Clear ``label``'s cooldown stamp — called on confirmed sustained
-    health (a ``transcript.*`` event following a kickstart), never on a
-    bare successful connect. Test-only convenience is not exposed here;
-    this is the one production reset path (Phase 4)."""
+async def try_kickstart(label: str) -> bool:
+    """Atomic "check cooldown, stamp it, kickstart" primitive. Never raises.
+
+    The single owner of the check-then-stamp-then-kickstart sequence both
+    call sites (``runtime._kickstart_and_retry`` for the preflight path,
+    ``WebSocketSTTService._maybe_kickstart`` for the live path) previously
+    hand-duplicated. Keeping it in one place is what makes the ordering
+    guarantee auditable: the cooldown check and the stamp happen with **no**
+    ``await`` between them, so two callers racing the same label on one event
+    loop can never both pass the check before either stamps.
+
+    The stamp lands even when ``launchctl`` subsequently fails — a failed
+    kickstart still counts against the window so a wedged label isn't
+    hammered once per reconnect cycle.
+
+    Returns ``True`` only when launchd accepted the restart request. ``False``
+    covers both "cooldown still active" and "kickstart failed"; every caller
+    treats those identically (fall through to today's behavior), so they are
+    deliberately not distinguished.
+    """
+    if not _cooldown_elapsed(label):
+        return False
+    _stamp_cooldown(label)
+    return await asyncio.to_thread(kickstart_stt_server, label)
+
+
+def recovery_message(label: str) -> str:
+    """The one recovery warning message, for every path that reports one.
+
+    Deliberately **bare** — no ``"stt: "`` branch prefix. Prefixing is
+    ``status``'s job (``format_warning_branch`` / ``set_warning_branch``), so
+    there is exactly one owner of the text and exactly one owner of the
+    branch-key lead-in. Both the preflight path
+    (``runtime._kickstart_and_retry``) and the live path
+    (``WebSocketSTTService._ensure_connected``) call this rather than
+    formatting their own copy.
+    """
+    return f"server restarted automatically (kickstarted {label})"
+
+
+def mark_unhealthy(label: str, token: str) -> None:
+    """Record that instance ``token`` is currently failing to connect.
+
+    Called from ``WebSocketSTTService._ensure_connected`` on that instance's
+    **first failed connect attempt** — deliberately *not* at full-backoff
+    exhaustion. Registering only at exhaustion left a ~15.5s hole: a sibling
+    that had just started failing was not yet registered, so the *other*
+    instance's confirmed transcript cleared the shared cooldown stamp
+    outright, and the sibling's own exhaustion moments later was then free to
+    SIGKILL and restart the server the healthy instance was actively using —
+    the exact double-kickstart storm the shared cooldown exists to prevent,
+    with the timing merely shifted. Registering on first failure only widens
+    the protected window; the registration is cleared by that same instance's
+    next confirmed transcript (:func:`reset_cooldown`) or by its
+    ``cleanup()`` (:func:`clear_unhealthy`), so nothing is narrowed.
+
+    The **preflight** path (``runtime._kickstart_and_retry``) deliberately
+    does *not* register: it runs once at startup against a throwaway probe
+    client, before any ``WebSocketSTTService`` exists, and has no lifecycle
+    on which to clear a token — a registration from there would linger for
+    the whole session and block every early cooldown reset. It is already
+    gated by the shared cooldown itself, which is the protection that matters
+    for the (startup-only, hence very narrow) preflight-vs-live race.
+
+    Paired with :func:`reset_cooldown`, which only performs the early
+    cooldown reset once *every* registered instance for the label has
+    confirmed health again.
+    """
+    _unhealthy.setdefault(label, set()).add(token)
+
+
+def clear_unhealthy(label: str, token: str) -> None:
+    """Drop ``token``'s unhealthy registration without touching the cooldown.
+
+    Used on teardown (``WebSocketSTTService.cleanup``) so a stopped instance
+    cannot hold its sibling's early cooldown reset hostage.
+    """
+    pending = _unhealthy.get(label)
+    if pending is None:
+        return
+    pending.discard(token)
+    if not pending:
+        _unhealthy.pop(label, None)
+
+
+def reset_cooldown(label: str, token: str | None = None) -> None:
+    """Clear ``label``'s cooldown stamp on confirmed sustained health.
+
+    Called from the live path on the first ``transcript.*`` event following a
+    kickstart — never on a bare successful connect. This is the one production
+    reset path (Phase 4); public (not ``_reset_cooldown``) because it is a
+    documented cross-module entry point like :func:`try_kickstart`.
+
+    ``token`` identifies the confirming ``WebSocketSTTService`` instance. The
+    cooldown is process-wide but confirmation is per-instance, so the stamp is
+    only dropped once no *other* instance sharing ``label`` is still in the
+    exhausted-and-unconfirmed state (see :data:`_unhealthy`). With ``token``
+    omitted (no instance context) the reset is unconditional, matching the
+    pre-guard behaviour.
+    """
+    if token is not None:
+        clear_unhealthy(label, token)
+        if _unhealthy.get(label):
+            return
     _last_kickstart.pop(label, None)
