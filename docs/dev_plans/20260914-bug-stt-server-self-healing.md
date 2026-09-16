@@ -1,12 +1,12 @@
 # Task: STT server self-healing + Onoats.app launch-at-login
 
-**Status**: Implemented — round 10's findings fixed directly post-cap (see "Round 10 fixes" below), outside the gauntlet's own automation since the loop was already at its hard cap; Phase 5 (native Swift launch-at-login) still pending manual build/spike verification by the user — the Swift edit in this pass is typecheck-unverified (no Xcode license in this environment, same limitation as Phase 5's original draft)
+**Status**: Implemented and committed — round 10's findings fixed directly post-cap (see "Round 10 fixes" below), outside the gauntlet's own automation since the loop was already at its hard cap; rounds 1-9's previously-uncommitted hardening fixes (launchd_label allowlist validation, per-instance `stt-mic`/`stt-system` status branches, `launchctl` absolute-path + minimal-env, the `try_kickstart`/`mark_unhealthy` double-kickstart-storm fix, `onoats init` carry-over, login-item main-actor fix) are now committed too — see "Implementation Notes (post-hoc)" below for how these differ from this plan's original Requirements/Architecture Decisions text. Phase 5 (native Swift launch-at-login) still pending manual build/spike verification by the user — the Swift edits in this branch are typecheck-unverified (no Xcode license in this environment, same limitation as Phase 5's original draft)
 **Component**: stt, recorder, macos
 **Assigned to**: Claude
 **Priority**: Medium
 **Branch**: bug/stt-server-self-healing
 **Created**: 2026-09-14
-**Completed**: 2026-09-15/16 (Phases 1-4 + review-gauntlet rounds 1-9 fixed and verified); review-gauntlet hit cap at round 10 (2026-09-16) with unresolved findings — Phase 5 manual verification also outstanding
+**Completed**: 2026-09-15/16 (Phases 1-4 + review-gauntlet rounds 1-9 fixed, verified, and committed); review-gauntlet hit cap at round 10 (2026-09-16), findings fixed and committed directly post-cap — Phase 5 manual verification still outstanding
 **Review Gates**: none
 
 ## Objective
@@ -315,7 +315,7 @@ Context lifecycle — what enters context at each step, and whether it clears or
 - Tests passing
 - Documentation updated
 
-<!-- reviewed: 2026-09-16 @ fab496e55982257a435db9487660830db4df7e57 -->
+<!-- reviewed: 2026-09-16 @ 4a581874c4db2efb67e8178242bc1594732322f9 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -486,6 +486,19 @@ The gauntlet loop itself terminated at `cap` (10 rounds) and cannot run an 11th 
 - **`_preflight_cache` outcome-blind (Important, architecture)** — the finding text itself notes this is pre-existing, not introduced by round 9's redaction work. Fixing it means `dual.py`'s `preflight_recovered` threading becomes cache-driven instead of manually threaded between two `_create_stt_service` calls — a structural change to the preflight-cache contract, not a redaction/credential-leak fix. Left for a follow-up pass rather than folded into this credential-leak-focused round.
 - **`RecorderModel`/`LoginItemManager` Swift separation-of-concerns (Minor, architecture)** — a taste-level refactor suggestion, not a correctness issue; no test can verify a Swift architectural reshuffle in this environment. Deferred.
 - **`_safe_exc_text` compat alias re-privatizing a public symbol (Minor)** — already substantively mitigated: `tests/test_redact.py` (new this pass) tests the public `onoats._redact.safe_exc_text`/`redact_uri` symbols directly, so the module's own public API is no longer test-blind. The `runtime._safe_exc_text = safe_exc_text` alias itself is kept deliberately, per round 9's stated backward-compatibility rationale, for existing `runtime._safe_exc_text`-qualified call sites and tests. Accepted as-is.
+
+### Implementation Notes (post-hoc)
+
+`/update-docs` found the contract sections above (Requirements, Review Focus, Architecture Decisions, Integration Seams) describe the design as originally specified, but rounds 1-9's review fixes refined several pieces beyond that text before landing (in commits `7c6b87a`, `53142e4`, `219147d`, `7077d76` — all committed 2026-09-16, after having sat uncommitted through the review-gauntlet rounds). Recorded here rather than rewritten into the contract sections above, to avoid re-litigating an already-`/review-plan`-signed-off design:
+
+- **Status-warning branch keys: two schemes, not one shared `"stt"` branch.** Requirements/Review Focus/Architecture Decisions/Integration Seams describe a single `"stt"` branch for both preflight and live-session recovery. Shipped behavior instead uses `status.stt_branch(instance)`: the shared `"stt"` branch for the startup preflight (unchanged — one probe, one server, before any instance exists), but **per-instance `"stt-mic"`/`"stt-system"`** branches for live-session recovery, so `dual.py`'s two `WebSocketSTTService` instances can't clear each other's still-unconfirmed warning. `status.format_warning_branch()` is the single owner of the `"<branch>: "` prefix (previously duplicated ad hoc).
+- **`launchd_label` is allowlist-validated**, not accepted as any non-empty string. `onoats.config.validate_launchd_label` (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) runs once at `OnoatsConfig.stt_launchd_label` resolution — the label reaches both the `gui/<uid>/<label>` launchctl target and the delimiter-sensitive status-warning merge, so an unvalidated value could redirect the kickstart target or forge extra branch entries on the next warning parse.
+- **`kickstart_stt_server` hardened**: absolute `/bin/launchctl` (not a PATH-resolved bare name) and an explicit minimal subprocess env (not the inherited environment, which carries STT/Deepgram credentials) — see `src/onoats/stt/launchd.py`'s `_kickstart_env`.
+- **`try_kickstart()` replaces hand-duplicated cooldown check/stamp logic** at each call site with one atomic primitive (no `await` between check and stamp), and `mark_unhealthy`/`clear_unhealthy`/`reset_cooldown(token=...)` add a per-instance "still exhausted and unconfirmed" guard on the early cooldown reset — fixes a double-kickstart storm where one instance's confirmed transcript could clear the shared cooldown while its sibling was still failing, letting the sibling's next exhaustion SIGKILL the server the first instance was actively using. `KICKSTART_CONFIRM_WINDOW_SEC = 120` (separate from `KICKSTART_COOLDOWN_SEC = 30`) bounds how long a post-kickstart connect may still be attributed to that kickstart.
+- **`onoats init` carries `[stt].launchd_label`/`[app]` forward across a re-run** instead of silently dropping them (the renderer rebuilds `config.toml` from the prompted field set only) — the carried label is re-validated through `validate_launchd_label`, not copied blind.
+- **`LoginItemManager.sync()` runs off the main actor** (`Task.detached`, hopping back only to publish the result) — Phase 5's mid-review found the synchronous `SMAppService` XPC calls could stall the menu bar's first render at login.
+
+See `AGENTS.md`'s "STT self-healing (`launchctl kickstart`) invariants" section for the authoritative, current description of the shipped design — it postdates and supersedes the summary above where they'd otherwise conflict.
 
 ### Review Waivers
 
