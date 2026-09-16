@@ -146,10 +146,6 @@ final class RecorderModel: ObservableObject {
     // ------------------------------------------------------------------ init
 
     init() {
-        // RecorderModel is constructed once, at OnoatsMenuBarApp startup —
-        // the "every launch" checkpoint the login-item sync is specified
-        // against (dev plan Phase 5).
-        loginItemHint = LoginItemManager.sync()
         refresh()
         // .common so the poll keeps firing during menu tracking.
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -157,6 +153,29 @@ final class RecorderModel: ObservableObject {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+
+        // RecorderModel is constructed once, at OnoatsMenuBarApp startup —
+        // the "every launch" checkpoint the login-item sync is specified
+        // against (dev plan Phase 5). `SMAppService`'s `.status`/
+        // `.register()`/`.unregister()` are synchronous XPC round-trips to
+        // the background-task-management daemon (up to 3 blocking calls) —
+        // right at login, when that daemon is busiest. Run off the main
+        // actor so a slow daemon can't stall the menu bar's first render;
+        // hop back only to publish the result.
+        Task.detached { [weak self] in
+            let hint = LoginItemManager.sync()
+            guard let self else { return }
+            await self.applyLoginItemHint(hint)
+        }
+    }
+
+    /// Publishes the login-item sync result. A dedicated `@MainActor`-isolated
+    /// method (rather than an inline `MainActor.run { self?...}` closure) so
+    /// the actor hop from `Task.detached` above doesn't recapture `self` in a
+    /// nested closure — that pattern is a warning today and an error under
+    /// the Swift 6 language mode (`self` isn't provably `Sendable`).
+    private func applyLoginItemHint(_ hint: String?) {
+        loginItemHint = hint
     }
 
     deinit {
