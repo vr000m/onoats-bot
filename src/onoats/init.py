@@ -35,7 +35,12 @@ import os
 import sys
 from pathlib import Path
 
-from onoats.config import config_toml_path, load_config, secrets_env_path
+from onoats.config import (
+    config_toml_path,
+    load_config,
+    secrets_env_path,
+    validate_launchd_label,
+)
 
 # --- STT backend identifiers written into config.toml [stt].service ---------
 # "local" splits into "whisper" (MLX/CPU) or "websocket" (stt_server socket);
@@ -272,8 +277,41 @@ def _seed_dictionary(import_path: str | None) -> Path:
 # ---------------------------------------------------------------------------
 
 
+_TOML_CONTROL_ESCAPES = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape ``value`` for embedding in a TOML basic (quoted) string.
+
+    Must escape every character TOML's basic-string grammar forbids literal,
+    not just backslash and quote: `tomllib` hands back an *actual* control
+    character (e.g. a real newline) for any TOML string that itself used a
+    `\\n`/`\\t`/etc. escape. Round-tripping that character back out unescaped
+    (the previous behavior here) emits a raw newline into `config.toml`,
+    producing a file `tomllib` then refuses to parse on the next load —
+    silently losing the user's settings. Escape backslash first so later
+    replacements don't double-escape the backslashes they introduce, then
+    quote, then the named single-character TOML escapes, then any remaining
+    control character as `\\uXXXX` (covers e.g. NUL, ESC — TOML forbids them
+    literal but has no dedicated short escape).
+    """
+    out = value.replace("\\", "\\\\").replace('"', '\\"')
+    for ch, escape in _TOML_CONTROL_ESCAPES.items():
+        out = out.replace(ch, escape)
+    # TOML's basic-string grammar forbids U+0000-U+0008, U+000A-U+001F, AND
+    # U+007F (DEL) literal — not just the < 0x20 range. A DEL byte slipping
+    # through here round-trips into a `config.toml` `tomllib` then refuses to
+    # parse, the exact silent-settings-loss failure this helper exists to
+    # prevent, just for one more code point than the range check below names.
+    return "".join(
+        f"\\u{ord(c):04x}" if ord(c) < 0x20 or ord(c) == 0x7F else c for c in out
+    )
 
 
 def _render_config_toml(
@@ -285,6 +323,7 @@ def _render_config_toml(
     categories: list[str],
     tuning: dict,
     data_dir: str | None = None,
+    app: dict | None = None,
 ) -> str:
     lines: list[str] = [
         "# onoats configuration — written by `onoats init`.",
@@ -307,7 +346,47 @@ def _render_config_toml(
         lines.append(f'ws_socket = "{_toml_escape(stt["ws_socket"])}"')
     if stt.get("language"):
         lines.append(f'language = "{_toml_escape(stt["language"])}"')
+    if stt.get("launchd_label"):
+        lines.append(f'launchd_label = "{_toml_escape(stt["launchd_label"])}"')
     lines.append("")
+    # `[app]` is Swift-only (the Python config reader never reads it), but it
+    # still has to survive a regeneration — see the carry-over in `main()`.
+    #
+    # Detect more than the bare-boolean form. `ConfigStore.readValue` (the
+    # Swift reader) strips surrounding quotes, so `launch_at_login = "false"`
+    # is a spelling the Swift side accepts and users do write — but `tomllib`
+    # hands it back as the *string* `"false"`, which an `isinstance(..., bool)`
+    # test rejects. The whole `[app]` section was then dropped on every
+    # `onoats init` re-run, silently RE-ENABLING a login item the user had
+    # explicitly disabled (absent means "take no action", which leaves an
+    # existing registration in place). Any other value is preserved verbatim
+    # as a quoted string rather than dropped: the Swift reader already treats
+    # an unrecognized spelling as absent, so round-tripping it is strictly
+    # safer than deleting the user's line.
+    app_login = app.get("launch_at_login") if isinstance(app, dict) else None
+    rendered_login: str | None = None
+    if isinstance(app_login, bool):
+        rendered_login = "true" if app_login else "false"
+    elif isinstance(app_login, str) and app_login in ("true", "false"):
+        # Exact match only — NOT `.strip()`ed. `ConfigStore.readValue` (Swift)
+        # trims outer whitespace only for a *bare* value; for a *quoted*
+        # string it preserves internal padding verbatim (only the
+        # surrounding quotes are stripped), so a stored `" false "` reads
+        # back on the Swift side as the literal string " false ", which the
+        # exact "true"/"false" check there treats as an unrecognized
+        # spelling — i.e. absent, no action taken. Normalizing it here to
+        # bare `false` would make it Swift-recognized where it wasn't
+        # before, turning a previously-inert value into an actual
+        # unregister on next app launch. Anything not already spelled
+        # exactly "true"/"false" falls through to the verbatim-preserved
+        # branch below instead, keeping it exactly as inert as it was.
+        rendered_login = app_login
+    elif app_login is not None:
+        rendered_login = f'"{_toml_escape(str(app_login))}"'
+    if rendered_login is not None:
+        lines.append("[app]")
+        lines.append(f"launch_at_login = {rendered_login}")
+        lines.append("")
     lines.append("[speakers]")
     lines.append(f'me = "{_toml_escape(speakers.get("me", "Me"))}"')
     lines.append(f'them = "{_toml_escape(speakers.get("them", "Them"))}"')
@@ -520,6 +599,56 @@ def main(argv: list[str] | None = None) -> int:
         if args.deepgram_key:
             secrets["DEEPGRAM_API_KEY"] = args.deepgram_key
 
+    # Carry over config.toml keys `onoats init` never prompts for. The
+    # renderer rebuilds the file from scratch out of the prompted field set
+    # only, so re-running `onoats init` on an already-configured install used
+    # to silently DROP `[stt].launchd_label` and the whole `[app]` section —
+    # disabling STT self-healing and launch-at-login for a user who had set
+    # them up by hand. Applies to both the interactive and flag paths, neither
+    # of which offers these keys.
+    #
+    # The carried value is re-validated, not copied blind: the runtime reader
+    # (`OnoatsConfig.stt_launchd_label`) already runs every label through
+    # `validate_launchd_label` and treats a non-conforming one as absent, so a
+    # schema-invalid value stored in config.toml is *already* inert at
+    # runtime. Copying it through unchecked let it reach `_toml_escape`
+    # (TypeError on a non-string — a TOML integer or array) or, for a string
+    # carrying a raw newline, corrupt the regenerated config.toml by breaking
+    # out of its own line. Dropping it here makes the rendered file agree with
+    # what the runtime would actually honour.
+    carried_label = existing_stt.get("launchd_label")
+    if carried_label is not None and not stt.get("launchd_label"):
+        # Strip before validating, matching `OnoatsConfig.stt_launchd_label`'s
+        # own normalization policy (`config/__init__.py`): the runtime reader
+        # strips whitespace before allowlist-validating a label, so a stored
+        # `" pipecat.stt-server "` resolves and self-heals correctly at
+        # runtime. Validating the RAW, unstripped string here disagreed with
+        # that and rejected/dropped the same value on every `onoats init`
+        # re-run, silently disabling self-healing the user had working.
+        stripped_label = (
+            carried_label.strip() if isinstance(carried_label, str) else None
+        )
+        # Empty/whitespace-only carries as silently absent, not "malformed":
+        # `OnoatsConfig.stt_launchd_label` (config/__init__.py) normalizes an
+        # empty/whitespace value via `val or None` *before* calling
+        # `validate_launchd_label`, so it never warns for that case. Passing
+        # `""` straight into `validate_launchd_label` instead (as this carry-
+        # over used to) fails the label regex and both logs a spurious
+        # "malformed" warning and prints a misleading note here, on every
+        # `onoats init` re-run of an install that simply never set a label.
+        validated_label = (
+            validate_launchd_label(stripped_label) if stripped_label else None
+        )
+        if validated_label:
+            stt["launchd_label"] = validated_label
+        elif stripped_label:
+            print(
+                f"  note: ignoring malformed [stt].launchd_label "
+                f"{carried_label!r} — it is already inert at runtime and is "
+                "not carried into the regenerated config.toml."
+            )
+    existing_app = existing.raw.get("app", {})
+
     if not args.no_preflight:
         _run_preflight(stt, secrets)
 
@@ -581,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         categories=categories,
         tuning=tuning,
         data_dir=data_dir,
+        app=existing_app,
     )
     _write_config_toml(config_path, content)
     _write_secrets_env(secrets_path, secrets, merge_existing=True)

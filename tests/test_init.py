@@ -151,6 +151,289 @@ def test_idempotent_rerun_preserves_values(_isolate_env, monkeypatch):
     assert cfg["stt"]["language"] == "auto"
 
 
+def test_rerun_preserves_launchd_label_and_app_section(_isolate_env, monkeypatch):
+    """Round-2 finding 12: `onoats init` regenerates config.toml from only the
+    field set it prompts for, so a re-run silently DROPPED a hand-configured
+    `[stt].launchd_label` and the whole `[app]` section — disabling STT
+    self-healing and launch-at-login on a routine rerun."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace(
+            "[stt]\n",
+            '[stt]\nlaunchd_label = "pipecat.stt-server.nemotron"\n',
+        )
+        + "\n[app]\nlaunch_at_login = true\n"
+    )
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["stt"]["launchd_label"] == "pipecat.stt-server.nemotron"
+    assert cfg["app"]["launch_at_login"] is True
+
+
+def test_rerun_preserves_a_quoted_launch_at_login_value(_isolate_env, monkeypatch):
+    """Round-3 finding 7: only the BARE-boolean form was detected, so a
+    `launch_at_login = "false"` (a spelling `ConfigStore.readValue` accepts,
+    since it strips surrounding quotes, and which `tomllib` hands back as a
+    string) caused the whole `[app]` section to be dropped on rerun —
+    silently RE-ENABLING a login item the user had explicitly disabled, since
+    absent means "take no action" and leaves an existing registration alone.
+    """
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text() + '\n[app]\nlaunch_at_login = "false"\n')
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    # Normalized to the bare boolean form both readers accept — but, crucially,
+    # still present and still FALSE.
+    assert cfg["app"]["launch_at_login"] is False
+
+
+def test_rerun_preserves_an_unrecognized_launch_at_login_value(
+    _isolate_env, monkeypatch
+):
+    """Same root cause as above: an unrecognized spelling (Python-style
+    `True`) is treated as absent by the Swift reader, but deleting the user's
+    line is strictly worse than round-tripping it — the value is preserved
+    verbatim so a typo is still visible and fixable in the file."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text() + '\n[app]\nlaunch_at_login = "True"\n')
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["app"]["launch_at_login"] == "True"
+
+
+def test_rerun_keeps_a_whitespace_padded_launch_at_login_inert(
+    _isolate_env, monkeypatch
+):
+    """Round-4 finding 2: a quoted, whitespace-padded value like
+    `launch_at_login = " false "` reads back on the Swift side as the
+    literal string " false " (`ConfigStore.readValue` trims OUTSIDE a quoted
+    value but preserves whitespace INSIDE one) — which its exact "true"/
+    "false" check treats as unrecognized, i.e. absent/inert, same as any
+    other typo. The carry-over used to `.strip()` before comparing, so it
+    normalized this to bare `false` on rerun — a spelling the Swift side
+    DOES recognize, turning a previously-inert value into a real unregister
+    on next app launch. It must round-trip verbatim (still inert) instead.
+    """
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text() + '\n[app]\nlaunch_at_login = " false "\n')
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    # Preserved verbatim (still the padded string, not normalized to the
+    # bare boolean `false`) — exactly as inert on the Swift side as before.
+    assert cfg["app"]["launch_at_login"] == " false "
+
+
+def test_rerun_escapes_a_control_character_in_launch_at_login(
+    _isolate_env, monkeypatch
+):
+    """Round-4 finding 3: an existing `[app].launch_at_login` string that
+    contains a raw control character (as `tomllib` hands back for a TOML
+    string that itself used a `\\n` escape) must be re-escaped, not emitted
+    literally — `_toml_escape` previously only escaped backslash and quote,
+    so a raw newline broke out of its own quoted string, producing a
+    config.toml that `tomllib` then refuses to parse on the next load."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    # A TOML basic string containing an escaped newline — tomllib hands
+    # this back to Python as the two-character... actually one-character
+    # (U+000A) real newline, not the two-character sequence "\n".
+    path.write_text(path.read_text() + '\n[app]\nlaunch_at_login = "bad\\nvalue"\n')
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    # The regenerated file must still be valid TOML (this alone would raise
+    # tomllib.TOMLDecodeError before the fix, since a raw newline inside a
+    # basic string is a syntax error).
+    cfg = _load_toml(config_toml_path())
+    assert cfg["app"]["launch_at_login"] == "bad\nvalue"
+    # And the raw file must not contain a literal, unescaped newline inside
+    # the quoted value.
+    raw = path.read_text()
+    line = next(ln for ln in raw.splitlines() if ln.startswith("launch_at_login"))
+    assert "\\n" in line
+
+
+def test_rerun_escapes_a_del_character_in_launch_at_login(_isolate_env, monkeypatch):
+    """Round-5 finding 1: TOML's basic-string grammar forbids U+007F (DEL)
+    literal, in addition to the U+0000-U+001F range — `_toml_escape`'s final
+    escape condition only checked `ord(c) < 0x20`, so a stored value
+    containing a DEL byte (e.g. `tomllib`'s decode of a source string that
+    itself used a `\\u007f` escape) round-tripped straight through unescaped,
+    producing a `config.toml` that is itself invalid TOML on the next
+    `tomllib` parse."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text() + '\n[app]\nlaunch_at_login = "bad\\u007fvalue"\n')
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    # The regenerated file must still be valid TOML (this alone would raise
+    # tomllib.TOMLDecodeError before the fix, since a raw DEL byte inside a
+    # basic string is forbidden).
+    cfg = _load_toml(config_toml_path())
+    assert cfg["app"]["launch_at_login"] == "bad\x7fvalue"
+    raw = path.read_text()
+    line = next(ln for ln in raw.splitlines() if ln.startswith("launch_at_login"))
+    assert "\x7f" not in line
+    assert "\\u007f" in line
+
+
+def test_rerun_carries_a_whitespace_padded_launchd_label(_isolate_env, monkeypatch):
+    """Round-5 finding 2: `OnoatsConfig.stt_launchd_label` (the runtime
+    reader) strips whitespace before allowlist-validating a label, so a
+    stored `" pipecat.stt-server "` resolves and self-heals correctly at
+    runtime. The `onoats init` carry-over validated the RAW, unstripped
+    string instead — disagreeing with the runtime reader — so it rejected
+    and silently DROPPED the same value on every `onoats init` rerun,
+    disabling self-healing the user had working."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace(
+            "[stt]\n",
+            '[stt]\nlaunchd_label = " pipecat.stt-server.nemotron "\n',
+        )
+    )
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["stt"]["launchd_label"] == "pipecat.stt-server.nemotron"
+
+
+def test_rerun_drops_a_schema_invalid_launchd_label(_isolate_env, monkeypatch):
+    """Round-3 finding 8: the carry-over copied `[stt].launchd_label` into the
+    regenerated file WITHOUT running it through `validate_launchd_label`,
+    unlike the runtime reader (`OnoatsConfig.stt_launchd_label`), which treats
+    a non-conforming value as absent. Such a value is therefore already inert
+    at runtime; copying it through unchecked could corrupt the regenerated
+    config.toml (a raw newline breaks out of its own line) or crash
+    `_toml_escape` (a non-string TOML value)."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    # A label with a shell-ish character the allowlist rejects.
+    path.write_text(
+        path.read_text().replace("[stt]\n", '[stt]\nlaunchd_label = "bad label;rm"\n')
+    )
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert "launchd_label" not in cfg["stt"]
+
+
+def test_rerun_drops_a_non_string_launchd_label(_isolate_env, monkeypatch):
+    """Same fix, the shape that used to raise: `_toml_escape` calls
+    `str.replace`, so a TOML integer stored under `launchd_label` crashed
+    `onoats init` outright once the round-2 carry-over started copying it."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text().replace("[stt]\n", "[stt]\nlaunchd_label = 42\n"))
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert "launchd_label" not in cfg["stt"]
+
+
+def test_rerun_carries_an_empty_launchd_label_silently(
+    _isolate_env, monkeypatch, capsys
+):
+    """Round-6 finding 2: an empty/whitespace-only `[stt].launchd_label` is
+    "absent", not "malformed" — `OnoatsConfig.stt_launchd_label` (the runtime
+    reader) normalizes it via `val or None` *before* calling
+    `validate_launchd_label`, so it never warns for this value. The carry-over
+    used to call `validate_launchd_label(carried_label.strip())` directly,
+    which fails the label regex on `""` and both logs a spurious "malformed"
+    warning and prints a misleading note here, on every `onoats init` re-run
+    of an install that simply never set a label."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace("[stt]\n", '[stt]\nlaunchd_label = "   "\n')
+    )
+
+    _force_tty(monkeypatch, value=False)
+    capsys.readouterr()  # drain output from the first run above
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    out = capsys.readouterr().out.lower()
+    assert "malformed" not in out
+    assert "launchd_label" not in out
+
+    cfg = _load_toml(config_toml_path())
+    assert "launchd_label" not in cfg["stt"]
+
+
+def test_rerun_without_the_new_keys_writes_no_empty_app_section(
+    _isolate_env, monkeypatch
+):
+    assert init_mod.main(["--no-preflight"]) == 0
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path_for_test())
+    assert "app" not in cfg
+    assert "launchd_label" not in cfg["stt"]
+
+
+def config_toml_path_for_test():
+    from onoats.config import config_toml_path
+
+    return config_toml_path()
+
+
 # ---------------------------------------------------------------------------
 # Interactive — local vs hosted branch
 # ---------------------------------------------------------------------------
