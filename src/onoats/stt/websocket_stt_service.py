@@ -395,8 +395,10 @@ class WebSocketSTTService(SegmentedSTTService):
                     yield ErrorFrame(error="stt_server decode timed out")
                     return
             except Exception as exc:
-                logger.warning(f"{self.name}: decode failed: {exc}")
-                yield ErrorFrame(error=f"stt_server decode failed: {exc}")
+                logger.warning(f"{self.name}: decode failed: {safe_exc_text(exc)}")
+                yield ErrorFrame(
+                    error=f"stt_server decode failed: {safe_exc_text(exc)}"
+                )
                 return
             finally:
                 await self.stop_processing_metrics()
@@ -550,7 +552,16 @@ class WebSocketSTTService(SegmentedSTTService):
                         f"retrying in {delay}s"
                     )
                     await asyncio.sleep(delay)
-        assert last_exc is not None
+        if last_exc is None:
+            # Not an `assert`: `python -O` strips those, and this one guards
+            # the `raise last_exc` below — under `-O` a `None` here became
+            # `TypeError: exceptions must derive from BaseException`, losing
+            # the real connect failure. The loop cannot leave `last_exc`
+            # unset (every path through it either returns or records one), so
+            # reaching this is a bug in the loop, not a connect failure.
+            raise RuntimeError(
+                f"{self.name}: connect loop ended with no recorded exception"
+            )
         logger.error(
             f"{self.name}: giving up after {total_attempts} connect attempts to {endpoint}"
         )
@@ -606,7 +617,9 @@ class WebSocketSTTService(SegmentedSTTService):
         try:
             self._on_recovery(message)
         except Exception as exc:
-            logger.warning(f"{self.name}: on_recovery callback failed: {exc}")
+            logger.warning(
+                f"{self.name}: on_recovery callback failed: {safe_exc_text(exc)}"
+            )
 
     async def _maybe_kickstart(self) -> None:
         """Best-effort self-heal after the reconnect backoff is exhausted.
@@ -765,7 +778,8 @@ class WebSocketSTTService(SegmentedSTTService):
                     self._on_preflight_confirmed()
                 except Exception as exc:
                     logger.warning(
-                        f"{self.name}: on_preflight_confirmed callback failed: {exc}"
+                        f"{self.name}: on_preflight_confirmed callback failed: "
+                        f"{safe_exc_text(exc)}"
                     )
         if self._kickstart_awaiting_transcript:
             self._kickstart_awaiting_transcript = False
@@ -849,7 +863,7 @@ class WebSocketSTTService(SegmentedSTTService):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(f"{self.name}: reader crashed: {exc}")
+            logger.warning(f"{self.name}: reader crashed: {safe_exc_text(exc)}")
             if client is self._client and self._pending and not self._pending.done():
                 self._pending.set_exception(exc)
         finally:
@@ -935,7 +949,17 @@ class WebSocketSTTService(SegmentedSTTService):
             # superseded reader act on a client this instance has finished
             # with. Cleared first so the `close_quietly` below — which
             # re-raises `CancelledError` — cannot skip it.
-            self._draining_client = None
+            #
+            # `is client`, not unconditional: `_detach_client(draining=True)`
+            # only ever *sets* this field, deliberately, so that a
+            # non-draining detach cannot revoke an open drain window's reader
+            # ownership. Clearing it unconditionally here is the mirror-image
+            # of the same mistake — this close would revoke a drain window it
+            # does not own. No live path interleaves two drains today; the
+            # guard costs one comparison and keeps the asymmetry from
+            # becoming a real bug the first time one does.
+            if self._draining_client is client:
+                self._draining_client = None
             await ledger.attempt(
                 _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
             )
