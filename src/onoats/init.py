@@ -517,7 +517,20 @@ def _write_secrets_env(path: Path, secrets: dict, *, merge_existing: bool) -> No
     if merge_existing and path.exists():
         from dotenv import dotenv_values
 
-        merged.update({k: v for k, v in dotenv_values(path).items() if v is not None})
+        # `interpolate=False`: see `_env_quote`. Double quotes are the one
+        # dotenv form that round-trips escapes, and they are also the one
+        # form `dotenv_values` expands `${VAR}` inside by default. A secret
+        # containing `${HOME}` would read back as the *environment's* value
+        # and then be rewritten with that substitution baked in by this very
+        # merge — silent, persistent corruption of the stored secret, and a
+        # channel for one env var's value to end up inside another's.
+        merged.update(
+            {
+                k: v
+                for k, v in dotenv_values(path, interpolate=False).items()
+                if v is not None
+            }
+        )
     merged.update({k: v for k, v in secrets.items() if v})
     # The file is always (re)created below with 0600 perms, even when empty,
     # so the path exists with correct perms for later edits.

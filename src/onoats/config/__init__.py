@@ -484,7 +484,16 @@ def _load_secrets(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
     try:
-        return {k: v for k, v in dotenv_values(path).items() if v is not None}
+        # `interpolate=False`: `init._write_secrets_env` double-quotes every
+        # value (the only dotenv form that round-trips escapes), and
+        # `dotenv_values` expands `${VAR}` inside double quotes by default.
+        # A secret containing `${...}` must reach the client byte-for-byte as
+        # stored, not as whatever that env var happens to hold here.
+        return {
+            k: v
+            for k, v in dotenv_values(path, interpolate=False).items()
+            if v is not None
+        }
     except OSError as exc:
         logger.warning(f"config: could not read {path}: {exc}")
         return {}

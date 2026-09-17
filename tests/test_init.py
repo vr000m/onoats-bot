@@ -718,6 +718,32 @@ def test_secrets_env_values_cannot_inject_a_second_key(tmp_path):
     assert merged["DEEPGRAM_API_KEY"] == "legit\nINJECTED_KEY=pwned"
 
 
+def test_secrets_env_values_are_not_env_interpolated(tmp_path, monkeypatch):
+    """Round-7 security finding: round 6's newline fix double-quotes every
+    value (the one dotenv form that round-trips escapes), and double quotes
+    are also the one form `dotenv_values` expands `${VAR}` inside by default.
+    A secret containing `${INJECTED}` therefore read back as an unrelated env
+    var's value at every read — and the next merge rewrote the file with that
+    substitution baked in, so the real secret was destroyed on disk. Both
+    readers (`config._load_secrets` and this module's merge) now pass
+    `interpolate=False`."""
+    from onoats.config import _load_secrets
+    from onoats.init import _write_secrets_env
+
+    monkeypatch.setenv("INJECTED", "PWNED")
+    path = tmp_path / "secrets.env"
+    secret = "sk-${INJECTED}-tail"
+    _write_secrets_env(path, {"DEEPGRAM_API_KEY": secret}, merge_existing=False)
+
+    # The config reader hands the client the stored bytes, not the env's.
+    assert _load_secrets(path)["DEEPGRAM_API_KEY"] == secret
+
+    # And the merge path does not rewrite the file with the substitution.
+    _write_secrets_env(path, {"STT_WS_URI": "ws://127.0.0.1:8765"}, merge_existing=True)
+    assert _load_secrets(path)["DEEPGRAM_API_KEY"] == secret
+    assert "PWNED" not in path.read_text(encoding="utf-8")
+
+
 def test_secrets_env_drops_a_malformed_key(tmp_path):
     """A key is a bare token on the left of the `=` — unlike a value it
     cannot be escaped into safety, so a malformed one is dropped."""
