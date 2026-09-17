@@ -24,11 +24,11 @@ from onoats.status import (
     Liveness,
     StatusRecord,
     _parse_warning_branches,
+    _write_warning_field,
     mark_rotation,
     read_status,
     resolve_liveness,
     set_devices,
-    set_warning,
     set_warning_branch,
     stamp_supervisor_failure,
     status_path,
@@ -97,22 +97,38 @@ def test_round_trip_v2_fields(tmp_path: Path):
     assert (got.warning, got.mic_device, got.system_device) == (None, None, None)
 
 
-def test_set_warning_sets_and_clears(tmp_path: Path):
-    # No record yet → best-effort no-op (the event raced ahead of the start write).
-    assert set_warning(tmp_path, "early") is None
-    assert read_status(tmp_path) is None
-
+def test_write_warning_field_sets_and_clears(tmp_path: Path):
+    """Round-3 architecture finding: the public `set_warning` was a third,
+    unguarded whole-field writer bypassing the branch grammar
+    `format_warning_branch` is the choke point for, with zero production
+    callers left. It is now the private `_write_warning_field`, which takes
+    the record its single caller (`set_warning_branch`) has already read and
+    gated, and does nothing but write the field."""
     write_running(tmp_path, pid=4242, audio_source="socket", stt_label="mlx-whisper")
-    set_warning(tmp_path, "mic: only zero samples for ~30 s — check hardware mute")
+    current = read_status(tmp_path)
+    assert current is not None
+    _write_warning_field(
+        tmp_path, current, "mic: only zero samples for ~30 s — check hardware mute"
+    )
     got = read_status(tmp_path)
     assert got is not None
     assert got.warning == "mic: only zero samples for ~30 s — check hardware mute"
     # The annotate must not clobber the session detail.
     assert got.running is True and got.audio_source == "socket"
 
-    set_warning(tmp_path, None)
+    _write_warning_field(tmp_path, got, None)
     got = read_status(tmp_path)
     assert got is not None and got.warning is None
+
+
+def test_status_module_exposes_no_unbranched_warning_writer():
+    """The single-writer property is structural, not conventional: there must
+    be no public way to write the `warning` field outside the branch grammar
+    (`set_warning_branch`) and the preflight `write_running(warning=...)`
+    seam, which itself routes through `format_warning_branch`."""
+    import onoats.status as status_module
+
+    assert not hasattr(status_module, "set_warning")
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +176,7 @@ def test_write_running_warning_defaults_to_none(tmp_path: Path):
 
 
 def test_set_warning_branch_noop_without_record(tmp_path: Path):
-    # Same best-effort contract as set_warning: no record yet → no-op, no crash.
+    # Same best-effort contract as mark_rotation: no record yet → no-op, no crash.
     assert set_warning_branch(tmp_path, "stt", "server unreachable") is None
     assert read_status(tmp_path) is None
 
@@ -244,7 +260,11 @@ def test_set_warning_branch_malformed_legacy_value_degrades_gracefully(
     `f"{branch}: "` parser can't cleanly split) must not raise — it degrades
     gracefully rather than crashing the caller."""
     write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
-    set_warning(tmp_path, "legacy free-form warning with no branch prefix")
+    seeded = read_status(tmp_path)
+    assert seeded is not None
+    _write_warning_field(
+        tmp_path, seeded, "legacy free-form warning with no branch prefix"
+    )
 
     # Must not raise, and the new branch's message must still land.
     set_warning_branch(tmp_path, "stt", "server unreachable")
@@ -337,7 +357,7 @@ def test_set_warning_branch_still_annotates_own_stopped_record(tmp_path: Path):
     not a different session's history — it is this same session's terminal
     record, and a trailing capturer/STT diagnostic arriving during the
     shutdown grace-drain window (after write_stopped already ran) must still
-    land on it, exactly like the pre-branch-keying `set_warning` did. Gating
+    land on it, exactly like the pre-branch-keying whole-field writer did. Gating
     only on `running` (not `pid`) would silently drop that trailing
     diagnostic — see cli.py's `_STDERR_READER_GRACE_SEC` drain, which keeps
     consuming capturer stderr for a bounded window after the recorder
@@ -408,7 +428,7 @@ def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):
 def test_set_devices_noop_on_stopped_record(tmp_path: Path):
     """Device events fire within the capturer's first second, when the on-disk
     record may still be the PREVIOUS session's — a stopped record must never be
-    device-stamped (unlike set_warning, which only requires existence)."""
+    device-stamped (unlike set_warning_branch, which only requires existence)."""
     write_running(tmp_path, pid=4242, audio_source="socket", stt_label="x")
     write_stopped(tmp_path, exit_reason="graceful")
     assert set_devices(tmp_path, mic_device="Some Mic (uid=u1)") is None

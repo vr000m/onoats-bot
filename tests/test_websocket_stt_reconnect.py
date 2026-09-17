@@ -26,6 +26,7 @@ import asyncio
 import pytest
 from stt_server import protocol as P
 
+from onoats import _closing
 from onoats.stt import launchd
 from onoats.stt import websocket_stt_service as wss_module
 from onoats.stt.websocket_stt_service import WebSocketSTTService
@@ -926,3 +927,114 @@ def test_endpoint_label_socket_path_and_host_port_shapes_unaffected():
     )
     svc = _make_service(socket_path=None, host="127.0.0.1", port=1234)
     assert svc._endpoint_label() == "ws://127.0.0.1:1234"
+
+
+# ---------------------------------------------------------------------------
+# Round-3 review-gauntlet: one bounded teardown, shared with runtime.py
+#
+# `TranscriptionClient` teardown used to have two owners with opposite rules:
+# `runtime._close_client_quietly` bounded every close (because an unreachable
+# server's close never completes), while this module closed the same client
+# type unbounded in four places — including the handler added specifically to
+# clean up after a connect timeout against a wedged server, i.e. exactly the
+# peer whose closing handshake also never completes. Both now go through
+# `onoats._closing.close_quietly`.
+# ---------------------------------------------------------------------------
+
+
+def test_wedged_connect_teardown_is_itself_bounded(monkeypatch):
+    """Round-3 finding 5: the connect-timeout cleanup closed the client with
+    a bare `await client.close()`. The `websockets` closing handshake has its
+    own ~10s default wait, so against the wedged server that handler exists
+    for, the teardown hung the reconnect loop the connect timeout had just
+    rescued — one unbounded close per attempt."""
+    monkeypatch.setattr(wss_module, "_CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(launchd, "kickstart_stt_server", lambda label, **kw: True)
+
+    class _WedgedClient(_FakeClient):
+        async def connect(self):
+            self.connect_calls += 1
+            await asyncio.sleep(999)
+
+        async def close(self):
+            # A peer that never completes the closing handshake.
+            await asyncio.sleep(999)
+
+    monkeypatch.setattr(wss_module, "TranscriptionClient", _WedgedClient)
+
+    svc = _make_service(launchd_label="label-wedged-close")
+
+    async def _run():
+        with pytest.raises(TimeoutError):
+            await svc._ensure_connected()
+
+    # The whole reconnect loop must finish well inside this bound; with an
+    # unbounded close it hangs on the first attempt's teardown.
+    asyncio.run(asyncio.wait_for(_run(), timeout=5))
+
+
+def test_discard_stale_teardown_is_bounded(monkeypatch):
+    """Same root cause, second call site: `_discard_stale` runs on the
+    reconnect path — precisely when the peer has already proven unreachable
+    — so an unbounded close there stalls every subsequent attempt."""
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 0.01)
+
+    class _HangingCloseClient(_FakeClient):
+        async def close(self):
+            await asyncio.sleep(999)
+
+    svc = _make_service()
+    stale = _HangingCloseClient()
+    svc._client = stale
+    svc._connected = True
+
+    asyncio.run(asyncio.wait_for(svc._discard_stale(), timeout=5))
+    assert svc._client is None and svc._connected is False
+
+
+def test_graceful_close_resets_state_even_if_close_hangs(monkeypatch):
+    """Same root cause, third call site — and it cost more than time: the
+    state reset (`_client`/`_reader_task`/`_connected`) sits AFTER the
+    `await client.close()` in the `finally`, so a close that hung or raised
+    left the instance half torn down, with a stale `_client` a later
+    `_ensure_connected` would treat as live."""
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 0.01)
+
+    class _HangingCloseClient(_FakeClient):
+        async def close(self):
+            await asyncio.sleep(999)
+
+    svc = _make_service()
+    svc._client = _HangingCloseClient()
+    svc._connected = True
+
+    asyncio.run(asyncio.wait_for(svc._graceful_close(), timeout=5))
+    assert svc._client is None
+    assert svc._reader_task is None
+    assert svc._connected is False
+
+
+def test_cancel_and_close_resets_state_even_if_close_raises(monkeypatch):
+    """Fourth call site, raising rather than hanging: an exception from
+    `close()` in the `finally` used to propagate out and skip the state
+    reset entirely."""
+
+    class _RaisingCloseClient(_FakeClient):
+        async def close(self):
+            raise OSError("socket already gone")
+
+    svc = _make_service()
+    svc._client = _RaisingCloseClient()
+    svc._connected = True
+
+    asyncio.run(asyncio.wait_for(svc._cancel_and_close(), timeout=5))
+    assert svc._client is None
+    assert svc._connected is False
+
+
+def test_close_timeout_constant_is_the_shared_one():
+    """The two modules must not drift back to two independently-edited 5.0s
+    constants — that duplication is what let one side be bounded and the
+    other not."""
+    assert wss_module._CLOSE_TIMEOUT_SECONDS is _closing.CLOSE_TIMEOUT_SEC

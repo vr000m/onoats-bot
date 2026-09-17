@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 from loguru import logger
 
+from onoats import _closing
 from onoats._redact import redact_uri, safe_exc_text
 from onoats._vendor.pid import (  # noqa: F401
     PID_FILENAME,
@@ -435,22 +436,13 @@ _POST_KICKSTART_DEADLINE_SEC = 45.0
 # still gets ~20 attempts.
 _POST_KICKSTART_SETTLE_SEC = 2.0
 _POST_KICKSTART_ATTEMPT_TIMEOUT_SEC = _PREFLIGHT_RETRY_TIMEOUT_SEC
-# Bound on each best-effort client teardown. `close_session()` waits for the
-# server's `session.closed` ack, so against the unreachable server every
-# caller of `_close_client_quietly` has already diagnosed, an unbounded close
-# can hang forever — and in the post-kickstart loop that means never reaching
-# the deadline check. Mirrors `websocket_stt_service`'s own close timeout.
-_CLOSE_TIMEOUT_SEC = 5.0
-# Floor for a deadline-capped closer's timeout. `asyncio.wait_for(coro, 0)`
-# does not run `coro` for even one step before cancelling it — the wrapping
-# Task is cancelled while still pending, so the underlying `close_session`/
-# `close` call is never even issued, not merely cut short. A caller whose
-# budget has already run out would otherwise silently skip closing the
-# socket entirely instead of at least starting the close. This floor is
-# deliberately tiny (it still lets a hung closer time out almost instantly)
-# — it exists only to guarantee the close is attempted, not to grant extra
-# budget.
-_MIN_CLOSE_ATTEMPT_TIMEOUT_SEC = 0.05
+# Teardown bounds (`CLOSE_TIMEOUT_SEC`, `MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`) and
+# the teardown itself live in `onoats._closing`, the leaf module this shares
+# with `stt.websocket_stt_service`: both modules tear down the same
+# `TranscriptionClient` type and used to own opposite policies plus a
+# near-duplicate 5.0s constant. Deliberately NOT re-exported under the old
+# module-level names here — a local alias would look monkeypatchable while
+# having no effect on the shared implementation.
 # Keyed on the endpoint tuple, not a bare bool, so that if a future
 # caller builds kwargs for a *different* endpoint on the second call
 # (dual path today uses the same resolved kwargs for both branches, but
@@ -531,14 +523,12 @@ async def log_stt_server_rss(phase: str) -> None:
         try:
             await asyncio.wait_for(_probe(), timeout=_RSS_PROBE_TIMEOUT_SEC)
         finally:
-            try:
-                await client.close_session()
-            except Exception:
-                pass
-            try:
-                await client.close()
-            except Exception:
-                pass
+            # Blast-radius sweep (round 3): the `wait_for` above bounds the
+            # probe, not this teardown — and a server unreachable enough to
+            # fail the probe is exactly the one whose `close_session` ack
+            # never arrives. Same bounded closer as every other teardown of
+            # this client type.
+            await _close_client_quietly(client)
     except Exception as exc:
         # Same leak class as `_preflight_stt_ws`/`_ensure_connected`: this
         # probe builds its own `TranscriptionClient` from the same
@@ -561,61 +551,24 @@ def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
 async def _close_client_quietly(
     client: object, *, deadline: float | None = None
 ) -> None:
-    """Best-effort, time-bounded teardown of a ``TranscriptionClient``.
+    """Best-effort, time-bounded full teardown of a ``TranscriptionClient``.
 
-    Never raises (``asyncio.CancelledError`` excepted, which must propagate).
-
-    Each closer is bounded by ``_CLOSE_TIMEOUT_SEC``, matching
-    ``websocket_stt_service``'s own ``asyncio.wait_for(..., 5)`` close pattern.
-    ``close_session`` writes a ``session.close`` and waits for the server's
-    ack, so against an unreachable/hung server it can block indefinitely —
-    and every caller here is on a path that has *already* concluded the server
-    is unreachable (the post-kickstart retry loop, where an unbounded close
-    would stop the loop ever reaching its deadline check).
-
-    ``deadline`` (an absolute ``loop.time()`` value) additionally caps the
-    teardown by the caller's *remaining* budget. Without it, the two closers'
-    fixed ``_CLOSE_TIMEOUT_SEC`` each could burn 10s combined **before** the
-    post-kickstart loop next re-checks its own monotonic deadline — so the
+    Thin wrapper over :func:`onoats._closing.close_quietly` — kept as a named
+    local seam because every call site in this module wants the same
+    (``close_session``, ``close``) sequence, and because ``deadline``'s
+    meaning here is specifically *this module's* budget: without it, the two
+    closers' fixed per-closer timeout could burn 10s combined **before** the
+    post-kickstart loop next re-checks its own monotonic deadline, so the
     documented "strict cap" of ``_POST_KICKSTART_DEADLINE_SEC`` could overrun
     by up to a full teardown. Teardown must never be what blows the budget it
-    is being run inside. Omit it (the default) for callers with no budget of
-    their own, which keeps today's fixed 5s-per-closer behaviour exactly.
+    is running inside.
 
-    An expired (or nearly expired) ``deadline`` still gets each closer a
-    floor of ``_MIN_CLOSE_ATTEMPT_TIMEOUT_SEC``, not a bare ``0``:
-    ``asyncio.wait_for(coro, timeout=0)`` cancels the wrapping ``Task``
-    before it is ever stepped, so ``coro`` never runs at all — the close is
-    skipped outright, not merely cut short, and a socket a failed candidate
-    already opened is left dangling with no exception to signal it. The
-    floor is small enough that a genuinely hung closer still times out
-    almost immediately.
-
-    Cancellation (``asyncio.CancelledError``, e.g. shutdown) during one
-    closer must not skip the other: ``close_session`` and ``close`` tear
-    down different resources, and losing ``close`` because ``close_session``
-    was interrupted mid-await leaves the underlying socket/FD open. Each
-    closer therefore always gets its turn; a cancellation seen along the way
-    is remembered and re-raised only once every closer has been attempted.
+    See ``onoats._closing``'s module docstring for the never-raises,
+    always-attempt-every-closer and floor-an-expired-deadline invariants, and
+    for why an unbounded close against the unreachable server every caller
+    here has *already* diagnosed can hang forever.
     """
-    loop = asyncio.get_running_loop()
-    cancelled: asyncio.CancelledError | None = None
-    for closer in ("close_session", "close"):
-        timeout = _CLOSE_TIMEOUT_SEC
-        if deadline is not None:
-            # A non-positive remaining budget must not collapse to a bare
-            # `0` timeout — see the floor rationale in the docstring above.
-            timeout = min(
-                timeout, max(_MIN_CLOSE_ATTEMPT_TIMEOUT_SEC, deadline - loop.time())
-            )
-        try:
-            await asyncio.wait_for(getattr(client, closer)(), timeout=timeout)
-        except asyncio.CancelledError as exc:
-            cancelled = exc
-        except Exception:
-            pass
-    if cancelled is not None:
-        raise cancelled
+    await _closing.close_quietly(client, deadline=deadline)
 
 
 class KickstartOutcome(enum.Enum):
@@ -709,8 +662,9 @@ async def _kickstart_and_retry(
     left — so a failure landing just under the deadline cannot overrun it by a
     whole sleep-plus-timeout. The per-attempt client **teardown** is capped by
     the same remaining budget: it runs before the next budget check, so a
-    fixed-timeout teardown (up to ``2 * _CLOSE_TIMEOUT_SEC``) was itself able
-    to push real wall-clock past the cap this docstring calls strict.
+    fixed-timeout teardown (up to ``2 * _closing.CLOSE_TIMEOUT_SEC``) was
+    itself able to push real wall-clock past the cap this docstring calls
+    strict.
     """
     from onoats.stt.launchd import recovery_message, try_kickstart
 
@@ -765,8 +719,8 @@ async def _kickstart_and_retry(
             # in-flight candidate's socket/FD leaks on shutdown cancellation.
             # `deadline=deadline` matches the TimeoutError/OSError/Exception
             # branches above: without it this teardown falls back to the full
-            # fixed `_CLOSE_TIMEOUT_SEC` per closer (up to 10s combined)
-            # instead of being capped by this loop's own strict budget,
+            # fixed `_closing.CLOSE_TIMEOUT_SEC` per closer (up to 10s
+            # combined) instead of being capped by this loop's own strict budget,
             # so a shutdown/CancelledError arriving mid-attempt could hang
             # process exit far longer than the rest of the self-healing
             # design's shutdown-responsiveness budget promises.
@@ -961,7 +915,7 @@ async def _preflight_stt_ws(
                 # attempt outright instead of just cutting it short.
                 remaining = _pre_kickstart_deadline - loop.time()
                 timeout_s = max(
-                    _MIN_CLOSE_ATTEMPT_TIMEOUT_SEC, min(timeout_s, remaining)
+                    _closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC, min(timeout_s, remaining)
                 )
             try:
                 await asyncio.wait_for(client.connect(), timeout=timeout_s)

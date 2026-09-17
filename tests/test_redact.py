@@ -256,3 +256,101 @@ def test_redact_uri_no_credential_passes_through():
 
 def test_redact_uri_ipv6_host_intact():
     assert redact_uri("ws://u:pass@[::1]:443/path") == "ws://[::1]:443/path"
+
+
+# ---------------------------------------------------------------------------
+# Round-3 regressions: the three findings below were all symptoms of ONE root
+# cause — tier 3 conflating "is there a port here" with "is there a credential
+# here", and the scheme-prefixed authority path sharing heuristics with the
+# bare, scheme-less path. The fix separates the two paths and gates on the
+# candidate span being credential-shaped; these cases pin both directions.
+# ---------------------------------------------------------------------------
+
+
+def test_tier3_does_not_fire_on_non_credential_leading_tokens():
+    """Round-3 finding 1: tier 3's gate was not credential-shaped, so ANY
+    first token whose colon-bonded remainder was non-numeric let it discard
+    everything up to the LAST `@` in the message — destroying
+    credential-free diagnostic text and fabricating a host out of prose."""
+    for text in (
+        "[::1]:443 isn't a valid URI: mail user@x",
+        "ws:/host isn't a valid URI: contact user@guide",
+        "2026-09-17T10:00:00 connect failed for user@host",
+        "unix:/tmp/x.sock failed: see admin@corp.com",
+        "C:/Users/me/file not found: mail ops@corp.com",
+    ):
+        assert safe_exc_text(Exception(text)) == text, text
+
+
+def test_authority_port_followed_by_a_path_is_still_recognized_as_a_port():
+    """Round-3 finding 2: the all-digits port gate measured the colon-bonded
+    token to the first WHITESPACE, so `host:8765/path` ("8765/path") was not
+    all-digits, the gate passed, and tier 3 destroyed the real host, port,
+    path and diagnostic tail while fabricating a fake host. The token is now
+    measured to the first `/?#`-or-whitespace, i.e. to the end of the
+    authority's first segment."""
+    for text in (
+        "ws://host:8765/path failed: could not reach user@relay",
+        "wss://stt.internal:2020/v1 failed: could not reach user@relay",
+        "wss://[::1]:2020/v1 failed: could not reach user@relay",
+    ):
+        assert safe_exc_text(Exception(text)) == text, text
+
+
+def test_bare_path_all_digit_password_segment_is_not_read_as_a_port():
+    """Round-3 finding 3 (HIGH, credential leak — the inverse of finding 2):
+    the all-digits port veto was also applied on the BARE, scheme-less path,
+    where there is no host:port at all and a colon-bonded token is ALWAYS the
+    password. A password whose leading whitespace-delimited segment was all
+    digits therefore made the veto true, which DISABLED the widen refusal and
+    let the full credential through unredacted."""
+    exc = Exception("user:1234 5678@host isnt a valid URI: nonempty path required")
+    safe = safe_exc_text(exc)
+    assert "1234" not in safe
+    assert "5678" not in safe
+    assert "user:" not in safe
+    assert safe == "host isnt a valid URI: nonempty path required"
+
+
+def test_bare_path_credential_with_a_space_still_redacts():
+    """The positive half of finding 3's fix: removing the port veto from the
+    bare path must not cost the case it was co-located with."""
+    exc = Exception(
+        "secretuser:hunter 2@stt.example.internal:2020 isn't a valid URI: "
+        "nonempty path required"
+    )
+    safe = safe_exc_text(exc)
+    assert "secretuser" not in safe
+    assert "hunter" not in safe
+    assert safe == (
+        "stt.example.internal:2020 isn't a valid URI: nonempty path required"
+    )
+
+
+def test_bare_path_tier1_requires_credential_shape():
+    """Tier 1 on the bare path is prose, not an authority: an `@` in the
+    leading token with no `user:pass` shape in front of it is not a
+    credential. (Previously tier 1 accepted unconditionally on both paths,
+    so a message opening with a bare email address was destructively
+    truncated.)"""
+    text = "admin@example.com for help"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_authority_path_unrelated_at_sign_in_a_path_segment_untouched():
+    """The port gate also covers tier 2: an unrelated `user@host` inside a
+    path segment of a `host:PORT` authority must not be read as userinfo."""
+    text = "ws://host:8765/p/user@y"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_tier3_widening_is_bounded_to_two_extra_words():
+    """`_MAX_USERINFO_SPACES`: two raw spaces in a password still redact
+    (the widest genuine shape this module has ever been asked to handle),
+    while a whole sentence of prose between the colon and an unrelated `@`
+    does not — that unbounded reach is what five consecutive rounds of
+    destructive truncation traced back to."""
+    safe = safe_exc_text(Exception("ws://u:p more words@host/path is invalid"))
+    assert safe == "ws://host/path is invalid"
+    text = "u:p one two three four@host is invalid"
+    assert safe_exc_text(Exception(text)) == text

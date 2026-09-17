@@ -79,6 +79,11 @@ from stt_server import protocol as P
 # imports, so this is a top-level, cycle-free import of a *public* name —
 # not a private symbol reached across a module boundary (`runtime.py` only
 # ever imports this `stt` subpackage lazily, to avoid a cycle).
+# `_closing` is a leaf module for the same reason and holds the ONE bounded
+# teardown both this module and `runtime.py` use: the two construct and tear
+# down the same `TranscriptionClient`, and each used to own a teardown policy
+# (plus a near-duplicate 5.0s constant) with opposite rules.
+from onoats import _closing
 from onoats._redact import redact_uri, safe_exc_text
 from onoats.stt import launchd
 
@@ -87,8 +92,12 @@ from onoats.stt import launchd
 # server cap plus a little MLX decode slack.
 _DECODE_TIMEOUT_SECONDS = 90.0
 
-# Bounded wait for session.close to be acknowledged on pipeline shutdown.
-_CLOSE_TIMEOUT_SECONDS = 5.0
+# Bounded wait for session.close to be acknowledged on pipeline shutdown, and
+# for the reader task to observe it. Shared with `runtime.py` via
+# `onoats._closing` rather than re-declared here: the two modules bound the
+# teardown of the same client type and a second, independently-edited 5.0
+# invited exactly the drift review found (one side bounded, one side not).
+_CLOSE_TIMEOUT_SECONDS = _closing.CLOSE_TIMEOUT_SEC
 
 # Bounded wait for session.updated after session.update.
 _SESSION_READY_TIMEOUT_SECONDS = 5.0
@@ -426,10 +435,16 @@ class WebSocketSTTService(SegmentedSTTService):
                     # no-ops on a `_ws` that never got set and closes it
                     # otherwise, whether `connect()` timed out or raised
                     # (e.g. the "expected server.hello" `RuntimeError`).
-                    try:
-                        await client.close()
-                    except Exception:
-                        pass
+                    # Bounded (`_closing.close_quietly`), not a bare
+                    # `await client.close()`: the wedged server this handler
+                    # exists for — socket accepted, handshake frames never
+                    # sent — is exactly the peer whose closing handshake also
+                    # never completes, so an unbounded close here would hang
+                    # the reconnect loop the connect timeout just rescued.
+                    # `TRANSPORT_ONLY`: no session exists yet to close.
+                    await _closing.close_quietly(
+                        client, closers=_closing.TRANSPORT_ONLY
+                    )
                     raise
                 loop = asyncio.get_running_loop()
                 self._session_ready = loop.create_future()
@@ -625,10 +640,11 @@ class WebSocketSTTService(SegmentedSTTService):
             await asyncio.gather(self._reader_task, return_exceptions=True)
         self._reader_task = None
         if self._client is not None:
-            try:
-                await self._client.close()
-            except Exception:
-                pass
+            # Bounded: this runs on the reconnect path, i.e. precisely when
+            # the peer has already proven unreachable — an unbounded close
+            # would stall every subsequent reconnect attempt behind a dead
+            # server's closing handshake.
+            await _closing.close_quietly(self._client, closers=_closing.TRANSPORT_ONLY)
         self._client = None
         self._connected = False
 
@@ -789,7 +805,12 @@ class WebSocketSTTService(SegmentedSTTService):
                 except (TimeoutError, asyncio.CancelledError):
                     self._reader_task.cancel()
         finally:
-            await client.close()
+            # Bounded, and swallowing: a raising/hanging `close()` here used
+            # to leave `_client`/`_reader_task`/`_connected` un-reset (the
+            # state reset sits after it), stranding the instance in a
+            # half-torn-down state a later `_ensure_connected` would treat
+            # as live.
+            await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
             self._client = None
             self._reader_task = None
             self._connected = False
@@ -817,7 +838,12 @@ class WebSocketSTTService(SegmentedSTTService):
                 # coroutine still propagates normally.
                 await asyncio.gather(self._reader_task, return_exceptions=True)
         finally:
-            await client.close()
+            # Bounded, and swallowing: a raising/hanging `close()` here used
+            # to leave `_client`/`_reader_task`/`_connected` un-reset (the
+            # state reset sits after it), stranding the instance in a
+            # half-torn-down state a later `_ensure_connected` would treat
+            # as live.
+            await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
             self._client = None
             self._reader_task = None
             self._connected = False

@@ -21,7 +21,7 @@ import asyncio
 
 import pytest
 
-from onoats import runtime
+from onoats import _closing, runtime
 from onoats.runtime import SttPreflightError, _preflight_stt_ws
 
 
@@ -1163,7 +1163,7 @@ def test_close_client_quietly_is_time_bounded(monkeypatch):
         async def close(self):
             await asyncio.sleep(3600)
 
-    monkeypatch.setattr(runtime, "_CLOSE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 0.01)
 
     async def _run():
         await runtime._close_client_quietly(_HangingCloser())
@@ -1338,7 +1338,7 @@ def test_post_kickstart_deadline_is_not_overrun_by_a_late_attempt(monkeypatch):
 
 def test_close_client_quietly_honours_a_caller_deadline(monkeypatch):
     """Round-3 finding 1: `_close_client_quietly` ran each of its two closers
-    on a fixed `_CLOSE_TIMEOUT_SEC`, so a teardown could burn up to 2x that
+    on a fixed `_closing.CLOSE_TIMEOUT_SEC`, so a teardown could burn up to 2x that
     *inside* a caller whose own budget was supposed to be a strict cap. With a
     `deadline` the teardown can never outlive the budget it runs inside."""
 
@@ -1349,7 +1349,7 @@ def test_close_client_quietly_honours_a_caller_deadline(monkeypatch):
         async def close(self):
             await asyncio.sleep(3600)
 
-    monkeypatch.setattr(runtime, "_CLOSE_TIMEOUT_SEC", 30.0)
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 30.0)
 
     async def _run():
         loop = asyncio.get_running_loop()
@@ -1379,17 +1379,17 @@ def test_kickstart_and_retry_cancellation_teardown_honours_the_deadline(monkeypa
     unlike this same function's ``TimeoutError``/``OSError``/``Exception``
     branches, which all pass ``deadline=deadline``. Without it, a
     cancellation landing here could burn the full, undeadlined
-    ``2 * _CLOSE_TIMEOUT_SEC`` instead of being capped by this loop's own
+    ``2 * _closing.CLOSE_TIMEOUT_SEC`` instead of being capped by this loop's own
     strict ``_POST_KICKSTART_DEADLINE_SEC`` budget — exactly the overrun
     ``_close_client_quietly``'s own docstring says ``deadline`` exists to
     prevent."""
     _allow_kickstart(monkeypatch)
     # Already-expired by the time the candidate's close runs: forces the
     # deadline-bound teardown down to the floor
-    # (`_MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`) per closer instead of the full fixed
-    # `_CLOSE_TIMEOUT_SEC` a missing `deadline=` would fall back to.
+    # (`_closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`) per closer instead of the full
+    # fixed `_closing.CLOSE_TIMEOUT_SEC` a missing `deadline=` falls back to.
     monkeypatch.setattr(runtime, "_POST_KICKSTART_DEADLINE_SEC", 0.0)
-    monkeypatch.setattr(runtime, "_CLOSE_TIMEOUT_SEC", 30.0)
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 30.0)
 
     class _CancelOnConnect:
         async def connect(self):
@@ -1432,7 +1432,7 @@ def test_post_kickstart_teardown_cannot_itself_blow_the_deadline(monkeypatch):
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_TIMEOUT_SEC", 0.01)
     monkeypatch.setattr(runtime, "_POST_KICKSTART_DEADLINE_SEC", 0.05)
     monkeypatch.setattr(runtime, "_POST_KICKSTART_SETTLE_SEC", 0.0)
-    monkeypatch.setattr(runtime, "_CLOSE_TIMEOUT_SEC", 0.5)
+    monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 0.5)
 
     class _HangingCloseClient:
         def __init__(self, **kwargs):
@@ -1612,7 +1612,7 @@ def test_pre_kickstart_second_connect_is_capped_by_remaining_deadline(monkeypatc
     monkeypatch.setattr(runtime, "_PREFLIGHT_TIMEOUT_SEC", 0.05)
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_TIMEOUT_SEC", 5.0)
-    # total_budget = 0.05 + 0.0 + 5.0 + 0.0 = 5.05s (default _CLOSE_TIMEOUT_SEC).
+    # total_budget = 0.05 + 0.0 + 5.0 + 0.0 = 5.05s (default _closing.CLOSE_TIMEOUT_SEC).
 
     created: list[_SlowFirstClient] = []
 

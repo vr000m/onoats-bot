@@ -279,20 +279,27 @@ def mark_rotation(data_dir: Path, *, when: float | None = None) -> Path | None:
     )
 
 
-def set_warning(data_dir: Path, warning: str | None) -> Path | None:
-    """Set (or clear, with ``None``) the live capture warning on the current record.
+def _write_warning_field(
+    data_dir: Path, current: StatusRecord, warning: str | None
+) -> Path:
+    """Write the merged ``warning`` field onto an already-read record.
 
-    Called by the socket supervisor when the capturer reports a non-fatal
-    capture anomaly (the all-zero-input detector) and again when real audio
-    re-arms it. Best-effort like :func:`mark_rotation`: returns ``None`` when
-    there is no readable record to annotate (e.g. the event raced ahead of the
-    recorder's start write — the detector needs ~30 s of session, so in
-    practice the record exists). Same last-writer-wins concurrency contract as
-    :func:`stamp_supervisor_failure`.
+    **Private on purpose.** This is the only whole-field writer of
+    ``warning``, and it takes the record the caller has already read and
+    gated — it neither reads nor gates on its own. Its sole production
+    caller is :func:`set_warning_branch`, which owns both the branch grammar
+    (via :func:`format_warning_branch`) and the same-pid/running gate.
+
+    It used to be a public ``set_warning(data_dir, warning)``: an unguarded
+    third whole-field writer that bypassed the branch grammar entirely and
+    carried a weaker gate than :func:`set_warning_branch` (existence only, no
+    same-pid check). Its last production callers — ``cli.py``'s capturer
+    zero-run warning/clear handlers — moved to :func:`set_warning_branch`,
+    leaving a public escape hatch around the choke point with nothing using
+    it. Folding it in here keeps the single-writer property structural rather
+    than conventional: there is no longer a supported way to write the field
+    without going through the grammar.
     """
-    current = read_status(data_dir)
-    if current is None:
-        return None
     return write_status(data_dir, replace(current, warning=warning))
 
 
@@ -371,9 +378,8 @@ def _parse_warning_branches(warning: str | None) -> dict[str, str]:
 def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path | None:
     """Set (or clear, with ``None``) one branch's slice of the ``warning`` field.
 
-    Unlike :func:`set_warning` (kept as the low-level whole-field writer),
-    this reads the current merged ``warning``, parses it into per-branch
-    entries (:func:`_parse_warning_branches`), replaces or removes only
+    The single public writer of the ``warning`` field: it reads the current
+    merged ``warning``, parses it into per-branch entries (:func:`_parse_warning_branches`), replaces or removes only
     ``branch``'s entry, and rewrites the merge in **sorted branch-name
     order** (matching ``cli.py``'s pre-existing ``sorted(active_warnings)``
     convention) — so concurrent branches (``mic``/``system``/``stt``) never
@@ -397,8 +403,8 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     ``warning`` grammar itself (e.g. escaping) would also change what the
     Swift menu-bar reader shares under
     ``STATUS_SCHEMA_VERSION`` and is out of scope here. Best-effort like
-    :func:`set_warning`: returns ``None`` when there is no readable record to
-    annotate.
+    :func:`mark_rotation`: returns ``None`` when there is no readable record
+    to annotate.
 
     ``message`` must be **bare** — never pre-prefixed with ``"<branch>: "``.
     :func:`format_warning_branch` is the sole owner of that lead-in and is
@@ -419,10 +425,10 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     diagnostics — including zero-run-warning/-clear — for a short window
     *after* :func:`write_stopped` has already run for this same session).
     Gating on ``running`` alone would silently drop those trailing
-    diagnostics, which :func:`set_warning` (the function this replaced) did
-    not do. Gating on ``pid`` instead of ``running`` distinguishes "a new
-    session already started" (block) from "my own session, already marked
-    stopped, still draining" (allow) — PID reuse within the same shutdown
+    diagnostics, which the unbranched whole-field writer this replaced (the
+    former public ``set_warning``) did not do. Gating on ``pid`` instead of
+    ``running`` distinguishes "a new session already started" (block) from
+    "my own session, already marked stopped, still draining" (allow) — PID reuse within the same shutdown
     window is not a realistic concern on any platform this runs on.
     """
     current = read_status(data_dir)
@@ -445,7 +451,7 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
         "; ".join(format_warning_branch(b, branches[b]) for b in sorted(branches))
         or None
     )
-    return write_status(data_dir, replace(current, warning=merged))
+    return _write_warning_field(data_dir, current, merged)
 
 
 def set_devices(
@@ -462,8 +468,8 @@ def set_devices(
     mid-session mic rebind. ``None`` arguments leave that field untouched, so
     one branch's update never clears the other's.
 
-    Unlike :func:`set_warning` this is a no-op on a NON-running record too:
-    device events fire within the capturer's first second, when the record on
+    Unlike :func:`set_warning_branch` this is a no-op on a NON-running
+    record too: device events fire within the capturer's first second, when the record on
     disk (if any) still belongs to the *previous* session — annotating that
     stopped record would mislabel history. Same last-writer-wins concurrency
     contract as :func:`stamp_supervisor_failure`.

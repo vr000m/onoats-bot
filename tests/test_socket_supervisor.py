@@ -176,7 +176,7 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
     #       run proves the always-drain property.
     #   events: ONOATS-EVENT lines written to stderr when the MIC connection
     #       arrives (after the fake recorder has written its running status
-    #       record, so set_warning has a record to annotate).
+    #       record, so set_warning_branch has a record to annotate).
     #   startup_events: ONOATS-EVENT lines written at STARTUP, before binding
     #       sockets — the real capturer's `device` event timing (it outruns
     #       the recorder's start write; the supervisor's deferred-apply task
@@ -403,7 +403,7 @@ def _install_fake_recorder(
         if write_running:
             # Mirror the real recorder's start-of-session status write, BEFORE
             # connecting — the fake capturer emits its ONOATS-EVENT lines only
-            # once a connection arrives, so the supervisor's set_warning always
+            # once a connection arrives, so the supervisor's set_warning_branch always
             # finds a record (the ordering the warning tests rely on).
             from onoats import status as status_file
 
@@ -1713,7 +1713,7 @@ async def test_stderr_reader_preserves_concurrent_stt_branch_warning(short_root)
 @pytest.mark.anyio
 async def test_stderr_reader_no_status_record_is_a_noop(short_root):
     """An event racing ahead of the recorder's start write must not crash the
-    reader (set_warning is best-effort) — and must not invent a record."""
+    reader (set_warning_branch is best-effort) — and must not invent a record."""
     from onoats import status as status_file
 
     data_dir = short_root / "d"
