@@ -548,6 +548,126 @@ def test_safe_exc_text_strips_a_query_from_every_uri_in_the_message():
     assert safe == "ws://a/x and wss://b/y both failed"
 
 
+# ---------------------------------------------------------------------------
+# Round 6. Two new leaks (A, B) plus four more instances of the fabrication
+# class. Root cause of the fabrication class: the "is this span already a
+# complete, well-formed authority?" question was only ever asked of an
+# *incumbent* candidate, never at the acceptance point — so a prose `@`
+# accepted as the FIRST candidate deleted a real, already-terminated
+# authority in front of it. `_scan` now asks it before the loop too.
+# ---------------------------------------------------------------------------
+
+
+def test_scheme_less_uri_query_string_is_stripped():
+    """Round-6 finding A (HIGH, leak): `_strip_query_spans` only scanned
+    from `scheme://` matches, but a scheme-less URI is exactly what raises
+    `websockets.InvalidURI` — the commonest operator typo of all — so its
+    `?token=` reached every reconnect warning and status-file warning
+    verbatim."""
+    text = (
+        "stt.example.com:8765/v1?token=QUERYSECRET isn't a valid URI: "
+        "scheme isn't ws or wss"
+    )
+    safe = safe_exc_text(Exception(text))
+    assert "QUERYSECRET" not in safe
+    assert safe == "stt.example.com:8765/v1 isn't a valid URI: scheme isn't ws or wss"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        ("stt.example.com:8765/v1#token=S3CR3T", "stt.example.com:8765/v1"),
+        ("stt.example.com:8765?token=S3CR3T", "stt.example.com:8765"),
+        ("[::1]:8765/v1?token=S3CR3T", "[::1]:8765/v1"),
+        ("h.local/v1?t=S3CR3T failed", "h.local/v1 failed"),
+    ),
+    ids=str,
+)
+def test_scheme_less_query_strip_shapes(text, expected):
+    assert safe_exc_text(Exception(text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        # Prose, not a URI: the scheme-less query strip must not cut here.
+        "Traceback? no, a warning",
+        "Error: what? nothing",
+        "connection refused: host unreachable",
+        "C:/Users/me/file not found: mail ops@corp.com",
+    ),
+    ids=str,
+)
+def test_scheme_less_query_strip_leaves_prose_alone(text):
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_at_inside_the_password_cannot_pin_the_scan_short():
+    """Round-6 finding B (MEDIUM, leak): an `@` *inside* the userinfo that
+    happened to be followed by a host-shaped token (`p@ss`) looked like a
+    settled authority, so the real terminating `@` was refused as a rival
+    and `_redact_text` deleted only up to the wrong one — leaving most of
+    the password in cleartext. Whitespace is the one authority terminator a
+    typed-in password can contain unencoded, so a host-shaped span ending at
+    whitespace settles nothing when the very next word carries on with more
+    userinfo."""
+    text = (
+        "http://user:p@ss w0rd:x@stt.example.com:8765/v1 isn't a valid URI: "
+        "scheme isn't ws or wss"
+    )
+    safe = redact_uri(text)
+    assert "w0rd" not in safe
+    assert "user:p" not in safe
+    assert safe == (
+        "http://stt.example.com:8765/v1 isn't a valid URI: scheme isn't ws or wss"
+    )
+    assert safe_exc_text(Exception(text)) == safe
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        # Round-6 `_redact.py:315` — a path-bearing, query-free URI plus two
+        # prose words plus an email collapsed to the email's domain.
+        "wss://host.example.com:443/v1 failed: user@corp.com",
+        "ws://1.2.3.4:8765/v1 failed: user@corp.com",
+        # Round-6 `_redact.py:373` — the same on the scheme-less path.
+        "unix:/tmp/x.sock error: svc@host.com",
+        "host.example.com:443/v1 failed: user@corp.com",
+        # Round-6 `_redact.py:246` — `_not_query_of_path` only recognised a
+        # query that followed a `/path`, so a path-free `host:port?query`
+        # (and its `#fragment` twin) still fabricated a host.
+        "wss://host.example.com:443?redirect=bob@corp.com",
+        "wss://host.example.com:443#redirect=bob@corp.com",
+        "wss://stt.internal:2020?user=bob@corp.com",
+    ),
+    ids=str,
+)
+def test_an_already_terminated_authority_is_never_deleted(text):
+    """The fabrication invariant, stated once: when the anchor's own
+    authority already ends well-formed, there is no userinfo in it and no
+    later `@` may delete it."""
+    assert redact_uri(text) == text
+    assert safe_exc_text(Exception(text)).startswith(text.split("?")[0].split("#")[0])
+
+
+def test_query_strip_never_truncates_an_unredacted_credential():
+    """Round-6 `_redact.py:499` (Minor): composing the query strip on top of
+    the scanner could cut inside a password the scanner had declined to
+    redact, emitting a fabricated host (`wss://user:a/b`) and losing the
+    real one. Both steps now cut only where the text in front of the `?` is
+    a well-formed authority — which also lets the scanner accept this
+    credential outright, since a truncated authority proves the `?` is a
+    password character."""
+    uri = "wss://user:a/b?c@host/v1"
+    assert redact_uri(uri) == "wss://host/v1"
+    assert display_uri(uri) == "wss://host/v1"
+    assert safe_exc_text(Exception(uri)) == "wss://host/v1"
+    # `strip_query` alone sees a netloc (`user:a`) that is not a well-formed
+    # `host[:port]`, so it fails closed rather than emitting `wss://user:a/b`.
+    assert strip_query(uri) == uri
+
+
 def test_display_uri_is_the_single_composition_of_both_steps():
     """Round-5 finding 8: `strip_query(redact_uri(x))` was open-coded
     identically at both display call sites."""
@@ -562,7 +682,21 @@ def test_display_uri_is_the_single_composition_of_both_steps():
 # x scheme-prefixed/bare x host shape.
 # ---------------------------------------------------------------------------
 
-_PASSWORD_TAILS = ("", "/seg", "?q", "#frag", " word", "://tail")
+_PASSWORD_TAILS = (
+    "",
+    "/seg",
+    "?q",
+    "#frag",
+    " word",
+    "://tail",
+    # Round-6 finding B: an `@` inside the password whose own tail is a
+    # clean, host-shaped token. Every pre-round-6 sweep axis put a
+    # non-numeric port after the in-userinfo `@` (`corp.com:hunter2`), which
+    # is why no generated case reached the settled-authority tie-break with
+    # a host-shaped tail and the leak survived five rounds.
+    "@ss word:x",
+    " w@rd",
+)
 _USERNAMES = ("user", "1user", "", "alice@corp.com")
 _PASSWORD_HEADS = ("hunter2", "1234", "AB+cd=")
 _HOSTS = ("stt.example.internal:2020", "host:8765", "h.local")
@@ -657,6 +791,16 @@ _NON_CREDENTIAL_CORPUS = (
     # tail substituted for it (`wss://example.com`).
     "wss://host:443/v1?redirect=user@example.com",
     "ws://localhost:8765/v1?user=bob@corp.com",
+    # Round-6 `_redact.py:246`: the path-free twins of the two above. The
+    # query guard used to require a `/path` in front of the `?`.
+    "wss://host.example.com:443?redirect=bob@corp.com",
+    "wss://host.example.com:443#redirect=bob@corp.com",
+    "wss://stt.internal:2020?user=bob@corp.com",
+    # Round-6 `_redact.py:315` / `:373`: a real, already-terminated
+    # authority followed by <=2 prose words and an email address.
+    "wss://host.example.com:443/v1 failed: user@corp.com",
+    "unix:/tmp/x.sock error: svc@host.com",
+    "host.example.com:443/v1 failed: user@corp.com",
 )
 
 
@@ -677,6 +821,29 @@ def test_sweep_non_credential_authorities_keep_their_host(text):
     safe = safe_exc_text(Exception(text))
     head = text.split("?")[0].split("#")[0]
     assert safe.startswith(head), (text, safe)
+
+
+def _query_corpus():
+    """Round-6 finding A, swept: every URI token shape that carries a query,
+    with and without a scheme. The scheme-less half is the one
+    `_strip_query_spans` never scanned."""
+    for scheme in ("ws://", "wss://", ""):
+        for host in ("stt.example.internal:2020", "h.local", "[::1]:2020"):
+            for path in ("", "/", "/v1"):
+                for mark in ("?", "#"):
+                    for suffix in ("", " isn't a valid URI: nonempty path required"):
+                        head = f"{scheme}{host}{path}"
+                        yield (
+                            f"{head}{mark}token=QUERYSECRET{suffix}",
+                            f"{head}{suffix}",
+                        )
+
+
+@pytest.mark.parametrize("text,expected", list(_query_corpus()), ids=str)
+def test_sweep_every_query_bearing_uri_is_stripped(text, expected):
+    safe = safe_exc_text(Exception(text))
+    assert "QUERYSECRET" not in safe, (text, safe)
+    assert safe == expected, (text, safe)
 
 
 # ---------------------------------------------------------------------------
