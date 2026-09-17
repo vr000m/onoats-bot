@@ -478,6 +478,38 @@ def _write_config_toml(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+# A POSIX-shell-safe env var name. A key is a bare, unquotable token on the
+# left of the `=`, so unlike a value it cannot be escaped into safety —
+# anything that is not a well-formed name is dropped rather than written.
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _env_quote(value: str) -> str:
+    """Render `value` as a dotenv double-quoted literal.
+
+    The writer below emits a ``KEY=value`` line per secret but never checked
+    that the value could *be* one. A secret carrying a newline — an argv
+    value (``--deepgram-key $'a\\nEVIL=1'``) or a mispaste — was written raw,
+    so the next :func:`dotenv_values` read of the 0600 file saw a second,
+    attacker-chosen ``KEY=value`` pair that no prompt ever accepted. Values
+    with an unquoted ``" #"`` were silently truncated at the comment marker
+    for the same reason: the value was assumed to be line-safe rather than
+    made so.
+
+    Double quotes, because that is the one dotenv form with escapes: both
+    readers of this file (``config._load_secrets`` and this module's own
+    merge step) go through ``dotenv_values``, which decodes ``\\n``, ``\\r``,
+    ``\\\\`` and ``\\"`` inside them, so every value round-trips byte-for-byte.
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
 def _write_secrets_env(path: Path, secrets: dict, *, merge_existing: bool) -> None:
     """Write ``secrets.env`` with mode 0600. Merges with existing values."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -491,7 +523,7 @@ def _write_secrets_env(path: Path, secrets: dict, *, merge_existing: bool) -> No
     # so the path exists with correct perms for later edits.
     lines = [
         "# onoats STT secrets — 0600. NEVER commit. STT secrets only, NO LLM keys.",
-        *[f"{k}={v}" for k, v in merged.items()],
+        *[f"{k}={_env_quote(v)}" for k, v in merged.items() if _ENV_KEY_RE.match(k)],
     ]
     # Create with restrictive perms from the start (avoid a readable window).
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

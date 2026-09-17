@@ -677,3 +677,56 @@ def test_section_header_grammar_is_shared_by_start_and_end_scans():
     assert init_mod._extract_raw_section(text, "app") == "[app]\nx = 1"
     assert init_mod._section_header_name("[]") == ""
     assert not hasattr(init_mod, "_SECTION_HEADER_RE")
+
+
+# ---------------------------------------------------------------------------
+# Round-6 security regression.
+# ---------------------------------------------------------------------------
+
+
+def test_secrets_env_values_cannot_inject_a_second_key(tmp_path):
+    """Round-6 security finding: `_write_secrets_env` rendered each secret as
+    a raw `f"{k}={v}"` line without ever checking that the value could BE one
+    line. A newline in an argv-supplied value (`--deepgram-key`) therefore
+    wrote a second, attacker-chosen `KEY=value` pair into the 0600 file that
+    no prompt had accepted — and the next merge read it back as a real
+    secret. Values are now written as dotenv double-quoted literals, so every
+    value round-trips byte-for-byte and none of them can be a line of their
+    own."""
+    from dotenv import dotenv_values
+
+    from onoats.init import _write_secrets_env
+
+    path = tmp_path / "secrets.env"
+    hostile = {
+        "DEEPGRAM_API_KEY": "legit\nINJECTED_KEY=pwned",
+        # Silently truncated at the comment marker before the fix.
+        "OPENAI_API_KEY": "tail # not-a-comment",
+        "ASSEMBLYAI_API_KEY": 'quote" and \\backslash',
+    }
+    _write_secrets_env(path, hostile, merge_existing=False)
+
+    got = dict(dotenv_values(path))
+    assert "INJECTED_KEY" not in got
+    assert got == hostile
+    assert oct(path.stat().st_mode)[-3:] == "600"
+
+    # And the injected pair does not reappear through the merge path either.
+    _write_secrets_env(path, {"STT_WS_URI": "ws://127.0.0.1:8765"}, merge_existing=True)
+    merged = dict(dotenv_values(path))
+    assert "INJECTED_KEY" not in merged
+    assert merged["DEEPGRAM_API_KEY"] == "legit\nINJECTED_KEY=pwned"
+
+
+def test_secrets_env_drops_a_malformed_key(tmp_path):
+    """A key is a bare token on the left of the `=` — unlike a value it
+    cannot be escaped into safety, so a malformed one is dropped."""
+    from dotenv import dotenv_values
+
+    from onoats.init import _write_secrets_env
+
+    path = tmp_path / "secrets.env"
+    _write_secrets_env(
+        path, {"GOOD_KEY": "v", "BAD KEY=X": "v", "9BAD": "v"}, merge_existing=False
+    )
+    assert dict(dotenv_values(path)) == {"GOOD_KEY": "v"}
