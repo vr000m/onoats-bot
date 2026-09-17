@@ -705,15 +705,25 @@ def test_create_stt_service_arms_preflight_confirm_on_the_new_instance(
     asyncio.run(runtime._create_stt_service(data_dir=tmp_path))
     assert captured_kwargs.get("on_preflight_confirmed") is None
 
-    # Case 3 (finding 12): a LATER instance whose own preflight call was a
-    # `_preflight_cache` hit still gets armed when the caller tells it an
-    # earlier call recovered — otherwise a session where only that instance
-    # ever produces transcripts leaves the shared warning pinned forever.
+    # Case 3 (finding 12, round-4 finding 3): a LATER instance whose own
+    # preflight call is a `_preflight_cache` hit still gets armed — not via
+    # a caller-relayed `preflight_recovered` flag (removed: it leaked
+    # `_preflight_cache` internals as temporal coupling between two
+    # `_create_stt_service` calls), but because the cache itself memoizes
+    # the recovery OUTCOME (not just "a probe ran") and replays it into
+    # `on_recovery` on a hit — see `_preflight_stt_ws`'s cache-hit branch.
+    # Restore the real `_preflight_stt_ws` (undoing case 2's fake), pin
+    # `_resolve_stt_ws_target` to a fixed endpoint, and pre-seed the cache
+    # exactly as an earlier call's real recovered probe would have left it.
     captured_kwargs.clear()
+    monkeypatch.setattr(runtime, "_preflight_stt_ws", _preflight_stt_ws)
+    monkeypatch.setattr(runtime, "_resolve_stt_ws_target", lambda *a, **kw: _kwargs())
+    key = runtime._preflight_key(_kwargs())
+    runtime._preflight_cache[key] = (
+        "stt: server restarted automatically (kickstarted x)"
+    )
     asyncio.run(
-        runtime._create_stt_service(
-            data_dir=tmp_path, branch_instance="system", preflight_recovered=True
-        )
+        runtime._create_stt_service(data_dir=tmp_path, branch_instance="system")
     )
     assert captured_kwargs.get("on_preflight_confirmed") is not None
 
@@ -1565,6 +1575,55 @@ def test_display_target_never_leaks_on_a_malformed_uri():
     assert runtime._display_target({"uri": "ws://host:8080/x"}) == "ws://host:8080/x"
 
 
+def test_display_target_strips_query_string_token():
+    """Round-4 finding 6: `redact_uri` (onoats._redact) is userinfo-only —
+    a token carried in a URI query string (`STT_WS_URI=wss://host:443/v1
+    ?token=s3cr3t`) survives it untouched and used to echo verbatim through
+    `_display_target` (and hence every preflight/error message that calls
+    it). Fixed at this call site (not in `_redact.py`, which is shared/leaf
+    and out of scope): the query string (and fragment) are stripped for
+    display, in addition to `redact_uri`'s existing userinfo strip."""
+    out = runtime._display_target({"uri": "wss://host:443/v1?token=s3cr3t"})
+    assert out == "wss://host:443/v1"
+    assert "s3cr3t" not in out
+
+    # Userinfo AND a query-string token together: both must be gone.
+    out = runtime._display_target(
+        {"uri": "wss://user:hunter2@host:443/v1?token=s3cr3t#frag"}
+    )
+    assert out == "wss://host:443/v1"
+    assert "hunter2" not in out and "s3cr3t" not in out and "frag" not in out
+
+    # No query string: unchanged (already covered by the malformed-uri test
+    # above, pinned again here for the specific "nothing to strip" case).
+    assert runtime._display_target({"uri": "ws://host:8080/x"}) == "ws://host:8080/x"
+
+
+def test_cleartext_token_warning_does_not_echo_query_string_token():
+    """Round-4 finding 6: the cleartext-token warning interpolated
+    `redact_uri(effective_uri)` directly, which strips userinfo but not a
+    query-string token — an operator-supplied `STT_WS_URI` with
+    `?token=...` echoed the token verbatim into the warning even though the
+    warning exists specifically to flag a token about to be sent in
+    cleartext."""
+    from loguru import logger
+
+    records: list[str] = []
+    sink_id = logger.add(lambda msg: records.append(str(msg)), level="WARNING")
+    try:
+        runtime._resolve_stt_ws_target(
+            {
+                "STT_WS_URI": "ws://remote.example:2020/v1?token=s3cr3t",
+                "STT_WS_TOKEN": "sekret-token",
+            }
+        )
+    finally:
+        logger.remove(sink_id)
+
+    assert any("cleartext" in r for r in records)
+    assert not any("s3cr3t" in r for r in records)
+
+
 def test_create_stt_service_gives_the_instance_a_stable_identity_token(
     monkeypatch, tmp_path
 ):
@@ -1669,6 +1728,59 @@ def test_pre_kickstart_second_connect_is_capped_by_remaining_deadline(monkeypatc
     # elapsed stays close to the budget, not roughly double it.
     assert elapsed < 8.0
     assert len(created) == 2
+
+
+def test_budget_exhausted_retry_skips_connect_instead_of_misreporting(monkeypatch):
+    """Round-4 finding 2: when the inter-attempt sleep (plus the deadline-
+    capped teardown) already consumes the whole pre-kickstart budget, the
+    second attempt's `connect()` timeout used to be floored at
+    `_closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC` (0.05s) and attempted anyway —
+    a connect with ~0.05s to work with cannot succeed, so this was a
+    guaranteed, near-instant `TimeoutError` reported as "did not complete
+    handshake within {budget}s", misrepresenting budget exhaustion (spent
+    on the delay/teardown, not on waiting for the server) as a real
+    handshake timeout. The fix skips the doomed attempt outright and
+    reports budget exhaustion honestly."""
+    _install_fake_client(monkeypatch, connect_raises=lambda: TimeoutError())
+    monkeypatch.setattr(runtime, "_PREFLIGHT_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_TIMEOUT_SEC", 0.01)
+    # The delay alone consumes almost the entire total_budget (0.07s), so by
+    # the time attempt 2's remaining budget is recomputed there is far less
+    # than `_MIN_CONNECT_ATTEMPT_TIMEOUT_SEC` (0.05s) left.
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.06)
+
+    with pytest.raises(SttPreflightError) as exc_info:
+        asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
+
+    assert "budget exhausted" in str(exc_info.value)
+    # Attempt 2's client was constructed (fresh-client-per-attempt is
+    # unchanged) but never asked to connect — the doomed attempt was
+    # skipped, not attempted-and-failed.
+    assert len(_FakeClient.instances) == 2
+    assert _FakeClient.instances[1].connect_calls == 0
+
+
+def test_connect_retry_floor_is_independent_of_close_domain_floor(monkeypatch):
+    """Round-4 finding 1: the retry loop used to floor a pre-kickstart
+    CONNECT timeout with `_closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC` — a
+    close-domain constant — so retuning that floor for teardown reasons
+    would silently retune the connect floor too. Retuning the close-domain
+    floor (even drastically) must not change whether a budget-exhausted
+    connect attempt is skipped: `_MIN_CONNECT_ATTEMPT_TIMEOUT_SEC` is its
+    own, separate constant."""
+    monkeypatch.setattr(_closing, "MIN_CLOSE_ATTEMPT_TIMEOUT_SEC", 10.0)
+    _install_fake_client(monkeypatch, connect_raises=lambda: TimeoutError())
+    monkeypatch.setattr(runtime, "_PREFLIGHT_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.06)
+
+    with pytest.raises(SttPreflightError):
+        asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
+
+    # Even with the close-domain floor retuned to 10s, the connect attempt
+    # was still skipped rather than floored up to (or beyond) that value —
+    # the two floors are independent.
+    assert _FakeClient.instances[1].connect_calls == 0
 
 
 # ---------------------------------------------------------------------------

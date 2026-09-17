@@ -486,6 +486,46 @@ def config_toml_path_for_test():
     return config_toml_path()
 
 
+def test_section_header_name_tolerates_whitespace_variant():
+    """Codex finding (round 4): both TOML (`tomllib.loads("[ app ]\\n...")`
+    parses fine) and the Swift `ConfigStore` reader trim whitespace inside
+    the brackets of a section header (comment in ConfigStore.swift:
+    "tolerate hand-edited [ stt ]"). `_section_header_name` must agree,
+    matching `[app]` and `[ app ]` (and other interior-whitespace spellings)
+    identically."""
+    assert init_mod._section_header_name("[app]") == "app"
+    assert init_mod._section_header_name("[ app ]") == "app"
+    assert init_mod._section_header_name("[  app  ]") == "app"
+    assert init_mod._section_header_name("[stt]") == "stt"
+    assert init_mod._section_header_name("not a header") is None
+
+
+def test_rerun_carries_an_app_section_with_whitespace_variant_header(
+    _isolate_env, monkeypatch
+):
+    """Codex finding (round 4, unreconciled): `_extract_raw_section`'s
+    exact-string header comparison (`line.strip() == "[app]"`) did not
+    tolerate a hand-edited `[ app ]` header, even though both TOML and the
+    Swift `ConfigStore` reader accept it — so re-running `onoats init`
+    against a config using that spelling silently dropped the entire `[app]`
+    block (including `launch_at_login`), reverting an installed launch-at-
+    login preference with no warning. Verified this fails pre-fix: with the
+    old exact-string check, `start` is never found for `[ app ]`, so
+    `app_raw_block` is `None` and the whole section is omitted."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text() + "\n[ app ]\nlaunch_at_login = true\n")
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["app"]["launch_at_login"] is True
+
+
 # ---------------------------------------------------------------------------
 # Interactive — local vs hosted branch
 # ---------------------------------------------------------------------------

@@ -409,6 +409,57 @@ def test_kickstart_returns_false_when_getuid_is_unavailable(monkeypatch):
     assert launchd.kickstart_stt_server("pipecat.stt-server") is False
 
 
+# ---------------------------------------------------------------------------
+# Round-4 finding 6: defense-in-depth label re-validation
+# ---------------------------------------------------------------------------
+
+
+def test_kickstart_rejects_a_label_containing_a_slash(monkeypatch):
+    """A `/` in `label` would redirect the `gui/<uid>/<label>` kickstart
+    target at a different job or domain. Every shipped caller already
+    resolves its label through `onoats.config.validate_launchd_label`
+    before calling this function, but the function itself had no validation
+    of its own — re-check here so a caller that bypasses the config
+    resolver (a bug, a future caller, a test) can't forge the target."""
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("subprocess.run must not be reached for a bad label")
+
+    monkeypatch.setattr(launchd.subprocess, "run", _boom)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: 1)
+
+    assert launchd.kickstart_stt_server("evil/../other-domain") is False
+
+
+def test_kickstart_rejects_a_label_containing_the_warning_delimiter(monkeypatch):
+    """A `label` containing `"; "` or `": "` would forge a pseudo-branch
+    entry the next time `status._parse_warning_branches` reads the merged
+    recovery message that embeds this label (`recovery_message`)."""
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError("subprocess.run must not be reached for a bad label")
+
+    monkeypatch.setattr(launchd.subprocess, "run", _boom)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: 1)
+
+    assert launchd.kickstart_stt_server("a; b: c") is False
+
+
+def test_kickstart_accepts_a_well_formed_label(monkeypatch):
+    """No false positive: the re-validation must not reject the shipped
+    label shapes (`pipecat.stt-server`, `pipecat.stt-server.nemotron`)."""
+    monkeypatch.setattr(
+        launchd.subprocess,
+        "run",
+        lambda argv, **kw: subprocess.CompletedProcess(
+            argv, returncode=0, stdout="", stderr=""
+        ),
+    )
+    monkeypatch.setattr(launchd.os, "getuid", lambda: 1)
+
+    assert launchd.kickstart_stt_server("pipecat.stt-server.nemotron") is True
+
+
 def test_mark_unhealthy_documents_the_first_failure_registration_point():
     """Round-3 finding 2's contract, pinned at the registry layer: a token
     registered before any kickstart still blocks a sibling's early cooldown

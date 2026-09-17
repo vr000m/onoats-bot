@@ -149,7 +149,34 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
     A ``True`` return means only that launchd accepted the restart
     request, not that the server is answering again — callers must confirm
     recovery with their own post-kickstart handshake/reconnect.
+
+    Defense in depth: ``label`` is re-validated here against the exact same
+    allowlist ``onoats.config.validate_launchd_label`` enforces at
+    config-resolution time, even though every shipped caller
+    (``runtime._create_stt_service``) already resolves its label through
+    that gate before this function ever sees it. This is a public entry
+    point interpolated straight into the ``launchctl`` argv with no
+    validation of its own otherwise — a future or test caller that bypasses
+    the config resolver would forge the ``gui/<uid>/<label>`` service target
+    verbatim (a ``label`` containing ``/`` redirects the kickstart at a
+    different job or domain) or corrupt the recovery-message merge (a
+    ``label`` containing ``"; "``/``": "`` forges a pseudo-branch entry on
+    the next :func:`onoats.status._parse_warning_branches` read). A rejected
+    label is treated exactly like every other failure mode here — logged
+    and swallowed, returning ``False`` — matching this function's "never
+    raises, callers fall through to today's behavior" contract rather than
+    raising, which would break that contract for the one caller that most
+    needs it to hold (a wedged/misconfigured label must never itself crash
+    the preflight or reconnect path it is meant to heal).
     """
+    from onoats.config import validate_launchd_label
+
+    if validate_launchd_label(label) is None:
+        logger.warning(
+            f"STT: kickstart of {label!r} refused — not a well-formed launchd "
+            "label (re-validated inside kickstart_stt_server, defense in depth)"
+        )
+        return False
     try:
         # `os.getuid` is POSIX-only and absent on Windows. onoats is a
         # macOS-only app, so this is defensive rather than a live platform

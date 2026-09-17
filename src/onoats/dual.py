@@ -503,21 +503,23 @@ async def run_onoats_dual(
     # Recovery message capture: only the *first* call's preflight actually
     # probes the endpoint (the second is a `_preflight_cache` hit for the
     # same resolved kwargs — see `_preflight_stt_ws`'s docstring), so at
-    # most one of the two calls returns a non-None message.
+    # most one of the two calls returns a non-None message. Both calls read
+    # the SAME memoized outcome, though: `_preflight_cache` stores the
+    # recovery message (not just "a probe ran"), and a cache-hit call
+    # replays it into its own `on_recovery`, so neither call needs to be
+    # told about the other's result — no `preflight_recovered` relay here.
     # `branch_instance` scopes each instance's LIVE-session status-warning
     # branch (`stt-mic` / `stt-system`) so mic's and system's independent
     # kickstart recoveries can't clear each other's still-unconfirmed
     # warning. The startup preflight's own recovery stays on the shared
-    # `stt` branch (one probe, one server) — which is why the second call is
-    # told about the first's recovery: it arms that instance's confirm gate
-    # too, so a system-audio-only session (no mic transcript ever) still
-    # clears the shared warning.
+    # `stt` branch (one probe, one server), so whichever instance's first
+    # transcript event lands first clears it — a system-audio-only session
+    # (no mic transcript ever) still clears the shared warning.
     mic_result = await _create_stt_service(data_dir=data_dir, branch_instance="mic")
     mic_stt = mic_result.service
     system_result = await _create_stt_service(
         data_dir=data_dir,
         branch_instance="system",
-        preflight_recovered=mic_result.preflight_recovery_message is not None,
     )
     system_stt = system_result.service
     preflight_recovery_warning = (

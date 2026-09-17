@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 from loguru import logger
 
 from onoats import _closing
-from onoats._redact import redact_uri, safe_exc_text
+from onoats._redact import redact_uri, safe_exc_text, strip_query
 from onoats._vendor.pid import (  # noqa: F401
     PID_FILENAME,
     PID_MARKER,
@@ -319,8 +319,8 @@ def _resolve_stt_ws_target(
     ):
         logger.warning(
             f"STT: STT_WS_TOKEN will be sent in cleartext to "
-            f"{redact_uri(effective_uri)}. Use wss:// for remote hosts, or bind "
-            "to loopback (127.0.0.1 / ::1 / UDS)."
+            f"{_display_target({'uri': effective_uri})}. Use wss:// for remote "
+            "hosts, or bind to loopback (127.0.0.1 / ::1 / UDS)."
         )
 
     return {
@@ -350,7 +350,7 @@ def _display_target(kwargs: dict) -> str:
     """
     uri = kwargs.get("uri")
     if uri:
-        return redact_uri(uri)
+        return strip_query(redact_uri(uri))
     return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
 
 
@@ -422,6 +422,19 @@ _PREFLIGHT_TIMEOUT_SEC = 2.0
 _PREFLIGHT_RETRY_DELAY_SEC = 1.0
 _PREFLIGHT_RETRY_TIMEOUT_SEC = 3.0
 
+# Floor for a pre-kickstart retry attempt's CONNECT timeout (used only when
+# the remaining pre-kickstart budget is recomputed after an intermediate
+# teardown — see the retry loop in `_preflight_stt_ws` below). Deliberately
+# its OWN constant, not `_closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`: that one
+# floors a *teardown* attempt, where even a near-zero timeout is meaningful
+# (a close either finishes or is cancelled cleanly either way). A CONNECT
+# attempt needs enough wall-clock to plausibly complete a handshake — reusing
+# the close-domain floor here would silently retune whenever that floor is
+# retuned for teardown reasons, and would guarantee this connect attempt
+# fails before it can do anything useful (see the budget-exhausted check
+# below, which skips the attempt outright once even this floor can't be met).
+_MIN_CONNECT_ATTEMPT_TIMEOUT_SEC = 0.05
+
 # Post-kickstart retry budget. Deliberately NOT the `_PREFLIGHT_RETRY_*`
 # constants above: those were sized for "already running but slow to answer",
 # a different scenario from "the process was just SIGKILLed and is reloading a
@@ -448,7 +461,19 @@ _POST_KICKSTART_ATTEMPT_TIMEOUT_SEC = _PREFLIGHT_RETRY_TIMEOUT_SEC
 # (dual path today uses the same resolved kwargs for both branches, but
 # nothing in the type system pins that) the probe re-runs against the
 # new endpoint instead of silently trusting a stale success.
-_preflight_cache: set[tuple[object, object, object, object]] = set()
+#
+# Maps the endpoint tuple to the recovery message (``None`` when the probe
+# succeeded without ever needing a kickstart). Round 4: this used to be a
+# bare `set` (outcome-blind — recorded only "a probe ran"), which forced
+# `dual.py` to manually relay a `preflight_recovered: bool` from the first
+# `_create_stt_service` call to the second so the second instance's confirm
+# gate could be armed even though its own preflight call was a cache hit.
+# Memoizing the *outcome* here instead means a cache-hit call replays the
+# same `on_recovery(message)` the original probe fired (see the cache-hit
+# branch in `_preflight_stt_ws`), so every caller reads the one memoized
+# result directly — no caller-to-caller relay, and no assumption about
+# which of the two calls runs first.
+_preflight_cache: dict[tuple[object, object, object, object], str | None] = {}
 
 
 _RSS_PROBE_TIMEOUT_SEC = 2.0
@@ -493,32 +518,47 @@ async def log_stt_server_rss(phase: str) -> None:
         async def _probe() -> None:
             await client.connect()
             await client.status()
-            async for event in client.events():
-                if event.get("type") != P.EVT_SERVER_STATUS:
-                    continue
-                pid = event.get("pid")
-                rss = event.get("rss_bytes")
-                uptime = event.get("uptime_seconds")
-                rss_mb = (
-                    (int(rss) / (1024 * 1024)) if isinstance(rss, (int, float)) else 0.0
-                )
-                uptime_s = float(uptime) if isinstance(uptime, (int, float)) else 0.0
-                # server.status mirrors the server.hello backend identity, so
-                # the probe line names the real ASR behind the socket — a
-                # wrong-model misconfig shows up in the RSS log too, not just
-                # at connect. Additive field: omit cleanly on older servers.
-                backend = event.get("backend") or {}
-                backend_desc = (
-                    f" backend={backend.get('name', '?')}/{backend.get('model', '?')}"
-                    if backend
-                    else ""
-                )
-                logger.info(
-                    f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
-                    f"session_uptime={uptime_s:.1f}s{backend_desc}"
-                )
-                return
-            logger.debug(f"stt_server RSS ({phase}): status reply missing")
+            # Held as a local so `finally` can explicitly `aclose()` it: a
+            # `wait_for` timeout/cancellation raises inside the generator's
+            # own suspended frame, which unwinds it but does not mark it
+            # closed — the underlying websocket-read state the generator
+            # owns can outlive this function's return without an explicit
+            # `aclose()` call.
+            events = client.events()
+            try:
+                async for event in events:
+                    if event.get("type") != P.EVT_SERVER_STATUS:
+                        continue
+                    pid = event.get("pid")
+                    rss = event.get("rss_bytes")
+                    uptime = event.get("uptime_seconds")
+                    rss_mb = (
+                        (int(rss) / (1024 * 1024))
+                        if isinstance(rss, (int, float))
+                        else 0.0
+                    )
+                    uptime_s = (
+                        float(uptime) if isinstance(uptime, (int, float)) else 0.0
+                    )
+                    # server.status mirrors the server.hello backend identity, so
+                    # the probe line names the real ASR behind the socket — a
+                    # wrong-model misconfig shows up in the RSS log too, not just
+                    # at connect. Additive field: omit cleanly on older servers.
+                    backend = event.get("backend") or {}
+                    backend_desc = (
+                        f" backend={backend.get('name', '?')}/{backend.get('model', '?')}"
+                        if backend
+                        else ""
+                    )
+                    logger.info(
+                        f"stt_server RSS ({phase}): pid={pid} rss={rss_mb:.1f}MB "
+                        f"session_uptime={uptime_s:.1f}s{backend_desc}"
+                    )
+                    return
+                logger.debug(f"stt_server RSS ({phase}): status reply missing")
+            finally:
+                with contextlib.suppress(Exception):
+                    await events.aclose()
 
         try:
             await asyncio.wait_for(_probe(), timeout=_RSS_PROBE_TIMEOUT_SEC)
@@ -528,7 +568,18 @@ async def log_stt_server_rss(phase: str) -> None:
             # fail the probe is exactly the one whose `close_session` ack
             # never arrives. Same bounded closer as every other teardown of
             # this client type.
-            await _close_client_quietly(client)
+            #
+            # Round 4: deadline-bound this too. Without it, `_close_client_
+            # quietly`'s two fixed-timeout closers (`close_session`, `close`)
+            # can run up to ~10s combined against an unreachable server, on
+            # top of the ~2s `wait_for` above already spent — costing up to
+            # ~12s total against a probe this function's own docstring calls
+            # "2s-bounded". Give teardown the same ``_RSS_PROBE_TIMEOUT_SEC``
+            # window the probe itself gets, not an unbounded extra budget.
+            await _close_client_quietly(
+                client,
+                deadline=asyncio.get_running_loop().time() + _RSS_PROBE_TIMEOUT_SEC,
+            )
     except Exception as exc:
         # Same leak class as `_preflight_stt_ws`/`_ensure_connected`: this
         # probe builds its own `TranscriptionClient` from the same
@@ -822,9 +873,22 @@ async def _preflight_stt_ws(
     (``onoats.stt.launchd``) has elapsed for it. With no label configured,
     or an active cooldown, or a failed kickstart, this reproduces today's
     ``SttPreflightError`` byte-for-byte.
+
+    A cache hit (``key`` already probed by an earlier call in this
+    process, for this or a different caller) replays the memoized outcome:
+    if that earlier call recovered via kickstart, ``on_recovery`` is
+    invoked here too, with the SAME message, so a second caller that never
+    itself probes still observes the recovery (see ``_preflight_cache``'s
+    module docstring).
     """
     key = _preflight_key(kwargs)
     if key in _preflight_cache:
+        cached_message = _preflight_cache[key]
+        if cached_message is not None and on_recovery is not None:
+            try:
+                on_recovery(cached_message)
+            except Exception as exc:
+                logger.warning(f"STT: on_recovery callback failed: {exc}")
         return
 
     import stt_server.client as _stt_client
@@ -850,6 +914,19 @@ async def _preflight_stt_ws(
                 "Set both STT_WS_HOST and STT_WS_PORT, or use STT_WS_URI / "
                 f"STT_WS_SOCKET. {hint}"
             )
+
+    # Captured so the eventual `_preflight_cache[key] = ...` store below can
+    # memoize the OUTCOME, not just the fact that a probe ran — see
+    # `_preflight_cache`'s module docstring. Wraps rather than replaces the
+    # caller's own `on_recovery`: the caller must still be notified in real
+    # time on an actual recovery; this only ADDS memoization on the side.
+    recovered_message: str | None = None
+
+    def _record_and_forward(msg: str | None) -> None:
+        nonlocal recovered_message
+        recovered_message = msg
+        if on_recovery is not None:
+            on_recovery(msg)
 
     # Attempt schedule — first is the fast-path, second retries only on
     # cold-start races (OSError). Other exceptions fail on the first try.
@@ -908,26 +985,42 @@ async def _preflight_stt_ws(
                 # actually remains — otherwise it always uses the full fixed
                 # `timeout_s` regardless, letting startup overrun the
                 # documented `total_budget`/`kickstart_budget` by up to a
-                # whole retry timeout. Floored, not zeroed, for the same
-                # reason `_close_client_quietly` floors its own timeout: a
-                # `wait_for(coro, 0)` cancels the wrapping task before
-                # `coro` is ever stepped, silently skipping the connect
-                # attempt outright instead of just cutting it short.
+                # whole retry timeout.
                 remaining = _pre_kickstart_deadline - loop.time()
-                timeout_s = max(
-                    _closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC, min(timeout_s, remaining)
-                )
+                timeout_s = min(timeout_s, remaining)
             try:
+                if idx > 0 and timeout_s <= _MIN_CONNECT_ATTEMPT_TIMEOUT_SEC:
+                    # The intermediate teardown (and/or the inter-attempt
+                    # sleep) already consumed the whole pre-kickstart
+                    # budget. Previously this floored `timeout_s` at
+                    # `_closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC` (0.05s) and
+                    # attempted the connect anyway — a connect with ~0.05s
+                    # to work with cannot succeed, so that "attempt" was
+                    # really just a guaranteed, near-instant `TimeoutError`
+                    # that then got reported as "did not complete handshake
+                    # within {budget}s", misrepresenting budget exhaustion
+                    # (spent on teardown, not on waiting for the server) as
+                    # a real handshake timeout. Skip the doomed attempt and
+                    # raise the same `TimeoutError` type so the existing
+                    # kickstart-and-retry / `SttPreflightError` handling
+                    # below is unchanged — only the message differs, via
+                    # `exc`'s own text.
+                    raise TimeoutError(
+                        "preflight retry budget exhausted before a connect "
+                        "attempt could be made (spent on inter-attempt "
+                        "teardown/delay)"
+                    )
                 await asyncio.wait_for(client.connect(), timeout=timeout_s)
                 break
             except TimeoutError as exc:
                 if not is_last:
                     continue
+                detail = f" ({exc})" if str(exc) else ""
                 if launchd_label is not None:
                     outcome, recovered = await _kickstart_and_retry(
                         _make_client,
                         launchd_label,
-                        on_recovery,
+                        _record_and_forward,
                         target=target,
                         hint=hint,
                     )
@@ -936,9 +1029,9 @@ async def _preflight_stt_ws(
                         recovered,
                         exhausted_message=(
                             f"STT: stt_server did not complete handshake within "
-                            f"{kickstart_budget:.1f}s at {target} (kickstarted "
-                            f"{launchd_label!r}, still unreachable after retry). "
-                            f"{hint}"
+                            f"{kickstart_budget:.1f}s at {target}{detail} "
+                            f"(kickstarted {launchd_label!r}, still unreachable "
+                            f"after retry). {hint}"
                         ),
                         exc=exc,
                     )
@@ -960,7 +1053,7 @@ async def _preflight_stt_ws(
                     # fall through, unchanged message.
                 raise SttPreflightError(
                     f"STT: stt_server did not complete handshake within "
-                    f"{total_budget:.1f}s at {target}. {hint}"
+                    f"{total_budget:.1f}s at {target}{detail}. {hint}"
                 ) from exc
             except ValueError as exc:
                 # Mis-shaped kwargs slipped past our completeness check
@@ -992,7 +1085,7 @@ async def _preflight_stt_ws(
                     outcome, recovered = await _kickstart_and_retry(
                         _make_client,
                         launchd_label,
-                        on_recovery,
+                        _record_and_forward,
                         target=target,
                         hint=hint,
                     )
@@ -1039,7 +1132,7 @@ async def _preflight_stt_ws(
     finally:
         await _close_client_quietly(client)
 
-    _preflight_cache.add(key)
+    _preflight_cache[key] = recovered_message
 
 
 def _vocabulary_bias() -> list[str]:
@@ -1104,7 +1197,6 @@ async def _create_stt_service(
     *,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
-    preflight_recovered: bool = False,
 ) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -1142,15 +1234,17 @@ async def _create_stt_service(
     it is one probe against one shared server, so it always lands on the
     shared ``stt`` branch.
 
-    ``preflight_recovered`` lets a caller declare that an *earlier*
-    ``_create_stt_service`` call in the same process already
-    kickstart-recovered during preflight. Only that first call actually
-    probes (the second is a ``_preflight_cache`` hit), so without this the
-    second instance never learns a recovery happened — and in a session where
-    only the second instance ever produces transcripts (e.g. system-audio
-    only, no mic speech) the shared ``stt`` warning would stay pinned for the
-    whole session. Passing it arms this instance's confirm gate too, so
-    whichever instance sees a transcript first clears the shared warning.
+    Only the FIRST ``_create_stt_service`` call for a given endpoint
+    actually probes; a later call for the same endpoint is a
+    ``_preflight_cache`` hit inside ``_preflight_stt_ws``. That cache
+    memoizes the recovery OUTCOME (not just "a probe ran"), so a cache-hit
+    call still gets its own ``on_recovery`` replayed with the same message
+    if an earlier call's probe kickstart-recovered — no caller-side
+    relay needed, and no assumption about which call runs first. This
+    arms the instance's confirm gate too, so whichever instance sees a
+    transcript first clears the shared ``stt`` warning (a session where
+    only the second instance ever produces transcripts, e.g. system-audio
+    only, would otherwise leave that warning pinned for the whole session).
     """
     from onoats.config import load_config
 
@@ -1190,8 +1284,6 @@ async def _create_stt_service(
         recovery_holder: dict[str, str | None] = {}
 
         def _branch_writer(branch: str) -> Callable[[str | None], None]:
-            from onoats import status as _status
-
             def _write(msg: str | None) -> None:
                 # Best-effort, like every other status write in this module.
                 # This fires from inside `_preflight_stt_ws`'s and
@@ -1200,7 +1292,7 @@ async def _create_stt_service(
                 # turn a successful self-heal into an uncaught crash, and must
                 # not be misread by `_ensure_connected` as a failed connect.
                 try:
-                    _status.set_warning_branch(data_dir, branch, msg)
+                    _status_mod.set_warning_branch(data_dir, branch, msg)
                 except Exception as exc:
                     logger.warning(f"STT: could not write recovery status ({exc})")
 
@@ -1249,14 +1341,15 @@ async def _create_stt_service(
         # ``TranscriptionClient``, which takes no ``language`` kwarg.
         # The preflight probe above (a throwaway ``TranscriptionClient``, run
         # before this instance exists) may have already kickstart-recovered —
-        # or an EARLIER ``_create_stt_service`` call's probe may have, with
-        # this call being a ``_preflight_cache`` hit (``preflight_recovered``).
-        # Either way, hand the instance a clear callback for the SHARED
-        # ``stt`` branch so its own first transcript event clears the warning
-        # ``recovery_holder`` / the earlier call handed to the caller.
-        recovered_in_preflight = (
-            preflight_recovered or recovery_holder.get("message") is not None
-        )
+        # either because THIS call actually probed, or because an EARLIER
+        # ``_create_stt_service`` call's probe did and this call's own
+        # `_preflight_stt_ws` call was a `_preflight_cache` hit that replayed
+        # the memoized outcome into `preflight_on_recovery` above (see that
+        # function's cache-hit branch). Either way, `recovery_holder` is
+        # populated identically, so this instance gets a clear callback for
+        # the SHARED ``stt`` branch: its own first transcript event clears
+        # the warning.
+        recovered_in_preflight = recovery_holder.get("message") is not None
         service = WebSocketSTTService(
             language=language,
             launchd_label=launchd_label,
@@ -1886,10 +1979,10 @@ def _write_status_running(
     into the fresh record (see ``status.write_running``'s docstring) — the
     live-path equivalent still goes through ``status.set_warning_branch``.
     """
-    from onoats import status as _status
+    from onoats import status as _status_mod
 
     try:
-        _status.write_running(
+        _status_mod.write_running(
             data_dir,
             pid=os.getpid(),
             audio_source=audio_source,
@@ -1902,10 +1995,10 @@ def _write_status_running(
 
 def _mark_status_rotation(data_dir: Path) -> None:
     """Stamp ``last_rotation_time`` on the current status record. Best-effort."""
-    from onoats import status as _status
+    from onoats import status as _status_mod
 
     try:
-        _status.mark_rotation(data_dir)
+        _status_mod.mark_rotation(data_dir)
     except OSError as exc:
         logger.warning(f"Could not update status file (rotation): {exc}")
 
@@ -1922,10 +2015,10 @@ def _write_status_stopped(
     Called inside the single-writer shutdown path BEFORE the pid file is removed,
     so the pid backstop and the status file never disagree about a live recorder.
     """
-    from onoats import status as _status
+    from onoats import status as _status_mod
 
     try:
-        _status.write_stopped(
+        _status_mod.write_stopped(
             data_dir,
             exit_reason=exit_reason,
             last_error=last_error,

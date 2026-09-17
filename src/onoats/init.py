@@ -40,8 +40,8 @@ from pathlib import Path
 from onoats.config import (
     config_toml_path,
     load_config,
+    normalize_launchd_label,
     secrets_env_path,
-    validate_launchd_label,
 )
 
 # --- STT backend identifiers written into config.toml [stt].service ---------
@@ -317,6 +317,27 @@ def _toml_escape(value: str) -> str:
 
 
 _SECTION_HEADER_RE = re.compile(r"^\[[^\]]+\]\s*$")
+# Captures the bracket interior so a header's *name* can be compared with
+# surrounding whitespace ignored — both TOML (`tomllib.loads("[ app ]\n...")`
+# parses fine) and the Swift `ConfigStore` reader (`readValue`/`writeValue`
+# in native/onoats-menubar/Sources/ConfigStore.swift both
+# `.trimmingCharacters` the bracket interior, comment: "tolerate hand-edited
+# [ stt ]") accept a hand-edited `[ app ]`. An exact-string header match
+# here disagreed with both and silently treated such a file as having no
+# `[app]` section at all, dropping the block (including `launch_at_login`)
+# on the next `onoats init` regeneration.
+_SECTION_HEADER_NAME_RE = re.compile(r"^\[\s*([^\]]*?)\s*\]\s*$")
+
+
+def _section_header_name(line: str) -> str | None:
+    """Return a stripped line's section name if it is a ``[...]`` header.
+
+    Whitespace-tolerant around the name (``[ app ]`` -> ``"app"``), matching
+    ``ConfigStore``'s own header parsing. Returns ``None`` for a non-header
+    line.
+    """
+    m = _SECTION_HEADER_NAME_RE.match(line)
+    return m.group(1) if m else None
 
 
 def _extract_raw_section(text: str, section: str) -> str | None:
@@ -348,8 +369,14 @@ def _extract_raw_section(text: str, section: str) -> str | None:
     instead, or omits it) rather than silently corrupting `config.toml`.
     """
     lines = text.splitlines()
-    header = f"[{section}]"
-    start = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if _section_header_name(line.strip()) == section
+        ),
+        None,
+    )
     if start is None:
         return None
     end = len(lines)
@@ -645,49 +672,51 @@ def main(argv: list[str] | None = None) -> int:
     # them up by hand. Applies to both the interactive and flag paths, neither
     # of which offers these keys.
     #
+    # Two carry-over mechanisms coexist here on purpose, not by accident.
+    # `[app]` (below) is copied as opaque raw text because Python never
+    # manages any key inside that section — Swift/`ConfigStore` owns it
+    # entirely, so this run never produces a "prompted" `[app]` value to
+    # merge against, and verbatim byte-for-byte round-tripping is both safe
+    # and the simplest correct thing (see `_extract_raw_section`'s
+    # docstring). `[stt]` is deliberately NOT copied the same way: Python
+    # actively re-renders several of its keys every run (`service`, `model`,
+    # `ws_socket`, `language`) from this run's prompts/flags, so a
+    # whole-section raw copy would silently discard those answers. Only
+    # `launchd_label` — the one `[stt]` key `onoats init` never prompts
+    # for — needs a carry-over, and it has to merge into the freshly-built
+    # `stt` dict below rather than overwrite the section, which the generic
+    # raw-block mechanism has no per-key granularity to do. So the generic
+    # mechanism cannot subsume this bespoke one; both stay.
+    #
     # The carried value is re-validated, not copied blind: the runtime reader
     # (`OnoatsConfig.stt_launchd_label`) already runs every label through
-    # `validate_launchd_label` and treats a non-conforming one as absent, so a
-    # schema-invalid value stored in config.toml is *already* inert at
-    # runtime. Copying it through unchecked let it reach `_toml_escape`
-    # (TypeError on a non-string — a TOML integer or array) or, for a string
-    # carrying a raw newline, corrupt the regenerated config.toml by breaking
-    # out of its own line. Dropping it here makes the rendered file agree with
-    # what the runtime would actually honour.
+    # `normalize_launchd_label` (strip -> empty-as-None -> allowlist-validate)
+    # and treats a non-conforming one as absent, so a schema-invalid value
+    # stored in config.toml is *already* inert at runtime. Copying it through
+    # unchecked let it reach `_toml_escape` (TypeError on a non-string — a
+    # TOML integer or array) or, for a string carrying a raw newline, corrupt
+    # the regenerated config.toml by breaking out of its own line. Calling
+    # the SAME shared helper the runtime reader uses (rather than hand-
+    # rolling the strip/empty/validate sequence here again) is what keeps
+    # this path from disagreeing with the runtime reader on "absent" vs
+    # "malformed" — the two independently drifted on that twice before
+    # (review-gauntlet rounds 5 and 6 on this branch).
     carried_label = existing_stt.get("launchd_label")
     if carried_label is not None and not stt.get("launchd_label"):
-        # Strip before validating, matching `OnoatsConfig.stt_launchd_label`'s
-        # own normalization policy (`config/__init__.py`): the runtime reader
-        # strips whitespace before allowlist-validating a label, so a stored
-        # `" pipecat.stt-server "` resolves and self-heals correctly at
-        # runtime. Validating the RAW, unstripped string here disagreed with
-        # that and rejected/dropped the same value on every `onoats init`
-        # re-run, silently disabling self-healing the user had working.
-        stripped_label = (
-            carried_label.strip() if isinstance(carried_label, str) else None
-        )
-        # Empty/whitespace-only carries as silently absent, not "malformed":
-        # `OnoatsConfig.stt_launchd_label` (config/__init__.py) normalizes an
-        # empty/whitespace value via `val or None` *before* calling
-        # `validate_launchd_label`, so it never warns for that case. Passing
-        # `""` straight into `validate_launchd_label` instead (as this carry-
-        # over used to) fails the label regex and both logs a spurious
-        # "malformed" warning and prints a misleading note here, on every
-        # `onoats init` re-run of an install that simply never set a label.
-        validated_label = (
-            validate_launchd_label(stripped_label) if stripped_label else None
-        )
+        carried_str = carried_label if isinstance(carried_label, str) else None
+        validated_label = normalize_launchd_label(carried_str)
         if validated_label:
             stt["launchd_label"] = validated_label
-        elif stripped_label:
+        elif carried_str and carried_str.strip():
             print(
                 f"  note: ignoring malformed [stt].launchd_label "
                 f"{carried_label!r} — it is already inert at runtime and is "
                 "not carried into the regenerated config.toml."
             )
     # Verbatim, not re-rendered from `existing.raw["app"]` — see
-    # `_extract_raw_section`'s docstring and `_render_config_toml`'s
-    # `[app]` handling for why.
+    # `_extract_raw_section`'s docstring, `_render_config_toml`'s `[app]`
+    # handling, and the comment above for why this section uses a different
+    # carry-over mechanism than `launchd_label`.
     app_raw_block: str | None = None
     if config_path.exists():
         try:

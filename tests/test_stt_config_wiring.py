@@ -222,6 +222,111 @@ def test_rss_probe_redacts_leaky_connect_exception_text(monkeypatch):
     assert "isn't a valid URI" in combined
 
 
+def test_rss_probe_teardown_is_deadline_bounded(monkeypatch):
+    """Round-4 finding 5: `log_stt_server_rss`'s shutdown-probe teardown
+    called `_close_client_quietly(client)` with NO deadline, so its two
+    fixed-`CLOSE_TIMEOUT_SEC` (5.0s each) closers could cost up to ~10s
+    against an unreachable server — on top of the ~2s the probe's own
+    `wait_for` already spent — despite this function's own docstring
+    calling the probe "2s-bounded". A `close_session`/`close` pair that
+    each hang past the bound must not push total elapsed anywhere near
+    the old ~12s; the fix caps teardown to the same
+    `_RSS_PROBE_TIMEOUT_SEC` window the probe itself gets.
+    """
+    import asyncio
+    import time
+
+    import stt_server.client as stt_client
+
+    monkeypatch.delenv("STT_WS_SOCKET", raising=False)
+    monkeypatch.setattr(
+        "onoats.config.load_config",
+        lambda: OnoatsConfig(raw={"stt": {"service": "websocket"}}),
+    )
+    monkeypatch.setattr(runtime, "_RSS_PROBE_TIMEOUT_SEC", 0.05)
+
+    class _HangingCloseClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def connect(self):
+            raise OSError("no server in test")  # probe fails fast
+
+        async def close_session(self):
+            await asyncio.sleep(10)
+
+        async def close(self):
+            await asyncio.sleep(10)
+
+    monkeypatch.setattr(stt_client, "TranscriptionClient", _HangingCloseClient)
+
+    started = time.monotonic()
+    asyncio.run(runtime.log_stt_server_rss("startup"))
+    elapsed = time.monotonic() - started
+
+    # Old behaviour: unbounded teardown could burn ~10s (2 closers x
+    # CLOSE_TIMEOUT_SEC=5.0) on top of the probe's own ~0.05s. Bounded to
+    # the probe's own window, total elapsed must stay well under 1s.
+    assert elapsed < 1.0
+
+
+def test_rss_probe_events_generator_is_explicitly_closed(monkeypatch):
+    """Round-4 finding 5: the probe's `async for event in client.events()`
+    left the underlying async generator without an explicit `aclose()` when
+    `wait_for` cancels the probe (timeout) — cancellation unwinds the
+    generator's own suspended frame but does not mark it closed. Assert the
+    generator instance the probe iterates is explicitly closed."""
+    import asyncio
+
+    import stt_server.client as stt_client
+
+    monkeypatch.delenv("STT_WS_SOCKET", raising=False)
+    monkeypatch.setattr(
+        "onoats.config.load_config",
+        lambda: OnoatsConfig(raw={"stt": {"service": "websocket"}}),
+    )
+
+    closed = {"n": 0}
+
+    class _TrackingEvents:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            # Never yields a `server.status` event — forces the probe to
+            # fall through to "status reply missing" without ever
+            # `return`-ing out of the `async for` early.
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            closed["n"] += 1
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def status(self):
+            pass
+
+        def events(self):
+            return _TrackingEvents()
+
+        async def close_session(self):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(stt_client, "TranscriptionClient", _FakeClient)
+
+    asyncio.run(runtime.log_stt_server_rss("startup"))
+
+    assert closed["n"] == 1
+
+
 # --- B. whisper-cpu Settings must not carry `device` ------------------------
 
 

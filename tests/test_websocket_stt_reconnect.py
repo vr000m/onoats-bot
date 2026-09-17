@@ -1033,8 +1033,62 @@ def test_cancel_and_close_resets_state_even_if_close_raises(monkeypatch):
     assert svc._connected is False
 
 
-def test_close_timeout_constant_is_the_shared_one():
+def test_close_timeout_constant_is_not_re_aliased_locally():
     """The two modules must not drift back to two independently-edited 5.0s
     constants — that duplication is what let one side be bounded and the
-    other not."""
-    assert wss_module._CLOSE_TIMEOUT_SECONDS is _closing.CLOSE_TIMEOUT_SEC
+    other not. Round 4 went one step further: this module no longer names
+    the close bound at all (every close goes through `_closing`), so the
+    re-alias that was being applied to a non-close wait is gone. The
+    reader-join wait now has its own, separately tunable constant."""
+    assert not hasattr(wss_module, "_CLOSE_TIMEOUT_SECONDS")
+    assert wss_module._READER_JOIN_TIMEOUT_SEC is not _closing.CLOSE_TIMEOUT_SEC
+
+
+# ---------------------------------------------------------------------------
+# Round-4 regression: cancellation-path state reset.
+# ---------------------------------------------------------------------------
+
+
+class _CancellingCloseClient:
+    """A client whose `close()` raises `CancelledError` — the shape
+    `_closing.close_quietly` re-raises by contract, and the shape every
+    teardown here actually runs under (Ctrl+C, `CancelFrame`, task
+    cancellation)."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+        raise asyncio.CancelledError()
+
+    async def close_session(self):
+        return None
+
+    async def cancel(self):
+        return None
+
+
+@pytest.mark.parametrize(
+    "method", ("_discard_stale", "_graceful_close", "_cancel_and_close")
+)
+def test_teardown_resets_state_even_when_close_is_cancelled(method):
+    """Round-4 finding 8: `_client`/`_reader_task`/`_connected` were assigned
+    AFTER the awaited `close_quietly`, so a `CancelledError` from it skipped
+    every one of them — stranding the instance with `_client` set and
+    `_connected` True, and making the next `_ensure_connected` short-circuit
+    on a dead client. The reset now happens before the awaited teardown."""
+    svc = _make_service()
+    client = _CancellingCloseClient()
+    svc._client = client
+    svc._connected = True
+
+    async def _run():
+        with pytest.raises(asyncio.CancelledError):
+            await getattr(svc, method)()
+
+    asyncio.run(_run())
+    assert client.closed is True, "the close must still be attempted"
+    assert svc._client is None
+    assert svc._reader_task is None
+    assert svc._connected is False

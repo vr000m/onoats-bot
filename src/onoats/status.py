@@ -34,6 +34,8 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from loguru import logger
+
 STATUS_FILENAME = "onoats.status.json"
 # v2 (release-plan Phase 4): adds the OPTIONAL `warning`, `mic_device`, and
 # `system_device` fields (all flat string scalars, default None). One bump
@@ -48,17 +50,40 @@ STATUS_FILENAME = "onoats.status.json"
 # `format_warning_branch`/`set_warning_branch`/`_parse_warning_branches` below:
 # zero or more `"<branch>: <message>"` entries, sorted by branch name, joined
 # by `"; "`. Both `branch` and `message` are sanitized against that same `"; "`
-# delimiter at the one production choke point (`format_warning_branch`), so
-# every writer of `warning` — `set_warning_branch` AND the raw
-# `write_running(warning=...)` startup-preflight path, which both route
-# through `format_warning_branch` — emits a string the grammar can always
-# split back apart unambiguously.
+# delimiter at the one production choke point (`format_warning_branch`).
+#
+# **Two entry points emit grammar-shaped content, one is exempt by design.**
+# `set_warning_branch` (via the private `_write_warning_field`) is the only
+# read-modify-write UPDATE path against an EXISTING record, and is what
+# actually prevents concurrent branches from clobbering each other.
+# `write_running(warning=...)` is a second, narrower entry point used only by
+# the startup-preflight kickstart-recovery seam, where no running record
+# exists yet for `set_warning_branch` to annotate — it validates its `warning`
+# argument (when not `None`) against this same grammar at write time (see its
+# docstring), so a caller that forgets to pre-format through
+# `format_warning_branch` is caught rather than silently corrupting the next
+# `set_warning_branch` merge. `write_prestart_waiting`'s `note` argument is
+# NOT part of this grammar at all, by design: it is a standalone, freeform
+# pre-session message written before any branch or session exists (see its
+# docstring) — a later `set_warning_branch` call landing on that record simply
+# fails to find a parseable entry in it and treats it as the documented
+# "malformed/legacy, drop it" case, which is expected, not a bug.
+# `write_status` remains the fully general, ungated atomic primitive every
+# producer in this module (including all of the above) uses to persist a
+# whole `StatusRecord` — it is not warning-specific, and gating it would gate
+# every field this module writes, not just `warning`.
 #
 # The Swift menu bar (`native/onoats-menubar/Sources/OnoatsMenuBarApp.swift`,
-# `RecorderModel.swift`) independently re-implements the SAME split (entries on
-# `"; "`, each half on `" — "`) because it cannot import this module. Treat
-# this docstring's grammar description as that shared decoder's spec: change
-# the join/key delimiters here only in lockstep with the Swift split, and bump
+# `RecorderModel.swift`) is a cosmetic line-splitter, NOT a decoder of this
+# grammar: it cannot import this module, so it re-implements only the OUTER
+# split (entries on `"; "`, matching the join above) to know where one
+# branch's text ends and the next begins for its own multi-line rendering.
+# The inner split it then applies to each entry's text, on `" — "` (em dash),
+# is unrelated to this grammar's `": "` branch/message separator — it exists
+# purely to keep a long single-line hint from stretching the whole menu, by
+# breaking on any em-dash clause the message text happens to contain. Swift
+# never extracts a branch key from `warning` at all. Change the outer `"; "`
+# join delimiter here only in lockstep with the Swift split, and bump
 # `STATUS_SCHEMA_VERSION` only if the *field's shape* changes (e.g. `warning`
 # stops being a string) — not for a change confined to this string's internal
 # grammar.
@@ -249,7 +274,28 @@ def write_running(
     overwritten the moment this function next runs; passing the captured
     message here avoids that race. ``None`` (the default) preserves today's
     behavior exactly.
+
+    Defense in depth: when ``warning`` is not ``None``, it is validated
+    against the same ``"<branch>: <message>"`` grammar
+    :func:`format_warning_branch`/:func:`set_warning_branch` produce and
+    consume. This function is a second, unguarded entry point into the
+    ``warning`` field (the module docstring above documents why it exists
+    alongside :func:`set_warning_branch`) — a caller that passes a raw,
+    un-prefixed message here would silently write a value the next
+    :func:`set_warning_branch` merge cannot parse back apart (it degrades to
+    "malformed/legacy, drop it" — see :func:`_parse_warning_branches`),
+    losing the message rather than corrupting anything, but silently. A
+    malformed value is logged and written anyway (this producer never
+    raises, matching every other write helper in this module) so the
+    misuse is visible instead of merely lossy on the next read.
     """
+    if warning is not None and not _is_well_formed_warning(warning):
+        logger.warning(
+            f"status.write_running: warning={warning!r} does not match the "
+            '"<branch>: <message>" grammar (expected output from '
+            "format_warning_branch) — writing it anyway, but a later "
+            "set_warning_branch() call will not be able to merge it"
+        )
     return write_status(
         data_dir,
         StatusRecord(
@@ -284,11 +330,16 @@ def _write_warning_field(
 ) -> Path:
     """Write the merged ``warning`` field onto an already-read record.
 
-    **Private on purpose.** This is the only whole-field writer of
-    ``warning``, and it takes the record the caller has already read and
-    gated — it neither reads nor gates on its own. Its sole production
-    caller is :func:`set_warning_branch`, which owns both the branch grammar
-    (via :func:`format_warning_branch`) and the same-pid/running gate.
+    **Private on purpose.** This is the only whole-field writer used for a
+    read-modify-write UPDATE of an EXISTING record's ``warning`` — it takes
+    the record the caller has already read and gated, and neither reads nor
+    gates on its own. Its sole production caller is :func:`set_warning_branch`,
+    which owns both the branch grammar (via :func:`format_warning_branch`) and
+    the same-pid/running gate. (See the module docstring above for how this
+    relates to :func:`write_running`'s narrower, validated ``warning=``
+    entry point, :func:`write_prestart_waiting`'s deliberately-exempt
+    freeform ``note``, and :func:`write_status`, which stays the fully
+    general, ungated primitive underneath all of these.)
 
     It used to be a public ``set_warning(data_dir, warning)``: an unguarded
     third whole-field writer that bypassed the branch grammar entirely and
@@ -296,9 +347,10 @@ def _write_warning_field(
     same-pid check). Its last production callers — ``cli.py``'s capturer
     zero-run warning/clear handlers — moved to :func:`set_warning_branch`,
     leaving a public escape hatch around the choke point with nothing using
-    it. Folding it in here keeps the single-writer property structural rather
-    than conventional: there is no longer a supported way to write the field
-    without going through the grammar.
+    it. Folding it in here keeps the "no clobbering between concurrent
+    branches" property structural rather than conventional for this update
+    path: there is no longer a supported way to merge a branch change into
+    an existing record's ``warning`` without going through the grammar.
     """
     return write_status(data_dir, replace(current, warning=warning))
 
@@ -375,6 +427,25 @@ def _parse_warning_branches(warning: str | None) -> dict[str, str]:
     return branches
 
 
+def _is_well_formed_warning(warning: str) -> bool:
+    """True if ``warning`` round-trips exactly through the branch grammar.
+
+    Parses ``warning`` with :func:`_parse_warning_branches` and re-renders it
+    with :func:`format_warning_branch`, in sorted branch order — the exact
+    merge :func:`set_warning_branch` performs. A non-empty string that is not
+    itself grammar-shaped (no branch at all, or extra text the parser drops)
+    fails to round-trip and is reported malformed. Used by
+    :func:`write_running` as a defense-in-depth check on its ``warning``
+    keyword-argument, the one entry point into this field that does not go
+    through :func:`set_warning_branch` itself.
+    """
+    parsed = _parse_warning_branches(warning)
+    if not parsed:
+        return False
+    rebuilt = "; ".join(format_warning_branch(b, parsed[b]) for b in sorted(parsed))
+    return rebuilt == warning
+
+
 def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path | None:
     """Set (or clear, with ``None``) one branch's slice of the ``warning`` field.
 
@@ -410,13 +481,13 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     :func:`format_warning_branch` is the sole owner of that lead-in and is
     applied here, so a caller that prefixes too would double it.
 
-    Like :func:`set_devices`, this is a no-op on a non-running record that
+    Like :func:`set_devices`, this is a no-op on a **stopped** record that
     belongs to a *different* process: a branch event (an stt kickstart-
     recovery confirm/clear, a capturer zero-run event) can race ahead of the
     next session's :func:`write_running` and land while the record on disk
-    already belongs to a new, different session — annotating that record
-    would mislabel history (the same reasoning :func:`set_devices` documents
-    for device fields).
+    still belongs to an earlier, now-stopped, different session — annotating
+    that record would mislabel history (the same reasoning :func:`set_devices`
+    documents for device fields).
 
     That race is about a *different* session's record, not this one's: a
     stopped record whose ``pid`` still matches the caller's own process is
@@ -426,10 +497,30 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     *after* :func:`write_stopped` has already run for this same session).
     Gating on ``running`` alone would silently drop those trailing
     diagnostics, which the unbranched whole-field writer this replaced (the
-    former public ``set_warning``) did not do. Gating on ``pid`` instead of
-    ``running`` distinguishes "a new session already started" (block) from
-    "my own session, already marked stopped, still draining" (allow) — PID reuse within the same shutdown
+    former public ``set_warning``) did not do. Gating on ``pid`` **in
+    addition to** ``running`` (not instead of it) distinguishes "a new
+    session already started" (block) from "my own session, already marked
+    stopped, still draining" (allow) — PID reuse within the same shutdown
     window is not a realistic concern on any platform this runs on.
+
+    **Scope this guard does NOT cover, by design, not by oversight:** a
+    *running* record whose ``pid`` differs from the caller's own process is
+    NOT blocked here. That is not the "stale event vs. a new session"
+    race above — it would mean two `onoats bot` recorder processes have a
+    live, ``running=true`` record for the same ``data_dir`` at once, which
+    the pid-file lock elsewhere in this system (see ``resolve_liveness`` /
+    the cli's start-up lock) is what actually prevents; every real branch
+    writer (the socket supervisor's mic/system events, the STT preflight and
+    live-reconnect recoveries) runs inside the same single process that owns
+    the current running record, so ``current.pid`` when ``current.running``
+    is true is always this caller's own pid in practice. A second pid check
+    on the running branch would therefore never fire against a real race —
+    only against test fixtures that plant an arbitrary ``pid=`` on a running
+    record as a stand-in for "some other process" (several of this module's
+    own tests do exactly that, e.g. ``write_running(..., pid=1, ...)``
+    followed by a same-process ``set_warning_branch`` call that must still
+    succeed) — so adding it would reject legitimate same-process calls in
+    every test that uses that shorthand without closing any real gap.
     """
     current = read_status(data_dir)
     if current is None:
@@ -574,6 +665,22 @@ def write_prestart_waiting(data_dir: Path, *, audio_source: str, note: str) -> P
     started. Every successor overwrites it: the recorder's
     :func:`write_running` builds a fresh record once the prompt is answered,
     and :func:`write_prestart_failure` replaces it if the wait times out.
+
+    **`note` is deliberately NOT branch-grammar content** — see the module
+    docstring's "two entry points ... one is exempt" note. There is no
+    branch and no session yet at this point (``stt_label`` is still the
+    pre-recorder sentinel), so there is nothing for :func:`set_warning_branch`
+    to merge against and no concurrent-branch clobbering to protect; `note`
+    is a plain, full sentence for the human reading ``onoats status``/the
+    menu bar (e.g. "waiting for the system-audio permission prompt — answer
+    the Screen & System Audio Recording dialog to start the session"),
+    exactly as it appears in ``cli.py``'s single caller. Routing it through
+    :func:`format_warning_branch` would fabricate a branch key for a
+    message that has none, changing what ships to the Swift menu bar for no
+    behavioral gain. If a branch write lands on this record before its
+    successor overwrites it (see above), :func:`_parse_warning_branches`
+    finds no ``": "``-separated entry in `note` and drops it as
+    malformed/legacy — expected, not a bug.
     """
     return write_status(
         data_dir,

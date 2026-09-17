@@ -168,6 +168,106 @@ def test_write_running_warning_defaults_to_none(tmp_path: Path):
     assert got is not None and got.warning is None
 
 
+def test_write_running_warns_but_still_writes_a_malformed_warning(
+    tmp_path: Path, caplog
+):
+    """Round-4 finding 1: `write_running(warning=...)` is a second entry
+    point into the `warning` field that bypasses `set_warning_branch`'s
+    grammar, with nothing checking its shape. A caller that forgets to
+    pre-format through `format_warning_branch` (e.g. passes a bare message
+    with no `"<branch>: "` lead-in) must be logged as a defense-in-depth
+    signal — this pins that write_running does NOT silently accept a
+    malformed value, while still writing it (best-effort, never raises,
+    like every other producer in this module)."""
+    import logging
+
+    from loguru import logger
+
+    from onoats.status import _is_well_formed_warning
+
+    assert _is_well_formed_warning("not-branch-shaped") is False
+
+    bridge = logging.getLogger("loguru-bridge-round4-1")
+    sink_id = logger.add(lambda m: bridge.warning(str(m)))
+    try:
+        with caplog.at_level(logging.WARNING, logger="loguru-bridge-round4-1"):
+            write_running(
+                tmp_path, pid=1, audio_source="socket", stt_label="mlx", warning="oops"
+            )
+    finally:
+        logger.remove(sink_id)
+    assert any("write_running" in rec.message for rec in caplog.records)
+
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "oops"
+
+
+def test_write_running_well_formed_warning_does_not_warn(tmp_path: Path, caplog):
+    """No false positive: a properly pre-formatted message (the real
+    preflight call site's shape) must not trip the defense-in-depth log."""
+    import logging
+
+    from loguru import logger
+
+    bridge = logging.getLogger("loguru-bridge-round4-2")
+    sink_id = logger.add(lambda m: bridge.warning(str(m)))
+    try:
+        with caplog.at_level(logging.WARNING, logger="loguru-bridge-round4-2"):
+            write_running(
+                tmp_path,
+                pid=1,
+                audio_source="socket",
+                stt_label="mlx",
+                warning="stt: server restarted automatically (kickstarted my.label)",
+            )
+    finally:
+        logger.remove(sink_id)
+    assert not any("write_running" in rec.message for rec in caplog.records)
+
+
+def test_set_warning_branch_still_annotates_a_running_record_from_a_different_pid(
+    tmp_path: Path,
+):
+    """Round-4 finding 3: the cross-session pid guard is ANDed with
+    `not current.running`, so it only blocks a stale event landing on a
+    *stopped* different-session record — it does NOT (and, per its
+    docstring, is not meant to) block one landing on a *running*
+    different-pid record. Pinning this as documented, tested behaviour:
+    every real branch writer runs inside the same process that owns the
+    current running record (the pid-file lock elsewhere prevents two live
+    recorders), so this scope carve-out costs nothing in production, and
+    several existing tests already rely on it (e.g. `write_running(...,
+    pid=1, ...)` followed by a same-process `set_warning_branch` call)."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    got = set_warning_branch(tmp_path, "mic", "check hardware mute")
+    assert got is not None
+    after = read_status(tmp_path)
+    assert after is not None
+    assert after.running is True and after.pid == 1
+    assert after.warning == "mic: check hardware mute"
+
+
+def test_write_prestart_waiting_note_is_not_branch_grammar(tmp_path: Path):
+    """Round-4 finding 2 (quarantined as design-intent, not a bug): `note`
+    is a standalone freeform pre-session message, not a `"<branch>:
+    <message>"` entry — there is no branch and no session yet at this point.
+    Pinning current behaviour: `_parse_warning_branches` cannot find a
+    branch in it (dropped as malformed/legacy), and a subsequent
+    `set_warning_branch` merge on that record therefore treats the prior
+    note as if there were no prior warning, rather than clobbering or
+    corrupting it."""
+    note = "waiting for the system-audio permission prompt"
+    write_prestart_waiting(tmp_path, audio_source="socket", note=note)
+    before = read_status(tmp_path)
+    assert before is not None and before.warning == note
+    assert _parse_warning_branches(before.warning) == {}
+
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    after = read_status(tmp_path)
+    assert after is not None
+    assert after.warning == "mic: check hardware mute"
+
+
 # ---------------------------------------------------------------------------
 # Phase 2 (self-healing plan): set_warning_branch — per-branch merge/replace
 # against the same `warning` field, sorted by branch name, so mic/system/stt

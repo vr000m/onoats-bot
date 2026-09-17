@@ -84,7 +84,7 @@ from stt_server import protocol as P
 # down the same `TranscriptionClient`, and each used to own a teardown policy
 # (plus a near-duplicate 5.0s constant) with opposite rules.
 from onoats import _closing
-from onoats._redact import redact_uri, safe_exc_text
+from onoats._redact import redact_uri, safe_exc_text, strip_query
 from onoats.stt import launchd
 
 # Wait at most this long for a decode round trip before surfacing an
@@ -92,12 +92,18 @@ from onoats.stt import launchd
 # server cap plus a little MLX decode slack.
 _DECODE_TIMEOUT_SECONDS = 90.0
 
-# Bounded wait for session.close to be acknowledged on pipeline shutdown, and
-# for the reader task to observe it. Shared with `runtime.py` via
-# `onoats._closing` rather than re-declared here: the two modules bound the
-# teardown of the same client type and a second, independently-edited 5.0
-# invited exactly the drift review found (one side bounded, one side not).
-_CLOSE_TIMEOUT_SECONDS = _closing.CLOSE_TIMEOUT_SEC
+# The client-close bound is NOT re-aliased here: every close in this module
+# goes through `onoats._closing.close_quietly`, which owns
+# `CLOSE_TIMEOUT_SEC`. The two modules bound the teardown of the same client
+# type, and a second, independently-edited 5.0 is exactly the drift review
+# found (one side bounded, one side not).
+#
+# Bounded wait for the reader task to observe `session.closed` during a
+# graceful close. Deliberately its OWN constant: joining a task is not
+# closing a client, so the same no-alias reasoning applies in the other
+# direction — retuning the client-close bound must not silently retune how
+# long shutdown waits on a reader coroutine.
+_READER_JOIN_TIMEOUT_SEC = 5.0
 
 # Bounded wait for session.updated after session.update.
 _SESSION_READY_TIMEOUT_SECONDS = 5.0
@@ -617,15 +623,30 @@ class WebSocketSTTService(SegmentedSTTService):
         if kw.get("socket_path"):
             return f"unix:{kw['socket_path']}"
         if kw.get("uri"):
-            return redact_uri(kw["uri"])
+            return strip_query(redact_uri(kw["uri"]))
         host = kw.get("host") or "127.0.0.1"
         port = kw.get("port")
         return f"ws://{host}:{port}" if port else f"ws://{host}"
 
     async def _discard_stale(self) -> None:
-        """Drop a dead client + reader without blocking on a broken socket."""
-        if self._reader_task is not None and not self._reader_task.done():
-            self._reader_task.cancel()
+        """Drop a dead client + reader without blocking on a broken socket.
+
+        State is cleared BEFORE the awaited teardown, not after: every await
+        below can raise `CancelledError` (`close_quietly` re-raises it by
+        contract, and that is exactly what `_cancel_and_close`/`cleanup` run
+        under), which skips every assignment that follows it. Leaving
+        `_client` set and `_connected` True there strands the instance so
+        the next `_ensure_connected` short-circuits on a dead client. The
+        objects being torn down are held in locals, so the teardown itself
+        is unaffected by the early reset.
+        """
+        reader = self._reader_task
+        client = self._client
+        self._reader_task = None
+        self._client = None
+        self._connected = False
+        if reader is not None and not reader.done():
+            reader.cancel()
             # `asyncio.gather(..., return_exceptions=True)`, not a plain
             # `await self._reader_task` under `except (CancelledError,
             # Exception): pass`: the plain form cannot distinguish "the
@@ -637,16 +658,13 @@ class WebSocketSTTService(SegmentedSTTService):
             # into its result list without raising, while still letting a
             # genuine external cancellation of the current coroutine
             # propagate normally through the `await gather(...)` itself.
-            await asyncio.gather(self._reader_task, return_exceptions=True)
-        self._reader_task = None
-        if self._client is not None:
+            await asyncio.gather(reader, return_exceptions=True)
+        if client is not None:
             # Bounded: this runs on the reconnect path, i.e. precisely when
             # the peer has already proven unreachable — an unbounded close
             # would stall every subsequent reconnect attempt behind a dead
             # server's closing handshake.
-            await _closing.close_quietly(self._client, closers=_closing.TRANSPORT_ONLY)
-        self._client = None
-        self._connected = False
+            await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
 
     def _maybe_confirm_kickstart_recovery(self) -> None:
         """First transcript.completed/transcript.failed event following a
@@ -785,42 +803,63 @@ class WebSocketSTTService(SegmentedSTTService):
         if self._client is None:
             return
         client = self._client
+        reader = self._reader_task
+        # Reset BEFORE the awaited teardown, not inside the `finally` after
+        # it: `_closing.close_quietly` re-raises `CancelledError` by
+        # contract, so every assignment sitting after that await is skipped
+        # on the cancellation path (Ctrl+C, `CancelFrame`, task
+        # cancellation) — leaving `_client` set and `_connected` True, and
+        # the next `_ensure_connected` short-circuiting on a dead client.
+        # The client and reader are held in locals, so the teardown below is
+        # unaffected.
+        self._client = None
+        self._reader_task = None
+        self._connected = False
         # Shutdown-phase timing: the Pipecat 20 s ``wait_for_cancel`` warning
         # is opaque by the time it fires — "STT close took Ns" from this
         # wrapper pins the blame here immediately instead.
         t0 = asyncio.get_running_loop().time()
+        # `_closing` owns the whole close sequence, including the
+        # "attempt every closer, remember a cancellation, re-raise it once"
+        # invariant. This used to hand-roll `close_session` with a raw
+        # `wait_for` + bare `except Exception: pass`, which dropped exactly
+        # that invariant for the graceful half of the teardown.
+        cancelled: asyncio.CancelledError | None = None
         try:
             try:
-                await asyncio.wait_for(
-                    client.close_session(), timeout=_CLOSE_TIMEOUT_SECONDS
-                )
-            except Exception:
-                pass
+                await _closing.close_quietly(client, closers=("close_session",))
+            except asyncio.CancelledError as exc:
+                cancelled = exc
             # Give the reader a bounded window to observe session.closed.
-            if self._reader_task is not None:
+            if reader is not None:
                 try:
-                    await asyncio.wait_for(
-                        self._reader_task, timeout=_CLOSE_TIMEOUT_SECONDS
-                    )
-                except (TimeoutError, asyncio.CancelledError):
-                    self._reader_task.cancel()
+                    await asyncio.wait_for(reader, timeout=_READER_JOIN_TIMEOUT_SEC)
+                except TimeoutError:
+                    reader.cancel()
+                except asyncio.CancelledError as exc:
+                    reader.cancel()
+                    cancelled = exc
         finally:
-            # Bounded, and swallowing: a raising/hanging `close()` here used
-            # to leave `_client`/`_reader_task`/`_connected` un-reset (the
-            # state reset sits after it), stranding the instance in a
-            # half-torn-down state a later `_ensure_connected` would treat
-            # as live.
-            await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
-            self._client = None
-            self._reader_task = None
-            self._connected = False
+            try:
+                await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
             elapsed = asyncio.get_running_loop().time() - t0
             logger.info(f"{self.name}: graceful close took {elapsed:.3f}s")
+        if cancelled is not None:
+            raise cancelled
 
     async def _cancel_and_close(self) -> None:
         if self._client is None:
             return
         client = self._client
+        reader = self._reader_task
+        # See `_graceful_close`: reset before the awaited teardown, because
+        # `close_quietly` re-raises `CancelledError` and this method is the
+        # one that runs *under* cancellation in the first place.
+        self._client = None
+        self._reader_task = None
+        self._connected = False
         t0 = asyncio.get_running_loop().time()
         try:
             try:
@@ -829,23 +868,17 @@ class WebSocketSTTService(SegmentedSTTService):
                 pass
             if self._pending and not self._pending.done():
                 self._pending.cancel()
-            if self._reader_task is not None:
-                self._reader_task.cancel()
+            if reader is not None:
+                reader.cancel()
                 # See `_discard_stale`'s matching comment: `gather(...,
                 # return_exceptions=True)` absorbs the reader task's own
                 # `CancelledError` from the `.cancel()` above without
                 # raising, while a genuine external cancellation of this
                 # coroutine still propagates normally.
-                await asyncio.gather(self._reader_task, return_exceptions=True)
+                await asyncio.gather(reader, return_exceptions=True)
         finally:
-            # Bounded, and swallowing: a raising/hanging `close()` here used
-            # to leave `_client`/`_reader_task`/`_connected` un-reset (the
-            # state reset sits after it), stranding the instance in a
-            # half-torn-down state a later `_ensure_connected` would treat
-            # as live.
+            # Bounded, and swallowing: see the module's teardown invariants
+            # in `onoats._closing`.
             await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
-            self._client = None
-            self._reader_task = None
-            self._connected = False
             elapsed = asyncio.get_running_loop().time() - t0
             logger.info(f"{self.name}: hard cancel took {elapsed:.3f}s")

@@ -277,6 +277,33 @@ feature rather than failing a test you'd notice:
 Regression tests: `tests/test_stt_launchd.py`, `tests/test_runtime_preflight.py`,
 `tests/test_websocket_stt_reconnect.py`.
 
+## Leaf modules
+
+A recurring pattern in `src/onoats/`: two higher-level modules that must
+neither import each other (`runtime.py`, the startup/preflight path, and
+`stt/websocket_stt_service.py`, the live-session reconnect path) both need
+the same small piece of logic. Rather than one importing it from the other
+(inverting the dependency direction) or duplicating it, the logic moves into
+a small **leaf module** — one with no imports from `onoats` itself (stdlib,
+and third-party only) — that both sides import from as a shared meeting
+point with no cycle. Check a leaf module's own docstring before assuming
+its scope; this list is a pointer, not the contract itself.
+
+- `src/onoats/stt/launchd.py` — `kickstart_stt_server()` (the
+  `launchctl kickstart` shellout) and the shared, process-wide,
+  label-keyed kickstart cooldown/health registry.
+- `src/onoats/_redact.py` — `safe_exc_text()`/`redact_uri()`, stripping
+  `user:pass@` userinfo out of a third-party exception's `str()` (or a raw
+  connect URI) before it reaches a log line or user-visible error message,
+  plus `strip_query()`, which display call sites compose on top to drop a
+  query-string token. **Read its docstring before touching it**: the
+  scanner has been rewritten eight times, every tiered/heuristic version
+  leaked, and the generated sweep in `tests/test_redact.py` — not any
+  hand-picked case list — is its specification.
+- `src/onoats/_closing.py` — bounded, best-effort teardown of a
+  `TranscriptionClient` (timeout + deadline cap + cancellation safety), so
+  a hung server's closing handshake can never block a caller forever.
+
 ## Wire-format contract
 
 `docs/audio-socket-contract.md` is the versioned (`v1`) capturer↔recorder

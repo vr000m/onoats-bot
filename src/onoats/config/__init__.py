@@ -101,6 +101,24 @@ def validate_launchd_label(value: str | None) -> str | None:
     return None
 
 
+def normalize_launchd_label(value: str | None) -> str | None:
+    """Strip, treat empty-as-absent, then allowlist-validate a launchd label.
+
+    This is the exact strip -> empty-as-None -> validate sequence both the
+    runtime resolver (``OnoatsConfig.stt_launchd_label``, below) and
+    ``onoats init``'s config-carry-over path (``init.py``) need to apply to a
+    *string* label, extracted here so the two can't independently drift on
+    what counts as "absent" vs "malformed" for the same value (they did,
+    twice, in review-gauntlet rounds 5 and 6 on this branch). Callers that
+    must also reject a non-string raw value (e.g. a TOML `true`/`42`) do that
+    typecheck themselves before calling this — it only handles ``str | None``.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return validate_launchd_label(stripped) if stripped else None
+
+
 def _config_home() -> Path:
     raw = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(raw).expanduser() if raw else Path.home() / ".config"
@@ -342,13 +360,12 @@ class OnoatsConfig:
                 "(expected a TOML string); self-healing kickstart disabled"
             )
             val = None
-        val = val.strip() if val is not None else ""
         # Allowlist-validate once, here, at the single resolution point: the
         # label is interpolated into launchctl's `gui/<uid>/<label>` service
         # target AND embedded in a status warning message whose merge format
         # is delimiter-sensitive. A non-conforming value normalizes to None
-        # (self-healing off) — see `validate_launchd_label`.
-        return validate_launchd_label(val or None)
+        # (self-healing off) — see `normalize_launchd_label`/`validate_launchd_label`.
+        return normalize_launchd_label(val)
 
     # ---- speakers (render-only display labels) ----
     @property

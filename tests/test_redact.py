@@ -22,9 +22,18 @@ This file covers (1) and (2) directly against `onoats._redact`; (3) is
 covered in `tests/test_runtime_preflight.py`
 (`test_display_target_never_leaks_on_a_malformed_uri`) and
 `tests/test_websocket_stt_reconnect.py` (`_endpoint_label` cases).
+
+Round 4 replaced the three-tier scanner these cases were written against
+with a single candidate scan plus two positive gates (see the module
+docstring). Every case below still holds; the tier vocabulary in the older
+docstrings is historical. The generated sweep at the bottom of this file —
+not any hand-picked list — is the specification: hand-picked cases are what
+missed all four credential leaks round 4 found.
 """
 
-from onoats._redact import redact_uri, safe_exc_text
+import pytest
+
+from onoats._redact import redact_uri, safe_exc_text, strip_query
 
 
 def test_password_containing_slash_is_still_redacted():
@@ -354,3 +363,229 @@ def test_tier3_widening_is_bounded_to_two_extra_words():
     assert safe == "ws://host/path is invalid"
     text = "u:p one two three four@host is invalid"
     assert safe_exc_text(Exception(text)) == text
+
+
+# ---------------------------------------------------------------------------
+# Round-4 regressions. All four leaks below were live against round 3's
+# three-tier scanner and were found by independent reviewers, not by the
+# case list above — which is why this file now ends in a generated sweep.
+# ---------------------------------------------------------------------------
+
+
+def test_digit_first_password_segment_does_not_veto_authority_redaction():
+    """Round-4 finding 1 (Critical, full-credential leak): round 3's
+    `_is_host_port_token` veto read an all-digit first password segment as a
+    port and abandoned the search, returning the whole credential. The port
+    heuristic is gone entirely — `_tail_accepts` now supplies the positive
+    evidence the veto was standing in for."""
+    exc = Exception("ws://user:1234 abcd@host:8765 isn't a valid URI")
+    safe = safe_exc_text(exc)
+    assert "user" not in safe
+    assert "1234" not in safe
+    assert "abcd" not in safe
+    assert safe == "ws://host:8765 isn't a valid URI"
+
+
+def test_at_inside_username_does_not_truncate_the_credential_search():
+    """Round-4 finding 2 (High, leaks on every normal startup INFO line):
+    round 3's tier 1 took `rfind("@", start, tier1_stop)` and returned
+    unconditionally on the authority path, so an `@` inside the USERNAME won
+    whenever a `/?#`-or-space in the password truncated the window before
+    the real credential-terminating `@`. The scan now walks every `@` in the
+    window and keeps the rightmost that passes the gates."""
+    safe = redact_uri("ws://alice@corp.com:Xy/9zQvHunter@stt.internal:2020/")
+    assert "alice" not in safe
+    assert "Xy" not in safe
+    assert "Hunter" not in safe
+    assert safe == "ws://stt.internal:2020/"
+
+
+def test_at_inside_username_in_exception_text_is_also_redacted():
+    exc = Exception(
+        "ws://alice@corp.com:Xy/9zQvHunter@stt.internal:2020/ isn't a valid URI"
+    )
+    safe = safe_exc_text(exc)
+    assert "Hunter" not in safe
+    assert safe == "ws://stt.internal:2020/ isn't a valid URI"
+
+
+def test_empty_username_token_auth_userinfo_is_redacted():
+    """Round-4 finding 3: RFC 3986 permits empty userinfo, and `:token@host`
+    is a live token-auth convention. Round 3's `colon <= start` check
+    rejected it outright."""
+    assert redact_uri("ws://:s3cr3t@host:8765/") == "ws://host:8765/"
+    safe = safe_exc_text(Exception(":s3cr3t@stt.internal:2020 isn't a valid URI"))
+    assert "s3cr3t" not in safe
+    assert safe == "stt.internal:2020 isn't a valid URI"
+
+
+def test_email_shaped_username_on_the_bare_path_is_redacted():
+    """Round-4 finding 4: `@` was in `_USERNAME_FORBIDDEN`, so an
+    email-as-username credential was unredactable on the bare path — the
+    opposite of the authority path's behaviour for the same input."""
+    safe = safe_exc_text(
+        Exception("alice@corp.com:hunter2@stt.internal:2020 isn't a valid URI")
+    )
+    assert "hunter2" not in safe
+    assert "alice" not in safe
+    assert safe == "stt.internal:2020 isn't a valid URI"
+
+
+def test_colon_bonded_prose_prefix_no_longer_destroys_diagnostics():
+    """Round-4 finding 5: bounded widening alone still destroyed
+    credential-free text, because the shape gate inspected only the first
+    colon and never constrained the span between it and the `@`.
+    `_tail_accepts` closes it structurally: a bare, single-label tail plus a
+    password carrying a second `:` (or a `/`) is prose, not userinfo."""
+    for text in (
+        "2026-09-17T10:00:00 connect user@host",
+        "2026-09-17T10:00:00 connect failed for user@host",
+        "C:/Users/bob connect user@host",
+        "C:/Users/bob failed for user@host",
+    ):
+        assert safe_exc_text(Exception(text)) == text, text
+
+
+def test_password_with_question_mark_and_equals_is_still_redacted():
+    """Round-4 finding 6: the query-structure guard vetoed a genuine
+    password containing `?` followed later by `=`. The guard is gone; the
+    username gate (`?redirect=user` carries a `/` or lacks a colon) rejects
+    real query structure on its own."""
+    safe = redact_uri("ws://user:pa?ss=x@host:8765/")
+    assert "pa?ss=x" not in safe
+    assert safe == "ws://host:8765/"
+
+
+# ---------------------------------------------------------------------------
+# Generated sweep. Round 4's four leaks all lived in combinations no
+# hand-written case covered, so the axes below are swept exhaustively rather
+# than sampled: password delimiter x username shape x digit-first password
+# x scheme-prefixed/bare x host shape.
+# ---------------------------------------------------------------------------
+
+_PASSWORD_TAILS = ("", "/seg", "?q", "#frag", " word")
+_USERNAMES = ("user", "1user", "", "alice@corp.com")
+_PASSWORD_HEADS = ("hunter2", "1234", "AB+cd=")
+_HOSTS = ("stt.example.internal:2020", "host:8765", "h.local")
+_SUFFIXES = ("", " isn't a valid URI: nonempty path required")
+
+
+def _credential_corpus():
+    for user in _USERNAMES:
+        for head in _PASSWORD_HEADS:
+            for tail in _PASSWORD_TAILS:
+                for host in _HOSTS:
+                    for scheme in ("ws://", "wss://", ""):
+                        for suffix in _SUFFIXES:
+                            password = head + tail
+                            uri = f"{scheme}{user}:{password}@{host}/"
+                            yield (
+                                f"{uri}{suffix}",
+                                user,
+                                password,
+                                f"{scheme}{host}/{suffix}",
+                                uri,
+                                f"{scheme}{host}/",
+                            )
+
+
+@pytest.mark.parametrize(
+    "text,user,password,expected,uri,redacted_uri",
+    list(_credential_corpus()),
+    ids=str,
+)
+def test_sweep_every_credential_shape_is_fully_redacted(
+    text, user, password, expected, uri, redacted_uri
+):
+    """Security invariant: for every generated `user:pass@host` shape, no
+    part of the userinfo survives, and the host/suffix survive verbatim.
+    Asserted through both entry points — `safe_exc_text` (exception text
+    with optional trailing prose) and `redact_uri` (the bare URI)."""
+    safe = safe_exc_text(Exception(text))
+    assert password not in safe, (text, safe)
+    if user:
+        assert user not in safe, (text, safe)
+    assert safe == expected, (text, safe)
+    assert redact_uri(uri) == redacted_uri, uri
+
+
+_PROSE_CORPUS = [
+    # (leading token, joining words) -- credential-free text that must never
+    # be truncated, swept against several unrelated `@` shapes.
+    ("connection", "to"),
+    ("Error:", "connect to"),
+    ("stt_server error:", "could not reach"),
+    ("2026-09-17T10:00:00", "connect"),
+    ("C:/Users/bob", "connect"),
+    ("unix:/tmp/x.sock", "failed: see"),
+    ("[::1]:443", "cannot reach"),
+]
+
+
+@pytest.mark.parametrize("head,mid", _PROSE_CORPUS, ids=str)
+@pytest.mark.parametrize("tail", ("user@host", "admin@corp", "ops@internal"))
+def test_sweep_credential_free_prose_is_never_truncated(head, mid, tail):
+    """The other half of the invariant: five consecutive rounds destroyed
+    credential-free diagnostics by widening the search into prose. A bare,
+    single-label host after the `@` is the shape that has to survive."""
+    text = f"{head} {mid} {tail}"
+    assert safe_exc_text(Exception(text)) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "ws://host:8765 isn't a valid URI: see user@guide",
+        "ws://host:8765/path failed: could not reach user@relay",
+        "wss://stt.internal:2020/v1 failed: could not reach user@relay",
+        "wss://[::1]:2020/v1 failed: could not reach user@relay",
+        "ws://host:8765/p/user@y",
+        "ws://host/path?redirect=user@example.org",
+        "ws://host/path?redirect=user:pass@example.org",
+        "GET https://example.com/api?redirect=user@example.org failed: 502",
+        "admin@example.com for help",
+        "connection refused: host unreachable",
+        "u:p one two three four@host is invalid",
+    ),
+    ids=str,
+)
+def test_sweep_non_credential_authorities_pass_through_unchanged(text):
+    assert safe_exc_text(Exception(text)) == text
+
+
+# ---------------------------------------------------------------------------
+# strip_query — composed on top of redact_uri by the two display call sites.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "uri,expected",
+    (
+        ("wss://host:443/v1?token=s3cr3t", "wss://host:443/v1"),
+        ("wss://host:443/v1#s3cr3t", "wss://host:443/v1"),
+        ("wss://host:443/v1?a=1&token=s3cr3t#frag", "wss://host:443/v1"),
+        ("wss://host:443/v1", "wss://host:443/v1"),
+        ("ws://host", "ws://host"),
+        ("unix:/tmp/stt.sock", "unix:/tmp/stt.sock"),
+    ),
+    ids=str,
+)
+def test_strip_query_drops_query_and_fragment(uri, expected):
+    """Round-4 finding 20: the scanner is userinfo-only, so a token in a
+    query string echoed verbatim into every endpoint label and preflight
+    error. Both display call sites now compose this on top of
+    `redact_uri`."""
+    assert strip_query(uri) == expected
+
+
+def test_strip_query_composes_with_redact_uri():
+    assert strip_query(redact_uri("wss://u:p@host:443/v1?token=s3cr3t")) == (
+        "wss://host:443/v1"
+    )
+
+
+def test_strip_query_leaves_an_unparseable_uri_to_redact_uri():
+    """Fails closed: an unparseable URI keeps whatever `redact_uri` made of
+    it rather than being re-rendered from half-parsed components."""
+    bad = "ws://u:p@[::1/v1?token=s3cr3t"
+    assert strip_query(bad) == bad
