@@ -1214,6 +1214,75 @@ def test_close_quietly_still_attempts_close_at_an_expired_deadline(
     assert calls == ["close_session", "close"]
 
 
+def test_rss_probe_teardown_reuses_the_probes_own_deadline(monkeypatch):
+    """Round-7 finding E: the `finally` recomputed `loop.time() +
+    _RSS_PROBE_TIMEOUT_SEC` AFTER the probe's `wait_for` had already expired,
+    so a hung `close_session` got a fresh full window on top of it and the
+    "2-second-bounded" probe ran ~4s. The deadline is now captured once,
+    before the probe, and shared."""
+    seen: dict[str, float] = {}
+
+    class _HangingClient:
+        async def connect(self):
+            await asyncio.sleep(3600)
+
+        async def close_session(self):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            await asyncio.sleep(3600)
+
+    async def _fake_close_quietly(client, *, closers=None, deadline=None):
+        loop = asyncio.get_running_loop()
+        seen["remaining"] = (deadline or loop.time()) - loop.time()
+
+    import stt_server.client as _stt_client
+
+    monkeypatch.setattr(runtime, "_RSS_PROBE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(
+        _stt_client, "TranscriptionClient", lambda **kw: _HangingClient()
+    )
+    monkeypatch.setattr(_closing, "close_quietly", _fake_close_quietly)
+
+    asyncio.run(asyncio.wait_for(runtime.log_stt_server_rss("test"), timeout=5))
+
+    # The probe consumed the whole 0.05s window, so teardown inherits a
+    # non-positive remainder — not another full window. (`close_quietly`
+    # still floors each closer's attempt; that is its own invariant.)
+    assert seen["remaining"] <= 0.0, seen
+
+
+def test_close_quietly_never_raises_when_a_closer_is_missing_or_raises():
+    """Round-7 logic finding: `getattr(client, closer)()` was evaluated in
+    the *argument expression* to `CancellationLedger.attempt`, outside its
+    `try` — so a client missing a closer (or one raising synchronously from
+    the call itself, before any await) broke the documented never-raises
+    contract AND skipped every remaining closer, which is the one thing the
+    ledger exists to prevent. The call now happens inside the guarded
+    region."""
+    calls: list[str] = []
+
+    class _NoCloseSession:
+        # `close_session` absent entirely -> AttributeError from the getattr.
+        async def close(self):
+            calls.append("close")
+
+    class _SyncRaiser:
+        def close_session(self):  # not a coroutine function: raises on call
+            raise RuntimeError("boom")
+
+        async def close(self):
+            calls.append("close")
+
+    async def _run():
+        await _closing.close_quietly(_NoCloseSession())
+        await _closing.close_quietly(_SyncRaiser())
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=5))
+    # Never raised, and `close` still ran for both clients.
+    assert calls == ["close", "close"]
+
+
 def test_close_quietly_runs_close_after_cancellation_mid_close_session(
     monkeypatch,
 ):

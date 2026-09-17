@@ -42,6 +42,12 @@ if TYPE_CHECKING:
 from loguru import logger
 
 from onoats import _closing
+
+# Module scope, like `_closing` above: `status` is an equally leaf-level
+# module (stdlib + loguru only) and imports nothing from `onoats`, so the
+# four function-local imports these replaced were deferring a cycle that
+# does not exist — the same finding that hoisted `launchd.py`'s.
+from onoats import status as _status_mod
 from onoats._redact import display_uri, safe_exc_text
 from onoats._vendor.pid import (  # noqa: F401
     PID_FILENAME,
@@ -561,6 +567,14 @@ async def log_stt_server_rss(phase: str) -> None:
                 with contextlib.suppress(Exception):
                     await events.aclose()
 
+        # Captured *before* the probe, not after it. Recomputing
+        # `loop.time() + _RSS_PROBE_TIMEOUT_SEC` in the `finally` handed
+        # teardown a fresh full window on top of whatever the probe had
+        # already spent, so a probe that timed out and then hung in
+        # `close_session` took ~2 + ~2 seconds inside a function whose
+        # docstring calls itself 2-second-bounded. One absolute deadline
+        # bounds the whole thing, probe and teardown together.
+        deadline = asyncio.get_running_loop().time() + _RSS_PROBE_TIMEOUT_SEC
         try:
             await asyncio.wait_for(_probe(), timeout=_RSS_PROBE_TIMEOUT_SEC)
         finally:
@@ -575,12 +589,15 @@ async def log_stt_server_rss(phase: str) -> None:
             # can run up to ~10s combined against an unreachable server, on
             # top of the ~2s `wait_for` above already spent — costing up to
             # ~12s total against a probe this function's own docstring calls
-            # "2s-bounded". Give teardown the same ``_RSS_PROBE_TIMEOUT_SEC``
-            # window the probe itself gets, not an unbounded extra budget.
-            await _closing.close_quietly(
-                client,
-                deadline=asyncio.get_running_loop().time() + _RSS_PROBE_TIMEOUT_SEC,
-            )
+            # "2s-bounded". Give teardown the *remaining* share of the one
+            # window this whole function gets — not a fresh one. Recomputing
+            # the deadline here handed a probe that had already burned its
+            # full timeout another full timeout to hang in `close_session`,
+            # which is ~2 + ~2 seconds inside a 2-second budget. An expired
+            # deadline still gets each closer a real attempt
+            # (`_closing.MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`), so reusing it
+            # bounds the teardown without ever skipping it.
+            await _closing.close_quietly(client, deadline=deadline)
     except Exception as exc:
         # Same leak class as `_preflight_stt_ws`/`_ensure_connected`: this
         # probe builds its own `TranscriptionClient` from the same
@@ -1255,8 +1272,6 @@ async def _create_stt_service(
                 "a root dependency installed by `uv sync`. Re-run `uv sync` "
                 f"to repair the environment. Original error: {exc}"
             ) from exc
-
-        from onoats import status as _status_mod
 
         launchd_label = cfg.stt_launchd_label
         # Shared branch for the one startup probe; per-instance branch for
@@ -1965,8 +1980,6 @@ def _write_status_running(
     into the fresh record (see ``status.write_running``'s docstring) — the
     live-path equivalent still goes through ``status.set_warning_branch``.
     """
-    from onoats import status as _status_mod
-
     try:
         _status_mod.write_running(
             data_dir,
@@ -1981,8 +1994,6 @@ def _write_status_running(
 
 def _mark_status_rotation(data_dir: Path) -> None:
     """Stamp ``last_rotation_time`` on the current status record. Best-effort."""
-    from onoats import status as _status_mod
-
     try:
         _status_mod.mark_rotation(data_dir)
     except OSError as exc:
@@ -2001,8 +2012,6 @@ def _write_status_stopped(
     Called inside the single-writer shutdown path BEFORE the pid file is removed,
     so the pid backstop and the status file never disagree about a live recorder.
     """
-    from onoats import status as _status_mod
-
     try:
         _status_mod.write_stopped(
             data_dir,

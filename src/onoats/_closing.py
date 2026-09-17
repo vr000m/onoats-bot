@@ -113,6 +113,20 @@ class CancellationLedger:
             raise self._cancelled
 
 
+async def _call_closer(client: object, closer: str, timeout: float) -> None:
+    """Resolve and await one closer.
+
+    A separate coroutine *function* so that the ``getattr`` and the call it
+    performs happen when this coroutine is awaited — i.e. inside
+    :meth:`CancellationLedger.attempt`'s ``try`` — rather than while building
+    the argument to it. Evaluated in the argument expression, a client
+    missing the method (or raising synchronously from it) escaped the
+    never-raises contract *and* skipped every remaining closer, which is the
+    one thing the ledger exists to prevent.
+    """
+    await asyncio.wait_for(getattr(client, closer)(), timeout=timeout)
+
+
 async def close_quietly(
     client: object,
     *,
@@ -146,7 +160,5 @@ async def close_quietly(
             timeout = min(
                 timeout, max(MIN_CLOSE_ATTEMPT_TIMEOUT_SEC, deadline - loop.time())
             )
-        await ledger.attempt(
-            asyncio.wait_for(getattr(client, closer)(), timeout=timeout)
-        )
+        await ledger.attempt(_call_closer(client, closer, timeout))
     ledger.raise_if_cancelled()
