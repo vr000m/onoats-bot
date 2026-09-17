@@ -11,6 +11,7 @@ import it without either importing the other.
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 
 import pytest
@@ -481,3 +482,28 @@ def test_mark_unhealthy_documents_the_first_failure_registration_point():
     assert "shared" not in launchd._last_kickstart
 
     launchd._unhealthy.clear()
+
+
+# ---------------------------------------------------------------------------
+# Round-5 finding 15: the "never raises" contract has to cover its own
+# validator, and a label that can never succeed must not burn the cooldown.
+# ---------------------------------------------------------------------------
+
+
+def test_kickstart_stt_server_never_raises_on_a_non_str_label():
+    """`validate_launchd_label` indexes/regexes its argument, and its call
+    sat ABOVE the `try` — so a non-`str` label raised `TypeError` straight
+    out of a function documented as never raising."""
+    assert launchd.kickstart_stt_server(None) is False  # type: ignore[arg-type]
+    assert launchd.kickstart_stt_server(object()) is False  # type: ignore[arg-type]
+
+
+def test_try_kickstart_rejects_a_bad_label_without_consuming_the_cooldown():
+    """The stamp deliberately survives a *failed* kickstart, but a malformed
+    label can never succeed — burning the shared window on it would suppress
+    the next legitimate kickstart. Validation therefore runs before the
+    stamp, and `try_kickstart` still never raises."""
+    launchd._last_kickstart.clear()
+    assert asyncio.run(launchd.try_kickstart("has/slash")) is False
+    assert asyncio.run(launchd.try_kickstart(None)) is False  # type: ignore[arg-type]
+    assert launchd._last_kickstart == {}

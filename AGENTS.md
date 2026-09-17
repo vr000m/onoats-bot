@@ -295,14 +295,26 @@ its scope; this list is a pointer, not the contract itself.
 - `src/onoats/_redact.py` — `safe_exc_text()`/`redact_uri()`, stripping
   `user:pass@` userinfo out of a third-party exception's `str()` (or a raw
   connect URI) before it reaches a log line or user-visible error message,
-  plus `strip_query()`, which display call sites compose on top to drop a
-  query-string token. **Read its docstring before touching it**: the
-  scanner has been rewritten eight times, every tiered/heuristic version
-  leaked, and the generated sweep in `tests/test_redact.py` — not any
-  hand-picked case list — is its specification.
+  plus `strip_query()` and `display_uri()` — the latter is the **single
+  owner** of the redact-then-strip-query composition every whole-URI
+  display site needs (`runtime._display_target`,
+  `websocket_stt_service._endpoint_label`); do not open-code the two steps
+  again, and note `safe_exc_text` composes the query strip itself.
+  **Read its docstring before touching it**: the scanner has been rewritten
+  nine times, every tiered/heuristic version leaked, and the generated
+  sweep in `tests/test_redact.py` — not any hand-picked case list — is its
+  specification. Its failure modes come in two directions: a credential
+  *leak*, and a destructive *over-redaction* that removes the credential
+  correctly but fabricates a hostname out of text later in the string. The
+  sweep pins both.
 - `src/onoats/_closing.py` — bounded, best-effort teardown of a
   `TranscriptionClient` (timeout + deadline cap + cancellation safety), so
-  a hung server's closing handshake can never block a caller forever.
+  a hung server's closing handshake can never block a caller forever, plus
+  `CancellationLedger` — the one implementation of the "attempt every step,
+  remember a cancellation, re-raise it once" invariant, composed by
+  `close_quietly` and by `_graceful_close` (which cannot use
+  `close_quietly` for its whole sequence because it must join the reader
+  task *between* the two closers).
 
 ## Wire-format contract
 

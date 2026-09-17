@@ -43,6 +43,41 @@ Annotated tags exist from `v0.9.0` forward.
   `STATUS_SCHEMA_VERSION` are unchanged.
 - `onoats init` no longer drops `[stt].launchd_label` or the `[app]` section
   when regenerating `config.toml` on a re-run.
+- **Credential redaction (`onoats._redact`) rewritten.** The tiered scanner
+  (three widening searches, each with its own accept conditions and its own
+  vetoes) is replaced by a single candidate scan behind positive gates.
+  Four credential leaks are closed — a veto added for one tier had been
+  silently disabling a protection another tier relied on, which is why each
+  previous round's patch reopened an older leak from a new angle. Also
+  closed: a password containing `://` leaked its username and password
+  prefix verbatim. The specification is now a generated sweep in
+  `tests/test_redact.py` (every combination of scheme, username shape,
+  password delimiter, host shape and trailing prose — ~2000 cases), not a
+  hand-picked case list; hand-picked lists are what missed every gap.
+- `safe_exc_text()` now drops a URI's query string as well as its userinfo,
+  matching what the whole-URI display call sites already did. A
+  `?token=...` in an operator-supplied `STT_WS_URI` was reaching the
+  reconnect warning and the status-file warnings verbatim inside
+  `websockets.InvalidURI`'s message. New `display_uri()` is the single
+  owner of the redact-then-strip-query composition both display call sites
+  had been open-coding.
+
+### Fixed
+
+- Redaction no longer destroys the hostname it was protecting. A ported,
+  path-and-query-bearing URI (`wss://host:443/v1?redirect=user@example.com`)
+  had its real host discarded and one fabricated from the query's tail; so
+  did any message where a real credential was followed by an unrelated
+  email address in trailing prose. Both reached `onoats status` and every
+  STT log line.
+- STT shutdown no longer burns the full reader-join timeout on every close.
+  `_graceful_close` cleared the reader's ownership handle before sending
+  `session.close`, so the reader discarded the `session.closed` ack the
+  close was waiting for — several seconds of dead shutdown time per
+  pipeline, doubled for the mic/system pair.
+- Cancelling an STT connect between the handshake and the `session.update`
+  ack no longer leaves the instance marked connected on an unconfigured
+  session.
 
 ## [1.2.0] - 2026-06-28
 

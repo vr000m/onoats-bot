@@ -169,15 +169,22 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
     needs it to hold (a wedged/misconfigured label must never itself crash
     the preflight or reconnect path it is meant to heal).
     """
-    from onoats.config import validate_launchd_label
-
-    if validate_launchd_label(label) is None:
-        logger.warning(
-            f"STT: kickstart of {label!r} refused — not a well-formed launchd "
-            "label (re-validated inside kickstart_stt_server, defense in depth)"
-        )
-        return False
     try:
+        # Inside the `try`, not above it. `validate_launchd_label` is typed
+        # for `str` and indexes/regexes its argument, so a non-`str` label
+        # from a bypassing caller raised `TypeError` straight out of a
+        # function documented as never raising — and, via `try_kickstart`,
+        # did so *after* the cooldown stamp had already been consumed. The
+        # contract has to cover its own validator.
+        from onoats.config import validate_launchd_label
+
+        if validate_launchd_label(label) is None:
+            logger.warning(
+                f"STT: kickstart of {label!r} refused — not a well-formed "
+                "launchd label (re-validated inside kickstart_stt_server, "
+                "defense in depth)"
+            )
+            return False
         # `os.getuid` is POSIX-only and absent on Windows. onoats is a
         # macOS-only app, so this is defensive rather than a live platform
         # gap — but the whole contract of this function is "never raises",
@@ -215,6 +222,11 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
         # raises" contract breaks and preflight aborts instead of falling
         # through to its normal unreachable-server error.
         ValueError,
+        # ``validate_launchd_label`` (now inside this ``try``) is typed for
+        # ``str`` and regexes its argument, so a non-``str`` label from a
+        # caller that bypassed the config resolver raises ``TypeError``
+        # before any of the shapes above can fire.
+        TypeError,
     ) as exc:
         logger.warning(f"STT: kickstart of {label!r} failed: {exc}")
         return False
@@ -254,10 +266,35 @@ async def try_kickstart(label: str) -> bool:
     treats those identically (fall through to today's behavior), so they are
     deliberately not distinguished.
     """
+    # Validate BEFORE stamping. The stamp deliberately survives a *failed*
+    # kickstart (a wedged label must not be hammered every reconnect), but a
+    # malformed label can never succeed, so burning the shared cooldown
+    # window on it would suppress the next legitimate kickstart for nothing.
+    if not _label_is_kickstartable(label):
+        return False
     if not _cooldown_elapsed(label):
         return False
     _stamp_cooldown(label)
     return await asyncio.to_thread(kickstart_stt_server, label)
+
+
+def _label_is_kickstartable(label: str) -> bool:
+    """Never-raises wrapper around ``config.validate_launchd_label``.
+
+    Both this and `kickstart_stt_server`'s own check are deliberate: this
+    one protects the *cooldown stamp*, that one protects the ``launchctl``
+    argv. Neither may raise — see `kickstart_stt_server`'s contract."""
+    try:
+        from onoats.config import validate_launchd_label
+
+        if validate_launchd_label(label) is not None:
+            return True
+    except Exception:
+        pass
+    logger.warning(
+        f"STT: kickstart of {label!r} refused — not a well-formed launchd label"
+    )
+    return False
 
 
 def recovery_message(label: str) -> str:

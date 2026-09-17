@@ -1092,3 +1092,87 @@ def test_teardown_resets_state_even_when_close_is_cancelled(method):
     assert svc._client is None
     assert svc._reader_task is None
     assert svc._connected is False
+
+
+# ---------------------------------------------------------------------------
+# Round-5 regressions: shutdown drain ownership, and the cancellation window
+# between "marked connected" and "session.update acked".
+# ---------------------------------------------------------------------------
+
+
+def test_graceful_close_reader_observes_session_closed_and_does_not_time_out(
+    monkeypatch,
+):
+    """Round-5 finding 5: `_graceful_close` nulled `self._client` BEFORE
+    sending `session.close`, and the reader's ownership test is
+    `client is self._client` — so the `session.closed` ack the close is
+    *waiting for* was `continue`d past, the reader's `break` became
+    unreachable, and the bounded join burned its FULL timeout on every
+    close (doubled for the mic/system pair). Asserted on wall-clock: the
+    join must finish well inside `_READER_JOIN_TIMEOUT_SEC`."""
+    monkeypatch.setattr(wss_module, "_READER_JOIN_TIMEOUT_SEC", 5.0)
+    _install_fake_client_factory(monkeypatch, lambda: None)
+
+    class _AckingClient(_FakeClient):
+        async def close_session(self):
+            self.session_closed = True
+            await self._events.put({"type": P.EVT_SESSION_CLOSED})
+
+    monkeypatch.setattr(
+        wss_module, "TranscriptionClient", lambda **kw: _AckingClient(**kw)
+    )
+    svc = _make_service()
+
+    async def _run():
+        await svc._ensure_connected()
+        reader = svc._reader_task
+        assert reader is not None
+        t0 = asyncio.get_running_loop().time()
+        await svc._graceful_close()
+        elapsed = asyncio.get_running_loop().time() - t0
+        # The reader exited on its own `break`, not on the join's cancel.
+        assert reader.done() and not reader.cancelled()
+        assert elapsed < 1.0, elapsed
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    assert svc._client is None
+    assert svc._draining_client is None
+    assert svc._connected is False
+
+
+def test_cancellation_while_awaiting_session_update_ack_resets_state(monkeypatch):
+    """Round-5 finding 6: `_client`/`_connected` are set before
+    `update_session` and the `_session_ready` wait complete, but the attempt
+    loop's handler is `except Exception`, which does NOT catch
+    `CancelledError` — so cancellation in that window skipped
+    `_discard_stale()` and left the instance falsely marked connected on a
+    session whose `session.update` was never acked. The next
+    `_ensure_connected` then short-circuits on it."""
+
+    class _NeverAckingClient(_FakeClient):
+        async def update_session(self, **kwargs):
+            # No session.updated ack: `_ensure_connected` parks on
+            # `_session_ready`, which is exactly the cancellation window.
+            return None
+
+    monkeypatch.setattr(
+        wss_module, "TranscriptionClient", lambda **kw: _NeverAckingClient(**kw)
+    )
+    svc = _make_service()
+
+    async def _run():
+        task = asyncio.create_task(svc._ensure_connected())
+        # Let it get past connect() and into the session_ready wait.
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if svc._connected:
+                break
+        assert svc._connected is True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    assert svc._connected is False
+    assert svc._client is None
+    assert svc._reader_task is None

@@ -66,6 +66,53 @@ FULL_CLOSERS = ("close_session", "close")
 TRANSPORT_ONLY = ("close",)
 
 
+class CancellationLedger:
+    """The "attempt every step, remember a cancellation, re-raise it once"
+    invariant, as a composable object.
+
+    :func:`close_quietly` is built on this, and so is
+    ``WebSocketSTTService._graceful_close`` — which cannot use
+    ``close_quietly`` for its whole sequence because it must join the reader
+    task *between* the two closers, and so used to hand-roll this same
+    invariant in parallel. Two independent implementations of a rule whose
+    whole point is that no step may be skipped is one edit away from one of
+    them skipping a step; there is now one.
+
+    Cancellation must never abandon the remaining steps —
+    ``close_session`` and ``close`` tear down different resources, and
+    losing ``close`` because ``close_session`` was interrupted mid-await
+    leaves the socket/FD open — but it must also never be swallowed, so it
+    is re-raised by :meth:`raise_if_cancelled` once every step has had its
+    turn.
+    """
+
+    __slots__ = ("_cancelled",)
+
+    def __init__(self) -> None:
+        self._cancelled: asyncio.CancelledError | None = None
+
+    async def attempt(self, awaitable) -> None:
+        """Await `awaitable`, swallowing any failure and *remembering* a
+        cancellation rather than letting it end the sequence."""
+        try:
+            await awaitable
+        except asyncio.CancelledError as exc:
+            self._cancelled = exc
+        except Exception:
+            pass
+
+    def remember(self, exc: asyncio.CancelledError) -> None:
+        """Record a cancellation caught by the caller's own ``except``, for
+        a step that needs side effects this class cannot run for it (the
+        reader join's ``reader.cancel()``)."""
+        self._cancelled = exc
+
+    def raise_if_cancelled(self) -> None:
+        """Re-raise the remembered cancellation, if any. Call last."""
+        if self._cancelled is not None:
+            raise self._cancelled
+
+
 async def close_quietly(
     client: object,
     *,
@@ -90,7 +137,7 @@ async def close_quietly(
     closer / floor-an-expired-deadline invariants.
     """
     loop = asyncio.get_running_loop()
-    cancelled: asyncio.CancelledError | None = None
+    ledger = CancellationLedger()
     for closer in closers:
         timeout = CLOSE_TIMEOUT_SEC
         if deadline is not None:
@@ -99,11 +146,7 @@ async def close_quietly(
             timeout = min(
                 timeout, max(MIN_CLOSE_ATTEMPT_TIMEOUT_SEC, deadline - loop.time())
             )
-        try:
-            await asyncio.wait_for(getattr(client, closer)(), timeout=timeout)
-        except asyncio.CancelledError as exc:
-            cancelled = exc
-        except Exception:
-            pass
-    if cancelled is not None:
-        raise cancelled
+        await ledger.attempt(
+            asyncio.wait_for(getattr(client, closer)(), timeout=timeout)
+        )
+    ledger.raise_if_cancelled()

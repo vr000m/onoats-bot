@@ -1935,13 +1935,21 @@ def test_safe_exc_text_case_d_password_containing_whitespace():
 
 def test_safe_exc_text_case_e_does_not_touch_unrelated_query_string_at_sign():
     """(e) codex-adversarial over-matching bug: an unrelated `@` inside a
-    query string of a non-credential URI must survive untouched — the
-    redaction must not cross the `?` boundary into the query."""
+    query string of a non-credential URI must not drag the surrounding
+    diagnostic into the redaction — the scheme + authority + path and the
+    trailing prose both survive verbatim.
+
+    The query itself is now dropped rather than preserved (round-5 finding
+    4: `safe_exc_text` composes a query strip, the same policy the display
+    call sites already had, because `websockets.InvalidURI` embeds a
+    `?token=...` verbatim otherwise). The over-matching invariant this test
+    was written for is unchanged.
+    """
     exc = RuntimeError(
         "GET https://example.com/api?redirect=user@example.org failed: 502"
     )
     safe = runtime.safe_exc_text(exc)
-    assert safe == str(exc)
+    assert safe == "GET https://example.com/api failed: 502"
 
 
 # ---------------------------------------------------------------------------

@@ -665,3 +665,15 @@ def test_secrets_env_mode_0600_interactive(_isolate_env, monkeypatch):
 
     mode = stat.S_IMODE(secrets_env_path().stat().st_mode)
     assert mode == 0o600
+
+
+def test_section_header_grammar_is_shared_by_start_and_end_scans():
+    """Round-5 finding 14: `_extract_raw_section`'s end-of-section scan and
+    `_section_header_name`'s start-of-section lookup used two regexes that
+    disagreed on the degenerate `[]` — the former required a non-empty
+    interior, the latter did not. One grammar now serves both."""
+    text = "[app]\nx = 1\n[]\n[stt]\ny = 2\n"
+    # The `[]` line ends the `[app]` section under both readings now.
+    assert init_mod._extract_raw_section(text, "app") == "[app]\nx = 1"
+    assert init_mod._section_header_name("[]") == ""
+    assert not hasattr(init_mod, "_SECTION_HEADER_RE")

@@ -316,7 +316,6 @@ def _toml_escape(value: str) -> str:
     )
 
 
-_SECTION_HEADER_RE = re.compile(r"^\[[^\]]+\]\s*$")
 # Captures the bracket interior so a header's *name* can be compared with
 # surrounding whitespace ignored — both TOML (`tomllib.loads("[ app ]\n...")`
 # parses fine) and the Swift `ConfigStore` reader (`readValue`/`writeValue`
@@ -338,6 +337,14 @@ def _section_header_name(line: str) -> str | None:
     """
     m = _SECTION_HEADER_NAME_RE.match(line)
     return m.group(1) if m else None
+
+
+# One grammar for "this line is a `[...]` header", used by both the
+# start-of-section lookup and `_extract_raw_section`'s end-of-section scan.
+# They used to be two regexes that disagreed on the degenerate `[]`: the
+# end-of-section one required a non-empty interior, the start-of-section one
+# did not. Unreachable today (`[]` never names a section onoats writes), but
+# two grammars for one rule is how a reachable disagreement gets born.
 
 
 def _extract_raw_section(text: str, section: str) -> str | None:
@@ -381,7 +388,7 @@ def _extract_raw_section(text: str, section: str) -> str | None:
         return None
     end = len(lines)
     for j in range(start + 1, len(lines)):
-        if _SECTION_HEADER_RE.match(lines[j].strip()):
+        if _section_header_name(lines[j].strip()) is not None:
             end = j
             break
     # Trailing blank lines are re-added by the caller's own section spacing

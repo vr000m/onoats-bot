@@ -33,7 +33,7 @@ missed all four credential leaks round 4 found.
 
 import pytest
 
-from onoats._redact import redact_uri, safe_exc_text, strip_query
+from onoats._redact import display_uri, redact_uri, safe_exc_text, strip_query
 
 
 def test_password_containing_slash_is_still_redacted():
@@ -108,10 +108,14 @@ def test_nested_url_in_unrelated_query_string_not_corrupted():
     unrelated query string must not have its outer, credential-free URL
     corrupted — only the genuinely credential-shaped inner span is
     touched."""
-    exc = Exception("https://host/path?redirect=https://user:pass@evil/path")
-    safe = safe_exc_text(exc)
+    text = "https://host/path?redirect=https://user:pass@evil/path"
+    # The scanner itself (userinfo only) touches nothing but the credential.
+    assert redact_uri(text) == "https://host/path?redirect=https://evil/path"
+    # `safe_exc_text` then composes the query strip (round-5 finding 4), so
+    # the query — nested URL and all — is dropped wholesale.
+    safe = safe_exc_text(Exception(text))
     assert "user:pass" not in safe
-    assert safe == "https://host/path?redirect=https://evil/path"
+    assert safe == "https://host/path"
 
 
 def test_unrelated_at_sign_in_trailing_prose_after_real_credential():
@@ -129,7 +133,10 @@ def test_unrelated_query_string_at_sign_still_untouched():
     round-10 rewrite: an unrelated `@` inside a query string must never
     be mistaken for a credential."""
     text = "GET https://example.com/api?redirect=user@example.org failed: 502"
-    assert safe_exc_text(Exception(text)) == text
+    assert redact_uri(text) == text
+    # The URI's query is dropped by `safe_exc_text`'s query strip; the
+    # surrounding prose ("GET ", " failed: 502") is untouched.
+    assert safe_exc_text(Exception(text)) == "GET https://example.com/api failed: 502"
 
 
 def test_unrelated_query_string_with_colon_still_untouched():
@@ -138,7 +145,8 @@ def test_unrelated_query_string_with_colon_still_untouched():
     credentials by tier 3 (which lacked tier 2's "no '=' in the gap"
     guard), corrupting the real path and query down to just the host."""
     text = "ws://host/path?redirect=user:pass@example.org"
-    assert safe_exc_text(Exception(text)) == text
+    assert redact_uri(text) == text
+    assert safe_exc_text(Exception(text)) == "ws://host/path"
 
 
 def test_password_with_multiple_spaces_is_still_redacted():
@@ -457,17 +465,116 @@ def test_password_with_question_mark_and_equals_is_still_redacted():
 
 
 # ---------------------------------------------------------------------------
+# Round 5 — destructive over-redaction / host fabrication. The credential
+# (where there is one) was already removed correctly; the bug was that the
+# *real host* was destroyed too and a fabricated one substituted from later
+# in the string, in exactly the `_display_target` / `_endpoint_label` output
+# operators diagnose from.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "wss://host:443/v1?redirect=user@example.com",
+        "ws://localhost:8765/v1?user=bob@corp.com",
+    ),
+    ids=str,
+)
+def test_ported_uri_with_an_at_sign_in_its_query_keeps_its_host(text):
+    """Round-5 finding 1: `_is_userinfo_shaped` took the FIRST `:` in the
+    span, which on a scheme-prefixed URI with a port is the PORT colon. The
+    span then read as `user=host` / `pass=443`, `_tail_accepts` passed on
+    the query's dotted tail, and the real host was replaced by it
+    (`wss://example.com`). There is no credential in either of these."""
+    assert redact_uri(text) == text
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        (
+            "wss://user:pass@host.example.com/v1 failed: admin@example.com",
+            "wss://host.example.com/v1 failed: admin@example.com",
+        ),
+        (
+            "wss://user:pass@1.2.3.4:8765/v1 oops x@y.z",
+            "wss://1.2.3.4:8765/v1 oops x@y.z",
+        ),
+        (
+            "user:pass@host.example.com/v1 failed: admin@example.com",
+            "host.example.com/v1 failed: admin@example.com",
+        ),
+    ),
+    ids=str,
+)
+def test_trailing_prose_email_cannot_hijack_a_real_credential(text, expected):
+    """Round-5 finding 2: rightmost-`@`-wins kept scanning after the real
+    in-authority credential was found, so a later `@` in trailing prose (or
+    a query) satisfied both gates and the true host was discarded along with
+    the credential. Swept across every credential shape by the
+    ` failed: admin@example.com` suffix in `_SUFFIXES` too."""
+    assert "user:pass" not in safe_exc_text(Exception(text))
+    assert safe_exc_text(Exception(text)) == expected
+
+
+def test_password_containing_a_scheme_prefix_does_not_leak():
+    """Round-5 finding 3 (codex P1): `outer_stop` was the next
+    `scheme://`-shaped match, which for a password containing `://` falls
+    INSIDE the password — before the real terminating `@`. No candidate was
+    found in that truncated window, the loop then re-anchored on the fake
+    scheme match, and `user:secret` was emitted verbatim."""
+    text = "wss://user:secret://tail@host.example.com"
+    safe = redact_uri(text)
+    assert "user" not in safe
+    assert "secret" not in safe
+    assert safe == "wss://host.example.com"
+    assert safe_exc_text(Exception(text)) == "wss://host.example.com"
+
+
+def test_safe_exc_text_strips_a_query_string_token():
+    """Round-5 finding 4: `safe_exc_text` did not compose `strip_query` the
+    way both display call sites do, so `websockets.InvalidURI`'s message
+    (`f"{uri} isn't a valid URI: {msg}"`) carried `?token=...` verbatim into
+    the reconnect warning and the status-file warnings."""
+    text = "wss://host:443/v1?token=s3cr3t isn't a valid URI: nonempty path required"
+    safe = safe_exc_text(Exception(text))
+    assert "s3cr3t" not in safe
+    assert safe == "wss://host:443/v1 isn't a valid URI: nonempty path required"
+
+
+def test_safe_exc_text_strips_a_query_from_every_uri_in_the_message():
+    safe = safe_exc_text(Exception("ws://a/x?t=1 and wss://b/y#t=2 both failed"))
+    assert safe == "ws://a/x and wss://b/y both failed"
+
+
+def test_display_uri_is_the_single_composition_of_both_steps():
+    """Round-5 finding 8: `strip_query(redact_uri(x))` was open-coded
+    identically at both display call sites."""
+    assert display_uri("wss://u:p@host:443/v1?token=s3cr3t") == "wss://host:443/v1"
+    assert display_uri("ws://127.0.0.1:8765") == "ws://127.0.0.1:8765"
+
+
+# ---------------------------------------------------------------------------
 # Generated sweep. Round 4's four leaks all lived in combinations no
 # hand-written case covered, so the axes below are swept exhaustively rather
 # than sampled: password delimiter x username shape x digit-first password
 # x scheme-prefixed/bare x host shape.
 # ---------------------------------------------------------------------------
 
-_PASSWORD_TAILS = ("", "/seg", "?q", "#frag", " word")
+_PASSWORD_TAILS = ("", "/seg", "?q", "#frag", " word", "://tail")
 _USERNAMES = ("user", "1user", "", "alice@corp.com")
 _PASSWORD_HEADS = ("hunter2", "1234", "AB+cd=")
 _HOSTS = ("stt.example.internal:2020", "host:8765", "h.local")
-_SUFFIXES = ("", " isn't a valid URI: nonempty path required")
+_SUFFIXES = (
+    "",
+    " isn't a valid URI: nonempty path required",
+    # Round-5 finding 2: trailing prose carrying an unrelated email. The
+    # rightmost-`@`-wins scan used to let this `@` beat the real
+    # in-authority one, discarding the true host and substituting
+    # `example.com`. Swept across every credential shape, not hand-picked.
+    " failed: admin@example.com",
+)
 
 
 def _credential_corpus():
@@ -532,25 +639,44 @@ def test_sweep_credential_free_prose_is_never_truncated(head, mid, tail):
     assert safe_exc_text(Exception(text)) == text
 
 
-@pytest.mark.parametrize(
-    "text",
-    (
-        "ws://host:8765 isn't a valid URI: see user@guide",
-        "ws://host:8765/path failed: could not reach user@relay",
-        "wss://stt.internal:2020/v1 failed: could not reach user@relay",
-        "wss://[::1]:2020/v1 failed: could not reach user@relay",
-        "ws://host:8765/p/user@y",
-        "ws://host/path?redirect=user@example.org",
-        "ws://host/path?redirect=user:pass@example.org",
-        "GET https://example.com/api?redirect=user@example.org failed: 502",
-        "admin@example.com for help",
-        "connection refused: host unreachable",
-        "u:p one two three four@host is invalid",
-    ),
-    ids=str,
+_NON_CREDENTIAL_CORPUS = (
+    "ws://host:8765 isn't a valid URI: see user@guide",
+    "ws://host:8765/path failed: could not reach user@relay",
+    "wss://stt.internal:2020/v1 failed: could not reach user@relay",
+    "wss://[::1]:2020/v1 failed: could not reach user@relay",
+    "ws://host:8765/p/user@y",
+    "ws://host/path?redirect=user@example.org",
+    "ws://host/path?redirect=user:pass@example.org",
+    "GET https://example.com/api?redirect=user@example.org failed: 502",
+    "admin@example.com for help",
+    "connection refused: host unreachable",
+    "u:p one two three four@host is invalid",
+    # Round-5 finding 1: a ported, path-and-query-bearing URI whose `@` is
+    # an ordinary query-value character. The port colon used to be read as
+    # the userinfo colon, so the real host was discarded and the query's
+    # tail substituted for it (`wss://example.com`).
+    "wss://host:443/v1?redirect=user@example.com",
+    "ws://localhost:8765/v1?user=bob@corp.com",
 )
+
+
+@pytest.mark.parametrize("text", _NON_CREDENTIAL_CORPUS, ids=str)
 def test_sweep_non_credential_authorities_pass_through_unchanged(text):
-    assert safe_exc_text(Exception(text)) == text
+    """The scanner is userinfo-only, so every one of these must survive it
+    character-for-character. (`safe_exc_text` additionally drops any query
+    string — see `test_sweep_non_credential_authorities_keep_their_host`.)"""
+    assert redact_uri(text) == text
+
+
+@pytest.mark.parametrize("text", _NON_CREDENTIAL_CORPUS, ids=str)
+def test_sweep_non_credential_authorities_keep_their_host(text):
+    """Round-5 findings 1 and 2: the destructive failure mode is not a leak
+    but a *fabricated host* — the real authority discarded and replaced by
+    a hostname pulled from later in the string. Whatever the query strip
+    removes, the scheme + authority prefix must always survive intact."""
+    safe = safe_exc_text(Exception(text))
+    head = text.split("?")[0].split("#")[0]
+    assert safe.startswith(head), (text, safe)
 
 
 # ---------------------------------------------------------------------------

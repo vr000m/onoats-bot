@@ -84,7 +84,7 @@ from stt_server import protocol as P
 # down the same `TranscriptionClient`, and each used to own a teardown policy
 # (plus a near-duplicate 5.0s constant) with opposite rules.
 from onoats import _closing
-from onoats._redact import redact_uri, safe_exc_text, strip_query
+from onoats._redact import display_uri, safe_exc_text
 from onoats.stt import launchd
 
 # Wait at most this long for a decode round trip before surfacing an
@@ -180,6 +180,14 @@ class WebSocketSTTService(SegmentedSTTService):
         )
         self._language = language
         self._client: TranscriptionClient | None = None
+        # The client `_graceful_close` is currently draining. `self._client`
+        # is deliberately cleared *before* the awaited teardown (see
+        # `_discard_stale`), which also revoked the reader's ownership — so
+        # the reader discarded the very `session.closed` event the graceful
+        # close was waiting for and the join always burned its full timeout.
+        # This is the reader's ownership handle across that window; nothing
+        # else reads it.
+        self._draining_client: TranscriptionClient | None = None
         self._reader_task: asyncio.Task | None = None
         self._pending: asyncio.Future[str] | None = None
         # Resolved by the reader when a session.updated or error event arrives
@@ -462,24 +470,22 @@ class WebSocketSTTService(SegmentedSTTService):
                 self._reader_task = asyncio.create_task(
                     self._read_events(client), name=f"{self.name}:ws_reader"
                 )
-                await client.update_session(
-                    turn_detection=None, language=self._language
-                )
                 try:
-                    await asyncio.wait_for(
-                        self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
-                    )
-                except TimeoutError as exc:
-                    # Re-raise as TimeoutError, not RuntimeError: a server
-                    # that completes the websocket handshake but never acks
-                    # session.update is a live-but-wedged server — exactly
-                    # the reachability failure the `isinstance(last_exc,
-                    # (TimeoutError, OSError))` kickstart gate below exists
-                    # to catch — not the auth/TLS/protocol misconfiguration
-                    # that gate is meant to filter out. A RuntimeError here
-                    # matched neither branch, so this path used to exhaust
-                    # all attempts and raise without ever self-healing.
-                    raise TimeoutError("stt_server did not ack session.update") from exc
+                    await self._negotiate_session(client)
+                except asyncio.CancelledError:
+                    # `self._client`/`self._connected` are already set above
+                    # (the reader needs them), but the session is not usable
+                    # until `session.update` is acked. `CancelledError` is a
+                    # `BaseException`, so the attempt loop's `except
+                    # Exception` handler below — the one that calls
+                    # `_discard_stale()` — never sees it, and the instance
+                    # would be left marked "connected" on a session whose
+                    # turn-detection settings were never applied; the next
+                    # `_ensure_connected` then short-circuits on it. Same
+                    # reason the `connect()` handler above uses
+                    # `except BaseException`.
+                    await self._discard_stale()
+                    raise
                 # Backend identity from server.hello — surfaces an operational
                 # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
                 # and is stashed on the instance so callers (banner, metrics,
@@ -560,6 +566,30 @@ class WebSocketSTTService(SegmentedSTTService):
             await self._maybe_kickstart()
         raise last_exc
 
+    async def _negotiate_session(self, client: TranscriptionClient) -> None:
+        """Send ``session.update`` and wait for the server's ack.
+
+        Extracted so `_ensure_connected` can wrap exactly this window — the
+        one in which the instance is already marked connected but the
+        session is not yet usable — in its own `CancelledError` handler.
+        """
+        await client.update_session(turn_detection=None, language=self._language)
+        try:
+            await asyncio.wait_for(
+                self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            # Re-raise as TimeoutError, not RuntimeError: a server that
+            # completes the websocket handshake but never acks
+            # session.update is a live-but-wedged server — exactly the
+            # reachability failure the `isinstance(last_exc, (TimeoutError,
+            # OSError))` kickstart gate in `_ensure_connected` exists to
+            # catch — not the auth/TLS/protocol misconfiguration that gate
+            # is meant to filter out. A RuntimeError here matched neither
+            # branch, so this path used to exhaust all attempts and raise
+            # without ever self-healing.
+            raise TimeoutError("stt_server did not ack session.update") from exc
+
     def _fire_recovery(self, message: str | None) -> None:
         """Invoke ``on_recovery`` without ever letting it escape.
 
@@ -613,17 +643,19 @@ class WebSocketSTTService(SegmentedSTTService):
     def _endpoint_label(self) -> str:
         """Human-readable connect target for logs — never the raw `uri`.
 
-        `uri` may carry `user:pass@` userinfo, and this feeds both error
-        logs and the happy-path "connected to {endpoint}" line, so it must
-        never return the raw kwarg verbatim. Routed through the same
-        `onoats._redact.redact_uri` `_display_target` uses, so there is one
-        redaction owner, not two.
+        `uri` may carry `user:pass@` userinfo (and a `?token=` query), and
+        this feeds both error logs and the happy-path "connected to
+        {endpoint}" line, so it must never return the raw kwarg verbatim.
+        Routed through the same `onoats._redact.display_uri`
+        `_display_target` uses, so there is one redaction owner, not two —
+        and one owner of the redact-then-strip-query *composition*, which
+        was previously open-coded identically in both places.
         """
         kw = self._connect_kwargs
         if kw.get("socket_path"):
             return f"unix:{kw['socket_path']}"
         if kw.get("uri"):
-            return strip_query(redact_uri(kw["uri"]))
+            return display_uri(kw["uri"])
         host = kw.get("host") or "127.0.0.1"
         port = kw.get("port")
         return f"ws://{host}:{port}" if port else f"ws://{host}"
@@ -713,8 +745,13 @@ class WebSocketSTTService(SegmentedSTTService):
         try:
             async for ev in client.events():
                 # Ignore any event from a superseded client (e.g. a failed
-                # handshake that's still draining while a retry is in flight).
-                if client is not self._client:
+                # handshake that's still draining while a retry is in
+                # flight). `_draining_client` is this same client during a
+                # `_graceful_close`, which clears `_client` before awaiting
+                # the teardown — without it the `session.closed` that close
+                # is *waiting for* would be discarded here and the join
+                # would always time out.
+                if client is not self._client and client is not self._draining_client:
                     continue
                 etype = ev.get("type")
                 if etype == P.EVT_TRANSCRIPT_COMPLETED:
@@ -798,6 +835,12 @@ class WebSocketSTTService(SegmentedSTTService):
                     self._pending.set_exception(
                         ConnectionError("stt_server connection lost mid-decode")
                     )
+            elif client is self._draining_client and saw_session_closed:
+                # A graceful close already reset the instance state, so
+                # there is nothing to tear down here — but the ack it was
+                # waiting for did arrive, and saying so is the whole point
+                # of waiting for it.
+                logger.info(f"{self.name}: session closed cleanly by server")
 
     async def _graceful_close(self) -> None:
         if self._client is None:
@@ -812,24 +855,35 @@ class WebSocketSTTService(SegmentedSTTService):
         # the next `_ensure_connected` short-circuiting on a dead client.
         # The client and reader are held in locals, so the teardown below is
         # unaffected.
+        #
+        # `_draining_client` is handed the client in the same breath. The
+        # reader's ownership test is `client is self._client`, so clearing
+        # `_client` here silently revoked the reader's right to act on the
+        # `session.closed` ack that `close_session` is about to provoke: the
+        # event was `continue`d past, the reader's early `break` became
+        # unreachable, and the bounded join below burned its FULL timeout on
+        # every single close (doubled for the mic/system pair). Two
+        # requirements collided — reset-before-await for cancellation
+        # safety, and reader ownership across the drain — so they now use
+        # two handles instead of one.
         self._client = None
+        self._draining_client = client
         self._reader_task = None
         self._connected = False
         # Shutdown-phase timing: the Pipecat 20 s ``wait_for_cancel`` warning
         # is opaque by the time it fires — "STT close took Ns" from this
         # wrapper pins the blame here immediately instead.
         t0 = asyncio.get_running_loop().time()
-        # `_closing` owns the whole close sequence, including the
-        # "attempt every closer, remember a cancellation, re-raise it once"
-        # invariant. This used to hand-roll `close_session` with a raw
-        # `wait_for` + bare `except Exception: pass`, which dropped exactly
-        # that invariant for the graceful half of the teardown.
-        cancelled: asyncio.CancelledError | None = None
+        # This sequence cannot be one `close_quietly` call — the reader join
+        # has to sit BETWEEN the two closers — but the "attempt every step,
+        # remember a cancellation, re-raise it once" invariant is the same
+        # one, so it is composed from `_closing.CancellationLedger` rather
+        # than hand-rolled a second time next to `close_quietly`'s copy.
+        ledger = _closing.CancellationLedger()
         try:
-            try:
-                await _closing.close_quietly(client, closers=("close_session",))
-            except asyncio.CancelledError as exc:
-                cancelled = exc
+            await ledger.attempt(
+                _closing.close_quietly(client, closers=("close_session",))
+            )
             # Give the reader a bounded window to observe session.closed.
             if reader is not None:
                 try:
@@ -837,17 +891,24 @@ class WebSocketSTTService(SegmentedSTTService):
                 except TimeoutError:
                     reader.cancel()
                 except asyncio.CancelledError as exc:
+                    # `ledger.remember`, not `ledger.attempt`: this step
+                    # needs a side effect (`reader.cancel()`) on the
+                    # cancellation path that the ledger cannot run for it.
                     reader.cancel()
-                    cancelled = exc
+                    ledger.remember(exc)
         finally:
-            try:
-                await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
-            except asyncio.CancelledError as exc:
-                cancelled = exc
+            # Ownership handed back before the transport close: the drain
+            # window is over, and a stale `_draining_client` would let a
+            # superseded reader act on a client this instance has finished
+            # with. Cleared first so the `close_quietly` below — which
+            # re-raises `CancelledError` — cannot skip it.
+            self._draining_client = None
+            await ledger.attempt(
+                _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
+            )
             elapsed = asyncio.get_running_loop().time() - t0
             logger.info(f"{self.name}: graceful close took {elapsed:.3f}s")
-        if cancelled is not None:
-            raise cancelled
+        ledger.raise_if_cancelled()
 
     async def _cancel_and_close(self) -> None:
         if self._client is None:

@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 from loguru import logger
 
 from onoats import _closing
-from onoats._redact import redact_uri, safe_exc_text, strip_query
+from onoats._redact import display_uri, safe_exc_text
 from onoats._vendor.pid import (  # noqa: F401
     PID_FILENAME,
     PID_MARKER,
@@ -339,18 +339,19 @@ def _display_target(kwargs: dict) -> str:
     (``ws://user:pass@host/``). Strip it before rendering so a typoed
     secret doesn't echo into stderr or a log line.
 
-    Delegates to ``onoats._redact.redact_uri`` (the same tiered search
-    ``safe_exc_text`` uses) rather than ``urlsplit``'s ``username``/
-    ``password`` properties: those silently report NO userinfo at all
-    (rather than raising) when the password contains an unencoded ``/``,
-    ``?``, or ``#`` — exactly the malformed-but-realistic credential shape
-    this function most needs to catch — which would otherwise let the raw,
-    credential-bearing ``uri`` fall through unchanged. One redaction
-    implementation, not two independently-maintained ones.
+    Delegates to ``onoats._redact.display_uri`` — the single owner of the
+    redact-then-strip-query composition both display call sites need —
+    rather than ``urlsplit``'s ``username``/``password`` properties: those
+    silently report NO userinfo at all (rather than raising) when the
+    password contains an unencoded ``/``, ``?``, or ``#`` — exactly the
+    malformed-but-realistic credential shape this function most needs to
+    catch — which would otherwise let the raw, credential-bearing ``uri``
+    fall through unchanged. One redaction implementation, not two
+    independently-maintained ones.
     """
     uri = kwargs.get("uri")
     if uri:
-        return strip_query(redact_uri(uri))
+        return display_uri(uri)
     return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
 
 
@@ -1015,7 +1016,15 @@ async def _preflight_stt_ws(
             except TimeoutError as exc:
                 if not is_last:
                     continue
-                detail = f" ({exc})" if str(exc) else ""
+                # Routed through `safe_exc_text` like every sibling branch.
+                # This was the one exception-text site that interpolated
+                # `exc` raw — and `TimeoutError` is an `OSError` subclass
+                # caught first here, so the sibling `except OSError` branch's
+                # redaction never covered it. Low exploitability, but an
+                # asymmetry in a redaction boundary is exactly what the last
+                # five rounds were spent removing.
+                safe_detail = safe_exc_text(exc)
+                detail = f" ({safe_detail})" if safe_detail else ""
                 if launchd_label is not None:
                     outcome, recovered = await _kickstart_and_retry(
                         _make_client,
