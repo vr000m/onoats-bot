@@ -676,6 +676,108 @@ def test_display_uri_is_the_single_composition_of_both_steps():
 
 
 # ---------------------------------------------------------------------------
+# Round 7. Two HIGH leaks in the scheme-less query strip (A, B), two more
+# credential leaks in `_not_query_of_path`'s and `_next_uri_boundary`'s
+# handling of password characters (C, D), and one query-strip truncation.
+# ---------------------------------------------------------------------------
+
+
+def test_strip_query_strips_a_scheme_less_uri():
+    """Round-7 finding A (HIGH, leak): `strip_query` parsed with `urlsplit`,
+    which gives a scheme-less URI an empty `netloc`, so its fail-closed
+    `host[:port]` guard returned the string unchanged — query and token
+    intact — through `display_uri`, the documented single owner of rendering
+    a whole connect URI. `strip_query` and `_strip_query_spans` are now one
+    implementation, so the scheme-less anchor exists on both paths."""
+    assert strip_query("stt.example.com:8765/v1?token=SEKRET") == (
+        "stt.example.com:8765/v1"
+    )
+    assert display_uri("stt.example.com:8765/v1?token=SEKRET") == (
+        "stt.example.com:8765/v1"
+    )
+    assert display_uri("u:pw@stt.example.com:8765/v1?token=SEKRET") == (
+        "stt.example.com:8765/v1"
+    )
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        (
+            "localhost:8765/v1?token=SEKRET isn't a valid URI: x",
+            "localhost:8765/v1 isn't a valid URI: x",
+        ),
+        ("stt-box:8765/v1?token=SEKRET", "stt-box:8765/v1"),
+        ("stt:8765?token=SEKRET", "stt:8765"),
+        ("localhost/v1?token=SEKRET", "localhost/v1"),
+        ("localhost?token=SEKRET", "localhost"),
+    ),
+    ids=str,
+)
+def test_scheme_less_single_label_host_query_is_stripped(text, expected):
+    """Round-7 finding B (HIGH, leak): round 6 closed the scheme-less anchor
+    for *dotted* hosts only, and `localhost` — this project's own canonical
+    local STT endpoint — has no dot. A numeric port, or a `key=value` query
+    behind a colon-free label, is now accepted as evidence in its place."""
+    assert safe_exc_text(Exception(text)) == expected
+
+
+def test_digit_shaped_password_is_not_mistaken_for_a_complete_authority():
+    """Round-7 finding C (codex, leak): `_not_query_of_path` vetoed the real
+    credential because `user:1234` fullmatches `host[:port]` and a `/path`
+    preceded the `?` — round 4's digit-password bug reopened through the
+    query gate. The veto now needs a dotted host with a path, or a
+    `key=value` query; `?q@` is neither."""
+    for uri, expected in (
+        (
+            "ws://user:1234/x?q@host.example.com:8765/v1",
+            "ws://host.example.com:8765/v1",
+        ),
+        ("ws://user:/x?q@host.example.com", "ws://host.example.com"),
+        ("ws://user:1234/x?q@host.example.com", "ws://host.example.com"),
+    ):
+        assert redact_uri(uri) == expected, uri
+        assert display_uri(uri) == expected, uri
+        assert safe_exc_text(Exception(uri)) == expected, uri
+
+
+def test_a_scheme_token_after_a_password_slash_does_not_truncate_the_scan():
+    """Round-7 finding D (codex, leak): `_next_uri_boundary` measured a
+    `scheme://`-shaped match against the *authority's* `/?#` boundary, but an
+    unencoded `/` in a password IS that boundary — so `x://` inside the
+    password fell on the far side, truncated the search window before the
+    real terminating `@`, and `user:p` was emitted verbatim. The yardstick is
+    now the whitespace-delimited token: a genuine second URI is always its
+    own token."""
+    uri = "ws://user:p/x://tail@host.example.com/v1"
+    assert redact_uri(uri) == "ws://host.example.com/v1"
+    assert safe_exc_text(Exception(uri)) == "ws://host.example.com/v1"
+    # The round-5 shape this boundary rule exists for still works, and a
+    # genuine second URI in its own token is still a boundary.
+    assert redact_uri("wss://user:secret://tail@host.example.com") == (
+        "wss://host.example.com"
+    )
+    assert safe_exc_text(Exception("ws://u1:p1@h1 and ws://u2:p2@h2 both failed")) == (
+        "ws://h1 and ws://h2 both failed"
+    )
+
+
+def test_query_strip_does_not_stop_at_a_scheme_inside_a_query_value():
+    """Round-7 Medium (logic): the scheme-less query strip was bounded by
+    `_next_uri_boundary`, so a query VALUE containing `://` ended the cut
+    early and the rest of the query was glued straight onto the path
+    (`...:8765/v1wss://relay.example.com/`). The cut now always runs to the
+    token's own end."""
+    text = (
+        "stt.example.com:8765/v1?next=wss://u:QUERYSECRET@relay.example.com/ "
+        "isn't a valid URI: x"
+    )
+    safe = safe_exc_text(Exception(text))
+    assert "QUERYSECRET" not in safe
+    assert safe == "stt.example.com:8765/v1 isn't a valid URI: x"
+
+
+# ---------------------------------------------------------------------------
 # Generated sweep. Round 4's four leaks all lived in combinations no
 # hand-written case covered, so the axes below are swept exhaustively rather
 # than sampled: password delimiter x username shape x digit-first password
@@ -823,12 +925,102 @@ def test_sweep_non_credential_authorities_keep_their_host(text):
     assert safe.startswith(head), (text, safe)
 
 
+# ---------------------------------------------------------------------------
+# Round 7. `_credential_corpus` and `_NON_CREDENTIAL_CORPUS` are generated
+# *disjointly*: one sweeps credential shapes with no query-`@`, the other
+# query-`@` shapes with no credential. The fabricated-host class survived two
+# rounds inside the gap between them — a URI carrying BOTH a real
+# `user:pass@` userinfo AND a later `@` in its query collapsed to the query's
+# domain (`wss://user:pass@host.example.com/v1?r=bob@corp.com` ->
+# `wss://corp.com`), while its credential-free twin was handled correctly.
+# The two families are crossed here so the gap cannot reopen silently.
+# ---------------------------------------------------------------------------
+
+_QUERY_AT_TAILS = (
+    "?r=bob@corp.com",
+    # Deliberately not `redirect=user@...`: the sweep asserts the username
+    # is absent from the output, and a query value spelling it would make
+    # every case a false failure rather than a real one.
+    "?redirect=peer@example.com",
+    "#f=bob@corp.com",
+    "?a=1&r=bob@corp.com#frag",
+)
+_COMBINED_HOSTS = (
+    "host.example.com",
+    "host.example.com:443",
+    "[::1]:443",
+    "1.2.3.4:8765",
+    "localhost:8765",
+)
+
+
+def _combined_corpus():
+    """Credential shapes crossed with query-`@` shapes.
+
+    The invariant has two halves and both are asserted: the userinfo is
+    gone, *and* the scheme+authority+path in front of the `?`/`#` survives
+    character-for-character. A fabricated host satisfies the first half on
+    its own, which is why five rounds of leak-only assertions never caught
+    this class.
+    """
+    for user, password in (
+        ("user", "pass"),
+        ("user", "1234"),
+        ("", "s3cr3t"),
+        ("alice@corp.com", "hunter2"),
+        ("user", "AB+cd="),
+    ):
+        for host in _COMBINED_HOSTS:
+            for path in ("/v1", "/", ""):
+                for tail in _QUERY_AT_TAILS:
+                    for scheme in ("ws://", "wss://", ""):
+                        head = f"{scheme}{host}{path}"
+                        yield (
+                            f"{scheme}{user}:{password}@{host}{path}{tail}",
+                            password,
+                            user,
+                            head,
+                        )
+
+
+@pytest.mark.parametrize("uri,password,user,head", list(_combined_corpus()), ids=str)
+def test_sweep_credential_plus_query_at_keeps_the_real_host(uri, password, user, head):
+    """Round-7 HIGH (logic lens): a credential and a query-`@` in the same
+    URI composed into the fabricated-host class. `_not_query_of_path`
+    measured the authority from the *anchor*, so the already-accepted
+    `user:pass@` prefix was still inside the span, `_HOST_PORT_RE` (which
+    excludes `@`) could never match it, and the gate that exists to refuse
+    exactly this never fired. It now measures from the acceptance point."""
+    for rendered in (redact_uri(uri), safe_exc_text(Exception(uri))):
+        assert password not in rendered, (uri, rendered)
+        if user:
+            assert user not in rendered, (uri, rendered)
+        assert rendered.startswith(head), (uri, rendered)
+    # The query strip removes the `@`-bearing tail outright.
+    assert safe_exc_text(Exception(uri)) == head, uri
+    assert display_uri(uri) == head, uri
+
+
 def _query_corpus():
     """Round-6 finding A, swept: every URI token shape that carries a query,
     with and without a scheme. The scheme-less half is the one
-    `_strip_query_spans` never scanned."""
+    `_strip_query_spans` never scanned.
+
+    Round-7 finding B added the single-label host axis. Round 6 closed the
+    scheme-less anchor for *dotted* hosts only, and `localhost` — this
+    project's own canonical local STT endpoint — has no dot and never will,
+    so `localhost:8765/v1?token=...` kept leaking through every sink the
+    round-6 fix was written for.
+    """
     for scheme in ("ws://", "wss://", ""):
-        for host in ("stt.example.internal:2020", "h.local", "[::1]:2020"):
+        for host in (
+            "stt.example.internal:2020",
+            "h.local",
+            "[::1]:2020",
+            "localhost:8765",
+            "localhost",
+            "stt:8765",
+        ):
             for path in ("", "/", "/v1"):
                 for mark in ("?", "#"):
                     for suffix in ("", " isn't a valid URI: nonempty path required"):

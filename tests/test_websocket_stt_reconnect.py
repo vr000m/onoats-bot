@@ -921,6 +921,25 @@ def test_endpoint_label_redacts_uri_credentials_with_special_char_password():
     assert label == "ws://stt.example.internal:2020/"
 
 
+def test_endpoint_label_strips_a_scheme_less_uris_query_token():
+    """Round-7 finding A (HIGH): `_endpoint_label` composes `display_uri`,
+    which composed a `strip_query` built on `urlsplit` — and `urlsplit` gives
+    a scheme-less URI an empty netloc, so the fail-closed `host[:port]` guard
+    returned it unchanged, query token and all, into this label and every log
+    line and `SttPreflightError` built from it. Finding B is the same sink
+    with `localhost`, the project's own canonical local endpoint, which the
+    round-6 dotted-host rule could never match."""
+    for uri, expected in (
+        ("stt.example.com:8765/v1?token=SEKRET", "stt.example.com:8765/v1"),
+        ("localhost:8765/v1?token=SEKRET", "localhost:8765/v1"),
+        ("u:pw@localhost:8765/v1?token=SEKRET", "localhost:8765/v1"),
+    ):
+        label = _make_service(socket_path=None, uri=uri)._endpoint_label()
+        assert "SEKRET" not in label, uri
+        assert "pw" not in label, uri
+        assert label == expected, uri
+
+
 def test_endpoint_label_socket_path_and_host_port_shapes_unaffected():
     assert (
         _make_service(socket_path="/tmp/x.sock")._endpoint_label() == "unix:/tmp/x.sock"
