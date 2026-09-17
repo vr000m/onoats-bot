@@ -660,23 +660,54 @@ class WebSocketSTTService(SegmentedSTTService):
         port = kw.get("port")
         return f"ws://{host}:{port}" if port else f"ws://{host}"
 
+    def _detach_client(
+        self, *, draining: bool = False
+    ) -> tuple[object | None, asyncio.Task | None]:
+        """Take ownership of the live client + reader and clear the instance
+        state, returning both as locals.
+
+        The shared preamble of all three teardown paths (`_discard_stale`,
+        `_graceful_close`, `_cancel_and_close`), which each re-derived it
+        with its own ordering and its own copy of the rationale.
+
+        State is cleared BEFORE any awaited teardown, never in a `finally`
+        after it: `_closing.close_quietly` re-raises `CancelledError` by
+        contract, so every assignment sitting after that await is skipped on
+        the cancellation path (Ctrl+C, `CancelFrame`, task cancellation) —
+        leaving `_client` set and `_connected` True, and the next
+        `_ensure_connected` short-circuiting on a dead client. The objects
+        being torn down come back as locals, so the teardown is unaffected
+        by the early reset.
+
+        `draining=True` additionally hands the client to `_draining_client`.
+        The reader's ownership test is `client is self._client`, so clearing
+        `_client` here would otherwise silently revoke the reader's right to
+        act on the `session.closed` ack `close_session` is about to provoke,
+        and the bounded join would burn its full timeout on every close. Two
+        requirements collided — reset-before-await for cancellation safety,
+        and reader ownership across the drain — so they use two handles.
+        The caller must clear `_draining_client` when the drain window ends.
+        """
+        client = self._client
+        reader = self._reader_task
+        self._client = None
+        if draining:
+            # Only ever *set* here, never cleared: a non-draining detach
+            # running while another path's drain window is open must not
+            # revoke that drain's reader ownership and strand its join on
+            # the full timeout.
+            self._draining_client = client
+        self._reader_task = None
+        self._connected = False
+        return client, reader
+
     async def _discard_stale(self) -> None:
         """Drop a dead client + reader without blocking on a broken socket.
 
-        State is cleared BEFORE the awaited teardown, not after: every await
-        below can raise `CancelledError` (`close_quietly` re-raises it by
-        contract, and that is exactly what `_cancel_and_close`/`cleanup` run
-        under), which skips every assignment that follows it. Leaving
-        `_client` set and `_connected` True there strands the instance so
-        the next `_ensure_connected` short-circuits on a dead client. The
-        objects being torn down are held in locals, so the teardown itself
-        is unaffected by the early reset.
+        See :meth:`_detach_client` for why the state reset happens before
+        the awaited teardown rather than after it.
         """
-        reader = self._reader_task
-        client = self._client
-        self._reader_task = None
-        self._client = None
-        self._connected = False
+        client, reader = self._detach_client()
         if reader is not None and not reader.done():
             reader.cancel()
             # `asyncio.gather(..., return_exceptions=True)`, not a plain
@@ -744,16 +775,27 @@ class WebSocketSTTService(SegmentedSTTService):
         saw_session_closed = False
         try:
             async for ev in client.events():
+                etype = ev.get("type")
                 # Ignore any event from a superseded client (e.g. a failed
                 # handshake that's still draining while a retry is in
                 # flight). `_draining_client` is this same client during a
                 # `_graceful_close`, which clears `_client` before awaiting
-                # the teardown — without it the `session.closed` that close
-                # is *waiting for* would be discarded here and the join
-                # would always time out.
-                if client is not self._client and client is not self._draining_client:
+                # the teardown — without the exemption the `session.closed`
+                # that close is *waiting for* would be discarded here and
+                # the join would always time out.
+                #
+                # The exemption is for that ONE event type and no other. A
+                # blanket "draining clients are exempt" let a closing
+                # session's late `transcript.completed` set a result on
+                # `self._pending` (which by then belongs to the *next*
+                # client's decode) and its `transcript.failed` reach
+                # `_maybe_confirm_kickstart_recovery`, firing an
+                # `on_recovery` and a `launchd.reset_cooldown()` off a
+                # session already being torn down.
+                if client is not self._client and not (
+                    client is self._draining_client and etype == P.EVT_SESSION_CLOSED
+                ):
                     continue
-                etype = ev.get("type")
                 if etype == P.EVT_TRANSCRIPT_COMPLETED:
                     self._maybe_confirm_kickstart_recovery()
                     if self._pending and not self._pending.done():
@@ -845,31 +887,7 @@ class WebSocketSTTService(SegmentedSTTService):
     async def _graceful_close(self) -> None:
         if self._client is None:
             return
-        client = self._client
-        reader = self._reader_task
-        # Reset BEFORE the awaited teardown, not inside the `finally` after
-        # it: `_closing.close_quietly` re-raises `CancelledError` by
-        # contract, so every assignment sitting after that await is skipped
-        # on the cancellation path (Ctrl+C, `CancelFrame`, task
-        # cancellation) — leaving `_client` set and `_connected` True, and
-        # the next `_ensure_connected` short-circuiting on a dead client.
-        # The client and reader are held in locals, so the teardown below is
-        # unaffected.
-        #
-        # `_draining_client` is handed the client in the same breath. The
-        # reader's ownership test is `client is self._client`, so clearing
-        # `_client` here silently revoked the reader's right to act on the
-        # `session.closed` ack that `close_session` is about to provoke: the
-        # event was `continue`d past, the reader's early `break` became
-        # unreachable, and the bounded join below burned its FULL timeout on
-        # every single close (doubled for the mic/system pair). Two
-        # requirements collided — reset-before-await for cancellation
-        # safety, and reader ownership across the drain — so they now use
-        # two handles instead of one.
-        self._client = None
-        self._draining_client = client
-        self._reader_task = None
-        self._connected = False
+        client, reader = self._detach_client(draining=True)
         # Shutdown-phase timing: the Pipecat 20 s ``wait_for_cancel`` warning
         # is opaque by the time it fires — "STT close took Ns" from this
         # wrapper pins the blame here immediately instead.
@@ -887,7 +905,22 @@ class WebSocketSTTService(SegmentedSTTService):
             # Give the reader a bounded window to observe session.closed.
             if reader is not None:
                 try:
-                    await asyncio.wait_for(reader, timeout=_READER_JOIN_TIMEOUT_SEC)
+                    # `gather(..., return_exceptions=True)`, matching
+                    # `_discard_stale`/`_cancel_and_close`: a plain
+                    # `wait_for(reader, ...)` surfaces the READER task's own
+                    # cancellation and an external cancellation of
+                    # `_graceful_close` itself as the same `CancelledError`,
+                    # so a reader cancelled by anything else was recorded in
+                    # the ledger as a shutdown of *this* coroutine and
+                    # re-raised at the end — aborting the caller's close for
+                    # a cancellation it never received. `gather` absorbs the
+                    # awaited task's own cancellation into its result list;
+                    # only a genuine cancellation of this coroutine still
+                    # reaches the `except` below.
+                    await asyncio.wait_for(
+                        asyncio.gather(reader, return_exceptions=True),
+                        timeout=_READER_JOIN_TIMEOUT_SEC,
+                    )
                 except TimeoutError:
                     reader.cancel()
                 except asyncio.CancelledError as exc:
@@ -913,14 +946,10 @@ class WebSocketSTTService(SegmentedSTTService):
     async def _cancel_and_close(self) -> None:
         if self._client is None:
             return
-        client = self._client
-        reader = self._reader_task
-        # See `_graceful_close`: reset before the awaited teardown, because
-        # `close_quietly` re-raises `CancelledError` and this method is the
-        # one that runs *under* cancellation in the first place.
-        self._client = None
-        self._reader_task = None
-        self._connected = False
+        # Detached before the awaited teardown (see `_detach_client`) —
+        # doubly load-bearing here, since this is the method that runs
+        # *under* cancellation in the first place.
+        client, reader = self._detach_client()
         t0 = asyncio.get_running_loop().time()
         try:
             try:

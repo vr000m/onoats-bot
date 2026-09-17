@@ -933,7 +933,7 @@ def test_endpoint_label_socket_path_and_host_port_shapes_unaffected():
 # Round-3 review-gauntlet: one bounded teardown, shared with runtime.py
 #
 # `TranscriptionClient` teardown used to have two owners with opposite rules:
-# `runtime._close_client_quietly` bounded every close (because an unreachable
+# `_closing.close_quietly` bounded every close (because an unreachable
 # server's close never completes), while this module closed the same client
 # type unbounded in four places — including the handler added specifically to
 # clean up after a connect timeout against a wedged server, i.e. exactly the
@@ -1176,3 +1176,82 @@ def test_cancellation_while_awaiting_session_update_ack_resets_state(monkeypatch
     assert svc._connected is False
     assert svc._client is None
     assert svc._reader_task is None
+
+
+# ---------------------------------------------------------------------------
+# Round-6 regressions.
+# ---------------------------------------------------------------------------
+
+
+def test_draining_client_bypass_admits_only_session_closed(monkeypatch):
+    """Round-6 finding (`_read_events`): the `_draining_client` exemption is
+    documented as existing solely so the `session.closed` ack a
+    `_graceful_close` is *waiting for* is not discarded — but it was written
+    as a blanket "this client is exempt", admitting every event type. A
+    closing session's late `transcript.completed` could therefore set a
+    result on `self._pending` (which by then belongs to the next client's
+    decode) and a late `transcript.failed` could reach
+    `_maybe_confirm_kickstart_recovery`, firing `on_recovery` and resetting
+    the shared launchd cooldown off an already-torn-down session."""
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    recovered: list[object] = []
+    svc = _make_service(on_recovery=lambda label: recovered.append(label))
+
+    async def _run():
+        await svc._ensure_connected()
+        client = svc._client
+        assert client is not None
+        # Enter the drain window by hand, exactly as `_graceful_close` does.
+        svc._client = None
+        svc._draining_client = client
+        svc._kickstart_awaiting_transcript = True
+        pending: asyncio.Future = asyncio.get_running_loop().create_future()
+        svc._pending = pending
+
+        await client.push_event(
+            {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "late"}
+        )
+        await client.push_event({"type": P.EVT_SESSION_CLOSED})
+        await asyncio.wait_for(svc._reader_task, timeout=5)
+        return pending
+
+    pending = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    # The late transcript was ignored: the next decode's future is untouched,
+    # and no recovery/cooldown-reset fired off the dying session.
+    assert not pending.done()
+    assert recovered == []
+    assert svc._kickstart_awaiting_transcript is True
+
+
+def test_graceful_close_does_not_mistake_the_readers_cancellation_for_its_own(
+    monkeypatch,
+):
+    """Round-6 finding (`_graceful_close`): the reader join used a plain
+    `wait_for(reader, ...)` under `except CancelledError`, which cannot tell
+    "the reader task I am joining was cancelled" from "someone cancelled
+    *me*" — both surface as `CancelledError` from the await. The former was
+    therefore recorded in the `CancellationLedger` and re-raised at the end,
+    aborting a close that was never cancelled. `_discard_stale` and
+    `_cancel_and_close` already use `gather(..., return_exceptions=True)` to
+    keep the two apart; this path now does too."""
+    monkeypatch.setattr(wss_module, "_READER_JOIN_TIMEOUT_SEC", 5.0)
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    svc = _make_service()
+
+    async def _run():
+        await svc._ensure_connected()
+        reader = svc._reader_task
+        assert reader is not None
+        # A third party cancels the reader task — not this coroutine.
+        reader.cancel()
+        await svc._graceful_close()
+        return reader
+
+    # No CancelledError escapes: `_graceful_close` completes normally.
+    reader = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    assert reader.cancelled()
+    assert svc._client is None
+    assert svc._draining_client is None
+    assert svc._connected is False
+    # The transport close still ran, despite the reader's cancellation.
+    assert _FakeClient.instances[-1].closed is True
