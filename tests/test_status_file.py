@@ -1202,3 +1202,48 @@ def test_stt_branch_keys_are_instance_scoped():
     assert stt_branch("mic") == "stt-mic"
     assert stt_branch("system") == "stt-system"
     assert stt_branch("mic") != stt_branch("system")
+
+
+def test_swift_menu_bar_splits_on_the_documented_warning_delimiter():
+    """Round-6 architecture finding: `status.py`'s header says the Swift
+    menu bar's outer split must change "in lockstep" with this module's
+    `warning` join delimiter, but nothing checked it — the delimiter was a
+    bare `"; "` literal in five places here and one `components(separatedBy:)`
+    call in Swift, and a change on either side would have silently produced a
+    menu bar that renders several branches as one unbroken line (or splits
+    mid-message).
+
+    This is the lockstep mechanism the convention lacked. It reads the Swift
+    source rather than importing it — the two languages cannot share a
+    constant, which is the whole reason the convention exists — and fails if
+    the Swift split string stops matching
+    `status.WARNING_ENTRY_DELIMITER`."""
+    from onoats.status import WARNING_ENTRY_DELIMITER
+
+    swift = (
+        Path(__file__).resolve().parents[1]
+        / "native"
+        / "onoats-menubar"
+        / "Sources"
+        / "OnoatsMenuBarApp.swift"
+    )
+    assert swift.is_file(), swift
+    source = swift.read_text(encoding="utf-8")
+
+    # The warning renderer's outer split. Matched structurally (the
+    # `components(separatedBy:)` call applied to `warning`), not by grepping
+    # for the literal anywhere in the file, so an unrelated `"; "` elsewhere
+    # in the Swift source cannot satisfy it.
+    m = re.search(
+        r"\bwarning\s*\n?\s*\.components\(separatedBy:\s*\"([^\"]*)\"\)", source
+    )
+    assert m is not None, (
+        "OnoatsMenuBarApp.swift no longer splits `warning` with "
+        "components(separatedBy:) — the status.py warning-grammar lockstep "
+        "convention has no reader to stay in step with."
+    )
+    assert m.group(1) == WARNING_ENTRY_DELIMITER, (
+        f"Swift splits `warning` on {m.group(1)!r} but "
+        f"status.WARNING_ENTRY_DELIMITER is {WARNING_ENTRY_DELIMITER!r}. "
+        "Change both in lockstep (see the status.py header)."
+    )

@@ -224,7 +224,7 @@ def test_rss_probe_redacts_leaky_connect_exception_text(monkeypatch):
 
 def test_rss_probe_teardown_is_deadline_bounded(monkeypatch):
     """Round-4 finding 5: `log_stt_server_rss`'s shutdown-probe teardown
-    called `_close_client_quietly(client)` with NO deadline, so its two
+    called `_closing.close_quietly(client)` with NO deadline, so its two
     fixed-`CLOSE_TIMEOUT_SEC` (5.0s each) closers could cost up to ~10s
     against an unreachable server — on top of the ~2s the probe's own
     `wait_for` already spent — despite this function's own docstring

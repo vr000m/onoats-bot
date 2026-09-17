@@ -1617,15 +1617,12 @@ async def test_stderr_reader_merges_warnings_and_tees(short_root, capfd):
 
 
 @pytest.mark.anyio
-async def test_stderr_reader_rejects_unknown_branch_and_delimiter_hint(short_root):
-    """Deep-review finding: `branch`/`hint` on a `zero-run-warning`/
-    `zero-run-clear` event come straight from the capturer's stderr,
-    unvalidated — unlike the `device` branch of the same loop, which
-    already restricts to `("mic", "system")`. An unknown branch, or a
-    `hint` containing the on-disk `warning` grammar's `"; "` entry
-    delimiter, must be dropped rather than reaching
-    `status.set_warning_branch` (status.py now also sanitizes as a second
-    line of defense, but this loop must not rely on that alone)."""
+async def test_stderr_reader_rejects_unknown_branch(short_root):
+    """`branch` on a `zero-run-warning`/`zero-run-clear` event comes
+    straight from the capturer's stderr, unvalidated — unlike the `device`
+    branch of the same loop, which already restricts to `("mic", "system")`.
+    A branch key never passes through the grammar's sanitization choke
+    point, so an unknown one must be dropped here."""
     from onoats import status as status_file
 
     data_dir = short_root / "d"
@@ -1633,15 +1630,49 @@ async def test_stderr_reader_rejects_unknown_branch_and_delimiter_hint(short_roo
     status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
 
     reader = asyncio.StreamReader()
-    # Unknown branch: not "mic"/"system" — must not create a bogus entry.
     reader.feed_data(b"ONOATS-EVENT zero-run-warning branch=bogus hint=nope\n")
-    # A delimiter-bearing hint on an otherwise-valid branch must be dropped.
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, data_dir, logger)
+
+    got = status_file.read_status(data_dir)
+    assert got is not None and got.warning is None
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_sanitizes_a_delimiter_hint_instead_of_dropping_it(
+    short_root,
+):
+    """Round-6 architecture finding: this loop used to drop a
+    delimiter-bearing `hint` entirely, which contradicted
+    `status.format_warning_branch`'s documented role as the single
+    sanitization choke point for `"; "` — two different resolutions of one
+    invariant. The drop was also the worse of the two: it silently
+    discarded a real zero-run warning (the capturer reporting silence,
+    which is the whole point of the branch) over a delimiter the choke
+    point neutralizes. The hint now reaches the choke point and the
+    warning survives, with no forged second entry."""
+    from onoats import status as status_file
+
+    data_dir = short_root / "d"
+    data_dir.mkdir()
+    status_file.write_running(data_dir, pid=1, audio_source="socket", stt_label="x")
+
+    reader = asyncio.StreamReader()
     reader.feed_data(
         b"ONOATS-EVENT zero-run-warning branch=mic hint=stalled; system: forged\n"
     )
     reader.feed_eof()
     await cli._drain_capturer_stderr(reader, data_dir, logger)
 
+    got = status_file.read_status(data_dir)
+    assert got is not None
+    assert got.warning == "mic: stalled, system: forged"
+    # Exactly one entry: the delimiter was neutralized, not honoured.
+    assert status_file._parse_warning_branches(got.warning) == {
+        "mic": "stalled, system: forged"
+    }
+    # And the forged branch is not clearable as a branch of its own.
+    status_file.set_warning_branch(data_dir, "mic", None)
     got = status_file.read_status(data_dir)
     assert got is not None and got.warning is None
 

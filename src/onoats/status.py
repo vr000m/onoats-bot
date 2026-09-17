@@ -82,12 +82,27 @@ STATUS_FILENAME = "onoats.status.json"
 # is unrelated to this grammar's `": "` branch/message separator — it exists
 # purely to keep a long single-line hint from stretching the whole menu, by
 # breaking on any em-dash clause the message text happens to contain. Swift
-# never extracts a branch key from `warning` at all. Change the outer `"; "`
-# join delimiter here only in lockstep with the Swift split, and bump
+# never extracts a branch key from `warning` at all. Change the outer
+# `WARNING_ENTRY_DELIMITER` join delimiter here only in lockstep with the
+# Swift split — `tests/test_status_file.py::
+# test_swift_menu_bar_splits_on_the_documented_warning_delimiter` reads the
+# Swift source and fails if the two diverge, so the lockstep is checked, not
+# merely asked for — and bump
 # `STATUS_SCHEMA_VERSION` only if the *field's shape* changes (e.g. `warning`
 # stops being a string) — not for a change confined to this string's internal
 # grammar.
 STATUS_SCHEMA_VERSION = 2
+
+# The `warning` grammar's outer entry delimiter, named so the "change it in
+# lockstep with the Swift split" convention above has something to check
+# against. The Swift side cannot import this module, so the lockstep is
+# enforced by `tests/test_status_file.py::
+# test_swift_menu_bar_splits_on_the_documented_warning_delimiter`, which reads
+# the Swift source and asserts it splits on exactly this string. That test is
+# the mechanism the convention previously lacked: before it, the delimiter was
+# a bare literal in five places here and one `components(separatedBy:)` call
+# in Swift, and nothing failed if they diverged.
+WARNING_ENTRY_DELIMITER = "; "
 
 # Active dir name mirrors the pid file's location (``<data_dir>/.active``).
 _ACTIVE_DIR = ".active"
@@ -402,7 +417,8 @@ def format_warning_branch(branch: str, message: str) -> str:
     unclearable pseudo-branch entry on the next :func:`_parse_warning_branches`
     read regardless of which writer produced it.
     """
-    return f"{branch.replace('; ', ',')}: {message.replace('; ', ', ')}"
+    delimiter = WARNING_ENTRY_DELIMITER
+    return f"{branch.replace(delimiter, ',')}: {message.replace(delimiter, ', ')}"
 
 
 def _parse_warning_branches(warning: str | None) -> dict[str, str]:
@@ -419,7 +435,7 @@ def _parse_warning_branches(warning: str | None) -> dict[str, str]:
     if not warning:
         return {}
     branches: dict[str, str] = {}
-    for part in warning.split("; "):
+    for part in warning.split(WARNING_ENTRY_DELIMITER):
         branch, sep, message = part.partition(": ")
         if not sep:
             continue
@@ -442,7 +458,9 @@ def _is_well_formed_warning(warning: str) -> bool:
     parsed = _parse_warning_branches(warning)
     if not parsed:
         return False
-    rebuilt = "; ".join(format_warning_branch(b, parsed[b]) for b in sorted(parsed))
+    rebuilt = WARNING_ENTRY_DELIMITER.join(
+        format_warning_branch(b, parsed[b]) for b in sorted(parsed)
+    )
     return rebuilt == warning
 
 
@@ -532,14 +550,16 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     # ends up on disk (format_warning_branch is the sole sanitization choke
     # point — see its docstring — but its output isn't parsed back through
     # this dict, so the key here must be pre-sanitized to stay consistent).
-    branch = branch.replace("; ", ",")
+    branch = branch.replace(WARNING_ENTRY_DELIMITER, ",")
     branches = _parse_warning_branches(current.warning)
     if message is None:
         branches.pop(branch, None)
     else:
         branches[branch] = message
     merged = (
-        "; ".join(format_warning_branch(b, branches[b]) for b in sorted(branches))
+        WARNING_ENTRY_DELIMITER.join(
+            format_warning_branch(b, branches[b]) for b in sorted(branches)
+        )
         or None
     )
     return _write_warning_field(data_dir, current, merged)

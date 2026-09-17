@@ -400,16 +400,24 @@ async def _drain_capturer_stderr(
         branch = fields.get("branch", "?")
         try:
             if event_type == "zero-run-warning":
-                # `branch` and `hint` come straight from the capturer's
-                # stderr, unlike the launchd label (allowlist-validated at
-                # resolution). Validate here the same way the `device`
-                # branch below already does: only "mic"/"system" are
-                # produced by the capturer's own `Resampler` labels, and a
-                # `hint` containing the "; " the on-disk `warning` grammar
-                # splits entries on would otherwise forge an unclearable
-                # pseudo-branch entry (see status.set_warning_branch).
+                # `branch` comes straight from the capturer's stderr, unlike
+                # the launchd label (allowlist-validated at resolution), so
+                # it is checked here the same way the `device` branch below
+                # is: only "mic"/"system" are produced by the capturer's own
+                # `Resampler` labels, and a branch key never passes through
+                # the grammar's sanitization choke point.
+                #
+                # `hint` is NOT checked here. It is a `message`, and
+                # `status.format_warning_branch` is the documented single
+                # choke point that sanitizes the `"; "` entry delimiter out
+                # of both `branch` and `message`. Dropping the whole event
+                # here instead was a second, contradictory resolution of the
+                # same invariant — and the wrong one: it silently discarded
+                # a real zero-run warning (a capturer delivering silence)
+                # because of a delimiter the choke point would have made
+                # harmless.
                 hint = fields.get("hint", "no detail provided")
-                if branch in ("mic", "system") and "; " not in hint:
+                if branch in ("mic", "system"):
                     status_file.set_warning_branch(data_dir, branch, hint)
             elif event_type == "zero-run-clear":
                 if branch in ("mic", "system"):

@@ -1,6 +1,8 @@
 """``launchctl kickstart`` self-healing for the STT server + shared cooldown.
 
-Leaf module: no ``runtime``/``status``/``dual`` imports. Both the preflight
+Leaf module: no ``runtime``/``status``/``dual`` imports (``onoats.config``,
+which itself imports nothing from ``onoats``, is the one exception and is
+imported at module scope like any other). Both the preflight
 path (``onoats.runtime._preflight_stt_ws``) and the live reconnect path
 (``onoats.stt.websocket_stt_service.WebSocketSTTService``) import from here
 without either importing the other — this module is the shared meeting
@@ -56,6 +58,8 @@ import time
 from collections.abc import Callable
 
 from loguru import logger
+
+from onoats.config import validate_launchd_label
 
 _KICKSTART_TIMEOUT_SEC = 5
 
@@ -170,14 +174,14 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
     the preflight or reconnect path it is meant to heal).
     """
     try:
-        # Inside the `try`, not above it. `validate_launchd_label` is typed
-        # for `str` and indexes/regexes its argument, so a non-`str` label
-        # from a bypassing caller raised `TypeError` straight out of a
+        # The CALL is inside the `try`, not above it. `validate_launchd_label`
+        # is typed for `str` and indexes/regexes its argument, so a non-`str`
+        # label from a bypassing caller raised `TypeError` straight out of a
         # function documented as never raising — and, via `try_kickstart`,
         # did so *after* the cooldown stamp had already been consumed. The
-        # contract has to cover its own validator.
-        from onoats.config import validate_launchd_label
-
+        # contract has to cover its own validator. (The import itself is at
+        # module scope: `onoats.config` imports nothing from `onoats`, so
+        # there is no cycle for a function-local import to break.)
         if validate_launchd_label(label) is None:
             logger.warning(
                 f"STT: kickstart of {label!r} refused — not a well-formed "
@@ -285,8 +289,6 @@ def _label_is_kickstartable(label: str) -> bool:
     one protects the *cooldown stamp*, that one protects the ``launchctl``
     argv. Neither may raise — see `kickstart_stt_server`'s contract."""
     try:
-        from onoats.config import validate_launchd_label
-
         if validate_launchd_label(label) is not None:
             return True
     except Exception:

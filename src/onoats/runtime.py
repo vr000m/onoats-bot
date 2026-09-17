@@ -577,7 +577,7 @@ async def log_stt_server_rss(phase: str) -> None:
             # ~12s total against a probe this function's own docstring calls
             # "2s-bounded". Give teardown the same ``_RSS_PROBE_TIMEOUT_SEC``
             # window the probe itself gets, not an unbounded extra budget.
-            await _close_client_quietly(
+            await _closing.close_quietly(
                 client,
                 deadline=asyncio.get_running_loop().time() + _RSS_PROBE_TIMEOUT_SEC,
             )
@@ -598,29 +598,6 @@ def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
         kwargs.get("host"),
         kwargs.get("port"),
     )
-
-
-async def _close_client_quietly(
-    client: object, *, deadline: float | None = None
-) -> None:
-    """Best-effort, time-bounded full teardown of a ``TranscriptionClient``.
-
-    Thin wrapper over :func:`onoats._closing.close_quietly` — kept as a named
-    local seam because every call site in this module wants the same
-    (``close_session``, ``close``) sequence, and because ``deadline``'s
-    meaning here is specifically *this module's* budget: without it, the two
-    closers' fixed per-closer timeout could burn 10s combined **before** the
-    post-kickstart loop next re-checks its own monotonic deadline, so the
-    documented "strict cap" of ``_POST_KICKSTART_DEADLINE_SEC`` could overrun
-    by up to a full teardown. Teardown must never be what blows the budget it
-    is running inside.
-
-    See ``onoats._closing``'s module docstring for the never-raises,
-    always-attempt-every-closer and floor-an-expired-deadline invariants, and
-    for why an unbounded close against the unreachable server every caller
-    here has *already* diagnosed can hang forever.
-    """
-    await _closing.close_quietly(client, deadline=deadline)
 
 
 class KickstartOutcome(enum.Enum):
@@ -756,12 +733,12 @@ async def _kickstart_and_retry(
                 # closer: this teardown runs before the loop's next budget
                 # check, so an unbounded-by-budget close is itself able to
                 # overrun the cap this loop documents as strict.
-                await _close_client_quietly(candidate, deadline=deadline)
+                await _closing.close_quietly(candidate, deadline=deadline)
             attempt += 1
             continue
         except Exception as exc:
             if candidate is not None:
-                await _close_client_quietly(candidate, deadline=deadline)
+                await _closing.close_quietly(candidate, deadline=deadline)
             raise SttPreflightError(
                 f"STT: handshake failed at {target} after kickstarting "
                 f"{label!r} ({type(exc).__name__}: {safe_exc_text(exc)}). {hint}"
@@ -778,7 +755,7 @@ async def _kickstart_and_retry(
             # design's shutdown-responsiveness budget promises.
             if candidate is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await _close_client_quietly(candidate, deadline=deadline)
+                    await _closing.close_quietly(candidate, deadline=deadline)
             raise
         if on_recovery is not None:
             # Swallow-and-log, like every other recovery-callback site
@@ -814,7 +791,7 @@ def _resolve_kickstart_outcome(
     awaiting the stale client's close) needs the assignment to happen in the
     CALLER's own stack frame with no ``await`` boundary in between, so that a
     cancellation arriving mid-close still leaves the caller's `finally`
-    block (``await _close_client_quietly(client)``) pointing at the live
+    block (``await _closing.close_quietly(client)``) pointing at the live
     client rather than the already-dead stale one. Moving the swap-then-
     close pair into an ``await``ed helper was tried and reverted: by the
     time such a helper returns and its result is assigned, the caller's
@@ -977,7 +954,7 @@ async def _preflight_stt_ws(
             if delay_s > 0:
                 await asyncio.sleep(delay_s)
             if idx > 0:
-                await _close_client_quietly(client, deadline=_pre_kickstart_deadline)
+                await _closing.close_quietly(client, deadline=_pre_kickstart_deadline)
                 client = _make_client()
                 # Recheck the remaining pre-kickstart budget after the sleep
                 # and the deadline-capped teardown above: when attempt 1 ran
@@ -1056,7 +1033,7 @@ async def _preflight_stt_ws(
                         # never closed and its socket/FD leaks.
                         stale = client
                         client = result
-                        await _close_client_quietly(stale)
+                        await _closing.close_quietly(stale)
                         break
                     # "kickstart_failed" (also: cooldown still active) ->
                     # fall through, unchanged message.
@@ -1113,7 +1090,7 @@ async def _preflight_stt_ws(
                         # ownership must transfer before the awaited close.
                         stale = client
                         client = result
-                        await _close_client_quietly(stale)
+                        await _closing.close_quietly(stale)
                         break
                     # "kickstart_failed" (also: cooldown still active) ->
                     # fall through, unchanged message.
@@ -1139,7 +1116,7 @@ async def _preflight_stt_ws(
                     f"({type(exc).__name__}: {safe_exc_text(exc)}). {hint}"
                 ) from exc
     finally:
-        await _close_client_quietly(client)
+        await _closing.close_quietly(client)
 
     _preflight_cache[key] = recovered_message
 

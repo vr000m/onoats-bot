@@ -1109,7 +1109,7 @@ def test_cancellation_during_stale_close_does_not_leak_the_recovered_client(
     monkeypatch,
 ):
     """Round-4 finding 4: on the "recovered" success path, the stale
-    pre-kickstart client used to be closed via `await _close_client_quietly(
+    pre-kickstart client used to be closed via `await _closing.close_quietly(
     client)` BEFORE `client = recovered` executed. If shutdown cancellation
     arrived during that await, the outer `finally` still saw `client`
     pointing at the already-dead stale client -- the live, connected
@@ -1160,7 +1160,7 @@ def test_cancellation_during_stale_close_does_not_leak_the_recovered_client(
     assert recovered.closed is True
 
 
-def test_close_client_quietly_is_time_bounded(monkeypatch):
+def test_close_quietly_is_time_bounded(monkeypatch):
     """Round-2 finding 6: `close_session()` waits for the server's ack, so
     against the unreachable server every caller has already diagnosed, an
     unbounded close hangs forever — and in the post-kickstart loop that means
@@ -1176,7 +1176,7 @@ def test_close_client_quietly_is_time_bounded(monkeypatch):
     monkeypatch.setattr(_closing, "CLOSE_TIMEOUT_SEC", 0.01)
 
     async def _run():
-        await runtime._close_client_quietly(_HangingCloser())
+        await _closing.close_quietly(_HangingCloser())
 
     asyncio.run(asyncio.wait_for(_run(), timeout=5))
 
@@ -1186,7 +1186,7 @@ def test_close_client_quietly_is_time_bounded(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_close_client_quietly_still_attempts_close_at_an_expired_deadline(
+def test_close_quietly_still_attempts_close_at_an_expired_deadline(
     monkeypatch,
 ):
     """Round-5 finding 3: a `deadline` already in the past used to floor the
@@ -1208,21 +1208,19 @@ def test_close_client_quietly_still_attempts_close_at_an_expired_deadline(
         loop = asyncio.get_running_loop()
         # Deadline already expired: the old code floored the timeout at 0.0,
         # skipping both closers entirely.
-        await runtime._close_client_quietly(
-            _TrackingCloser(), deadline=loop.time() - 1.0
-        )
+        await _closing.close_quietly(_TrackingCloser(), deadline=loop.time() - 1.0)
 
     asyncio.run(asyncio.wait_for(_run(), timeout=5))
     assert calls == ["close_session", "close"]
 
 
-def test_close_client_quietly_runs_close_after_cancellation_mid_close_session(
+def test_close_quietly_runs_close_after_cancellation_mid_close_session(
     monkeypatch,
 ):
     """Round-5 finding 4: `except Exception: pass` does not catch
     `asyncio.CancelledError` (a `BaseException`), so a cancellation arriving
     during `close_session`'s await used to propagate straight out of
-    `_close_client_quietly` before the loop ever reached `close()` — leaving
+    `_closing.close_quietly` before the loop ever reached `close()` — leaving
     the underlying socket/FD (torn down by `close()`, not `close_session()`)
     open on the recovered-client handoff path."""
 
@@ -1238,7 +1236,7 @@ def test_close_client_quietly_runs_close_after_cancellation_mid_close_session(
 
     async def _run():
         with pytest.raises(asyncio.CancelledError):
-            await runtime._close_client_quietly(_CancelDuringCloseSession())
+            await _closing.close_quietly(_CancelDuringCloseSession())
 
     asyncio.run(_run())
     # `close()` must still have been attempted before the cancellation
@@ -1346,8 +1344,8 @@ def test_post_kickstart_deadline_is_not_overrun_by_a_late_attempt(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_close_client_quietly_honours_a_caller_deadline(monkeypatch):
-    """Round-3 finding 1: `_close_client_quietly` ran each of its two closers
+def test_close_quietly_honours_a_caller_deadline(monkeypatch):
+    """Round-3 finding 1: `_closing.close_quietly` ran each of its two closers
     on a fixed `_closing.CLOSE_TIMEOUT_SEC`, so a teardown could burn up to 2x that
     *inside* a caller whose own budget was supposed to be a strict cap. With a
     `deadline` the teardown can never outlive the budget it runs inside."""
@@ -1365,13 +1363,11 @@ def test_close_client_quietly_honours_a_caller_deadline(monkeypatch):
         loop = asyncio.get_running_loop()
         started = loop.time()
         # Deadline already in the past: nothing may be waited on at all.
-        await runtime._close_client_quietly(_HangingCloser(), deadline=loop.time())
+        await _closing.close_quietly(_HangingCloser(), deadline=loop.time())
         spent_expired = loop.time() - started
 
         started = loop.time()
-        await runtime._close_client_quietly(
-            _HangingCloser(), deadline=loop.time() + 0.05
-        )
+        await _closing.close_quietly(_HangingCloser(), deadline=loop.time() + 0.05)
         spent_budgeted = loop.time() - started
         return spent_expired, spent_budgeted
 
@@ -1385,13 +1381,13 @@ def test_close_client_quietly_honours_a_caller_deadline(monkeypatch):
 def test_kickstart_and_retry_cancellation_teardown_honours_the_deadline(monkeypatch):
     """The ``except BaseException:`` branch (shutdown/``CancelledError``
     arriving mid post-kickstart connect attempt) used to close the in-flight
-    candidate via ``_close_client_quietly(candidate)`` with no ``deadline=``,
+    candidate via ``_closing.close_quietly(candidate)`` with no ``deadline=``,
     unlike this same function's ``TimeoutError``/``OSError``/``Exception``
     branches, which all pass ``deadline=deadline``. Without it, a
     cancellation landing here could burn the full, undeadlined
     ``2 * _closing.CLOSE_TIMEOUT_SEC`` instead of being capped by this loop's own
     strict ``_POST_KICKSTART_DEADLINE_SEC`` budget — exactly the overrun
-    ``_close_client_quietly``'s own docstring says ``deadline`` exists to
+    ``_closing.close_quietly``'s own docstring says ``deadline`` exists to
     prevent."""
     _allow_kickstart(monkeypatch)
     # Already-expired by the time the candidate's close runs: forces the
