@@ -79,8 +79,7 @@ from stt_server import protocol as P
 # imports, so this is a top-level, cycle-free import of a *public* name —
 # not a private symbol reached across a module boundary (`runtime.py` only
 # ever imports this `stt` subpackage lazily, to avoid a cycle).
-from onoats._redact import redact_uri
-from onoats._redact import safe_exc_text as _safe_exc_text
+from onoats._redact import redact_uri, safe_exc_text
 from onoats.stt import launchd
 
 # Wait at most this long for a decode round trip before surfacing an
@@ -138,7 +137,7 @@ class WebSocketSTTService(SegmentedSTTService):
         auth_token: str | None = None,
         language: str | None = "en",
         launchd_label: str | None = None,
-        branch_instance: str | None = None,
+        instance_name: str | None = None,
         on_recovery: Callable[[str | None], None] | None = None,
         on_preflight_confirmed: Callable[[], None] | None = None,
         **kwargs,
@@ -197,11 +196,16 @@ class WebSocketSTTService(SegmentedSTTService):
         # address, so a token from an instance that leaked a registration
         # (torn down without `cleanup()`) could be inherited wholesale by a
         # later instance — silently either stealing or resurrecting an
-        # unhealthy mark. `branch_instance` ("mic"/"system") is the stable
-        # identity the call site (`runtime._create_stt_service`) already has;
-        # `self.name` (Pipecat's `<Class>#<monotonic counter>`) is the
-        # single-pipeline fallback and is never reused within a process.
-        self._instance_token = branch_instance or self.name
+        # unhealthy mark. `instance_name` ("mic"/"system") is the stable
+        # identity the call site (`runtime._create_stt_service`) already has
+        # — an opaque identity token to this leaf service, which has no
+        # notion of status-warning branches (that concept is owned by
+        # `status.stt_branch()`/`format_warning_branch()`; the call site
+        # happens to reuse the same string for both purposes, but this class
+        # only ever uses it as a registry key). `self.name` (Pipecat's
+        # `<Class>#<monotonic counter>`) is the single-pipeline fallback and
+        # is never reused within a process.
+        self._instance_token = instance_name or self.name
         # True from the moment this instance's own reconnect exhaustion
         # triggers a kickstart until that instance's *next* successful
         # connect — gates the one-time "server restarted automatically"
@@ -330,7 +334,7 @@ class WebSocketSTTService(SegmentedSTTService):
                 # sanitize before this reaches the log or a user-visible
                 # ErrorFrame. Same leak class as runtime.py's preflight
                 # error messages.
-                safe_exc = _safe_exc_text(exc)
+                safe_exc = safe_exc_text(exc)
                 logger.warning(f"WebSocketSTTService: connect failed: {safe_exc}")
                 yield ErrorFrame(error=f"stt_server connect failed: {safe_exc}")
                 return
@@ -407,9 +411,26 @@ class WebSocketSTTService(SegmentedSTTService):
         for attempt in range(total_attempts):
             try:
                 client = TranscriptionClient(**self._connect_kwargs)
-                hello = await asyncio.wait_for(
-                    client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
-                )
+                try:
+                    hello = await asyncio.wait_for(
+                        client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
+                    )
+                except BaseException:
+                    # `client` never became `self._client` (that assignment
+                    # is below, only on success), so it is invisible to
+                    # `_discard_stale()`'s cleanup — close it here or a
+                    # wedged server (TCP/UDS accepted, handshake frames never
+                    # sent, exactly the case `_CONNECT_TIMEOUT_SECONDS` exists
+                    # to catch) leaks one open websocket per attempt. Closing
+                    # is safe at any point mid-handshake: `client.close()`
+                    # no-ops on a `_ws` that never got set and closes it
+                    # otherwise, whether `connect()` timed out or raised
+                    # (e.g. the "expected server.hello" `RuntimeError`).
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+                    raise
                 loop = asyncio.get_running_loop()
                 self._session_ready = loop.create_future()
                 self._client = client
@@ -498,7 +519,7 @@ class WebSocketSTTService(SegmentedSTTService):
                     delay = _RECONNECT_BACKOFF_SECONDS[attempt]
                     logger.warning(
                         f"{self.name}: connect attempt {attempt + 1} failed "
-                        f"({_safe_exc_text(exc)}) [endpoint={endpoint}], "
+                        f"({safe_exc_text(exc)}) [endpoint={endpoint}], "
                         f"retrying in {delay}s"
                     )
                     await asyncio.sleep(delay)

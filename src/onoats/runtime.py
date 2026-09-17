@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import os
 import platform
 import signal
@@ -28,6 +29,15 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    # Type-checking only: this module keeps MLX/pipecat-service imports lazy
+    # (see `_create_stt_service`'s docstring) so a plain `import onoats.runtime`
+    # with no `STT_SERVICE` set never pulls in `mlx_whisper`. `from __future__
+    # import annotations` (above) makes every annotation a string, so this
+    # import never runs at module load time — only under a type checker.
+    from pipecat.services.stt_service import STTService
 
 from loguru import logger
 
@@ -343,13 +353,15 @@ def _display_target(kwargs: dict) -> str:
     return kwargs.get("socket_path") or f"{kwargs.get('host')}:{kwargs.get('port')}"
 
 
-# `safe_exc_text` lives in `onoats._redact` — a leaf module with no
-# `onoats` imports — so both this module and
-# `onoats.stt.websocket_stt_service` can import it top-level without either
-# reaching into the other's private symbols. Re-exported under the old
-# private name so every call site in this module (and any external code
-# that imported `runtime._safe_exc_text`) keeps working unchanged.
-_safe_exc_text = safe_exc_text
+# `safe_exc_text`/`redact_uri` live in `onoats._redact` — a leaf module with
+# no `onoats` imports — so both this module and
+# `onoats.stt.websocket_stt_service` can import them top-level without either
+# reaching into the other's private symbols. No `_safe_exc_text` compat
+# alias: `_redact` is a new module on an unreleased branch, so there is no
+# external compatibility to preserve, and mixing `_safe_exc_text` with the
+# public `safe_exc_text` in the same module invited exactly the split this
+# note used to describe (see git history) — every call site below uses the
+# public name.
 
 
 def stt_banner() -> str:
@@ -533,8 +545,8 @@ async def log_stt_server_rss(phase: str) -> None:
         # `STT_WS_URI` and calls `connect()`, so a malformed URI can raise
         # `websockets.exceptions.InvalidURI` with the raw, unredacted URI
         # embedded in its message here too. Gated by LOG_LEVEL=DEBUG, but
-        # the fix is the same — route through `_safe_exc_text`.
-        logger.debug(f"stt_server RSS ({phase}): probe failed ({_safe_exc_text(exc)})")
+        # the fix is the same — route through `safe_exc_text`.
+        logger.debug(f"stt_server RSS ({phase}): probe failed ({safe_exc_text(exc)})")
 
 
 def _preflight_key(kwargs: dict) -> tuple[object, object, object, object]:
@@ -606,6 +618,32 @@ async def _close_client_quietly(
         raise cancelled
 
 
+class KickstartOutcome(enum.Enum):
+    """``_kickstart_and_retry``'s outcome — see its docstring for what each
+    member means. An enum (checkable, no typo-silently-falls-through-to-
+    ``None`` risk), not the three magic strings this replaced: a producer/
+    consumer spelling mismatch on a bare string outcome would previously
+    fall through ``_resolve_kickstart_outcome``'s comparisons silently
+    (treated as "kickstart failed") with no error."""
+
+    RECOVERED = "recovered"
+    RETRY_EXHAUSTED = "retry_exhausted"
+    KICKSTART_FAILED = "kickstart_failed"
+
+
+class KickstartResult(NamedTuple):
+    """``_kickstart_and_retry``'s return value — a named pair, not a bare
+    tuple, for the same reason ``SttServiceResult`` replaced `_create_stt_
+    service`'s: a future field needs a seam that doesn't re-break every
+    caller's positional unpacking. `NamedTuple`, not a plain dataclass,
+    because both call sites destructure it with tuple-unpacking
+    (``outcome, recovered = await _kickstart_and_retry(...)``) and that
+    calling convention is preserved unchanged."""
+
+    outcome: KickstartOutcome
+    client: object | None
+
+
 async def _kickstart_and_retry(
     make_client: Callable[[], object],
     label: str,
@@ -613,7 +651,7 @@ async def _kickstart_and_retry(
     *,
     target: str,
     hint: str,
-) -> tuple[str, object | None]:
+) -> KickstartResult:
     """Best-effort kickstart + deadline-bounded post-kickstart connect retry.
 
     Called only from ``_preflight_stt_ws``'s final-attempt exhaustion and only
@@ -639,20 +677,20 @@ async def _kickstart_and_retry(
     the next attempt silently overwrote — a leaked socket/FD per failed
     attempt, with only the last one ever closed.
 
-    Returns ``(outcome, recovered_client)``:
-      ``("recovered", client)``      — kickstart succeeded AND a post-kickstart
-                                       handshake succeeded on ``client`` (now
-                                       the live, connected client, which the
-                                       caller owns and must close);
-                                       ``on_recovery`` already fired.
-      ``("kickstart_failed", None)`` — cooldown still active, or ``launchctl
-                                       kickstart`` itself failed — caller falls
-                                       through to today's unchanged
-                                       ``SttPreflightError``.
-      ``("retry_exhausted", None)``  — kickstart succeeded but the deadline
-                                       expired with the server still
-                                       unreachable — caller raises a
-                                       kickstart-noting error.
+    Returns a ``KickstartResult(outcome, client)``:
+      ``RECOVERED, client``       — kickstart succeeded AND a post-kickstart
+                                     handshake succeeded on ``client`` (now
+                                     the live, connected client, which the
+                                     caller owns and must close);
+                                     ``on_recovery`` already fired.
+      ``KICKSTART_FAILED, None``  — cooldown still active, or ``launchctl
+                                     kickstart`` itself failed — caller falls
+                                     through to today's unchanged
+                                     ``SttPreflightError``.
+      ``RETRY_EXHAUSTED, None``   — kickstart succeeded but the deadline
+                                     expired with the server still
+                                     unreachable — caller raises a
+                                     kickstart-noting error.
 
     **Only reachability failures are retried.** A post-kickstart attempt that
     fails with anything other than ``TimeoutError``/``OSError`` (auth rejected,
@@ -677,7 +715,7 @@ async def _kickstart_and_retry(
     from onoats.stt.launchd import recovery_message, try_kickstart
 
     if not await try_kickstart(label):
-        return "kickstart_failed", None
+        return KickstartResult(KickstartOutcome.KICKSTART_FAILED, None)
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _POST_KICKSTART_DEADLINE_SEC
@@ -692,11 +730,11 @@ async def _kickstart_and_retry(
             # full sleep plus a full connect timeout, overrunning by ~5s.
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return "retry_exhausted", None
+                return KickstartResult(KickstartOutcome.RETRY_EXHAUSTED, None)
             await asyncio.sleep(min(_POST_KICKSTART_SETTLE_SEC, remaining))
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return "retry_exhausted", None
+                return KickstartResult(KickstartOutcome.RETRY_EXHAUSTED, None)
             timeout_s = min(timeout_s, remaining)
         candidate: object | None = None
         try:
@@ -720,7 +758,7 @@ async def _kickstart_and_retry(
                 await _close_client_quietly(candidate, deadline=deadline)
             raise SttPreflightError(
                 f"STT: handshake failed at {target} after kickstarting "
-                f"{label!r} ({type(exc).__name__}: {_safe_exc_text(exc)}). {hint}"
+                f"{label!r} ({type(exc).__name__}: {safe_exc_text(exc)}). {hint}"
             ) from exc
         except BaseException:
             # asyncio.CancelledError is a BaseException: without this the
@@ -748,11 +786,11 @@ async def _kickstart_and_retry(
                 on_recovery(recovery_message(label))
             except Exception as exc:
                 logger.warning(f"STT: on_recovery callback failed: {exc}")
-        return "recovered", candidate
+        return KickstartResult(KickstartOutcome.RECOVERED, candidate)
 
 
 def _resolve_kickstart_outcome(
-    outcome: str,
+    outcome: KickstartOutcome,
     recovered: object | None,
     *,
     exhausted_message: str,
@@ -761,7 +799,7 @@ def _resolve_kickstart_outcome(
     """Shared "what does this ``_kickstart_and_retry`` outcome mean" branch,
     called from both the ``TimeoutError`` and ``OSError`` except-blocks of
     ``_preflight_stt_ws`` below — their only difference is the message
-    template for ``"retry_exhausted"``.
+    template for ``RETRY_EXHAUSTED``.
 
     Returns the recovered, live client on a ``"recovered"`` outcome — but
     deliberately does NOT perform the caller's ownership-transfer-then-close
@@ -783,13 +821,13 @@ def _resolve_kickstart_outcome(
     no ``await`` on the right-hand side) before anything is awaited — see
     the call sites' own comments for why that ordering matters.
     Raises ``SttPreflightError`` (chained from ``exc``) on
-    ``"retry_exhausted"``. Returns ``None`` on ``"kickstart_failed"``
+    ``RETRY_EXHAUSTED``. Returns ``None`` on ``KICKSTART_FAILED``
     (kickstart itself failed, or the cooldown was still active) — the caller
     falls through to its own unchanged, un-kickstarted error.
     """
-    if outcome == "retry_exhausted":
+    if outcome == KickstartOutcome.RETRY_EXHAUSTED:
         raise SttPreflightError(exhausted_message) from exc
-    if outcome == "recovered":
+    if outcome == KickstartOutcome.RECOVERED:
         return recovered
     return None
 
@@ -1042,7 +1080,7 @@ async def _preflight_stt_ws(
                 # a race, the config is wrong.
                 raise SttPreflightError(
                     f"STT: handshake failed at {target} "
-                    f"({type(exc).__name__}: {_safe_exc_text(exc)}). {hint}"
+                    f"({type(exc).__name__}: {safe_exc_text(exc)}). {hint}"
                 ) from exc
     finally:
         await _close_client_quietly(client)
@@ -1104,7 +1142,7 @@ class SttServiceResult:
     service instance can ignore ``.preflight_recovery_message``.
     """
 
-    service: object
+    service: STTService
     preflight_recovery_message: str | None = None
 
 
@@ -1270,10 +1308,14 @@ async def _create_stt_service(
             launchd_label=launchd_label,
             # Stable cross-instance identity for the shared unhealthy
             # registry — the same "mic"/"system" name that already selects
-            # this instance's status branch. Previously the service derived
-            # its own token from `id(self)`, a memory address CPython reuses
-            # after GC.
-            branch_instance=branch_instance,
+            # this instance's status branch. `WebSocketSTTService` has no
+            # notion of status-warning branches (that's this module's/
+            # `status.py`'s concept); to the leaf service this is just an
+            # opaque instance identity token, hence `instance_name`, not
+            # `branch_instance`. Previously the service derived its own
+            # token from `id(self)`, a memory address CPython reuses after
+            # GC.
+            instance_name=branch_instance,
             on_recovery=live_on_recovery,
             on_preflight_confirmed=(
                 on_preflight_confirmed if recovered_in_preflight else None

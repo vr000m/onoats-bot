@@ -234,6 +234,25 @@ def test_rerun_preserves_the_app_section_byte_for_byte(_isolate_env, monkeypatch
     assert cfg["app"]["some_future_swift_only_key"] == 42
 
 
+def test_extract_raw_section_rejects_a_boundary_it_cannot_trust():
+    """Round-2 review-gauntlet finding: `_extract_raw_section` is a lexical
+    line-scanner, not a real TOML parser — it ends a section at the first
+    line that merely looks like `[...]`. A multi-line value's continuation
+    line that happens to match that shape would end the section early,
+    splicing a truncated fragment into the regenerated file. The extracted
+    block must now be validated as standalone TOML before being trusted;
+    when it isn't (as here, since the scanner cuts the triple-quoted string
+    off mid-value, leaving it unterminated), the section reports as absent
+    rather than corrupt."""
+    text = '[app]\nlaunch_at_login = true\nweird = """\n[oops]\n"""\n'
+    assert init_mod._extract_raw_section(text, "app") is None
+
+
+def test_extract_raw_section_accepts_a_normal_single_line_section():
+    text = '[app]\nlaunch_at_login = "false"\nsome_future_swift_only_key = 42\n'
+    assert init_mod._extract_raw_section(text, "app") == text.rstrip("\n")
+
+
 def test_rerun_preserves_an_unrecognized_launch_at_login_value(
     _isolate_env, monkeypatch
 ):

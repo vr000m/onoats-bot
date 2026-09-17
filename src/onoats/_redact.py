@@ -55,21 +55,41 @@ territory):
    — this is what a password containing one of those characters needs (a
    *malformed* URI is exactly what ``InvalidURI`` is raised for, so this is
    a realistic shape, not an adversarial one). This widened match is used
-   **only if** the text between tier 1's stop point and the found ``@``
-   contains no ``=`` — an ``=`` there is the signature of URL *query*
-   structure (``?redirect=user@host``), which is exactly the shape that
-   must NOT be swallowed (this is what keeps case (e) below correct even
-   though tier 2 no longer stops at ``?``).
+   **only if** ``_looks_like_query_structure`` says the gap is not genuine
+   URL *query* structure (``?redirect=user@host``) — see below for exactly
+   what that checks (this is what keeps case (e) below correct even though
+   tier 2 no longer stops at ``?``).
 3. **Tier 3** — only tried when tier 1 AND tier 2 both find no ``@``, and
-   only when the text up to the first whitespace already contains a ``:``
-   (a `user:` -shaped start — the gate that keeps this tier from firing on
-   arbitrary two-word prose): re-search all the way to ``outer_stop``
-   (ignoring whitespace as a stop entirely, same as tier 2 ignores
-   ``/?#``), subject to the same "no ``=`` in the gap" query-string guard
-   tier 2 uses. This is what a password containing one or more raw,
-   un-encoded spaces needs (case (a) below) — stopping after only one
-   extra whitespace-delimited word would still miss a password embedding
-   two or more spaces.
+   only when a ``:`` appears before the first whitespace AND that ``:`` is
+   immediately followed by a non-whitespace character (a `user:pass`
+   -shaped token, colon directly bonded to its value — the gate that keeps
+   this tier from firing on ordinary ``"Word: "`` prose, e.g. "Error:
+   connect to user@host failed" or "stt_server error: ..." — those end
+   their first token in ``": "``, whitespace immediately after the colon,
+   which is not how a credential's colon is ever followed): re-search all
+   the way to ``outer_stop`` (ignoring whitespace as a stop entirely, same
+   as tier 2 ignores ``/?#``), subject to the same ``_looks_like_query_
+   structure`` guard tier 2 uses. This is what a password containing one or
+   more raw, un-encoded spaces needs (case (a) below) — stopping after only
+   one extra whitespace-delimited word would still miss a password
+   embedding two or more spaces.
+
+**The query-string guard (`_looks_like_query_structure`).** Tiers 2 and 3
+both widen past tier 1's stop point, which reopens the one ambiguity tier 1
+was designed to avoid: is the ``@`` they find genuine authority userinfo, or
+an unrelated ``user@host`` sitting inside a query string's value (``?
+key=user@host``)? The guard resolves this **structurally**, not merely by
+asking whether an ``=`` appears anywhere in the gap (round 1 of this loop's
+bug: a base64-encoded password containing both ``/`` and its own ``=``
+padding has an ``=`` in the gap for a reason that has nothing to do with
+query structure, and used to be rejected — i.e. leaked unredacted — on that
+basis alone): it looks for an actual ``?`` between tier 1's stop point and
+the candidate ``@``, and only THEN checks for an ``=`` between that ``?``
+and the ``@``. No ``?`` in the gap at all means there is no query component
+to be confused with, however many ``=`` characters the gap contains — so a
+malformed password like a base64 token is redacted, while ``?redirect=
+user@host`` (a real ``?`` followed by a real ``=`` before the ``@``) is
+still correctly left alone.
 
 Each tier reports both the ``@`` position and the window boundary it used,
 so the caller redacts exactly ``[start, @)`` and resumes unmodified output
@@ -125,15 +145,16 @@ Traced against the required cases:
     (e2) unrelated query-string ``user:pass@host`` (colon variant) —
         ``"ws://host/path?redirect=user:pass@example.org"`` — tier 1 (up
         to the first ``/``) has no ``@``; tier 2's window is unchanged
-        (still no whitespace before it), and its "no ``=`` in the gap"
-        check rejects the match on the same ``=`` as case (e); tier 3's
-        gate now *does* engage (the ``:`` in "user:pass" is found before
-        the first — nonexistent — whitespace, so the gate scans the whole
-        remainder), but tier 3 carries the identical "no ``=`` in the gap"
-        guard as tier 2, so it refuses the same match for the same
-        reason. The message passes through completely unchanged — without
-        this guard on tier 3, this shape used to be misredacted down to
-        ``"ws://example.org"``, destroying the real path and query.
+        (still no whitespace before it), and ``_looks_like_query_structure``
+        rejects the match on the same ``?...=`` shape as case (e); tier 3's
+        gate now *does* engage (the ``:`` in "user:pass" is immediately
+        followed by "pass", a non-whitespace character, and there is no
+        whitespace anywhere in the string to bound it), but tier 3 carries
+        the identical query-structure guard as tier 2, so it refuses the
+        same match for the same reason. The message passes through
+        completely unchanged — without this guard on tier 3, this shape
+        used to be misredacted down to ``"ws://example.org"``, destroying
+        the real path and query.
     (f) password containing ``/``, ``?``, or ``#`` —
         ``"ws://user:pa/ss@host/path"`` — tier 1 (up to the first ``/``,
         right after "pa") has no ``@``; tier 2 widens past that ``/`` and
@@ -160,6 +181,51 @@ Traced against the required cases:
     (j) no credential-shaped substring anywhere — no tier ever finds a
         usable ``@``, so nothing is ever replaced; the message passes
         through unchanged.
+    (k) ordinary ``"Word: "``-prefixed diagnostic text, unrelated ``@``
+        later in the message — ``"Error: connect to user@host failed"`` or
+        ``"stt_server error: could not reach user@host"`` — tier 1/2 (bare
+        case, up to the first whitespace, "Error:"/"stt_server") have no
+        ``@``; tier 3's gate finds the ``:`` ending the first token but that
+        ``:`` is immediately followed by whitespace (the space after
+        "Error:"), not a value character — the gate requires the colon to
+        be *bonded* to the next character, so it never engages. The message
+        passes through completely unchanged. (Round-2 regression: the prior
+        gate only checked "is there a ``:`` anywhere in the first token",
+        which every ``"Word: "``-prefixed message satisfies, destructively
+        truncating ordinary diagnostic text down to whatever followed the
+        LAST ``@`` in the entire remainder.)
+    (l) multiple unrelated ``@``\\ s in ordinary prose, no credential
+        present — ``"Error: mail admin@a.com or ops@b.com"`` — same gate as
+        (k): the first token's ``:`` is followed by whitespace, so tier 3
+        never engages and tier 1/2 find nothing either. Passes through
+        unchanged (previously collapsed to just ``"b.com"``, the text after
+        the LAST ``@``).
+    (m) base64-shaped password (contains both ``/`` and ``=``) —
+        ``"ws://user:AB/cd+EF=@host:8765/"`` — tier 1 (up to the first
+        ``/``, right after "user:") has no ``@``; tier 2 widens past that
+        ``/`` and finds the ``@`` after "AB/cd+EF="; the gap
+        ``"AB/cd+EF="`` contains ``=`` but no ``?`` at all, so
+        ``_looks_like_query_structure`` returns ``False`` (there is no query
+        component here to be confused with) — tier 2 accepts, redacting to
+        ``"ws://host:8765/"``. (Round-2 regression: the prior guard rejected
+        on ``=`` presence alone, so ANY base64-shaped password — the ``=``
+        padding and ``/`` from the base64 alphabet co-occur routinely —
+        bypassed redaction entirely and leaked in cleartext.)
+    (n) scheme-prefixed authority with a port, unrelated ``@`` later in
+        trailing prose — ``"ws://host:8765 isn't a valid URI: see
+        user@guide"`` — tier 1/2 (window bounded at the first whitespace,
+        right after "8765") have no ``@``; tier 3's colon-bonded gate sees
+        ``:`` in "host:8765" immediately followed by "8765", a non-
+        whitespace token, so the plain adjacency check from case (k) is not
+        enough to reject it on its own — an ordinary ``host:PORT``
+        authority is exactly as colon-bonded as a real credential. The
+        additional all-digits check rejects it (a port is always digits;
+        a real password essentially never is), so tier 3 never widens to
+        ``outer_stop`` and the message passes through completely
+        unchanged. (Round-2 regression: without this check, tier 3 widened
+        past "8765", found the unrelated ``@`` in "user@guide", and
+        fabricated a fake host — ``"ws://guide"`` — destroying the real
+        host and the whole diagnostic tail.)
 
 The scheme-less (bare) case is applied **only** at the literal start of the
 message (after any leading whitespace, preserved verbatim) — this is what
@@ -171,9 +237,9 @@ credential. It is anchored this way because it is specifically the leading
 token of ``f"{uri} isn't a valid URI: {msg}"`` — the one realistic shape a
 scheme-less credential reaches this function through.
 
-**Known, accepted limitation:** a password containing TWO OR MORE of
-``/``, ``?``, ``#`` in a way that makes the tier-2 "no ``=`` in the gap"
-check ambiguous with genuine query structure cannot be perfectly
+**Known, accepted limitation:** a password containing a genuine ``?``
+followed later by a genuine ``=`` — the same shape ``_looks_like_query_
+structure`` uses to recognize real query structure — cannot be perfectly
 distinguished from a look-alike non-credential string using only local
 syntax — this is a fundamentally ambiguous problem for a generic text
 scanner with no schema information, not a solvable bug. The tiers above are
@@ -206,6 +272,23 @@ def _first_stop(text: str, start: int, pattern: re.Pattern[str], limit: int) -> 
     return m.start() if m else limit
 
 
+def _looks_like_query_structure(text: str, gap_start: int, at: int) -> bool:
+    """Is `text[gap_start:at]` shaped like URL query structure (`?key=...`)?
+
+    Used to veto a tier 2/3 widened `@` match that is really an unrelated
+    `user@host` sitting inside a query string's value, e.g.
+    `?redirect=user@host`. Structural, not merely "does `=` appear anywhere
+    in the gap": that alone also fires on a malformed password's OWN `=`
+    (a base64 token's padding, say), which has nothing to do with query
+    structure and must still be redacted — see module docstring case (m).
+    Requires an actual `?` in the gap, and an `=` between that `?` and
+    `at`; no `?` at all means there is no query component to confuse this
+    `@` with, however many `=` characters the gap otherwise contains.
+    """
+    qpos = text.find("?", gap_start, at)
+    return qpos != -1 and "=" in text[qpos:at]
+
+
 def _find_credential_at(
     text: str, start: int, outer_stop: int
 ) -> tuple[int, int] | tuple[None, None]:
@@ -223,19 +306,36 @@ def _find_credential_at(
 
     first_ws = _first_stop(text, start, _WHITESPACE_RE, outer_stop)
     at = text.rfind("@", start, first_ws)
-    if at != -1 and "=" not in text[tier1_stop:at]:
+    if at != -1 and not _looks_like_query_structure(text, tier1_stop, at):
         return at, first_ws
 
-    if ":" not in text[start:first_ws]:
+    # Tier 3's gate: the first token must end in a `:` that is itself
+    # immediately followed by a non-whitespace character — a `user:pass`
+    # -shaped token, colon bonded directly to its value. This is what
+    # distinguishes a real credential start from ordinary "Word: " prose
+    # (`"Error: connect to ..."`, `"stt_server error: ..."`), whose first
+    # token also ends in `:` but has whitespace right after it — see
+    # module docstring cases (k)/(l).
+    colon = text.find(":", start, first_ws)
+    if colon == -1 or colon + 1 >= len(text) or text[colon + 1].isspace():
+        return None, None
+    # On the scheme-prefixed path, `text[start:first_ws]` IS the authority,
+    # so an ordinary `host:PORT` satisfies the check above unconditionally
+    # — a port number is exactly as colon-bonded as a real credential's
+    # `user:pass`. A port is always all-digits (RFC 3986); a genuine
+    # password is not going to coincide with that shape purely by accident
+    # nearly as often as a `host:PORT` authority occurs, so require the
+    # colon-bonded token to be non-numeric before trusting it as a
+    # credential start — see module docstring case (n).
+    if text[colon + 1 : first_ws].isdigit():
         return None, None
     # Tier 3 widens all the way to `outer_stop` (not just a second
     # whitespace-delimited word) so a password containing more than one
-    # raw space is still redacted — bounded by the same "no '=' in the
-    # gap" query-string guard tier 2 uses, since widening past whitespace
-    # reopens the same query-string ambiguity tier 2 already guards
-    # against.
+    # raw space is still redacted — bounded by the same query-structure
+    # guard tier 2 uses, since widening past whitespace reopens the same
+    # query-string ambiguity tier 2 already guards against.
     at = text.rfind("@", start, outer_stop)
-    if at != -1 and "=" not in text[tier1_stop:at]:
+    if at != -1 and not _looks_like_query_structure(text, tier1_stop, at):
         return at, outer_stop
     return None, None
 

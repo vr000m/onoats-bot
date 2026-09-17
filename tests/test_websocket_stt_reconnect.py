@@ -681,6 +681,35 @@ def test_wedged_connect_times_out_and_still_kickstarts(monkeypatch):
     assert kickstart_calls == ["label-wedged"]
 
 
+def test_wedged_connect_timeout_closes_the_leaked_client(monkeypatch):
+    """Round-2 review-gauntlet finding: `client` is only assigned to
+    `self._client` AFTER `client.connect()` succeeds, so on every timeout
+    (the exact wedged-server case `test_wedged_connect_times_out_and_still_
+    kickstarts` above exercises) the locally-constructed client was
+    invisible to `_discard_stale()`'s cleanup and its open websocket leaked
+    — accumulating server-side connections against the very server the
+    kickstart is trying to recover. Every attempt's client must be closed
+    even though it never becomes `self._client`."""
+    monkeypatch.setattr(wss_module, "_CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(launchd, "kickstart_stt_server", lambda label, **kw: True)
+
+    class _HangingClient(_FakeClient):
+        async def connect(self):
+            self.connect_calls += 1
+            await asyncio.sleep(999)
+
+    monkeypatch.setattr(wss_module, "TranscriptionClient", _HangingClient)
+
+    svc = _make_service(launchd_label="label-wedged-leak")
+    with pytest.raises(TimeoutError):
+        asyncio.run(svc._ensure_connected())
+
+    assert _FakeClient.instances  # sanity: attempts actually happened
+    assert all(inst.closed for inst in _FakeClient.instances), (
+        "every timed-out connect attempt's client must be closed, not leaked"
+    )
+
+
 def test_session_update_ack_timeout_is_classified_as_reachability(monkeypatch):
     """Deep-review finding: the `session.update` ack timeout was re-raised
     as a bare `RuntimeError`, which matches neither `TimeoutError` nor
@@ -762,8 +791,8 @@ def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monke
     exc_holder = {"exc": _always_refused}
     _install_fake_client_factory(monkeypatch, lambda: exc_holder["exc"]())
 
-    mic = _make_service(launchd_label="shared-label", branch_instance="mic")
-    system = _make_service(launchd_label="shared-label", branch_instance="system")
+    mic = _make_service(launchd_label="shared-label", instance_name="mic")
+    system = _make_service(launchd_label="shared-label", instance_name="system")
 
     # T0: mic exhausts and wins the kickstart.
     with pytest.raises(Exception):
@@ -817,7 +846,7 @@ def test_instance_token_is_the_branch_name_not_a_memory_address():
     unrelated later instance. The call site already has the stable
     `"mic"`/`"system"` identity; `self.name` (Pipecat's monotonic
     `<Class>#<n>`) is the single-pipeline fallback and is never reused."""
-    mic = _make_service(launchd_label="l", branch_instance="mic")
+    mic = _make_service(launchd_label="l", instance_name="mic")
     assert mic._instance_token == "mic"
     assert mic._instance_token != f"{id(mic):x}"
 

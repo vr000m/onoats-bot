@@ -1746,7 +1746,7 @@ def test_safe_exc_text_strips_userinfo_generically():
     """Unit-level check of the shared helper itself, independent of the
     preflight plumbing above."""
     exc = _InvalidURILikeError(_LEAKY_URI, "bad")
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "secretuser" not in safe
     assert "hunter2" not in safe
     assert safe == "ws://stt.example.internal/v1 isn't a valid URI: bad"
@@ -1777,7 +1777,7 @@ def test_safe_exc_text_case_a_scheme_less_credential_leaks_without_scheme():
     exc = _BareInvalidURILikeError(
         "secretuser:hunter2@stt.example.internal:2020", "scheme isn't ws or wss"
     )
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "secretuser" not in safe
     assert "hunter2" not in safe
     assert safe == "stt.example.internal:2020 isn't a valid URI: scheme isn't ws or wss"
@@ -1787,7 +1787,7 @@ def test_safe_exc_text_case_b_scheme_prefixed_credential_still_redacted():
     """(b) The already-covered `scheme://user:pass@host` shape must keep
     working after the rewrite."""
     exc = _InvalidURILikeError(_LEAKY_URI, "bad")
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "secretuser" not in safe
     assert "hunter2" not in safe
     assert safe == "ws://stt.example.internal/v1 isn't a valid URI: bad"
@@ -1802,7 +1802,7 @@ def test_safe_exc_text_case_c_password_containing_at_sign():
     exc = _InvalidURILikeError(
         "ws://secretuser:hun@ter2@stt.example.internal/v1", "bad"
     )
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "secretuser" not in safe
     assert "hun@ter2" not in safe
     assert "ter2" not in safe
@@ -1815,7 +1815,7 @@ def test_safe_exc_text_case_d_password_containing_whitespace():
     exc = _InvalidURILikeError(
         "ws://secretuser:hunter 2@stt.example.internal/v1", "bad"
     )
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "secretuser" not in safe
     assert "hunter 2" not in safe
     assert safe == "ws://stt.example.internal/v1 isn't a valid URI: bad"
@@ -1828,7 +1828,7 @@ def test_safe_exc_text_case_e_does_not_touch_unrelated_query_string_at_sign():
     exc = RuntimeError(
         "GET https://example.com/api?redirect=user@example.org failed: 502"
     )
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert safe == str(exc)
 
 
@@ -1850,7 +1850,7 @@ def test_safe_exc_text_case_f_scheme_less_credential_with_whitespace_password():
         "secretuser:hunter 2@stt.example.internal:2020",
         "scheme isn't ws or wss",
     )
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "secretuser" not in safe
     assert "hunter 2" not in safe
     assert safe == "stt.example.internal:2020 isn't a valid URI: scheme isn't ws or wss"
@@ -1864,7 +1864,7 @@ def test_safe_exc_text_case_g_trailing_prose_survives_non_port_shaped_authority(
     exc = RuntimeError(
         "ws://user:pass@host:9999 isn't a valid URI: nonempty path required"
     )
-    safe = runtime._safe_exc_text(exc)
+    safe = runtime.safe_exc_text(exc)
     assert "user:pass" not in safe
     assert safe == "ws://host:9999 isn't a valid URI: nonempty path required"
 

@@ -34,6 +34,7 @@ import argparse
 import os
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 from onoats.config import (
@@ -332,6 +333,19 @@ def _extract_raw_section(text: str, section: str) -> str | None:
     cross-language coupling entirely: whatever the user's file said, byte
     for byte (including any key besides ``launch_at_login`` a future Swift
     version adds), survives every ``onoats init`` regeneration.
+
+    This is a lexical approximation of TOML (it ends the section at the
+    first line that merely *looks* like ``[...]``), not a real TOML parser —
+    only valid for a section holding single-line scalar assignments, which
+    is the only shape ``ConfigStore`` (the section's sole writer) ever
+    produces. A multi-line value (an array or triple-quoted string) whose
+    continuation line happens to look like a section header would end the
+    block early and splice a truncated fragment into the regenerated file.
+    Bounded here rather than left as a silent trap: the extracted block is
+    validated as a standalone TOML document before being returned, so a
+    future value shape this scanner can't handle degrades to "treat the
+    section as absent" (the caller re-renders `[app]` from the parsed dict
+    instead, or omits it) rather than silently corrupting `config.toml`.
     """
     lines = text.splitlines()
     header = f"[{section}]"
@@ -348,7 +362,17 @@ def _extract_raw_section(text: str, section: str) -> str | None:
     # them here avoids doubling up.
     while end > start + 1 and not lines[end - 1].strip():
         end -= 1
-    return "\n".join(lines[start:end])
+    block = "\n".join(lines[start:end])
+    try:
+        tomllib.loads(block)
+    except tomllib.TOMLDecodeError:
+        # The line-scan's section boundary doesn't line up with a real TOML
+        # section boundary (e.g. a multi-line value's continuation line was
+        # mistaken for the next header) — the extracted text is not
+        # trustworthy to splice verbatim. Report absence; the caller falls
+        # back to its own handling of a missing `[app]` section.
+        return None
+    return block
 
 
 def _render_config_toml(

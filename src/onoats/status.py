@@ -41,6 +41,27 @@ STATUS_FILENAME = "onoats.status.json"
 # Both readers (this module and the menu bar's RecorderModel.swift) hard-reject
 # any other version, so app + CLI must be reinstalled together
 # (`make -C native install`) — a mixed-version window shows schema drift, not data.
+#
+# **`warning`'s grammar is frozen under v2, deliberately, not versioned
+# separately.** `warning` is still a single string field at the schema level —
+# no bump — but its CONTENTS are a small merged-branch grammar owned by
+# `format_warning_branch`/`set_warning_branch`/`_parse_warning_branches` below:
+# zero or more `"<branch>: <message>"` entries, sorted by branch name, joined
+# by `"; "`. Both `branch` and `message` are sanitized against that same `"; "`
+# delimiter at the one production choke point (`format_warning_branch`), so
+# every writer of `warning` — `set_warning_branch` AND the raw
+# `write_running(warning=...)` startup-preflight path, which both route
+# through `format_warning_branch` — emits a string the grammar can always
+# split back apart unambiguously.
+#
+# The Swift menu bar (`native/onoats-menubar/Sources/OnoatsMenuBarApp.swift`,
+# `RecorderModel.swift`) independently re-implements the SAME split (entries on
+# `"; "`, each half on `" — "`) because it cannot import this module. Treat
+# this docstring's grammar description as that shared decoder's spec: change
+# the join/key delimiters here only in lockstep with the Swift split, and bump
+# `STATUS_SCHEMA_VERSION` only if the *field's shape* changes (e.g. `warning`
+# stops being a string) — not for a change confined to this string's internal
+# grammar.
 STATUS_SCHEMA_VERSION = 2
 
 # Active dir name mirrors the pid file's location (``<data_dir>/.active``).
@@ -312,8 +333,17 @@ def format_warning_branch(branch: str, message: str) -> str:
     exists yet for :func:`set_warning_branch` to annotate), so without a shared
     formatter the two paths each own a copy of the prefixing rule and drift.
     Callers pass a **bare** message; nobody pre-prefixes.
+
+    Also the single sanitization choke point for the ``"; "`` entry delimiter:
+    stripping it here, rather than only in :func:`set_warning_branch`, covers
+    BOTH writers of the merged ``warning`` grammar (``set_warning_branch``'s
+    read-modify-write path and the preflight path's direct
+    ``write_running(warning=format_warning_branch(...))`` call) — a stray
+    ``"; "`` in either ``branch`` or ``message`` would otherwise forge an
+    unclearable pseudo-branch entry on the next :func:`_parse_warning_branches`
+    read regardless of which writer produced it.
     """
-    return f"{branch}: {message}"
+    return f"{branch.replace('; ', ',')}: {message.replace('; ', ', ')}"
 
 
 def _parse_warning_branches(warning: str | None) -> dict[str, str]:
@@ -355,11 +385,17 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     caller-controlled text used to be merely cosmetic, back when ``cli.py``
     kept its own in-process ``active_warnings`` dict as the authority — it
     is not cosmetic now that this helper round-trips through the on-disk
-    string). Sanitized here, at the single choke point, rather than left as
-    a rule every caller must independently uphold: this helper strips any
-    ``"; "`` occurring inside ``branch`` or ``message`` before merging.
-    Changing the on-disk ``warning`` grammar itself (e.g. escaping) would
-    also change what the Swift menu-bar reader shares under
+    string). :func:`format_warning_branch` is the single sanitization choke
+    point for this delimiter (it strips any ``"; "`` occurring inside
+    ``branch`` or ``message`` before rendering the entry) — this helper only
+    pre-sanitizes ``branch`` for its own dict lookup/pop, since that key never
+    passes through :func:`format_warning_branch` itself. Moved there rather
+    than kept only here so the preflight path's direct
+    ``write_running(warning=format_warning_branch(...))`` call — which never
+    goes through this function — gets the same protection, not just
+    :func:`set_warning_branch`'s read-modify-write path. Changing the on-disk
+    ``warning`` grammar itself (e.g. escaping) would also change what the
+    Swift menu-bar reader shares under
     ``STATUS_SCHEMA_VERSION`` and is out of scope here. Best-effort like
     :func:`set_warning`: returns ``None`` when there is no readable record to
     annotate.
@@ -394,15 +430,17 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
         return None
     if not current.running and current.pid != os.getpid():
         return None
-    # Strip the parser's own entry delimiter so neither `branch` nor
-    # `message` can forge a second pseudo-branch entry on the next read —
-    # see the docstring above.
+    # `"; "`-strip `branch` the same way `format_warning_branch` will below,
+    # so the dict key used for pop()/lookup matches the sanitized key that
+    # ends up on disk (format_warning_branch is the sole sanitization choke
+    # point — see its docstring — but its output isn't parsed back through
+    # this dict, so the key here must be pre-sanitized to stay consistent).
     branch = branch.replace("; ", ",")
     branches = _parse_warning_branches(current.warning)
     if message is None:
         branches.pop(branch, None)
     else:
-        branches[branch] = message.replace("; ", ", ")
+        branches[branch] = message
     merged = (
         "; ".join(format_warning_branch(b, branches[b]) for b in sorted(branches))
         or None

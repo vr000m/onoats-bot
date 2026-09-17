@@ -147,6 +147,75 @@ def test_no_credential_shaped_substring_passes_through_unchanged():
     assert safe_exc_text(Exception(text)) == text
 
 
+def test_word_colon_prefixed_diagnostic_with_unrelated_at_sign_untouched():
+    """Round-2 review-gauntlet regression: tier 3's old gate fired on ANY
+    colon in the first whitespace-delimited token, which is the shape of
+    almost every prefixed diagnostic message ("Error:", "stt_server
+    error:"). It then `rfind`-searched the ENTIRE remainder for an `@` and
+    discarded everything up to and including it, destroying ordinary
+    diagnostic text that happened to contain an unrelated `@` — even
+    though no credential was present anywhere."""
+    text = "Error: connect to user@host failed"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_word_colon_prefixed_diagnostic_two_word_prefix_untouched():
+    text = "stt_server error: could not reach user@host"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_multiple_unrelated_at_signs_in_prefixed_prose_untouched():
+    """Round-2 regression: because tier 3 used `rfind` over the whole
+    string, a message with several unrelated `@`s kept only the text after
+    the LAST one."""
+    text = "Error: mail admin@a.com or ops@b.com"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_base64_shaped_password_is_still_redacted():
+    """Round-2 review-gauntlet regression (credential leak): a URI password
+    containing both `/` (or `?`/`#`) and `=` — i.e. any base64-shaped
+    token — bypassed redaction entirely, because the query-string guard
+    rejected on `=` presence in the gap alone, with no check for an actual
+    `?` marking real query structure."""
+    exc = Exception("ws://user:/+++rd7K/rq+AQI=@stt.local:8765/ isn't a valid URI")
+    safe = safe_exc_text(exc)
+    assert "rd7K" not in safe
+    assert "AQI=" not in safe
+    assert safe == "ws://stt.local:8765/ isn't a valid URI"
+
+
+def test_base64_shaped_password_with_equals_and_slash_scheme_variant():
+    exc = Exception("ws://user:ab/cd=ef@host/path isn't a valid URI")
+    safe = safe_exc_text(exc)
+    assert "ab/cd=ef" not in safe
+    assert safe == "ws://host/path isn't a valid URI"
+
+
+def test_scheme_authority_with_port_and_unrelated_at_sign_untouched():
+    """Round-2 review-gauntlet security finding: on the scheme-prefixed
+    path, `text[start:first_ws]` IS the authority, so an ordinary
+    `host:PORT` satisfied tier 3's old colon-in-first-token gate
+    unconditionally — a port is exactly as colon-bonded as a real
+    credential. Tier 3 then widened past the port, found an unrelated `@`
+    later in trailing prose, and fabricated a fake host, destroying the
+    real host and the whole diagnostic tail."""
+    text = "ws://host:8765 isn't a valid URI: see user@guide"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_scheme_authority_with_port_multiple_unrelated_at_signs_untouched():
+    text = "ws://host:8765 failed: peer admin@corp rejected token"
+    assert safe_exc_text(Exception(text)) == text
+
+
+def test_redact_uri_base64_shaped_password():
+    assert (
+        redact_uri("ws://user:/+++rd7K/rq+AQI=@stt.local:8765/")
+        == "ws://stt.local:8765/"
+    )
+
+
 def test_ipv6_host_survives_redaction_intact():
     exc = Exception("ws://user:pass@[::1]:443/path isn't a valid URI")
     safe = safe_exc_text(exc)
