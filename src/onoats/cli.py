@@ -404,8 +404,15 @@ async def _drain_capturer_stderr(
                 # the launchd label (allowlist-validated at resolution), so
                 # it is checked here the same way the `device` branch below
                 # is: only "mic"/"system" are produced by the capturer's own
-                # `Resampler` labels, and a branch key never passes through
-                # the grammar's sanitization choke point.
+                # `Resampler` labels. The reason is NOT that a branch key
+                # escapes sanitization — `status.format_warning_branch` does
+                # sanitize `branch` (via `sanitize_warning_branch`), same as
+                # `message`. It is that a branch key is an *identity*, not
+                # free text: it is the lookup key a later clear must match,
+                # and it names a row in the menu bar. Sanitizing an unknown
+                # key would preserve it as a real, permanent-looking
+                # pseudo-branch nobody clears, so an unrecognized key is
+                # dropped outright rather than made harmless.
                 #
                 # `hint` is NOT checked here. It is a `message`, and
                 # `status.format_warning_branch` is the documented single

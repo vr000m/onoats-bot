@@ -49,8 +49,11 @@ STATUS_FILENAME = "onoats.status.json"
 # no bump — but its CONTENTS are a small merged-branch grammar owned by
 # `format_warning_branch`/`set_warning_branch`/`_parse_warning_branches` below:
 # zero or more `"<branch>: <message>"` entries, sorted by branch name, joined
-# by `"; "`. Both `branch` and `message` are sanitized against that same `"; "`
-# delimiter at the one production choke point (`format_warning_branch`).
+# by `"; "`. `message` is sanitized against that entry delimiter, and `branch`
+# against BOTH it and the `": "` field delimiter, at the one production choke
+# point (`format_warning_branch`, which defers the branch rule to
+# `sanitize_warning_branch` so `set_warning_branch`'s lookup key is derived the
+# identical way).
 #
 # **Two entry points emit grammar-shaped content, one is exempt by design.**
 # `set_warning_branch` (via the private `_write_warning_field`) is the only
@@ -103,6 +106,22 @@ STATUS_SCHEMA_VERSION = 2
 # a bare literal in five places here and one `components(separatedBy:)` call
 # in Swift, and nothing failed if they diverged.
 WARNING_ENTRY_DELIMITER = "; "
+
+# The grammar's *inner* delimiter, between a branch key and its message.
+# Named for the same reason the outer one is: it was a bare literal in the
+# formatter and in `_parse_warning_branches`, and only the outer delimiter was
+# ever sanitized out of a branch key — so a branch containing `": "` forged a
+# pseudo-branch on the next parse exactly as a `"; "` would, and the entry
+# could never be cleared. Unlike `WARNING_ENTRY_DELIMITER` this one is *not*
+# under the Swift lockstep: the menu bar splits entries, never fields, and
+# extracts no branch key at all.
+WARNING_FIELD_DELIMITER = ": "
+
+# What either delimiter is replaced by when it appears inside a branch key.
+# One constant because the two writers must agree on the *replacement*, not
+# merely on what they strip: a key sanitized to `","` by one path and `", "`
+# by the other never matches on lookup, and the entry becomes unclearable.
+WARNING_BRANCH_REPLACEMENT = ","
 
 # Active dir name mirrors the pid file's location (``<data_dir>/.active``).
 _ACTIVE_DIR = ".active"
@@ -398,6 +417,20 @@ def stt_branch(instance: str | None = None) -> str:
     return STT_WARNING_BRANCH if not instance else f"{STT_WARNING_BRANCH}-{instance}"
 
 
+def sanitize_warning_branch(branch: str) -> str:
+    """Make `branch` safe to use as a key in the merged ``warning`` grammar.
+
+    Both delimiters, one replacement. :func:`format_warning_branch` writes the
+    key and :func:`set_warning_branch` looks it up, and they have to agree on
+    the *output*, not just on which substrings are illegal — a key sanitized
+    two different ways never matches itself on ``pop()`` and its entry can
+    never be cleared.
+    """
+    return branch.replace(WARNING_ENTRY_DELIMITER, WARNING_BRANCH_REPLACEMENT).replace(
+        WARNING_FIELD_DELIMITER, WARNING_BRANCH_REPLACEMENT
+    )
+
+
 def format_warning_branch(branch: str, message: str) -> str:
     """Render one branch's entry exactly as :func:`set_warning_branch` merges it.
 
@@ -408,17 +441,24 @@ def format_warning_branch(branch: str, message: str) -> str:
     formatter the two paths each own a copy of the prefixing rule and drift.
     Callers pass a **bare** message; nobody pre-prefixes.
 
-    Also the single sanitization choke point for the ``"; "`` entry delimiter:
-    stripping it here, rather than only in :func:`set_warning_branch`, covers
-    BOTH writers of the merged ``warning`` grammar (``set_warning_branch``'s
+    Also the single sanitization choke point for both delimiters: stripping
+    them here, rather than only in :func:`set_warning_branch`, covers BOTH
+    writers of the merged ``warning`` grammar (``set_warning_branch``'s
     read-modify-write path and the preflight path's direct
     ``write_running(warning=format_warning_branch(...))`` call) — a stray
-    ``"; "`` in either ``branch`` or ``message`` would otherwise forge an
+    delimiter in either ``branch`` or ``message`` would otherwise forge an
     unclearable pseudo-branch entry on the next :func:`_parse_warning_branches`
     read regardless of which writer produced it.
+
+    The branch rule itself lives in :func:`sanitize_warning_branch`, not
+    inline: :func:`set_warning_branch` must sanitize its lookup key the same
+    way, and two copies of a rule have to agree on the replacement character
+    as well as on what they strip.
     """
-    delimiter = WARNING_ENTRY_DELIMITER
-    return f"{branch.replace(delimiter, ',')}: {message.replace(delimiter, ', ')}"
+    return (
+        f"{sanitize_warning_branch(branch)}{WARNING_FIELD_DELIMITER}"
+        f"{message.replace(WARNING_ENTRY_DELIMITER, ', ')}"
+    )
 
 
 def _parse_warning_branches(warning: str | None) -> dict[str, str]:
@@ -436,7 +476,7 @@ def _parse_warning_branches(warning: str | None) -> dict[str, str]:
         return {}
     branches: dict[str, str] = {}
     for part in warning.split(WARNING_ENTRY_DELIMITER):
-        branch, sep, message = part.partition(": ")
+        branch, sep, message = part.partition(WARNING_FIELD_DELIMITER)
         if not sep:
             continue
         branches[branch] = message
@@ -474,17 +514,20 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
     convention) — so concurrent branches (``mic``/``system``/``stt``) never
     clobber each other's entries the way a whole-field overwrite would.
 
-    ``"; "`` is the split-based parser's entry delimiter, so a ``branch`` or
-    ``message`` containing it would otherwise forge a second, unclearable
+    ``"; "`` is the split-based parser's entry delimiter and ``": "`` its
+    field delimiter, so a ``branch`` containing either (or a ``message``
+    containing the former) would otherwise forge a second, unclearable
     pseudo-branch entry on the next read (a stray delimiter in
     caller-controlled text used to be merely cosmetic, back when ``cli.py``
     kept its own in-process ``active_warnings`` dict as the authority — it
     is not cosmetic now that this helper round-trips through the on-disk
     string). :func:`format_warning_branch` is the single sanitization choke
-    point for this delimiter (it strips any ``"; "`` occurring inside
-    ``branch`` or ``message`` before rendering the entry) — this helper only
-    pre-sanitizes ``branch`` for its own dict lookup/pop, since that key never
-    passes through :func:`format_warning_branch` itself. Moved there rather
+    point for both (it strips ``"; "`` from ``message`` and, via
+    :func:`sanitize_warning_branch`, both delimiters from ``branch`` before
+    rendering the entry) — this helper only pre-sanitizes ``branch`` for its
+    own dict lookup/pop, since that key never passes through
+    :func:`format_warning_branch` itself, and it calls the *same* function to
+    do it so the two can never disagree on the replacement character. Moved there rather
     than kept only here so the preflight path's direct
     ``write_running(warning=format_warning_branch(...))`` call — which never
     goes through this function — gets the same protection, not just
@@ -545,12 +588,12 @@ def set_warning_branch(data_dir: Path, branch: str, message: str | None) -> Path
         return None
     if not current.running and current.pid != os.getpid():
         return None
-    # `"; "`-strip `branch` the same way `format_warning_branch` will below,
-    # so the dict key used for pop()/lookup matches the sanitized key that
-    # ends up on disk (format_warning_branch is the sole sanitization choke
-    # point — see its docstring — but its output isn't parsed back through
-    # this dict, so the key here must be pre-sanitized to stay consistent).
-    branch = branch.replace(WARNING_ENTRY_DELIMITER, ",")
+    # Sanitize the lookup key through the SAME function
+    # `format_warning_branch` writes with, so the key used for pop()/lookup
+    # matches the sanitized key that ends up on disk. (That function is the
+    # sole choke point — see its docstring — but its output isn't parsed back
+    # through this dict, so the key here must be pre-sanitized identically.)
+    branch = sanitize_warning_branch(branch)
     branches = _parse_warning_branches(current.warning)
     if message is None:
         branches.pop(branch, None)

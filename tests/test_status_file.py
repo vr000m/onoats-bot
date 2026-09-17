@@ -495,6 +495,36 @@ def test_set_warning_branch_message_with_delimiter_is_sanitized(
     }
 
 
+@pytest.mark.parametrize("delimiter", ("; ", ": "), ids=("entry", "field"))
+def test_a_branch_key_carrying_either_delimiter_stays_clearable(
+    tmp_path: Path, delimiter: str
+):
+    """Round-7 architecture finding: the *entry* delimiter (`"; "`) was
+    sanitized out of a branch key by both writers, but the *field* delimiter
+    (`": "`) was sanitized by neither and was a bare literal in the formatter
+    and the parser. A branch key containing `": "` therefore parsed back as a
+    different, shorter key than the one `set_warning_branch` looks up — so
+    the entry could never be cleared. Both delimiters now go through one
+    `sanitize_warning_branch`, which is also what makes the two writers agree
+    on the replacement character and not merely on what they strip."""
+    from onoats.status import sanitize_warning_branch
+
+    branch = f"stt{delimiter}forged"
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, branch, "server unreachable")
+
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    # Exactly one entry, keyed by the sanitized name — no forged second one.
+    key = sanitize_warning_branch(branch)
+    assert delimiter not in key
+    assert _parse_warning_branches(got.warning) == {key: "server unreachable"}
+    # The formatter and the lookup agree, so the entry clears.
+    assert set_warning_branch(tmp_path, branch, None) is not None
+    cleared = read_status(tmp_path)
+    assert cleared is not None and not cleared.warning
+
+
 def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):
     # No record yet → best-effort no-op (device events outrun the start write).
     assert set_devices(tmp_path, mic_device="Some Mic (uid=u1)") is None

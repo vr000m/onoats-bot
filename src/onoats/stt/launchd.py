@@ -163,9 +163,13 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
     validation of its own otherwise — a future or test caller that bypasses
     the config resolver would forge the ``gui/<uid>/<label>`` service target
     verbatim (a ``label`` containing ``/`` redirects the kickstart at a
-    different job or domain) or corrupt the recovery-message merge (a
-    ``label`` containing ``"; "``/``": "`` forges a pseudo-branch entry on
-    the next :func:`onoats.status._parse_warning_branches` read). A rejected
+    different job or domain). It would *not* forge a pseudo-branch entry in
+    the recovery-message merge: ``status.format_warning_branch`` is the
+    choke point for that, and it sanitizes both ``"; "`` and ``": "`` out of
+    every branch key regardless of where the key came from. The label
+    allowlist is argv defence, and only argv defence — do not rely on it for
+    the status grammar's integrity, and do not weaken the status grammar's
+    own sanitizer on the strength of it. A rejected
     label is treated exactly like every other failure mode here — logged
     and swallowed, returning ``False`` — matching this function's "never
     raises, callers fall through to today's behavior" contract rather than
