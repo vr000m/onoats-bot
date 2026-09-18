@@ -37,7 +37,16 @@ from loguru import logger
 # STT_MODEL, and BOT_NAME at module load. onoats's consolidated config
 # (config.toml + secrets.env) is the source of truth; this dotenv load is a
 # convenience for a project-local .env in dev. Env vars still override.
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
+load_dotenv(
+    os.path.join(os.path.dirname(__file__), "..", ".env"),
+    override=False,
+    # Match the `dotenv_values` readers in `onoats.config`: a `$VAR`
+    # or `${VAR}` inside a value is a literal, not an interpolation.
+    # `.env` is dev-only (`secrets.env` is the real boundary), but one
+    # reader silently rewriting values another reader passes through is
+    # a divergence worth not having.
+    interpolate=False,
+)
 
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,

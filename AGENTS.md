@@ -301,7 +301,8 @@ its scope; this list is a pointer, not the contract itself.
   `websocket_stt_service._endpoint_label`); do not open-code the two steps
   again, and note `safe_exc_text` composes the query strip itself.
   **Read its docstring before touching it**: the scanner has been rewritten
-  nine times, every tiered/heuristic version leaked, and the generated
+  or restructured in most review-gauntlet rounds to date, every tiered
+  version leaked, and the generated
   sweep in `tests/test_redact.py` — not any hand-picked case list — is its
   specification. Its failure modes come in two directions: a credential
   *leak*, and a destructive *over-redaction* that removes the credential

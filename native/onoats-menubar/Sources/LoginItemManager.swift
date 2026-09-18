@@ -70,7 +70,7 @@ enum LoginItemManager {
             }
         } catch {
             return
-                "launch-at-login: failed to \(wantsEnabled ? "register" : "unregister") — \(error.localizedDescription)"
+                "launch_at_login: failed to \(wantsEnabled ? "register" : "unregister") — \(error.localizedDescription)"
         }
 
         // A fresh .register() can land in .requiresApproval (System
@@ -79,7 +79,7 @@ enum LoginItemManager {
         // menu hint, instead of silently leaving the app not actually
         // launching at login.
         if wantsEnabled, service.status == .requiresApproval {
-            return "launch-at-login: approve Onoats in System Settings ▸ Login Items"
+            return "launch_at_login: approve Onoats in System Settings ▸ Login Items"
         }
         return nil
     }
