@@ -1277,3 +1277,113 @@ def test_swift_menu_bar_splits_on_the_documented_warning_delimiter():
         f"status.WARNING_ENTRY_DELIMITER is {WARNING_ENTRY_DELIMITER!r}. "
         "Change both in lockstep (see the status.py header)."
     )
+
+
+def test_swift_menu_bar_shares_one_hint_splitter_across_every_hint():
+    """Round-9 architecture finding: two rendering policies for one kind of
+    string. `model.warning` was split on `"; "` then `" — "` inline in its own
+    branch, while `model.loginItemHint` — added later, built by
+    `LoginItemManager` with that same `" — "` delimiter and carrying unbounded
+    text (a user-edited config.toml value, `error.localizedDescription`) —
+    rendered unsplit and stretched the whole menu, the exact problem the split
+    exists to prevent.
+
+    The split now lives in one helper (`hintCaptionLines`) that every `⚠` hint
+    goes through. Checked here rather than left to convention because the
+    convention is what failed: the second producer inherited the wrong
+    behaviour by default, and nothing said so.
+    """
+    swift = (
+        Path(__file__).resolve().parents[1]
+        / "native"
+        / "onoats-menubar"
+        / "Sources"
+        / "OnoatsMenuBarApp.swift"
+    )
+    source = swift.read_text(encoding="utf-8")
+    assert "func hintCaptionLines(" in source, (
+        "the shared hint splitter is gone — each hint call site is free to "
+        "invent its own rendering again."
+    )
+    # No hint may be rendered as a bare, unsplit menu item.
+    for field in ("model.warning", "model.flushNote", "model.loginItemHint"):
+        assert f'Text("⚠ \\({field}' not in source, field
+    for binding in ("warning", "note", "hint"):
+        assert f"hintLines({binding})" in source, binding
+
+
+def test_read_status_survives_a_non_utf8_status_file(tmp_path: Path):
+    """Round-9 finding: `read_status` promises "a partial/corrupt/drifted file
+    is 'no status', never an exception", and `Path.read_text` does the I/O and
+    the decode in one call — so a mojibake or mid-multibyte-truncated file
+    raised `UnicodeDecodeError`, a `ValueError` subclass that is not an
+    `OSError` and flew past both handlers. It escapes into `onoats status`,
+    the menu-bar poller, and `write_stopped`'s read-modify-write in the
+    shutdown tail."""
+    status_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    status_path(tmp_path).write_bytes(b'{"schema": 2, "pid": \xff\xfe}')
+    assert read_status(tmp_path) is None
+
+
+def test_write_running_carries_forward_a_branch_warning(tmp_path: Path):
+    """Round-9 finding: `write_running` builds a FRESH record, which is right
+    for every field except the one with a second, concurrent, *merging*
+    writer. The socket supervisor's capturer-event drain is live before the
+    recorder's start write, so a `zero-run-warning` (a mic delivering pure
+    silence) could land first and be erased a moment later — permanently,
+    because the branch is only emitted on the transition and nothing
+    re-asserts it. `cli.py`'s `active_warnings` dict used to absorb this by
+    accident and went away when `set_warning_branch` became the single
+    writer."""
+    write_running(tmp_path, pid=os.getpid(), audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "only zero samples for ~30 s")
+    # The recorder's own start write, landing after the supervisor's event.
+    write_running(
+        tmp_path,
+        pid=os.getpid(),
+        audio_source="socket",
+        stt_label="websocket",
+        warning="stt: server restarted automatically",
+    )
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.stt_label == "websocket"
+    branches = _parse_warning_branches(got.warning)
+    assert branches == {
+        "mic": "only zero samples for ~30 s",
+        "stt": "server restarted automatically",
+    }
+    # Still clearable through the normal single writer.
+    set_warning_branch(tmp_path, "mic", None)
+    got = read_status(tmp_path)
+    assert got is not None
+    assert _parse_warning_branches(got.warning) == {
+        "stt": "server restarted automatically"
+    }
+
+
+def test_write_running_does_not_inherit_a_stale_sessions_warning(tmp_path: Path):
+    """The other half: a crashed previous session leaves `running=true` on
+    disk. Its warnings describe a session that is gone and must not be
+    donated to the new one."""
+    write_status(tmp_path, _record(pid=999_999, warning="mic: stale from last time"))
+    write_running(tmp_path, pid=4242, audio_source="socket", stt_label="mlx")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+def test_write_running_carry_forward_keeps_a_malformed_warning_visible(tmp_path: Path):
+    """A value the grammar cannot parse cannot be merged into the grammar
+    either — re-rendering would drop it, turning the logged misuse into a
+    silent one."""
+    write_running(tmp_path, pid=os.getpid(), audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "zero samples")
+    write_running(
+        tmp_path,
+        pid=os.getpid(),
+        audio_source="socket",
+        stt_label="mlx",
+        warning="not-branch-shaped",
+    )
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "not-branch-shaped"

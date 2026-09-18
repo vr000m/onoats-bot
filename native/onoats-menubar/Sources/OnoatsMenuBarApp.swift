@@ -36,35 +36,58 @@ struct OnoatsMenuBarApp: App {
     }
 }
 
+/// Break one status-hint string into the caption lines the menu renders.
+///
+/// The one rendering policy for every long, delimiter-joined hint this menu
+/// shows, not just the schema-v2 `warning` field. It used to live inline in
+/// the `warning` branch alone, so `loginItemHint` — added later, built by
+/// `LoginItemManager` with the same `" — "` clause delimiter and carrying
+/// unbounded text (a user-edited `config.toml` value,
+/// `error.localizedDescription`) — rendered as a single unwrapped item and
+/// stretched the whole menu, which is the exact problem the `warning` split
+/// exists to prevent. Two producers of the same string shape must not get
+/// opposite rendering because only one call site knew the rule.
+///
+/// `status.set_warning_branch` can merge SEVERAL branches
+/// (mic/system/stt/stt-mic/stt-system) into one string, `"; "`-joined per
+/// `status.format_warning_branch`, so the outer split comes first and breaks
+/// per-branch entries apart; the inner `" — "` split then breaks each entry's
+/// own em-dash clauses. Native menu items render one line and never wrap, and
+/// a single hint can be ~200 chars (observed live, 2026-06-11).
+///
+/// The `"; "` literal here is under the lockstep convention documented in
+/// `status.py`'s header and checked by `tests/test_status_file.py::
+/// test_swift_menu_bar_splits_on_the_documented_warning_delimiter`, which
+/// reads this source. The parameter is named `warning` because that test
+/// matches the split structurally, against that name.
+func hintCaptionLines(_ warning: String) -> [String] {
+    return warning
+        .components(separatedBy: "; ")
+        .flatMap { $0.components(separatedBy: " — ") }
+}
+
 struct MenuContent: View {
     @ObservedObject var model: RecorderModel
+
+    /// One hint, rendered as stacked caption lines with a leading marker on
+    /// the first. Shared by every `⚠` hint in the menu.
+    @ViewBuilder
+    private func hintLines(_ text: String) -> some View {
+        let lines = hintCaptionLines(text)
+        ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+            Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
+        }
+    }
 
     var body: some View {
         Text(statusLine)
         // Live capture warning (schema-v2 `warning`): the branch-specific hint
         // from the capturer's all-zero-input detector, or an STT
         // kickstart-recovery message. Cleared automatically when the branch
-        // clears. Native menu items render one line and never wrap, and a
-        // single hint can be ~200 chars — rendered as ONE item it stretches
-        // the whole menu to its width (observed live, 2026-06-11). Split on
-        // the hint's em-dash clause breaks into stacked caption lines
-        // instead; the unsplit text stays in `onoats status` and the log.
-        //
-        // `status.set_warning_branch` can also merge SEVERAL branches
-        // (mic/system/stt/stt-mic/stt-system) into one `warning` string,
-        // "; "-joined per `status.format_warning_branch`. Splitting only on
-        // the em-dash misses that outer join: a capturer warning and an STT
-        // recovery message active at once would render as one unbroken line
-        // again. Split on "; " first to break into per-branch entries, then
-        // on the em-dash within each entry, so every branch's own hint still
-        // gets its own stacked caption line(s).
+        // clears. The unsplit text stays in `onoats status` and the log; see
+        // `hintCaptionLines` for the splitting policy and why it is shared.
         if let warning = model.warning {
-            let lines = warning
-                .components(separatedBy: "; ")
-                .flatMap { $0.components(separatedBy: " — ") }
-            ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
-                Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
-            }
+            hintLines(warning)
         }
         if case .failed(let reason, let detail) = model.state {
             Text("Last session failed: \(reason)")
@@ -76,10 +99,14 @@ struct MenuContent: View {
             Text("⚠ status file schema drift — update onoats / this app")
         }
         if let note = model.flushNote {
-            Text("⚠ \(note)")
+            hintLines(note)
         }
         if let hint = model.loginItemHint {
-            Text("⚠ \(hint)")
+            // `LoginItemManager` builds these with the same `" — "` clause
+            // delimiter the `warning` grammar uses, and interpolates
+            // unbounded text into them (a user-edited `config.toml` value,
+            // `error.localizedDescription`). Same shape, same rendering.
+            hintLines(hint)
         }
 
         Divider()

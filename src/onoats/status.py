@@ -231,6 +231,18 @@ def read_status(data_dir: Path) -> StatusRecord | None:
         return None
     except OSError:
         return None
+    except UnicodeDecodeError:
+        # `read_text` does the I/O and the decode in one call, so the decode
+        # failure lands in a `try` that only ever expected I/O failures — and
+        # `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so it flew
+        # straight past both handlers and out of a function documented as
+        # "never an exception". A status file is written by us as UTF-8, so
+        # reaching here means truncation mid-multibyte-sequence or a foreign
+        # writer: both are exactly the "partial/corrupt/drifted file" the
+        # tolerant contract exists for. Listed separately from the
+        # `json.JSONDecodeError`/`ValueError` catch below because that one
+        # guards a different call.
+        return None
     try:
         obj = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
@@ -339,8 +351,56 @@ def write_running(
             audio_source=audio_source,
             stt_label=stt_label,
             running=True,
-            warning=warning,
+            warning=_carry_forward_warning(data_dir, pid, warning),
         ),
+    )
+
+
+def _carry_forward_warning(data_dir: Path, pid: int, warning: str | None) -> str | None:
+    """Merge branches already on this session's record under ``warning``.
+
+    :func:`write_running` builds a **fresh** record, which is right for every
+    other field and wrong for this one: ``warning`` is the single field with a
+    *second* writer (:func:`set_warning_branch`) that runs concurrently and
+    merges rather than replaces. The supervisor's capturer-event drain is
+    live before the recorder's start write, so a ``zero-run-warning`` — a mic
+    delivering pure silence, the single most important thing the status file
+    has to say — could land first and be erased a moment later with no way
+    back: nothing re-asserts it, because the branch is only emitted on the
+    transition. ``cli.py`` used to hold an in-process ``active_warnings``
+    dict and rewrite the whole merged field from it, which absorbed this by
+    accident; the dict was removed when :func:`set_warning_branch` became the
+    single writer, and the re-assert path went with it.
+
+    Scoped to **this session's own** record — running, and belonging either to
+    this process or to the pid being written. A stale ``running=true`` record
+    left by a crashed previous session must not donate its warnings to a new
+    one, and the ``pid`` alternative keeps the ``write_running(pid=1, ...)``
+    shorthand this module's own tests use working the same way
+    :func:`set_warning_branch` does. A prestart record's freeform ``note``
+    carries no ``": "`` entry, so :func:`_parse_warning_branches` drops it
+    exactly as :func:`write_prestart_waiting` documents — the successor
+    overwrites it, as before.
+    """
+    if warning is not None and not _is_well_formed_warning(warning):
+        # Already logged by the caller. A value the grammar cannot parse
+        # cannot be merged *into* the grammar either — re-rendering would
+        # silently drop it, turning a visible misuse into an invisible one.
+        return warning
+    current = read_status(data_dir)
+    if current is None or not current.running:
+        return warning
+    if current.pid not in (os.getpid(), pid):
+        return warning
+    branches = _parse_warning_branches(current.warning)
+    if not branches:
+        return warning
+    branches.update(_parse_warning_branches(warning))
+    return (
+        WARNING_ENTRY_DELIMITER.join(
+            format_warning_branch(b, branches[b]) for b in sorted(branches)
+        )
+        or None
     )
 
 
