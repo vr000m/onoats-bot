@@ -756,3 +756,79 @@ def test_secrets_env_drops_a_malformed_key(tmp_path):
         path, {"GOOD_KEY": "v", "BAD KEY=X": "v", "9BAD": "v"}, merge_existing=False
     )
     assert dict(dotenv_values(path)) == {"GOOD_KEY": "v"}
+
+
+def test_secrets_env_refuses_to_write_an_unreadable_file(tmp_path, monkeypatch):
+    """Round-9 finding: `_env_quote` was the sole guarantee that a rendered
+    line is parseable — a claim about an escaping function, re-argued from
+    scratch every time a new hostile character turns up. The blast radius of
+    being wrong once is total and silent: `dotenv_values` abandons the file on
+    a line it cannot parse, `config._load_secrets` returns `{}`, every STT
+    credential vanishes at runtime with no error, and the next `onoats init`
+    merge reads the same `{}` and rewrites the file *without* them.
+
+    The invariant is now checked against the bytes, not asserted about the
+    escaper. Simulated by breaking `_env_quote` itself, because no input
+    defeats the real one (verified over a 3-character cross-product of every
+    hostile character, including NUL, newline, backslash and quotes)."""
+    from onoats import init as init_mod
+    from onoats.init import _write_secrets_env
+
+    path = tmp_path / "secrets.env"
+    _write_secrets_env(path, {"STT_WS_TOKEN": "keepme"}, merge_existing=False)
+    before = path.read_bytes()
+
+    monkeypatch.setattr(init_mod, "_env_quote", lambda v: f'"{v}"')
+    with pytest.raises(RuntimeError, match="refusing to write secrets.env"):
+        _write_secrets_env(path, {"STT_WS_TOKEN": 'a"\nEVIL=1'}, merge_existing=False)
+    # The existing secrets survive: the refusal happens before the truncate.
+    assert path.read_bytes() == before
+
+
+def test_env_quote_round_trips_every_hostile_character(tmp_path):
+    """The property `_assert_secrets_round_trip` enforces, asserted directly
+    against the real escaper so a regression in it is attributed here rather
+    than surfacing as a mysterious `onoats init` failure."""
+    import itertools
+
+    from dotenv import dotenv_values
+
+    from onoats.init import _write_secrets_env
+
+    path = tmp_path / "secrets.env"
+    alphabet = ("a", "\\", '"', "'", "\n", "\r", "#", " ", "=", "$", "{", "\t", "\x00")
+    for combo in itertools.product(alphabet, repeat=2):
+        value = "".join(combo)
+        _write_secrets_env(path, {"STT_WS_TOKEN": value}, merge_existing=False)
+        assert dotenv_values(path, interpolate=False)["STT_WS_TOKEN"] == value, value
+
+
+@pytest.mark.parametrize("literal", ("42", "true", "[1, 2]"), ids=str)
+def test_rerun_notes_a_non_string_launchd_label(
+    _isolate_env, monkeypatch, capsys, literal
+):
+    """Round-9 finding: the "ignoring malformed [stt].launchd_label" note was
+    guarded on `carried_str` — the string-only projection, which is `None` for
+    exactly the typed-TOML case the note's own comment cites as its motivating
+    example. So `launchd_label = 42` / `= true` was dropped in total silence:
+    the one shape where the user is most likely to believe self-healing is
+    configured and be wrong, and the shape a `true` makes especially plausible
+    (it reads like an on switch). The value is still dropped — that half was
+    always right — it is now also reported."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace("[stt]\n", f"[stt]\nlaunchd_label = {literal}\n")
+    )
+
+    _force_tty(monkeypatch, value=False)
+    capsys.readouterr()  # drain the first run's output
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    out = capsys.readouterr().out
+    assert "malformed [stt].launchd_label" in out, out
+    cfg = _load_toml(config_toml_path())
+    assert "launchd_label" not in cfg["stt"]

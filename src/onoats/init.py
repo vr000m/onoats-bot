@@ -31,6 +31,7 @@ process env > config.toml/secrets.env > built-in default.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import sys
@@ -534,17 +535,56 @@ def _write_secrets_env(path: Path, secrets: dict, *, merge_existing: bool) -> No
     merged.update({k: v for k, v in secrets.items() if v})
     # The file is always (re)created below with 0600 perms, even when empty,
     # so the path exists with correct perms for later edits.
+    writable = {k: v for k, v in merged.items() if _ENV_KEY_RE.match(k)}
     lines = [
         "# onoats STT secrets — 0600. NEVER commit. STT secrets only, NO LLM keys.",
-        *[f"{k}={_env_quote(v)}" for k, v in merged.items() if _ENV_KEY_RE.match(k)],
+        *[f"{k}={_env_quote(v)}" for k, v in writable.items()],
     ]
+    body = "\n".join(lines).rstrip() + "\n"
+    _assert_secrets_round_trip(body, writable)
     # Create with restrictive perms from the start (avoid a readable window).
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, ("\n".join(lines).rstrip() + "\n").encode("utf-8"))
+        os.write(fd, body.encode("utf-8"))
     finally:
         os.close(fd)
     os.chmod(path, 0o600)
+
+
+def _assert_secrets_round_trip(body: str, expected: dict[str, str]) -> None:
+    """Refuse to write a ``secrets.env`` the reader cannot read back.
+
+    :func:`_env_quote` has been the sole guarantee that a rendered line is
+    parseable, and it is the wrong shape of guarantee: it is a *claim* about
+    an escaping function, re-argued from scratch every time a new hostile
+    character is found, while the property that actually matters is a
+    property of the whole rendered file. The blast radius of being wrong once
+    is total and silent — ``dotenv_values`` abandons the file on a line it
+    cannot parse, so ``config._load_secrets`` returns ``{}``, every STT
+    credential vanishes at runtime with no error, and the next
+    ``onoats init`` merge reads the same ``{}`` and rewrites the file
+    *without* them, making the loss permanent.
+
+    So the invariant is checked rather than asserted: parse the bytes we are
+    about to write, with the same function and the same ``interpolate=False``
+    both readers use, and require every key and value back verbatim. A
+    mismatch raises before the 0600 file is truncated, which leaves the
+    existing secrets intact and turns a silent total loss into a loud one.
+    """
+    from dotenv import dotenv_values
+
+    parsed = dotenv_values(stream=io.StringIO(body), interpolate=False)
+    if dict(parsed) != expected:
+        missing = sorted(set(expected) - set(parsed))
+        wrong = sorted(k for k in expected if k in parsed and parsed[k] != expected[k])
+        extra = sorted(set(parsed) - set(expected))
+        raise RuntimeError(
+            "refusing to write secrets.env: the rendered file does not read "
+            "back as written and would silently lose every secret in it "
+            f"(unreadable keys: {missing}, corrupted: {wrong}, "
+            f"fabricated: {extra}). This is a bug in _env_quote; the "
+            "existing file has been left untouched."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +799,15 @@ def main(argv: list[str] | None = None) -> int:
         validated_label = normalize_launchd_label(carried_str)
         if validated_label:
             stt["launchd_label"] = validated_label
-        elif carried_str and carried_str.strip():
+        elif not isinstance(carried_label, str) or carried_label.strip():
+            # Guarded on `carried_label` (what the user actually wrote), not
+            # on `carried_str` (the string-only projection above, which is
+            # `None` for exactly the typed-TOML case this note's own comment
+            # cites as its motivating example). A `launchd_label = true` or
+            # `= 42` therefore disappeared in silence — the one shape where
+            # the user is most likely to think self-healing is configured and
+            # be wrong. Only a genuinely blank string stays quiet: that is
+            # "absent", not "malformed".
             print(
                 f"  note: ignoring malformed [stt].launchd_label "
                 f"{carried_label!r} — it is already inert at runtime and is "

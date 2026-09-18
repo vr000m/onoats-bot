@@ -105,3 +105,26 @@ def test_normalize_launchd_label_shared_strip_empty_validate_sequence():
     assert normalize_launchd_label(None) is None
     # Well-formed but with an interior character the allowlist rejects.
     assert normalize_launchd_label("bad label;rm") is None
+
+
+def test_blank_stt_launchd_label_env_var_disables_kickstart(tmp_path, monkeypatch):
+    """Round-9 finding: `stt_launchd_label`'s docstring promises that an
+    empty/whitespace-only value "from either source" normalizes to `None`, but
+    `_env_or` reads a blank env var as *absent* and falls through to
+    config.toml — so `STT_LAUNCHD_LABEL=` in a plist or shell wrapper silently
+    kept kickstarting whatever label config.toml named, and there was no way
+    to turn self-healing off from the environment at all. Presence, not
+    truthiness, is the question an explicit override asks."""
+    from onoats.config import OnoatsConfig
+
+    cfg = OnoatsConfig(raw={"stt": {"launchd_label": "pipecat.stt-server"}})
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    assert cfg.stt_launchd_label == "pipecat.stt-server"
+
+    for blank in ("", "   ", "\t"):
+        monkeypatch.setenv("STT_LAUNCHD_LABEL", blank)
+        assert cfg.stt_launchd_label is None, blank
+
+    # A real env value still wins over config.toml, unchanged.
+    monkeypatch.setenv("STT_LAUNCHD_LABEL", "pipecat.stt-server.nemotron")
+    assert cfg.stt_launchd_label == "pipecat.stt-server.nemotron"

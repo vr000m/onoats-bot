@@ -347,6 +347,18 @@ class OnoatsConfig:
         (``pipecat.stt-server.nemotron`` vs. ``pipecat.stt-server`` for a
         bare ``mlx`` backend) prove no reliable derivation rule exists.
         """
+        if "STT_LAUNCHD_LABEL" in os.environ:
+            # `_env_or` reads a blank env var as *absent* and falls through to
+            # config.toml. That is the right rule for every setting whose
+            # empty value means "use the default" — and the wrong one here,
+            # where this property's own docstring promises that an empty value
+            # "from either source" disables self-healing, and where disabling
+            # it is the only reason a user would export the variable empty in
+            # the first place. `STT_LAUNCHD_LABEL=` in a launchd plist or a
+            # shell wrapper silently kept kickstarting whatever label
+            # config.toml named. Presence, not truthiness, is the question an
+            # explicit override asks.
+            return normalize_launchd_label(os.environ["STT_LAUNCHD_LABEL"])
         val = _env_or("STT_LAUNCHD_LABEL", self.raw.get("stt", {}).get("launchd_label"))
         if val is not None and not isinstance(val, str):
             # A typed config.toml value (bool `true`, int `42`, ...) must not
