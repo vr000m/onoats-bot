@@ -1135,13 +1135,19 @@ def test_cancellation_during_stale_close_does_not_leak_the_recovered_client(
                 raise ConnectionRefusedError("refused")
 
         async def close_session(self):
+            assert self.index != 1, (
+                "the stale pre-kickstart client never reached a session, so "
+                "round 8 tears it down with `_closing.TRANSPORT_ONLY`"
+            )
+
+        async def close(self):
             if self.index == 1:
                 # Simulate shutdown cancellation arriving mid-teardown of
                 # the STALE (already-dead) pre-kickstart client — the exact
-                # window the fix must survive.
+                # window the fix must survive. Injected at `close` rather
+                # than `close_session` since round 8: `close` is the one
+                # closer a failed-connect teardown actually runs.
                 raise asyncio.CancelledError()
-
-        async def close(self):
             self.closed = True
 
     import stt_server.client as stt_client
@@ -2137,3 +2143,48 @@ def test_characterization_oserror_redacts_credential_in_exception_text(
         asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
 
     assert "secretpass" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Round 8. `close_quietly`'s `closers` contract, honoured at every
+# failed-connect teardown in `runtime` (it already was in
+# `websocket_stt_service`).
+# ---------------------------------------------------------------------------
+
+
+def test_failed_connect_teardown_skips_close_session(monkeypatch):
+    """Round-8 architecture finding: `runtime` passed the default
+    `FULL_CLOSERS` at all six of its failed-connect teardowns, against
+    `_closing`'s documented contract ("use `TRANSPORT_ONLY` for a client that
+    never reached a live session").
+
+    Not cosmetic. `close_quietly` walks its closers in order under ONE
+    deadline-derived budget, and `close_session` on a session-less client
+    against the wedged server these paths exist for can only hang to its own
+    timeout — so it eats the budget and leaves `close`, the call that
+    actually releases the FD, with the 0.05s floor.
+    """
+    _install_fake_client(monkeypatch, connect_raises=lambda: OSError("refused"))
+
+    with pytest.raises(SttPreflightError):
+        asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
+
+    assert _FakeClient.instances, "no client was built"
+    for inst in _FakeClient.instances:
+        assert inst.closed is True, "the transport must still be closed"
+        assert inst.session_closed is False, (
+            "a client whose connect() failed has no session to close"
+        )
+
+
+def test_successful_preflight_still_closes_the_session(monkeypatch):
+    """The other half of the mixed `finally`: on the `break` path `client` is
+    live and owes a real `session.close`, so the round-8 change must not
+    demote it to `TRANSPORT_ONLY`."""
+    _install_fake_client(monkeypatch, connect_raises=lambda: None)
+
+    asyncio.run(_preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"))
+
+    inst = _FakeClient.instances[0]
+    assert inst.session_closed is True
+    assert inst.closed is True

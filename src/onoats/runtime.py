@@ -750,12 +750,25 @@ async def _kickstart_and_retry(
                 # closer: this teardown runs before the loop's next budget
                 # check, so an unbounded-by-budget close is itself able to
                 # overrun the cap this loop documents as strict.
-                await _closing.close_quietly(candidate, deadline=deadline)
+                #
+                # `TRANSPORT_ONLY`: `connect()` just failed, so no session
+                # exists. `close_quietly` spends ONE deadline-derived budget
+                # across all its closers in order, and `close_session` against
+                # the wedged server these paths exist for cannot succeed —
+                # it hangs to its own timeout and leaves `close`, the call
+                # that actually releases the FD, with the 0.05s floor.
+                await _closing.close_quietly(
+                    candidate, deadline=deadline, closers=_closing.TRANSPORT_ONLY
+                )
             attempt += 1
             continue
         except Exception as exc:
             if candidate is not None:
-                await _closing.close_quietly(candidate, deadline=deadline)
+                # `TRANSPORT_ONLY`: the failed `connect()` above left no
+                # session to close. See the `TimeoutError`/`OSError` branch.
+                await _closing.close_quietly(
+                    candidate, deadline=deadline, closers=_closing.TRANSPORT_ONLY
+                )
             raise SttPreflightError(
                 f"STT: handshake failed at {target} after kickstarting "
                 f"{label!r} ({type(exc).__name__}: {safe_exc_text(exc)}). {hint}"
@@ -772,7 +785,13 @@ async def _kickstart_and_retry(
             # design's shutdown-responsiveness budget promises.
             if candidate is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await _closing.close_quietly(candidate, deadline=deadline)
+                    # `TRANSPORT_ONLY` for the same reason as the branches
+                    # above, and doubly so here: shutdown cancellation is the
+                    # one path where spending the budget on a `close_session`
+                    # that cannot complete directly delays process exit.
+                    await _closing.close_quietly(
+                        candidate, deadline=deadline, closers=_closing.TRANSPORT_ONLY
+                    )
             raise
         if on_recovery is not None:
             # Swallow-and-log, like every other recovery-callback site
@@ -785,7 +804,9 @@ async def _kickstart_and_retry(
             try:
                 on_recovery(recovery_message(label))
             except Exception as exc:
-                logger.warning(f"STT: on_recovery callback failed: {exc}")
+                logger.warning(
+                    f"STT: on_recovery callback failed: {safe_exc_text(exc)}"
+                )
         return KickstartResult(KickstartOutcome.RECOVERED, candidate)
 
 
@@ -883,7 +904,9 @@ async def _preflight_stt_ws(
             try:
                 on_recovery(cached_message)
             except Exception as exc:
-                logger.warning(f"STT: on_recovery callback failed: {exc}")
+                logger.warning(
+                    f"STT: on_recovery callback failed: {safe_exc_text(exc)}"
+                )
         return
 
     import stt_server.client as _stt_client
@@ -965,13 +988,24 @@ async def _preflight_stt_ws(
     # graceful close, which should be allowed its full 5s.
     loop = asyncio.get_running_loop()
     _pre_kickstart_deadline = loop.time() + total_budget
+    # Which closers the `finally` below owes this client. Every exit from the
+    # `try` other than a `break` is a raise from a failed/timed-out
+    # `connect()`, which leaves no session to close; only the two `break`s
+    # hand `finally` a live one.
+    connected = False
     try:
         for idx, (timeout_s, delay_s) in enumerate(attempts):
             is_last = idx == len(attempts) - 1
             if delay_s > 0:
                 await asyncio.sleep(delay_s)
             if idx > 0:
-                await _closing.close_quietly(client, deadline=_pre_kickstart_deadline)
+                # `TRANSPORT_ONLY`: this client's `connect()` failed on the
+                # previous attempt, so it has no session. See `_closing`.
+                await _closing.close_quietly(
+                    client,
+                    deadline=_pre_kickstart_deadline,
+                    closers=_closing.TRANSPORT_ONLY,
+                )
                 client = _make_client()
                 # Recheck the remaining pre-kickstart budget after the sleep
                 # and the deadline-capped teardown above: when attempt 1 ran
@@ -1006,6 +1040,7 @@ async def _preflight_stt_ws(
                         "teardown/delay)"
                     )
                 await asyncio.wait_for(client.connect(), timeout=timeout_s)
+                connected = True
                 break
             except TimeoutError as exc:
                 if not is_last:
@@ -1050,7 +1085,12 @@ async def _preflight_stt_ws(
                         # never closed and its socket/FD leaks.
                         stale = client
                         client = result
-                        await _closing.close_quietly(stale)
+                        connected = True
+                        # `TRANSPORT_ONLY`: `stale` is the pre-kickstart
+                        # client whose `connect()` timed out — no session.
+                        await _closing.close_quietly(
+                            stale, closers=_closing.TRANSPORT_ONLY
+                        )
                         break
                     # "kickstart_failed" (also: cooldown still active) ->
                     # fall through, unchanged message.
@@ -1107,7 +1147,12 @@ async def _preflight_stt_ws(
                         # ownership must transfer before the awaited close.
                         stale = client
                         client = result
-                        await _closing.close_quietly(stale)
+                        connected = True
+                        # `TRANSPORT_ONLY`: `stale` is the pre-kickstart
+                        # client whose `connect()` timed out — no session.
+                        await _closing.close_quietly(
+                            stale, closers=_closing.TRANSPORT_ONLY
+                        )
                         break
                     # "kickstart_failed" (also: cooldown still active) ->
                     # fall through, unchanged message.
@@ -1133,7 +1178,15 @@ async def _preflight_stt_ws(
                     f"({type(exc).__name__}: {safe_exc_text(exc)}). {hint}"
                 ) from exc
     finally:
-        await _closing.close_quietly(client)
+        # Mixed site: on the `break` paths `client` is the live, connected
+        # socket and owes a real `session.close`; on every raising path it
+        # never reached a session, and `close_session` would spend the shared
+        # budget hanging against the wedged server before `close` — the call
+        # that releases the FD — gets its turn.
+        await _closing.close_quietly(
+            client,
+            closers=_closing.FULL_CLOSERS if connected else _closing.TRANSPORT_ONLY,
+        )
 
     _preflight_cache[key] = recovered_message
 
@@ -1295,7 +1348,9 @@ async def _create_stt_service(
                 try:
                     _status_mod.set_warning_branch(data_dir, branch, msg)
                 except Exception as exc:
-                    logger.warning(f"STT: could not write recovery status ({exc})")
+                    logger.warning(
+                        f"STT: could not write recovery status ({safe_exc_text(exc)})"
+                    )
 
             return _write
 
