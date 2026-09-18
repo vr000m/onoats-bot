@@ -31,6 +31,8 @@ not any hand-picked list — is the specification: hand-picked cases are what
 missed all four credential leaks round 4 found.
 """
 
+import itertools
+
 import pytest
 
 from onoats._redact import display_uri, redact_uri, safe_exc_text, strip_query
@@ -354,11 +356,20 @@ def test_bare_path_tier1_requires_credential_shape():
     assert safe_exc_text(Exception(text)) == text
 
 
-def test_authority_path_unrelated_at_sign_in_a_path_segment_untouched():
-    """The port gate also covers tier 2: an unrelated `user@host` inside a
-    path segment of a `host:PORT` authority must not be read as userinfo."""
-    text = "ws://host:8765/p/user@y"
-    assert safe_exc_text(Exception(text)) == text
+def test_authority_path_at_sign_with_a_dotted_tail_is_over_redacted():
+    """Limitation 5, and deliberately so: an `@` in a *path* segment is
+    character-for-character the genuine `ws://user:1234/seg@host.tld` the
+    sweep requires be redacted, so the ambiguity resolves toward redaction.
+
+    Round 8 extended this from dotted tails to bare reg-name tails
+    (`_tail_accepts` branch (c)). `ws://host:8765/p/user@y` used to survive
+    only because `y` carried no `.`/`:`/`/` — and so did
+    `ws://user:S3CRETPW/seg@localhost`, whose credential leaked whole.
+    `localhost` is this project's own canonical STT host and will never grow
+    a dot, so the bare tail had to be accepted and this shape goes with it.
+    """
+    assert safe_exc_text(Exception("wss://host:443/path/to/a@b.com")) == "wss://b.com"
+    assert safe_exc_text(Exception("ws://host:8765/p/user@y")) == "ws://y"
 
 
 def test_tier3_widening_is_bounded_to_two_extra_words():
@@ -778,10 +789,172 @@ def test_query_strip_does_not_stop_at_a_scheme_inside_a_query_value():
 
 
 # ---------------------------------------------------------------------------
+# Round 8. Three fresh credential/query leak classes, all from RFC 3986
+# authority shapes no corpus generator had ever produced: a scheme-relative
+# `//host` reference, an *empty* authority, and a bare single-label host
+# with no port and no path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        (
+            "//user:SEKRET@host.example.com:8765/v1?token=TOK",
+            "//host.example.com:8765/v1",
+        ),
+        ("//user:SEKRET@host.example.com/v1", "//host.example.com/v1"),
+        ("//:SEKRET@localhost:8765/v1?token=TOK", "//localhost:8765/v1"),
+        ("//localhost:8765/v1?token=TOK", "//localhost:8765/v1"),
+        ("//[::1]:2020/v1?token=TOK", "//[::1]:2020/v1"),
+    ),
+    ids=str,
+)
+def test_protocol_relative_uri_is_redacted_and_stripped(text, expected):
+    """Round-8 finding 1 (HIGH, leak): RFC 3986 §4.2 scheme-relative
+    references defeated *both* scheme-less anchors from one cause measured in
+    two places. The credential scan anchored on the first `/`, so every
+    candidate's username span held a `/` and `_is_userinfo_shaped` refused
+    it; the query strip anchored there too, so `_AUTHORITY_STOP_RE` matched
+    at offset zero and the authority span it tested was empty. Both anchors
+    now go through `_authority_anchor`."""
+    assert display_uri(text) == expected
+    assert safe_exc_text(Exception(text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "// note: see bob@corp.com",
+        "//  spaced comment",
+        "///triple/slash?not=a-host",
+    ),
+    ids=str,
+)
+def test_protocol_relative_anchor_does_not_step_into_prose(text):
+    """`_authority_anchor` advances only over a genuine authority: a `//`
+    followed by whitespace or a third `/` keeps the pre-round-8 anchor, so
+    comment-shaped and path-shaped prose is untouched."""
+    assert safe_exc_text(Exception(text)) == text
+
+
+def _empty_authority_corpus():
+    """Round-8 finding 2: `ws:///v1?token=...`. `websockets.uri.parse_uri`
+    raises `InvalidURI` on this shape and embeds the whole token in the
+    message, so it reaches `safe_exc_text` in production."""
+    for scheme in ("ws://", "wss://"):
+        for path in ("", "/", "/v1", "/v1/x"):
+            for mark in ("?", "#"):
+                for suffix in ("", " isn't a valid URI: x"):
+                    head = f"{scheme}{path}"
+                    yield f"{head}{mark}token=QUERYSECRET{suffix}", f"{head}{suffix}"
+
+
+@pytest.mark.parametrize("text,expected", list(_empty_authority_corpus()), ids=str)
+def test_empty_authority_uri_still_has_its_query_stripped(text, expected):
+    """Round-8 finding 2 (HIGH, leak): an empty authority immediately
+    followed by `/`, `?` or `#` is *well-formed* RFC 3986, not a truncated
+    one — but `_HOST_PORT_RE` needs at least one character, so `_query_cut`
+    read the `None` as "the `?` is a password character" and let the token
+    through. A zero-length span cannot hold userinfo, so there is no password
+    for the `?` to belong to and the cut is unconditionally safe."""
+    safe = safe_exc_text(Exception(text))
+    assert "QUERYSECRET" not in safe, (text, safe)
+    assert safe == expected, (text, safe)
+
+
+_BARE_HOST_PASSWORD_TAILS = ("/seg", "?q", "#frag", ":x", "/a/b", "?a=1", "#f")
+_BARE_HOSTS = ("localhost", "stt-box", "host")
+
+
+def _bare_host_credential_corpus():
+    """Round-8 finding 3: an illegal-character password against a bare
+    single-label host — no dot, no port, no path. `_tail_accepts` had a rule
+    for a dotted tail and a rule for a legal password and no rule at all for
+    a plain reg-name, which is what `localhost` is."""
+    for user in ("user", "", "alice@corp.com"):
+        for head in ("hunter2", "1234", "AB+cd="):
+            for tail in _BARE_HOST_PASSWORD_TAILS:
+                for host in _BARE_HOSTS:
+                    for scheme in ("ws://", "wss://", "//"):
+                        for suffix in ("", " failed: admin@example.com"):
+                            password = head + tail
+                            yield (
+                                f"{scheme}{user}:{password}@{host}{suffix}",
+                                password,
+                                user,
+                                f"{scheme}{host}{suffix}",
+                            )
+
+
+@pytest.mark.parametrize(
+    "text,password,user,expected", list(_bare_host_credential_corpus()), ids=str
+)
+def test_sweep_bare_single_label_host_credentials_are_redacted(
+    text, password, user, expected
+):
+    """Round-8 finding 3 (HIGH, leak): emitted verbatim before this round,
+    and with trailing prose it was worse than verbatim — the scan fell
+    through to the prose's own `@` and fabricated a host
+    (`ws://user:S3CRETPW/seg@host failed: admin@example.com` ->
+    `ws://example.com`). Both halves are asserted: the userinfo is gone AND
+    the real host plus the trailing prose survive."""
+    safe = safe_exc_text(Exception(text))
+    assert password not in safe, (text, safe)
+    if user:
+        assert user not in safe, (text, safe)
+    assert safe == expected, (text, safe)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        # Round-8 finding 4 (codex): `_not_query_of_path` vetoed the real
+        # credential because `user:1234` fullmatches `host[:port]` and `x=1`
+        # looked like a real query. A single label with no path behind it is
+        # the weakest authority there is, and only while nothing has been
+        # accepted yet.
+        ("ws://user:1234?x=1@host.example.com/v1", "ws://host.example.com/v1"),
+        ("ws://user:1234#x=1@host.example.com/v1", "ws://host.example.com/v1"),
+        # Round-8 finding 5 (codex): the settled-authority override demanded
+        # an RFC-legal password, which a password whose `/` ended the
+        # authority early can never be. The widened word `/seg` is not a word
+        # any sentence contains, which is evidence of its own.
+        ("ws://user:1234 /seg@host.example.com/v1", "ws://host.example.com/v1"),
+        ("ws://user:1234 ?q@host.example.com/v1", "ws://host.example.com/v1"),
+    ),
+    ids=str,
+)
+def test_round8_codex_credential_shapes_are_redacted(text, expected):
+    assert display_uri(text) == expected
+    assert safe_exc_text(Exception(text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        # The other side of finding 5's override: a widened span containing a
+        # plain prose label must never overturn a settled authority.
+        "wss://host.example.com:443/v1 failed: user@corp.com",
+        "unix:/tmp/x.sock error: svc@host.com",
+        "ws://host:8765/path failed: could not reach user@relay",
+        "C:/Users/bob connect user@host",
+        "2026-09-17T10:00:00 connect user@host",
+    ),
+    ids=str,
+)
+def test_round8_override_widening_does_not_destroy_diagnostics(text):
+    assert redact_uri(text) == text
+
+
+# ---------------------------------------------------------------------------
 # Generated sweep. Round 4's four leaks all lived in combinations no
 # hand-written case covered, so the axes below are swept exhaustively rather
 # than sampled: password delimiter x username shape x digit-first password
 # x scheme-prefixed/bare x host shape.
+#
+# Round 8 added `//` to every scheme axis: the scheme-relative reference had
+# never appeared in any corpus, and it defeated both scheme-less anchors.
 # ---------------------------------------------------------------------------
 
 _PASSWORD_TAILS = (
@@ -818,7 +991,7 @@ def _credential_corpus():
         for head in _PASSWORD_HEADS:
             for tail in _PASSWORD_TAILS:
                 for host in _HOSTS:
-                    for scheme in ("ws://", "wss://", ""):
+                    for scheme in ("ws://", "wss://", "", "//"):
                         for suffix in _SUFFIXES:
                             password = head + tail
                             uri = f"{scheme}{user}:{password}@{host}/"
@@ -880,7 +1053,10 @@ _NON_CREDENTIAL_CORPUS = (
     "ws://host:8765/path failed: could not reach user@relay",
     "wss://stt.internal:2020/v1 failed: could not reach user@relay",
     "wss://[::1]:2020/v1 failed: could not reach user@relay",
-    "ws://host:8765/p/user@y",
+    # Deliberately NOT `ws://host:8765/p/user@y`: a path `@` with a bare
+    # single-label tail is limitation 5, over-redacted since round 8 so that
+    # `ws://user:S3CRETPW/seg@localhost` can be redacted at all. See
+    # `test_authority_path_at_sign_with_a_dotted_tail_is_over_redacted`.
     "ws://host/path?redirect=user@example.org",
     "ws://host/path?redirect=user:pass@example.org",
     "GET https://example.com/api?redirect=user@example.org failed: 502",
@@ -1012,7 +1188,7 @@ def _query_corpus():
     so `localhost:8765/v1?token=...` kept leaking through every sink the
     round-6 fix was written for.
     """
-    for scheme in ("ws://", "wss://", ""):
+    for scheme in ("ws://", "wss://", "", "//"):
         for host in (
             "stt.example.internal:2020",
             "h.local",
@@ -1074,3 +1250,98 @@ def test_strip_query_leaves_an_unparseable_uri_to_redact_uri():
     it rather than being re-rendered from half-parsed components."""
     bad = "ws://u:p@[::1/v1?token=s3cr3t"
     assert strip_query(bad) == bad
+
+
+# ---------------------------------------------------------------------------
+# Round 8. Cross-product fuzz over every axis at once, asserted as loops
+# rather than parametrized cases: ~92k inputs is too many ids for pytest to
+# carry, and the value here is coverage of *combinations*, not per-case
+# reporting. This is what found the last round-8 leak
+# (`ws://user:p/x@localhost?token=T` — a bare host with a query behind it,
+# which `_tail_accepts` branch (c) measured past).
+# ---------------------------------------------------------------------------
+
+_FUZZ_SCHEMES = ("ws://", "wss://", "", "//", "unix:")
+_FUZZ_USERS = ("user", "", "alice@corp.com", "1u")
+_FUZZ_PASSWORDS = (
+    "hunter2",
+    "1234",
+    "AB+cd=",
+    "p/x",
+    "p?q",
+    "p#f",
+    "p:z",
+    "p w",
+    "p ?q",
+    "p /s",
+    "p://t",
+)
+_FUZZ_HOSTS = (
+    "localhost",
+    "host:8765",
+    "h.local",
+    "stt.ex.com:2020",
+    "[::1]:443",
+    "host",
+    "",
+)
+_FUZZ_PATHS = ("", "/", "/v1", "/v1/x")
+_FUZZ_QUERIES = ("", "?token=T", "#f", "?a=1&r=bob@corp.com", "?q@x")
+_FUZZ_SUFFIXES = ("", " failed: admin@example.com", " isn't a valid URI: x")
+
+
+def _is_subsequence(out: str, src: str) -> bool:
+    it = iter(src)
+    return all(ch in it for ch in out)
+
+
+def test_fuzz_output_is_always_a_deletion_of_the_input():
+    """The module's stated invariant, asserted directly: the output is the
+    input with zero or more spans deleted. Nothing is ever rewritten,
+    re-ordered or synthesised — which is what makes "apply exactly once" safe
+    advice rather than a correctness requirement (a second pass can delete a
+    little more, but can never re-expose what the first pass removed)."""
+    checked = 0
+    for parts in itertools.product(
+        _FUZZ_SCHEMES,
+        _FUZZ_USERS,
+        _FUZZ_PASSWORDS,
+        _FUZZ_HOSTS,
+        _FUZZ_PATHS,
+        _FUZZ_QUERIES,
+        _FUZZ_SUFFIXES,
+    ):
+        scheme, user, password, host, path, query, suffix = parts
+        text = f"{scheme}{user}:{password}@{host}{path}{query}{suffix}"
+        checked += 1
+        for rendered in (safe_exc_text(Exception(text)), display_uri(text)):
+            assert _is_subsequence(rendered, text), (text, rendered)
+            # Second pass: still deletion-only, never re-exposure.
+            assert _is_subsequence(display_uri(rendered), rendered), (text, rendered)
+    assert checked > 90_000, checked
+
+
+def test_fuzz_single_token_credentials_never_leak():
+    """The security half. Restricted to credentials that fit in ONE
+    whitespace-delimited token and name a real host: those are unambiguous by
+    construction, so there is no prose reading to trade against and a
+    surviving password is a leak, full stop. (Spaced passwords are
+    limitations 2 and 3 and are swept separately, with their expected outputs
+    rather than a blanket rule.)"""
+    checked = 0
+    for parts in itertools.product(
+        ("ws://", "wss://", "", "//"),
+        _FUZZ_USERS,
+        tuple(p for p in _FUZZ_PASSWORDS if " " not in p),
+        tuple(h for h in _FUZZ_HOSTS if h),
+        _FUZZ_PATHS,
+        _FUZZ_QUERIES,
+    ):
+        scheme, user, password, host, path, query = parts
+        uri = f"{scheme}{user}:{password}@{host}{path}{query}"
+        checked += 1
+        for rendered in (display_uri(uri), safe_exc_text(Exception(uri))):
+            assert password not in rendered, (uri, rendered)
+            if user:
+                assert user not in rendered, (uri, rendered)
+    assert checked > 10_000, checked

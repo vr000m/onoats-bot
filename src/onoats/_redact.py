@@ -10,10 +10,44 @@ message — a raw ``websockets.exceptions.InvalidURI``
 (``f"{uri} isn't a valid URI: {msg}"``) embeds the exact, unredacted connect
 URI the caller typed in, credential and all.
 
+**Why this is a scanner and not a URL parser.** Round 8 re-opened the
+question of replacing the whole module with ``urllib.parse.urlsplit``-first
+parsing, or with a canonical re-render (emit ``scheme://`` plus a
+positively-recognised ``host[:port]`` and drop everything else). Both were
+weighed and both were rejected, for reasons that are properties of the
+*inputs*, not of this implementation:
+
+* ``urlsplit`` cannot see the credentials this module exists for. It reports
+  ``username``/``password`` as ``None`` — silently, without raising — for
+  exactly the malformed shapes that reach here, because an unencoded ``/``,
+  ``?`` or ``#`` in a password ends its netloc early. The module's whole
+  reason to exist is that ``websockets.InvalidURI`` embeds a URI *the parser
+  already refused*. Parsing first would therefore hand the easy, well-formed
+  cases to a parser and leave every hard case on the heuristic path — the
+  hard cases being the only ones that have ever leaked.
+* A canonical re-render does kill the "fabricated host" and "half a password
+  survives" failure modes by construction, and it is genuinely attractive.
+  It does not kill the leak family, because the residual ambiguity is not a
+  boundary problem: ``user:1234`` and ``localhost:8765`` are the same string
+  in the same grammar (limitations 2, 4 and 5 below), so *recognising* the
+  authority needs the same heuristics that *locating* it needs today. It
+  also changes the output contract of every assertion in the generated
+  sweep, which is the only artefact that has ever caught one of these bugs.
+
+What *was* structural about rounds 1-8 is narrower and is fixed here: the
+authority's **start** and its **well-formedness** were each re-derived
+independently at four sites (:func:`_scan`, :func:`_query_cut`,
+:func:`_incumbent_is_settled`, :func:`_not_query_of_path`), and RFC 3986's
+two authority edge cases — a scheme-relative ``//host`` reference (§4.2) and
+an *empty* authority (``ws:///path``) — were handled at none of them. Both
+are now handled once, at :func:`_authority_anchor` and in
+:func:`_query_cut`'s well-formedness test.
+
 **The algorithm.** The credential's *start* is never guessed: it is either
 the character after a ``scheme://`` prefix (the **authority path**) or the
-message's first non-whitespace character (the **bare path**). Only the
-*end* — which ``@`` terminates the userinfo — is in question. So:
+message's first non-whitespace character, advanced past a leading ``//``
+(the **bare path**). Only the *end* — which ``@`` terminates the userinfo —
+is in question. So:
 
 1. Compute the search window: from ``start`` to the first whitespace, then
    widened by at most :data:`_MAX_USERINFO_SPACES` further whitespace-
@@ -41,9 +75,11 @@ All are positive; nothing is accepted by failing to match something else.
   path-bearing span, and prose with no colon at all. The username may be
   empty (``:token@host``) and may itself contain ``@``.
 * :func:`_tail_accepts` — either (a) the token after the ``@`` looks like a
-  URI continuation (it contains ``.``, ``:``, ``/`` or ``[``), or (b) the
+  URI continuation (it contains ``.``, ``:``, ``/`` or ``[``), (b) the
   password is RFC-legal userinfo apart from its spaces
-  (:func:`_password_is_legal_userinfo`).
+  (:func:`_password_is_legal_userinfo`), or (c) the tail is a complete bare
+  reg-name (``localhost``, ``stt-box``) and the ``@`` sits inside the
+  anchor's *own* whitespace-delimited token.
 * :func:`_not_query_of_path` — the text before the first ``?``/``#``, read
   from the **acceptance point** (one past the rightmost ``@`` accepted so
   far, not from the anchor), must not *already* be a well-formed
@@ -95,10 +131,26 @@ implementation, not inherited from an earlier docstring):
 2. Prose of the exact shape ``word:word word@host.tld`` is
    indistinguishable from a real credential by local syntax and *is*
    discarded (``"note:see bob@corp.com"`` -> ``"corp.com"``). Resolved
-   toward redaction because the alternative is a leak.
-3. Conversely, a credential whose password contains ``/`` or ``:`` *and*
-   whose host is a bare single-label name (``user:a/b c@host``) fails both
-   halves of :func:`_tail_accepts` and is not redacted.
+   toward redaction because the alternative is a leak. This covers the case
+   where the ``word:word`` is itself a *settled* authority
+   (``"ws://localhost:8765 retry as admin@corp.com"`` -> ``"ws://corp.com"``,
+   destroying a credential-free diagnostic): the widened span
+   ``8765 retry as admin`` is RFC-legal userinfo, so it is
+   character-for-character the genuine ``ws://user:1234 retry as admin@…``
+   the sweep requires be redacted. Demanding stronger tail evidence to
+   overturn a settled authority would close it, and would simultaneously
+   leak ``ws://user:1234 pw@localhost`` — this project's own canonical
+   endpoint. Round 8 quarantined it on those grounds; see
+   :func:`_scan`'s override rule.
+3. A credential whose password contains ``/``, ``?``, ``#`` or a second
+   ``:`` *and* which crosses a whitespace boundary into a word that is
+   itself plain prose (``user:a/b c@host``) fails every branch of
+   :func:`_tail_accepts` and both halves of :func:`_scan`'s override, and is
+   not redacted. Within a single token the same shape *is* redacted
+   (``ws://user:a/b@localhost``, ``ws://user:1234 /seg@host.tld/v1``), which
+   is the shape an operator actually types; the spaced-plus-illegal
+   combination survives only because the alternative is to delete the
+   trailing half of ordinary diagnostics.
 4. A URI whose query carries an ``@`` but *names no parameter*
    (``wss://localhost:443?bob@corp.com``) is over-redacted to
    ``wss://corp.com``. ``user:1234`` and ``localhost:443`` are the same
@@ -107,10 +159,14 @@ implementation, not inherited from an earlier docstring):
    resolves the rest toward redaction like limitation 2. Every real query
    shape (``?token=…``, ``?redirect=…``) keeps its authority.
 5. A well-formed URI whose ``@`` sits in a *path* segment with no query
-   (``wss://host:443/path/to/a@b.com``) is still over-redacted to
-   ``wss://b.com``: it is character-for-character the same grammar as the
-   genuine ``wss://user:1234/seg@host.tld`` the sweep requires be redacted,
-   so the ambiguity is resolved toward redaction like limitation 2.
+   (``wss://host:443/path/to/a@b.com``, ``ws://host:8765/p/user@y``) is
+   still over-redacted to ``wss://b.com`` / ``ws://y``: it is
+   character-for-character the same grammar as the genuine
+   ``wss://user:1234/seg@host.tld`` and ``ws://user:pw/seg@localhost`` the
+   sweep requires be redacted, so the ambiguity is resolved toward redaction
+   like limitation 2. Round 8 extended this from dotted tails to bare
+   reg-name tails (:func:`_tail_accepts` branch (c)) because ``localhost``
+   is this project's own canonical STT host and had no dot to offer.
 6. A scheme-less credential is redacted, and a scheme-less query stripped,
    only when the URI is the message's **leading** token
    (``user:pw@host/v1?token=…`` yes; ``could not connect:
@@ -122,6 +178,17 @@ implementation, not inherited from an earlier docstring):
    ``f"{uri} isn't a valid URI: {msg}"``) leads with the URI — so the
    exposure is latent, not live. Re-check this limitation before feeding
    :func:`safe_exc_text` an exception type that embeds a URI mid-sentence.
+   A leading ``//`` (RFC 3986 §4.2 scheme-relative reference) counts as the
+   leading token and is anchored past — see :func:`_authority_anchor`.
+
+**Apply exactly once.** Every entry point here is idempotent in the sense
+that matters — a second pass can never re-expose a span the first pass
+deleted — but it is *not* a fixed point: re-feeding an already-redacted
+string can delete a little more, because deleting a credential can leave a
+shape the scanner reads as a new one (300k-case fuzz confirms deletion-only,
+never re-exposure). No call site double-applies; :func:`display_uri` is the
+one composition of the two steps, and it is the only thing display sites
+call.
 
 The generated sweep in ``tests/test_redact.py``, not this docstring, is the
 specification.
@@ -192,6 +259,31 @@ _HOST_CONTINUATION = frozenset(".:/[")
 # widening is what repeatedly destroyed credential-free diagnostic text and
 # fabricated fake hosts.
 _MAX_USERINFO_SPACES = 2
+
+
+def _authority_anchor(text: str, start: int) -> int:
+    """Advance a scheme-less anchor past a leading ``//``.
+
+    RFC 3986 §4.2: a relative reference beginning ``//`` is
+    *scheme-relative*, and its authority starts two characters in.
+    ``//user:pass@host:8765/v1?token=…`` therefore defeated **both**
+    scheme-less anchors at once, from one cause measured in two places: the
+    credential scan rejected every candidate because ``//user`` carries a
+    ``/`` in the username span (`_is_userinfo_shaped`), and the query strip
+    found `_AUTHORITY_STOP_RE` matching at offset zero, so the authority
+    span it tested was empty. Advancing the anchor once, here, fixes both.
+
+    Only a genuine authority is stepped over: ``// note: see bob@corp.com``
+    (a comment, or prose) has whitespace after the slashes, and ``///x`` has
+    a third, so neither is advanced and both keep the pre-existing
+    prose-safe behaviour.
+    """
+    if not text.startswith("//", start):
+        return start
+    nxt = start + 2
+    if nxt >= len(text) or text[nxt].isspace() or text[nxt] == "/":
+        return start
+    return nxt
 
 
 def _first_stop(text: str, start: int, pattern: re.Pattern[str], limit: int) -> int:
@@ -392,28 +484,97 @@ def _not_query_of_path(text: str, start: int, origin: int, at: int) -> bool:
     dotted = _DOTTED_HOST_PORT_RE.fullmatch(text, origin, authority_stop) is not None
     if dotted and slash != -1:
         return False
+    if not dotted and slash == -1 and origin == start:
+        # Weakest possible authority: a single label, no path, nothing but a
+        # `?` behind it — and *nothing accepted yet*, so this span is still
+        # the raw anchor. `user:1234` is that shape and so is
+        # `localhost:8765`, and no local syntax separates them, but
+        # `ws://user:1234?x=1@host.example.com/v1` is a real credential whose
+        # password merely happens to open a `key=value` run, so the `=`
+        # evidence is not strong enough to veto on its own here.
+        #
+        # `origin == start` is what keeps that from re-opening the round-7
+        # class. Once an `@` has been accepted the span is no longer a
+        # userinfo candidate at all — it is the authority the credential
+        # pointed at (`ws://user:pass@localhost:8765?r=bob@corp.com`) — and
+        # a single label with a real port is then exactly as good a host as
+        # a dotted one, which `_SINGLE_LABEL_PORT_RE` says elsewhere.
+        return True
+    tail_end = _first_stop(text, at + 1, _WHITESPACE_RE, len(text))
+    if (
+        _HOST_PORT_RE.fullmatch(text, at + 1, tail_end) is not None
+        and _DOTTED_HOST_PORT_RE.fullmatch(text, at + 1, tail_end) is None
+    ):
+        # The `@` is followed by a *dotless* reg-name (`@localhost`,
+        # `@stt-box:8765`). Every shape this veto exists to protect ends in
+        # an email address, and an email address has a dotted domain; a
+        # query value that ends at an `@` followed by a bare single label is
+        # not a query value at all. Found by round 8's own generated sweep:
+        # `ws://alice@corp.com:1234?a=1@localhost` presents `corp.com:1234`
+        # as a dotted authority with a `key=value` query behind it — exactly
+        # `ws://alice@corp.com:hunter2@host.example.com:443?r=bob@corp.com`,
+        # which must keep its host — and the tail is the only thing that
+        # tells them apart.
+        return True
     return "=" not in text[query.start() + 1 : at]
 
 
-def _tail_accepts(text: str, start: int, at: int, outer_stop: int) -> bool:
+def _tail_accepts(
+    text: str, start: int, at: int, outer_stop: int, first_ws: int
+) -> bool:
     """Positive evidence that the ``@`` at `at` really terminates userinfo.
 
     Required for every candidate past the authority's own `/?#`-or-
     whitespace boundary — i.e. for exactly the malformed shapes a
     well-formed-URI parser cannot handle. Either:
 
-    (a) the token after the ``@`` continues a URI (`_HOST_CONTINUATION`), or
-    (b) the password is RFC-legal userinfo apart from its spaces.
+    (a) the token after the ``@`` continues a URI (`_HOST_CONTINUATION`),
+    (b) the password is RFC-legal userinfo apart from its spaces, or
+    (c) the tail is a complete bare reg-name and the ``@`` is inside the
+        anchor's own whitespace-delimited token.
 
     A prose span such as ``"2026-09-17T10:00:00 connect user@host"`` fails
-    both — a bare ``host`` tail, and a password (``"00:00 connect user"``)
-    carrying a second colon.
+    all three — a bare ``host`` tail, a password (``"00:00 connect user"``)
+    carrying a second colon, and an ``@`` three words downstream of the
+    anchor.
+
+    Branch (c) is round 8's. A bare reg-name is a perfectly legal RFC 3986
+    host, and ``localhost`` — this project's own canonical STT endpoint —
+    is one, so ``ws://user:S3CRETPW/seg@localhost`` and
+    ``ws://user:pw?q@localhost`` (password characters that end the authority
+    early, against a host with no dot, no port and no path) satisfied
+    neither (a) nor (b) and were emitted verbatim, credential and all. With
+    trailing prose they were worse than verbatim: the scan fell through to
+    the prose's own ``@`` and fabricated a host from it.
+
+    `first_ws` is what keeps (c) from swallowing diagnostics. Inside one
+    token ``user:pw/seg@localhost`` has no prose reading; across a space it
+    has almost nothing else, and every credential-free shape the sweep
+    protects (``"Error: connect to user@host"``,
+    ``"C:/Users/bob connect user@host"``) puts its ``@`` in a later word.
+    The price is limitation 5, now extended to bare tails: a well-formed
+    ``ws://host:8765/p/user@y`` is over-redacted to ``ws://y``, because it
+    is the same string grammar.
     """
     tail_end = _first_stop(text, at + 1, _WHITESPACE_RE, outer_stop)
     tail = text[at + 1 : tail_end]
     if tail and any(ch in _HOST_CONTINUATION for ch in tail):
         return True
-    return _password_is_legal_userinfo(text, start, at)
+    if _password_is_legal_userinfo(text, start, at):
+        return True
+    # Branch (c) measures the tail to the *authority's* own terminator, not
+    # to the whitespace branch (a) uses: `ws://user:p/x@localhost?token=T`
+    # has a bare host AND a query, and bounding at the whitespace made the
+    # tail `localhost?token=T`, which no `host[:port]` can fullmatch — so the
+    # credential was emitted verbatim with its own query behind it. Found by
+    # round 8's fuzz over the cross product, not by a hand-written case.
+    host_end = _first_stop(text, at + 1, _AUTHORITY_STOP_RE, outer_stop)
+    return (
+        at < first_ws
+        and host_end > at + 1
+        and _HOST_PORT_RE.fullmatch(text, at + 1, host_end) is not None
+        and _is_userinfo_shaped(text, start, at)
+    )
 
 
 def _password_is_legal_userinfo(text: str, start: int, at: int) -> bool:
@@ -429,6 +590,35 @@ def _password_is_legal_userinfo(text: str, start: int, at: int) -> bool:
         return False
     password = text[colon + 1 : at]
     return bool(password) and not any(ch in _PASSWORD_ILLEGAL for ch in password)
+
+
+def _widened_span_is_not_prose(text: str, first_ws: int, at: int) -> bool:
+    """Is every word the widening added to the password *not* a prose word?
+
+    The second way a candidate may overturn a settled authority, alongside
+    `_password_is_legal_userinfo`. That one asks whether the password is
+    RFC-legal, which a password cannot be once an unencoded ``/``, ``?``,
+    ``#`` or second ``:`` is what ended the authority early — precisely the
+    malformed shape this module exists for. So
+    ``ws://user:1234 /seg@host.example.com/v1`` had its real credential
+    refused and ``user:1234 /seg`` emitted verbatim: ``user:1234`` is a
+    complete ``host:port`` and therefore "settled", and the password's ``/``
+    disqualified the only override there was.
+
+    The evidence here is the widened words themselves. A word carrying a
+    URI-structural character (``/ ? # : [ ] @``) is not a word that appears
+    in a sentence; a bare label (`_BARE_LABEL_RE`) is. Requiring *every*
+    added word to be structural keeps the diagnostics the sweep protects —
+    ``"wss://host.example.com:443/v1 failed: user@corp.com"`` adds
+    ``failed:`` (structural) and ``user`` (a plain label), so the override
+    stays refused and the authority stands.
+    """
+    if at <= first_ws:
+        return False
+    words = text[first_ws:at].split()
+    if not words:
+        return False
+    return not any(_BARE_LABEL_RE.fullmatch(word) for word in words)
 
 
 def _search_window(text: str, start: int, outer_stop: int) -> tuple[int, int, int]:
@@ -464,9 +654,18 @@ def _scan(text: str, start: int, outer_stop: int, *, bare: bool) -> int | None:
     *settled*, a candidate from a later whitespace-delimited word may only
     overturn it with evidence that does not come from the prose it sits in:
     a password that is self-evidently RFC-legal userinfo
-    (`_password_is_legal_userinfo`). `_tail_accepts` branch (a)'s "the next
-    word looks like a host" is not enough, because every email address in
-    every diagnostic satisfies it.
+    (`_password_is_legal_userinfo`), or a widened span made entirely of
+    words no sentence would contain (`_widened_span_is_not_prose`).
+    `_tail_accepts` branch (a)'s "the next word looks like a host" is not
+    enough, because every email address in every diagnostic satisfies it.
+
+    Neither override can distinguish ``ws://localhost:8765 retry as
+    admin@corp.com`` (credential-free prose, destroyed) from
+    ``ws://user:1234 retry as admin@corp.com`` (a real credential): the two
+    are the same string in the same grammar. Round 8 considered demanding a
+    dotted or ported tail before overturning a settled authority, which
+    closes the first — and opens ``ws://user:1234 pw@localhost``, a leak
+    against this project's own canonical host. Kept as limitation 2.
 
     Settledness is **one** question asked of whichever authority is current,
     re-answered — not accumulated — each time the current authority changes.
@@ -514,7 +713,7 @@ def _scan(text: str, start: int, outer_stop: int, *, bare: bool) -> int | None:
         elif not (
             _is_userinfo_shaped(text, start, at)
             and _not_query_of_path(text, start, origin, at)
-            and _tail_accepts(text, start, at, outer_stop)
+            and _tail_accepts(text, start, at, outer_stop, first_ws)
         ):
             continue
         if best is not None:
@@ -523,6 +722,7 @@ def _scan(text: str, start: int, outer_stop: int, *, bare: bool) -> int | None:
             settled
             and at >= first_ws
             and not _password_is_legal_userinfo(text, start, at)
+            and not _widened_span_is_not_prose(text, first_ws, at)
         ):
             continue
         best = at
@@ -553,7 +753,7 @@ def _redact_text(text: str) -> str:
     # character, and bounded by the first *genuine* `scheme://` occurrence.
     # An unanchored bare search would read any `user@host`-shaped substring
     # anywhere in a message as a credential.
-    stripped_offset = n - len(text.lstrip())
+    stripped_offset = _authority_anchor(text, n - len(text.lstrip()))
     bare_outer_stop = _next_uri_boundary(text, stripped_offset, n)
     at = _find_bare_credential(text, stripped_offset, bare_outer_stop)
     if at is not None:
@@ -642,6 +842,16 @@ def _query_cut(
             text, authority_start, authority_stop, cut, token_end
         ):
             return None
+    elif authority_stop == authority_start:
+        # An *empty* authority (`ws:///v1?token=…`, `ws://?token=…`) is
+        # well-formed RFC 3986, not a truncated one: `authority_stop` can
+        # only land on `/`, `?` or `#` here (whitespace is `token_end`), and
+        # a zero-length span cannot hold userinfo, so there is no password
+        # for the `?` to belong to. `_HOST_PORT_RE` requires at least one
+        # character, so it read this as truncation and let the query through
+        # — verified against the real `websockets.uri.parse_uri`, which
+        # raises `InvalidURI` on exactly this shape and embeds the token.
+        pass
     elif _HOST_PORT_RE.fullmatch(text, authority_start, authority_stop) is None:
         return None
     return cut, token_end
@@ -671,15 +881,16 @@ def _strip_query_spans(text: str) -> str:
     n = len(text)
     out: list[str] = []
     cursor = 0
-    stripped_offset = n - len(text.lstrip())
+    lead = n - len(text.lstrip())
     # The scheme-less anchor exists only when the leading token is *not*
     # itself a `scheme://` URI — that one belongs to the loop below. Beyond
     # that single question the anchor is bounded by its own token
-    # (`_query_cut`), never by `_next_uri_boundary`.
+    # (`_query_cut`), never by `_next_uri_boundary`. `_authority_anchor`
+    # steps it past a leading `//`, whose authority starts two characters in.
     bare = (
         None
-        if _SCHEME_PREFIX_RE.match(text, stripped_offset) is not None
-        else _query_cut(text, stripped_offset, n, bare=True)
+        if _SCHEME_PREFIX_RE.match(text, lead) is not None
+        else _query_cut(text, _authority_anchor(text, lead), n, bare=True)
     )
     if bare is not None:
         cut, cursor = bare
