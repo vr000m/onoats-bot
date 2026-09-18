@@ -1274,3 +1274,72 @@ def test_graceful_close_does_not_mistake_the_readers_cancellation_for_its_own(
     assert svc._connected is False
     # The transport close still ran, despite the reader's cancellation.
     assert _FakeClient.instances[-1].closed is True
+
+
+# ---------------------------------------------------------------------------
+# Round-9 regressions.
+# ---------------------------------------------------------------------------
+
+
+def test_graceful_close_has_no_live_reader_at_the_transport_close(monkeypatch):
+    """Round 9 reported this path as a leak of the "cancel, then join"
+    discipline its two siblings follow — it cancels the reader and walks
+    straight on to the transport close with no join. Investigated and found
+    NOT to be a bug: `asyncio.wait_for` cancels the awaitable it wraps and
+    awaits that cancellation to completion before raising `TimeoutError`, and
+    cancelling a `gather` cancels its children, so the reader is already
+    joined by then even when its own cleanup is slow. The `.cancel()` that
+    follows is a defensive no-op.
+
+    The test stays because the *property* is worth pinning even though the
+    reported fix was not needed: no reader may still be live on the client at
+    the instant that client is released. It is `wait_for`'s cancellation
+    semantics that supply it here, so a refactor away from `wait_for` — the
+    realistic way this would actually break — trips this rather than shipping
+    the bug the finding described.
+    """
+    monkeypatch.setattr(wss_module, "_READER_JOIN_TIMEOUT_SEC", 0.05)
+    _install_fake_client_factory(monkeypatch, lambda: None)
+
+    class _NeverAckingCloseClient(_FakeClient):
+        async def close_session(self):
+            # No `session.closed` ack, so the reader never breaks on its own
+            # and the bounded join below times out — the path under test.
+            self.session_closed = True
+
+    monkeypatch.setattr(
+        wss_module, "TranscriptionClient", lambda **kw: _NeverAckingCloseClient(**kw)
+    )
+    svc = _make_service()
+
+    observed: list[bool] = []
+
+    async def _run():
+        await svc._ensure_connected()
+        reader = svc._reader_task
+        assert reader is not None
+        real_close_quietly = wss_module._closing.close_quietly
+
+        async def _spy(*args, **kwargs):
+            observed.append(reader.done())
+            return await real_close_quietly(*args, **kwargs)
+
+        monkeypatch.setattr(wss_module._closing, "close_quietly", _spy)
+        await svc._graceful_close()
+        return reader, observed
+
+    reader, observed = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    # Asserted at the moment the TRANSPORT close begins, not after
+    # `_graceful_close` returns: by then the loop has run the cancelled task
+    # anyway, so a post-hoc `reader.done()` passes either way and proves
+    # nothing. The invariant is that no reader is still live on the client at
+    # the instant that client is released.
+    assert observed and observed[-1] is True, (
+        f"a reader is still live at the transport close: reader.done() at "
+        f"each close_quietly call = {observed}"
+    )
+    assert reader.done()
+    assert svc._client is None
+    assert svc._draining_client is None
+    assert svc._connected is False
+    assert _FakeClient.instances[-1].closed is True

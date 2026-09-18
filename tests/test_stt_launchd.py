@@ -205,8 +205,40 @@ def test_cooldown_is_keyed_per_label():
     assert launchd._cooldown_elapsed("label-b", clock=lambda: 0.0) is True
 
 
-def test_kickstart_cooldown_sec_constant_is_30():
-    assert launchd.KICKSTART_COOLDOWN_SEC == 30
+def test_kickstart_cooldown_covers_the_full_reconnect_cycle():
+    """Round-9 finding: the cooldown was pinned at 30 by a bare value
+    assertion, and 30 was derived from the reconnect backoff *sleeps* alone
+    (~15.5s). The sleeps are one term of three. Against the wedged-server
+    case a kickstart is the response to, every attempt also spends
+    `_CONNECT_TIMEOUT_SECONDS` on the handshake and up to
+    `_closing.CLOSE_TIMEOUT_SEC` tearing the dead client down in
+    `_discard_stale`, so the real cycle runs 45.5-75.5s — and a 30s cooldown
+    expires halfway through it, letting the cycle's own later attempts arm a
+    second kickstart and SIGKILL a server still warming up from the first.
+
+    Pinned as the derivation rather than the number, because the number was
+    only ever wrong in the first place for having no derivation attached.
+    `launchd.py` is a leaf module and must not import the STT service, so
+    this test is the lockstep: it imports both sides and fails if either
+    constant drifts out from under the comment.
+    """
+    from onoats import _closing
+    from onoats.stt import websocket_stt_service as wss
+
+    attempts = 1 + len(wss._RECONNECT_BACKOFF_SECONDS)
+    worst_case = (
+        sum(wss._RECONNECT_BACKOFF_SECONDS)
+        + attempts * wss._CONNECT_TIMEOUT_SECONDS
+        + attempts * _closing.CLOSE_TIMEOUT_SEC
+    )
+    assert launchd.KICKSTART_COOLDOWN_SEC > worst_case, (
+        f"KICKSTART_COOLDOWN_SEC={launchd.KICKSTART_COOLDOWN_SEC} does not "
+        f"outlast one full reconnect cycle ({worst_case}s), so a cycle can "
+        "re-kickstart a server it is still waiting on."
+    )
+    # The confirm window must in turn outlast the cooldown: a recovery
+    # confirmed after the cooldown has already lapsed cannot reset it.
+    assert launchd.KICKSTART_CONFIRM_WINDOW_SEC > launchd.KICKSTART_COOLDOWN_SEC
 
 
 # ---------------------------------------------------------------------------

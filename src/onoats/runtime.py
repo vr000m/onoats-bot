@@ -442,6 +442,14 @@ _PREFLIGHT_RETRY_TIMEOUT_SEC = 3.0
 # below, which skips the attempt outright once even this floor can't be met).
 _MIN_CONNECT_ATTEMPT_TIMEOUT_SEC = 0.05
 
+# How long the preflight's final teardown may spend on a client whose connect
+# has already failed. Small on purpose: the `SttPreflightError` the caller is
+# about to see quotes `total_budget`, and it cannot be raised until the
+# teardown returns, so every second spent here is a second the user waits
+# past a number the message told them to expect. A close against a server
+# that would not complete a handshake has nothing to accomplish.
+_FAILED_TEARDOWN_BUDGET_SEC = 0.5
+
 # Post-kickstart retry budget. Deliberately NOT the `_PREFLIGHT_RETRY_*`
 # constants above: those were sized for "already running but slow to answer",
 # a different scenario from "the process was just SIGKILLed and is reloading a
@@ -990,8 +998,9 @@ async def _preflight_stt_ws(
     _pre_kickstart_deadline = loop.time() + total_budget
     # Which closers the `finally` below owes this client. Every exit from the
     # `try` other than a `break` is a raise from a failed/timed-out
-    # `connect()`, which leaves no session to close; only the two `break`s
-    # hand `finally` a live one.
+    # `connect()`, which leaves no session to close; only the three `break`s
+    # (the fast-path one and the two post-kickstart recovery ones) hand
+    # `finally` a live one.
     connected = False
     try:
         for idx, (timeout_s, delay_s) in enumerate(attempts):
@@ -1001,9 +1010,22 @@ async def _preflight_stt_ws(
             if idx > 0:
                 # `TRANSPORT_ONLY`: this client's `connect()` failed on the
                 # previous attempt, so it has no session. See `_closing`.
+                #
+                # The deadline RESERVES this attempt's own connect timeout
+                # rather than handing the teardown everything that is left.
+                # Capping at `_pre_kickstart_deadline` looks conservative and
+                # is the opposite: against a wedged server the close hangs
+                # until the deadline, `remaining` then comes back at ~0, and
+                # the `timeout_s <= _MIN_CONNECT_ATTEMPT_TIMEOUT_SEC` branch
+                # below raises "budget exhausted before a connect attempt
+                # could be made" — so the retry this whole schedule exists
+                # for never issues a second connect, in exactly the cold-start
+                # case it is meant to cover. `close_quietly` floors an already
+                # expired deadline at `MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`, so the
+                # teardown still gets a real (if tiny) attempt.
                 await _closing.close_quietly(
                     client,
-                    deadline=_pre_kickstart_deadline,
+                    deadline=_pre_kickstart_deadline - timeout_s,
                     closers=_closing.TRANSPORT_ONLY,
                 )
                 client = _make_client()
@@ -1183,9 +1205,21 @@ async def _preflight_stt_ws(
         # never reached a session, and `close_session` would spend the shared
         # budget hanging against the wedged server before `close` — the call
         # that releases the FD — gets its turn.
+        #
+        # Bounded on the FAILURE path only. The success path keeps the full
+        # graceful close it has always had. The failure path was left
+        # unbounded on the reasoning that "the outcome is already decided" —
+        # but the outcome being decided is precisely why the user is still
+        # waiting: the `SttPreflightError` quotes `total_budget` (~6s) and
+        # cannot be raised until this returns, so a close hanging its default
+        # 5s against the same wedged server that just failed the connect made
+        # the measured wall clock ~11s for an error that says 6.0s. Nothing
+        # useful can happen in a close against a server that would not
+        # complete a handshake; the FD goes with the process either way.
         await _closing.close_quietly(
             client,
             closers=_closing.FULL_CLOSERS if connected else _closing.TRANSPORT_ONLY,
+            deadline=(None if connected else loop.time() + _FAILED_TEARDOWN_BUDGET_SEC),
         )
 
     _preflight_cache[key] = recovered_message
@@ -2074,7 +2108,17 @@ def _write_status_stopped(
             last_error=last_error,
             supervisor_rc=supervisor_rc,
         )
-    except OSError as exc:
+    except Exception as exc:
+        # Not `except OSError`. This runs in the single-writer shutdown tail,
+        # before the pid file is removed — if it raises, the pid file survives
+        # a stopped session and every later `onoats status` reads a live
+        # recorder that is not there. `write_stopped` reads the existing
+        # record first, and `read_status`'s "never an exception" contract has
+        # been broken by a `ValueError` subclass before (`UnicodeDecodeError`
+        # on a mojibake status file); `json.dumps` can raise `TypeError` on a
+        # field a future `StatusRecord` adds. Neither is an `OSError`. The
+        # shutdown tail's job is to finish, so the net is the exception
+        # hierarchy, not one branch of it.
         logger.warning(f"Could not write status file (stop): {exc}")
 
 

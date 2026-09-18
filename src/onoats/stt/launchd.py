@@ -69,10 +69,29 @@ _KICKSTART_TIMEOUT_SEC = 5
 # prepend. ``/bin/launchctl`` is the shipped location on every supported macOS.
 _LAUNCHCTL = "/bin/launchctl"
 
-# Must exceed WebSocketSTTService's live reconnect backoff total (~15.5s,
-# see websocket_stt_service.py's `_RECONNECT_BACKOFF_SECONDS` comment) plus
-# margin, so a kickstart's own retry window can never itself trigger a
-# second kickstart.
+# Must exceed WebSocketSTTService's whole live reconnect *cycle*, so a
+# kickstart's own retry window can never itself trigger a second kickstart.
+#
+# Round 9: this used to be derived from the backoff sleeps alone (~15.5s,
+# `_RECONNECT_BACKOFF_SECONDS`) and set to 30. The sleeps are one term of
+# three. Against the case this cooldown exists for — a server that accepts
+# the socket and then wedges, which is exactly what a kickstart is a response
+# to — each of the six attempts also spends `_CONNECT_TIMEOUT_SECONDS` (5s)
+# on the handshake and up to `_closing.CLOSE_TIMEOUT_SEC` (5s) tearing the
+# dead client down in `_discard_stale`:
+#
+#     15.5 (sleeps) + 6 * 5.0 (connect) + 6 * 5.0 (teardown)  =  75.5s
+#
+# with a floor of 45.5s when every teardown returns instantly. A 30s cooldown
+# expires roughly halfway through that cycle, so the cycle's own later
+# attempts could arm a second kickstart and SIGKILL a server still warming up
+# from the first — the failure mode the cooldown is the only guard against.
+#
+# Not computed by importing those constants: this module is a leaf about
+# launchctl and must not depend on the STT service. The arithmetic is pinned
+# instead by `tests/test_stt_launchd.py::
+# test_kickstart_cooldown_covers_the_full_reconnect_cycle`, which imports
+# both sides and fails if either drifts.
 #
 # Deep-review finding: this window does NOT uniformly hold for the full 30s
 # across the preflight/live handoff. `mark_unhealthy` is deliberately never
@@ -85,7 +104,7 @@ _LAUNCHCTL = "/bin/launchctl"
 # `reset_cooldown` exists to detect. Only a *live-path* kickstart (which does
 # register the kickstarting instance as unhealthy) is actually held to the
 # full window until every registered instance confirms.
-KICKSTART_COOLDOWN_SEC = 30
+KICKSTART_COOLDOWN_SEC = 90
 
 # How long after a kickstart a subsequent successful connect may still be
 # attributed to it ("server restarted automatically" + arm the transcript

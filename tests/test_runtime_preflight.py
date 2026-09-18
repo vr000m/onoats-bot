@@ -2188,3 +2188,113 @@ def test_successful_preflight_still_closes_the_session(monkeypatch):
     inst = _FakeClient.instances[0]
     assert inst.session_closed is True
     assert inst.closed is True
+
+
+# ---------------------------------------------------------------------------
+# Round 9 — the two teardowns that spent the user's wall clock
+# ---------------------------------------------------------------------------
+
+
+def test_intermediate_teardown_reserves_the_retrys_own_connect_budget(monkeypatch):
+    """Round-9 finding: the inter-attempt teardown was capped by the ENTIRE
+    remaining pre-kickstart budget, which looks conservative and is the
+    opposite. Against a wedged server — the cold-start case this two-attempt
+    schedule exists for — the close hangs until the deadline, `remaining`
+    comes back at ~0, and the `_MIN_CONNECT_ATTEMPT_TIMEOUT_SEC` branch then
+    raises "budget exhausted before a connect attempt could be made". So the
+    retry never issued a second connect at all: the whole schedule degraded to
+    one attempt plus a long hang.
+
+    The teardown now reserves the upcoming attempt's own timeout. Its cap is
+    the leftover, floored by `close_quietly` at
+    `MIN_CLOSE_ATTEMPT_TIMEOUT_SEC`, so the close still gets a real attempt.
+    """
+    monkeypatch.setattr(runtime, "_PREFLIGHT_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_TIMEOUT_SEC", 0.2)
+
+    created: list[object] = []
+
+    class _WedgedThenRefused:
+        """Attempt 1 fails fast and then hangs on close, exactly as a close
+        against an unreachable peer does. Attempt 2 must still get a real
+        connect call."""
+
+        def __init__(self, **kwargs):
+            self.index = len(created)
+            created.append(self)
+            self.connect_calls = 0
+
+        async def connect(self):
+            self.connect_calls += 1
+            raise TimeoutError("wedged")
+
+        async def close_session(self):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            await asyncio.sleep(3600)
+
+    import stt_server.client as stt_client
+
+    monkeypatch.setattr(
+        stt_client, "TranscriptionClient", lambda **kw: _WedgedThenRefused(**kw)
+    )
+
+    with pytest.raises(SttPreflightError) as exc_info:
+        asyncio.run(
+            asyncio.wait_for(
+                _preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock"), timeout=20
+            )
+        )
+
+    assert len(created) == 2
+    # The point of the fix: attempt 2 actually happened.
+    assert created[1].connect_calls == 1
+    # And it is reported as a handshake timeout, not as budget exhaustion.
+    assert "budget exhausted" not in str(exc_info.value)
+
+
+def test_failed_preflight_teardown_does_not_outlast_the_quoted_budget(monkeypatch):
+    """Round-9 finding: the `finally` teardown was left unbounded on the
+    reasoning that "the outcome is already decided". The outcome being decided
+    is precisely why the user is still waiting — the `SttPreflightError` quotes
+    `total_budget` and cannot be raised until this returns, so a close hanging
+    its default 5s against the same wedged server that just failed the connect
+    made the measured wall clock ~11s for an error that says 6.0s. The success
+    path keeps its full graceful close; only the failure path is bounded."""
+    monkeypatch.setattr(runtime, "_PREFLIGHT_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
+    monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(runtime, "_FAILED_TEARDOWN_BUDGET_SEC", 0.3)
+
+    class _HangsOnClose:
+        def __init__(self, **kwargs):
+            pass
+
+        async def connect(self):
+            raise TimeoutError("wedged")
+
+        async def close_session(self):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            await asyncio.sleep(3600)
+
+    import stt_server.client as stt_client
+
+    monkeypatch.setattr(
+        stt_client, "TranscriptionClient", lambda **kw: _HangsOnClose(**kw)
+    )
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(SttPreflightError):
+            await _preflight_stt_ws(_kwargs(), "unix:/tmp/stt.sock")
+        return loop.time() - started
+
+    elapsed = asyncio.run(asyncio.wait_for(_run(), timeout=20))
+    # Budget is ~0.1s. Unbounded, the final teardown alone added
+    # `_closing.CLOSE_TIMEOUT_SEC` (5s) on top.
+    assert elapsed < 2.0, elapsed

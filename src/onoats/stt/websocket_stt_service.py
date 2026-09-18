@@ -936,6 +936,19 @@ class WebSocketSTTService(SegmentedSTTService):
                         timeout=_READER_JOIN_TIMEOUT_SEC,
                     )
                 except TimeoutError:
+                    # No join follows, unlike `_discard_stale` and
+                    # `_cancel_and_close`, and the asymmetry is apparent
+                    # rather than real: `asyncio.wait_for` cancels the
+                    # awaitable it wraps and **awaits that cancellation to
+                    # finish** before raising `TimeoutError`, and cancelling a
+                    # `gather` cancels its children — so `reader` is already
+                    # done and joined by the time this line runs, even when
+                    # its own cancellation cleanup is slow. The siblings need
+                    # an explicit join because their `.cancel()` is
+                    # standalone; here it is a defensive no-op on an
+                    # already-cancelled task. Pinned by
+                    # `test_graceful_close_has_no_live_reader_at_the_transport_close`,
+                    # which is what a refactor away from `wait_for` would trip.
                     reader.cancel()
                 except asyncio.CancelledError as exc:
                     # `ledger.remember`, not `ledger.attempt`: this step
