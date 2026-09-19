@@ -281,8 +281,8 @@ Context lifecycle — what enters context at each step, and whether it clears or
 - [x] Supervisor-level regression test extending `tests/test_socket_supervisor.py`: an stt-branch warning set concurrently with mic zero-run-warning/zero-run-clear events survives the migration to `set_warning_branch()`
 - [x] Test that the preflight-path recovery warning survives `_write_status_running` via the new `warning=` keyword-argument (not just that `set_warning_branch()` was called somewhere) — `tests/test_runtime_preflight.py` (superseded across rounds by the single-writer fix in round 2 finding 5; still covered by an equivalent regression test)
 - [x] Config precedence tests for `stt_launchd_label` in `tests/test_stt_config_wiring.py`: absent → `None`; config.toml only; env only; env overrides config.toml
-- [ ] Manual/E2E check of the Python self-healing path (not just mocked units): kill/bootout the STT launchd job before `onoats bot` starts → preflight recovers, `stt:` warning visible in `onoats status`; kill mid-session → exactly one kickstart, warning sets then clears on the next transcript
-- [ ] Manual check with `launchctl print gui/$UID/<label>` before/after a hand-run `kickstart -k`, confirming it restarts a wedged-but-running job and bypasses `ThrottleInterval` backoff (Requirements) — record in `## Findings`
+- [ ] **Not tested.** Manual/E2E check of the Python self-healing path (not just mocked units): kill/bootout the STT launchd job before `onoats bot` starts → preflight recovers, `stt:` warning visible in `onoats status`; kill mid-session → exactly one kickstart, warning sets then clears on the next transcript. Left unverified — merging without it; unit/integration test coverage for the underlying logic is otherwise complete (6540 passing).
+- [ ] **Not tested.** Manual check with `launchctl print gui/$UID/<label>` before/after a hand-run `kickstart -k`, confirming it restarts a wedged-but-running job and bypasses `ThrottleInterval` backoff (Requirements). Left unverified — merging without it.
 - [x] Manual spike + verification of Phase 5 (native), core path — 2026-09-19: `make -C native install` built and linked cleanly (first real build, previously only `swiftc -typecheck`-checked); `[app].launch_at_login = true` registered via `SMAppService` (macOS "Login Item Added" notification confirmed, no `.requiresApproval` friction for this self-signed/non-notarized bundle); toggling to `false` and relaunching unregistered it; a real reboot with the key set to `true` confirmed Onoats.app launches automatically at login. See `## Findings` for the recorded result.
 - [ ] Phase 5 edge cases not yet exercised: `.requiresApproval` hint when the login item is explicitly denied in System Settings; `[app].launch_at_login` absent with a login item already registered out-of-band (confirm no action taken); `[app].launch_at_login` set to a non-bare-boolean value (e.g. Python-style `True`, confirm treated as absent)
 
@@ -316,7 +316,7 @@ Context lifecycle — what enters context at each step, and whether it clears or
 - Tests passing
 - Documentation updated
 
-<!-- reviewed: 2026-09-19 @ 4a52de4d72902932e1e327e9483a8b31e3ed0073 -->
+<!-- reviewed: 2026-09-19 @ afb5a85c2ca30d6c9f08f07dab391064af22b21b -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
