@@ -6,13 +6,59 @@ import AppKit
 import CoreAudio
 import SwiftUI
 
+/// App-lifecycle state that belongs to the launch itself, not to the recorder.
+///
+/// The login-item sync is an "every launch" checkpoint (dev plan Phase 5): it
+/// reconciles `config.toml`'s `launch_at_login` against `SMAppService`'s actual
+/// registration once, at startup. It has no relationship to recorder state, and
+/// living on `RecorderModel` — whose job is consuming the status file and
+/// backstopping pid-file liveness — was justified only by that class happening
+/// to be constructed once at startup. That is a coincidence of construction
+/// timing, not an ownership claim, and it put an unrelated `@Published` field
+/// in front of every view that observes recorder state.
+///
+/// Owned by `OnoatsMenuBarApp` via `@StateObject`, so it is created exactly
+/// once for the app's lifetime — the same "every launch" guarantee, from the
+/// object that actually represents the launch.
+@MainActor
+final class LaunchState: ObservableObject {
+    /// Login-item registration hint — set once at launch by
+    /// `LoginItemManager.sync()`, e.g. `.requiresApproval` or a registration
+    /// failure. nil once `launch_at_login` is absent, matches the registered
+    /// state already, or was never configured.
+    @Published var loginItemHint: String?
+
+    init() {
+        // `SMAppService`'s `.status`/`.register()`/`.unregister()` are
+        // synchronous XPC round-trips to the background-task-management daemon
+        // (up to 3 blocking calls) — right at login, when that daemon is
+        // busiest. Run off the main actor so a slow daemon can't stall the menu
+        // bar's first render; hop back only to publish the result.
+        Task.detached { [weak self] in
+            let hint = LoginItemManager.sync()
+            guard let self else { return }
+            await self.applyLoginItemHint(hint)
+        }
+    }
+
+    /// Publishes the login-item sync result. A dedicated `@MainActor`-isolated
+    /// method (rather than an inline `MainActor.run { self?...}` closure) so
+    /// the actor hop from `Task.detached` above doesn't recapture `self` in a
+    /// nested closure — that pattern is a warning today and an error under the
+    /// Swift 6 language mode (`self` isn't provably `Sendable`).
+    private func applyLoginItemHint(_ hint: String?) {
+        loginItemHint = hint
+    }
+}
+
 @main
 struct OnoatsMenuBarApp: App {
     @StateObject private var model = RecorderModel()
+    @StateObject private var launch = LaunchState()
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(model: model)
+            MenuContent(model: model, launch: launch)
         } label: {
             Image(systemName: menuSymbol)
         }
@@ -68,6 +114,9 @@ func hintCaptionLines(_ warning: String) -> [String] {
 
 struct MenuContent: View {
     @ObservedObject var model: RecorderModel
+    /// Launch-lifecycle state, observed separately from recorder state — the
+    /// login-item hint is not a recorder field and must not arrive as one.
+    @ObservedObject var launch: LaunchState
 
     /// One hint, rendered as stacked caption lines with a leading marker on
     /// the first. Shared by every `⚠` hint in the menu.
@@ -101,7 +150,7 @@ struct MenuContent: View {
         if let note = model.flushNote {
             hintLines(note)
         }
-        if let hint = model.loginItemHint {
+        if let hint = launch.loginItemHint {
             // `LoginItemManager` builds these with the same `" — "` clause
             // delimiter the `warning` grammar uses, and interpolates
             // unbounded text into them (a user-edited `config.toml` value,

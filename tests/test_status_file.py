@@ -1282,7 +1282,7 @@ def test_swift_menu_bar_splits_on_the_documented_warning_delimiter():
 def test_swift_menu_bar_shares_one_hint_splitter_across_every_hint():
     """Round-9 architecture finding: two rendering policies for one kind of
     string. `model.warning` was split on `"; "` then `" — "` inline in its own
-    branch, while `model.loginItemHint` — added later, built by
+    branch, while the login-item hint — added later, built by
     `LoginItemManager` with that same `" — "` delimiter and carrying unbounded
     text (a user-edited config.toml value, `error.localizedDescription`) —
     rendered unsplit and stretched the whole menu, the exact problem the split
@@ -1306,7 +1306,7 @@ def test_swift_menu_bar_shares_one_hint_splitter_across_every_hint():
         "invent its own rendering again."
     )
     # No hint may be rendered as a bare, unsplit menu item.
-    for field in ("model.warning", "model.flushNote", "model.loginItemHint"):
+    for field in ("model.warning", "model.flushNote", "launch.loginItemHint"):
         assert f'Text("⚠ \\({field}' not in source, field
     for binding in ("warning", "note", "hint"):
         assert f"hintLines({binding})" in source, binding
@@ -1387,3 +1387,45 @@ def test_write_running_carry_forward_keeps_a_malformed_warning_visible(tmp_path:
     )
     got = read_status(tmp_path)
     assert got is not None and got.warning == "not-branch-shaped"
+
+
+def test_login_item_sync_is_owned_by_app_lifecycle_not_the_recorder_model():
+    """Round-6 deferral, resolved in round 10.
+
+    `RecorderModel.init()` spawned the login-item sync and published the hint
+    as a `@Published` field, justified only by "RecorderModel is constructed
+    once, at OnoatsMenuBarApp startup". That is a coincidence of construction
+    timing, not an ownership claim: reconciling `config.toml`'s
+    `launch_at_login` against `SMAppService` has nothing to do with the status
+    file or pid-file liveness, which is what that class's own doc comment says
+    it is for. It now lives on `LaunchState`, owned by `OnoatsMenuBarApp` via
+    `@StateObject` — the same once-per-launch guarantee, from the object that
+    actually represents the launch.
+
+    Pinned here because this environment has no Xcode license, so nothing else
+    would notice the concern drifting back.
+    """
+    sources = (
+        Path(__file__).resolve().parents[1] / "native" / "onoats-menubar" / "Sources"
+    )
+    recorder = (sources / "RecorderModel.swift").read_text(encoding="utf-8")
+    app = (sources / "OnoatsMenuBarApp.swift").read_text(encoding="utf-8")
+
+    assert "LoginItemManager" not in recorder, (
+        "the login-item sync is back in RecorderModel; it belongs to app "
+        "lifecycle, not to the status-file consumer"
+    )
+    assert "loginItemHint" not in recorder
+
+    assert "final class LaunchState" in app
+    assert "LoginItemManager.sync()" in app
+    # Owned once per launch by the App, and observed by the menu separately
+    # from recorder state.
+    assert "@StateObject private var launch = LaunchState()" in app
+    assert "@ObservedObject var launch: LaunchState" in app
+    # The @MainActor isolation verified in round 8 is preserved: the sync runs
+    # off the main actor and hops back through a dedicated isolated method
+    # rather than a nested closure recapturing `self`.
+    assert "@MainActor\nfinal class LaunchState" in app
+    assert "Task.detached" in app
+    assert "private func applyLoginItemHint(" in app

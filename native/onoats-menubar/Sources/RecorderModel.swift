@@ -67,12 +67,6 @@ final class RecorderModel: ObservableObject {
     /// Non-nil when the last Flush failed — shown in the menu, cleared on the
     /// next Flush or Start.
     @Published var flushNote: String?
-    /// Login-item registration hint (dev plan Phase 5) — set once at launch
-    /// by `LoginItemManager.sync()` in `init()` below, e.g. `.requiresApproval`
-    /// or a registration failure. nil once launch_at_login is absent, matches
-    /// the registered state already, or was never configured.
-    @Published var loginItemHint: String?
-
     /// Cosmetic "external stop in flight" flag for a handle-less session. Set
     /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
     /// spawn, and the direct argument to the Stop button's `.disabled(...)` — so
@@ -153,29 +147,6 @@ final class RecorderModel: ObservableObject {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
-
-        // RecorderModel is constructed once, at OnoatsMenuBarApp startup —
-        // the "every launch" checkpoint the login-item sync is specified
-        // against (dev plan Phase 5). `SMAppService`'s `.status`/
-        // `.register()`/`.unregister()` are synchronous XPC round-trips to
-        // the background-task-management daemon (up to 3 blocking calls) —
-        // right at login, when that daemon is busiest. Run off the main
-        // actor so a slow daemon can't stall the menu bar's first render;
-        // hop back only to publish the result.
-        Task.detached { [weak self] in
-            let hint = LoginItemManager.sync()
-            guard let self else { return }
-            await self.applyLoginItemHint(hint)
-        }
-    }
-
-    /// Publishes the login-item sync result. A dedicated `@MainActor`-isolated
-    /// method (rather than an inline `MainActor.run { self?...}` closure) so
-    /// the actor hop from `Task.detached` above doesn't recapture `self` in a
-    /// nested closure — that pattern is a warning today and an error under
-    /// the Swift 6 language mode (`self` isn't provably `Sendable`).
-    private func applyLoginItemHint(_ hint: String?) {
-        loginItemHint = hint
     }
 
     deinit {
