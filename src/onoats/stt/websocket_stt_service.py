@@ -683,7 +683,9 @@ class WebSocketSTTService(SegmentedSTTService):
 
         The shared preamble of all three teardown paths (`_discard_stale`,
         `_graceful_close`, `_cancel_and_close`), which each re-derived it
-        with its own ordering and its own copy of the rationale.
+        with its own ordering and its own copy of the rationale. The second
+        shared step is :meth:`_cancel_and_join_reader`; what legitimately
+        still differs between the three is listed on :meth:`_graceful_close`.
 
         State is cleared BEFORE any awaited teardown, never in a `finally`
         after it: `_closing.close_quietly` re-raises `CancelledError` by
@@ -716,6 +718,38 @@ class WebSocketSTTService(SegmentedSTTService):
         self._connected = False
         return client, reader
 
+    @staticmethod
+    async def _cancel_and_join_reader(reader: asyncio.Task | None) -> None:
+        """Cancel the reader task and wait for it to finish unwinding.
+
+        The second shared step of the teardown paths, after
+        :meth:`_detach_client`. `_discard_stale` and `_cancel_and_close`
+        each hand-rolled it with its own copy of the rationale below;
+        `_graceful_close` deliberately does **not** use it — see the
+        teardown-divergence note on :meth:`_graceful_close` for why.
+
+        `asyncio.gather(..., return_exceptions=True)`, not a plain `await
+        reader` under `except (CancelledError, Exception): pass`: the plain
+        form cannot distinguish "the reader task I just cancelled finished
+        as cancelled" (the expected, benign outcome of the `.cancel()`
+        above) from "someone cancelled ME while I was awaiting it" — both
+        surface identically as `CancelledError` from the `await`. `gather`
+        absorbs the *awaited task's own* `CancelledError` into its result
+        list without raising, while still letting a genuine external
+        cancellation of the current coroutine propagate normally through
+        the `await gather(...)` itself.
+
+        The join is unconditional rather than guarded on `not reader.done()`:
+        a reader that already finished by raising still has to be awaited for
+        its exception to be retrieved, or asyncio logs "exception was never
+        retrieved" when the task is collected. `.cancel()` on a finished task
+        is a documented no-op.
+        """
+        if reader is None:
+            return
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
     async def _discard_stale(self) -> None:
         """Drop a dead client + reader without blocking on a broken socket.
 
@@ -723,20 +757,7 @@ class WebSocketSTTService(SegmentedSTTService):
         the awaited teardown rather than after it.
         """
         client, reader = self._detach_client()
-        if reader is not None and not reader.done():
-            reader.cancel()
-            # `asyncio.gather(..., return_exceptions=True)`, not a plain
-            # `await self._reader_task` under `except (CancelledError,
-            # Exception): pass`: the plain form cannot distinguish "the
-            # reader task I just cancelled finished as cancelled" (the
-            # expected, benign outcome of the `.cancel()` two lines above)
-            # from "someone cancelled ME while I was awaiting it" — both
-            # surface identically as `CancelledError` from the `await`.
-            # `gather` absorbs the *awaited task's own* `CancelledError`
-            # into its result list without raising, while still letting a
-            # genuine external cancellation of the current coroutine
-            # propagate normally through the `await gather(...)` itself.
-            await asyncio.gather(reader, return_exceptions=True)
+        await self._cancel_and_join_reader(reader)
         if client is not None:
             # Bounded: this runs on the reconnect path, i.e. precisely when
             # the peer has already proven unreachable — an unbounded close
@@ -901,6 +922,40 @@ class WebSocketSTTService(SegmentedSTTService):
                 logger.info(f"{self.name}: session closed cleanly by server")
 
     async def _graceful_close(self) -> None:
+        """Close the session cleanly, giving the reader a window to ack.
+
+        **What still differs between the three teardown paths, and why** —
+        the shared parts are :meth:`_detach_client` (the preamble),
+        :meth:`_cancel_and_join_reader` (the reader join) and the final
+        bounded `close_quietly(..., TRANSPORT_ONLY)`. Everything below is a
+        real requirement of this call site, not leftover duplication, and
+        should not be converged away:
+
+        * **The reader is waited for, not cancelled.** `_discard_stale` and
+          `_cancel_and_close` are tearing down a client that is dead or being
+          abandoned, so they cancel the reader outright. This path has just
+          asked the server to close the session and the reader is the only
+          thing that can observe the `session.closed` ack — cancelling it
+          first would throw away the very event this close exists to collect.
+          It therefore *waits*, bounded by `_READER_JOIN_TIMEOUT_SEC`, and
+          falls back to `reader.cancel()` only on timeout or on a genuine
+          cancellation of this coroutine. That is why it cannot call
+          :meth:`_cancel_and_join_reader`, which cancels first by definition.
+        * **`draining=True`.** Only this path holds `_draining_client`, for
+          the same reason: the reader's ownership test is
+          `client is self._client`, and clearing `_client` in the preamble
+          would silently revoke the reader's right to act on the ack it is
+          waiting for. The other two have no ack to wait for and no drain
+          window to keep open.
+        * **The `_closing.CancellationLedger`.** Two closers run here with a
+          reader join between them, so a cancellation arriving mid-sequence
+          must not skip the transport close. The other two paths have a
+          single closer in a `finally` and need no ledger.
+        * **`_discard_stale` logs no elapsed time.** It runs once per
+          reconnect attempt on the hot path; the other two run once per
+          session teardown, where the timing is what pins the blame for
+          Pipecat's opaque 20s `wait_for_cancel` warning.
+        """
         if self._client is None:
             return
         client, reader = self._detach_client(draining=True)
@@ -922,7 +977,7 @@ class WebSocketSTTService(SegmentedSTTService):
             if reader is not None:
                 try:
                     # `gather(..., return_exceptions=True)`, matching
-                    # `_discard_stale`/`_cancel_and_close`: a plain
+                    # `_cancel_and_join_reader`: a plain
                     # `wait_for(reader, ...)` surfaces the READER task's own
                     # cancellation and an external cancellation of
                     # `_graceful_close` itself as the same `CancelledError`,
@@ -997,14 +1052,7 @@ class WebSocketSTTService(SegmentedSTTService):
                 pass
             if self._pending and not self._pending.done():
                 self._pending.cancel()
-            if reader is not None:
-                reader.cancel()
-                # See `_discard_stale`'s matching comment: `gather(...,
-                # return_exceptions=True)` absorbs the reader task's own
-                # `CancelledError` from the `.cancel()` above without
-                # raising, while a genuine external cancellation of this
-                # coroutine still propagates normally.
-                await asyncio.gather(reader, return_exceptions=True)
+            await self._cancel_and_join_reader(reader)
         finally:
             # Bounded, and swallowing: see the module's teardown invariants
             # in `onoats._closing`.

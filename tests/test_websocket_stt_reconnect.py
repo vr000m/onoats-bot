@@ -1346,3 +1346,119 @@ def test_graceful_close_has_no_live_reader_at_the_transport_close(monkeypatch):
     assert svc._draining_client is None
     assert svc._connected is False
     assert _FakeClient.instances[-1].closed is True
+
+
+# ---------------------------------------------------------------------------
+# Round 10: the teardown paths' second shared helper, and the divergence that
+# deliberately survives it.
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_and_join_reader_absorbs_the_readers_own_cancellation():
+    """The reason the join is `gather(..., return_exceptions=True)` and not a
+    plain `await`: a plain await cannot tell "the task I just cancelled
+    finished as cancelled" from "someone cancelled me", because both arrive
+    as `CancelledError` from the same expression."""
+
+    async def _run():
+        async def _never():
+            await asyncio.sleep(3600)
+
+        reader = asyncio.create_task(_never())
+        await asyncio.sleep(0)
+        # Must NOT raise, and must leave the task actually joined.
+        await WebSocketSTTService._cancel_and_join_reader(reader)
+        return reader
+
+    reader = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+    assert reader.done() and reader.cancelled()
+
+
+def test_cancel_and_join_reader_still_propagates_an_external_cancellation():
+    """The other half of the same property: `gather` absorbs only the awaited
+    task's own cancellation. A genuine cancellation of the *caller* must still
+    unwind it, or a teardown would silently continue through a shutdown."""
+
+    async def _run():
+        async def _slow_to_die():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await asyncio.sleep(3600)  # refuses to finish unwinding
+
+        reader = asyncio.create_task(_slow_to_die())
+        await asyncio.sleep(0)
+        joiner = asyncio.create_task(
+            WebSocketSTTService._cancel_and_join_reader(reader)
+        )
+        await asyncio.sleep(0)
+        joiner.cancel()  # external cancellation of the joining coroutine
+        with pytest.raises(asyncio.CancelledError):
+            await joiner
+        reader.cancel()
+        return True
+
+    assert asyncio.run(asyncio.wait_for(_run(), timeout=5)) is True
+
+
+def test_cancel_and_join_reader_retrieves_a_failed_readers_exception():
+    """`_discard_stale` used to skip the join entirely when the reader was
+    already `done()`. A reader that finished by *raising* then had its
+    exception never retrieved, which asyncio logs at collection time. The
+    join is unconditional now; `.cancel()` on a finished task is a no-op."""
+
+    async def _run():
+        async def _boom():
+            raise RuntimeError("reader died")
+
+        reader = asyncio.create_task(_boom())
+        await asyncio.sleep(0)
+        assert reader.done()
+        await WebSocketSTTService._cancel_and_join_reader(reader)
+        return reader
+
+    reader = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+    assert reader.exception() is not None  # retrieved, not orphaned
+
+
+def test_graceful_close_deliberately_does_not_use_the_shared_reader_join():
+    """The divergence that must survive consolidation.
+
+    `_cancel_and_join_reader` cancels first by definition. `_graceful_close`
+    has just asked the server to close the session, and the reader is the only
+    thing that can observe the `session.closed` ack — cancelling it up front
+    would throw away the event the whole path exists to collect. It therefore
+    *waits*, bounded, and cancels only as a fallback.
+
+    Pinned against the source because the failure mode is a well-meaning
+    refactor that "finishes the job" by routing all three paths through the
+    helper. That would not fail any behavioural test quickly: it would merely
+    stop collecting acks, and show up much later as sessions that never
+    confirm a clean close.
+    """
+    import inspect
+
+    src = inspect.getsource(WebSocketSTTService._graceful_close)
+    # The docstring and two comments name the helper (to say why it is NOT
+    # used here); only a real call is a violation. Strip the docstring and
+    # every comment line before asserting on what is left.
+    code = "\n".join(
+        line
+        for line in src.split('"""')[2].splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "_cancel_and_join_reader" not in code, (
+        "_graceful_close must wait for the session.closed ack, not cancel the "
+        "reader up front -- see its docstring's teardown-divergence note"
+    )
+    assert "_READER_JOIN_TIMEOUT_SEC" in code
+    # ...while both siblings DO share it.
+    for method in (
+        WebSocketSTTService._discard_stale,
+        WebSocketSTTService._cancel_and_close,
+    ):
+        body = inspect.getsource(method)
+        assert "self._cancel_and_join_reader(reader)" in body, method.__name__
+        assert "asyncio.gather(reader" not in body, (
+            f"{method.__name__} re-hand-rolled the reader join"
+        )
