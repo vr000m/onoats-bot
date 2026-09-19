@@ -1048,6 +1048,86 @@ def test_round9_dotless_tail_rule_ignores_a_trailing_path(text, expected):
     assert display_uri(text) == expected
 
 
+# ---------------------------------------------------------------------------
+# Round 10. No behaviour change: the two tests below pin the *cost* of
+# limitation 4 on both sides, because every attempt to close either side
+# re-opens the other and the docstring had, until now, denied that the leak
+# side existed at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        # Limitation 4, leak half. The sibling of the round-9 sweep case
+        # `ws://alice@corp.com:1234?a=1@localhost` (which redacts whole),
+        # differing only in that the tail carries a dot -- so the dotless-tail
+        # rule in `_not_query_of_path` does not fire, `corp.com:1234`
+        # fullmatches a dotted `host[:port]`, and the `a=1` evidence vetoes
+        # the second `@`. The pre-`?` half of the password survives.
+        #
+        # Found by round 10 and NOT by any earlier sweep: the generated
+        # `_credential_corpus` has no `?key=value` password tail, and
+        # `_bare_host_credential_corpus` has the tail but only bare,
+        # single-label hosts -- so `?a=1` crossed with a dotted host crossed
+        # with an `@`-bearing username was never generated.
+        ("ws://alice@corp.com:1234?a=1@h.example", "ws://corp.com:1234"),
+        ("wss://alice@corp.com:1234?a=1@h.example", "wss://corp.com:1234"),
+        ("ws://alice@corp.com:1234?a=1@h.example/v1", "ws://corp.com:1234"),
+        ("ws://alice@corp.com:1234?a=1@host.example.com:8765", "ws://corp.com:1234"),
+    ),
+    ids=str,
+)
+def test_limitation4_dotted_query_tail_keeps_half_the_password(text, expected):
+    """Asserted as the *documented* behaviour, not as desirable behaviour.
+
+    Closing it means letting the second `@` through, which is the same move
+    as dropping the dotless-tail rule -- and that fabricates a host for every
+    shape `test_limitation4_token_userinfo_counter_family` pins. Round 10
+    measured eight variants of the two gates against three corpora; each one
+    moved cases between the leak column and the fabrication column and none
+    reduced both. If a future round changes this expectation it must also
+    change that one, and must say which of the two costs it is buying.
+    """
+    assert display_uri(text) == expected
+    assert safe_exc_text(Exception(text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    (
+        # The counter-family: a *token* userinfo (RFC-legal, colon-free) in
+        # front of a real authority whose query carries an `@`. These keep
+        # their real host today only because `_not_query_of_path` vetoes on
+        # the dotted tail...
+        ("ws://alice@host.example:443?x=peer@corp.com", "ws://host.example:443"),
+        ("ws://TOKEN123@host.example:443?r=bob@corp.com", "ws://host.example:443"),
+        (
+            "wss://alice@corp.example.com/v1?redirect=user@example.com",
+            "wss://corp.example.com/v1",
+        ),
+        # ...and lose it when the tail is dotless, which is limitation 4's
+        # fabrication half showing up in the same family. Pinned so the
+        # asymmetry is visible rather than surprising.
+        ("ws://alice@host.example.com:8765?x=peer@localhost", "ws://localhost"),
+    ),
+    ids=str,
+)
+def test_limitation4_token_userinfo_counter_family(text, expected):
+    """The reason no local rule can close limitation 4's leak half.
+
+    `ws://alice@host.example:443?x=peer@corp.com` (token userinfo, real host
+    `host.example:443`, query value `corp.com`) and
+    `ws://alice@corp.com:1234?a=1@h.example` (username `alice@corp.com`,
+    password `1234?a=1`, host `h.example`) are the same grammar. Any rule
+    that redacts the second fabricates a host for the first; round 10's
+    `origin > start and ":" not in accepted_userinfo` discriminator did
+    exactly that, trading 36 leaks for 144 new fabrications.
+    """
+    assert display_uri(text) == expected
+    assert safe_exc_text(Exception(text)) == expected
+
+
 @pytest.mark.parametrize(
     "text,expected",
     (

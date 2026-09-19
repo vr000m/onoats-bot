@@ -172,7 +172,8 @@ implementation, not inherited from an earlier docstring):
    combination survives only because the alternative is to delete the
    trailing half of ordinary diagnostics.
 4. A URI whose query carries an ``@`` may lose its authority to the query's
-   own tail — a **fabricated host**, never a leak. Two shapes do this, both
+   own tail — usually a **fabricated host**, but see the third bullet: one
+   shape loses the *front half of a password* instead. All three happen
    because ``user:1234`` and ``localhost:443`` are the same grammar and no
    local syntax separates them:
 
@@ -185,17 +186,39 @@ implementation, not inherited from an earlier docstring):
      ``@`` has already been accepted
      (``ws://u:p@host.example:443?x=peer@localhost`` -> ``ws://localhost``).
 
-   Both were tried the other way in round 9 and both leaked: refusing the
-   first leaks ``ws://user:1234?x=1@host.example.com``, and refusing the
-   second leaks half the password of
-   ``ws://alice@corp.com:1234?a=1@localhost`` (username ``alice@corp.com``,
-   password ``1234?a=1``, host ``localhost``) — a case the generated sweep
-   requires. Resolved toward redaction like limitation 2. What a fabricated
-   host may **not** do any more is carry a secret: excluding ``&`` and ``=``
-   from :data:`_HOST_CHAR` means the remainder of a query string can never
-   pass for a reg-name, so ``?r=bob@corp.com&token=SEKRET`` keeps its real
-   authority and loses its whole query. Earlier rounds of this docstring
-   claimed "every real query shape keeps its authority"; that was false.
+   * the **leak half**, and the one earlier rounds of this docstring denied
+     existed: when the ``@``'s tail is *dotted*, the dotless-tail rule above
+     does not fire, the span in front of the ``?`` fullmatches a dotted
+     ``host[:port]``, and the ``key=value`` evidence vetoes the candidate —
+     so ``ws://alice@corp.com:1234?a=1@h.example`` renders as
+     ``ws://corp.com:1234``, keeping the pre-``?`` half of the password.
+     It is the exact sibling of the sweep case named below and differs from
+     it only in whether the tail carries a dot.
+
+   Round 9 tried refusing the first two and both leaked: refusing the first
+   leaks ``ws://user:1234?x=1@host.example.com``, and refusing the second
+   leaks half the password of ``ws://alice@corp.com:1234?a=1@localhost``
+   (username ``alice@corp.com``, password ``1234?a=1``, host ``localhost``)
+   — a case the generated sweep requires. Round 10 swept eight further
+   variants of the two gates in :func:`_not_query_of_path` (dropping the
+   dotless-tail rule, gating it on ``origin == start``, dropping the
+   single-label rule, dropping the ``key=value`` evidence, and a new
+   discriminator on whether the *already-accepted* userinfo carried a
+   ``:``) against three corpora — credentials, credential-free queries, and
+   a token-userinfo counter-family. **Every variant moved cases between the
+   leak column and the fabrication column and none reduced both**, which is
+   the same result the "canonical re-render" analysis above predicts: the
+   two readings are character-for-character the same grammar, so no local
+   rule can separate them. The leak half is therefore left in place rather
+   than traded for the 168 extra fabrications that closing it costs, and is
+   pinned by ``test_limitation4_dotted_query_tail_keeps_half_the_password``
+   and ``test_limitation4_token_userinfo_counter_family`` so round 11 does
+   not spend itself rediscovering the trade.
+
+   What a fabricated host may **not** do is carry a secret: excluding ``&``
+   and ``=`` from :data:`_HOST_CHAR` means the remainder of a query string
+   can never pass for a reg-name, so ``?r=bob@corp.com&token=SEKRET`` keeps
+   its real authority and loses its whole query.
 5. A well-formed URI whose ``@`` sits in a *path* segment with no query
    (``wss://host:443/path/to/a@b.com``, ``ws://host:8765/p/user@y``) is
    still over-redacted to ``wss://b.com`` / ``ws://y``: it is
@@ -616,7 +639,11 @@ def _not_query_of_path(
         # character-for-character the same grammar (`corp.com:1234` /
         # `host.example:443`). Round 9 tried the gate and it leaked half the
         # sweep case's password. Kept resolved toward redaction; the cost is
-        # limitation 4.
+        # limitation 4. Round 10 removed this rule outright and measured the
+        # result: 96 fewer fabricated hosts and 72 fewer in the
+        # token-userinfo counter-family, bought with 54 more leaked password
+        # halves. Every other variant it tried traded the same way. Do not
+        # re-litigate without a discriminator that is not a local rule.
         return True
     if not dotted and slash == -1 and origin == start:
         # Weakest possible authority: a single label, no path, nothing but a
