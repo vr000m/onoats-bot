@@ -31,7 +31,6 @@ import argparse
 import asyncio
 import os
 import sys
-from typing import Optional
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -40,7 +39,16 @@ from loguru import logger
 # Load dev-local .env (convenience; config.toml / secrets.env is canonical)
 # ---------------------------------------------------------------------------
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
+load_dotenv(
+    os.path.join(os.path.dirname(__file__), "..", ".env"),
+    override=False,
+    # Match the `dotenv_values` readers in `onoats.config`: a `$VAR`
+    # or `${VAR}` inside a value is a literal, not an interpolation.
+    # `.env` is dev-only (`secrets.env` is the real boundary), but one
+    # reader silently rewriting values another reader passes through is
+    # a divergence worth not having.
+    interpolate=False,
+)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -57,13 +65,11 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
-    RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
+    RecorderAlreadyRunningError,
     SttPreflightError,
     _acquire_instance_lock,
     _create_stt_service,
-    stop_pipeline_for_shutdown,
-    wait_or_force,
     _install_signal_handlers,
     _remove_pid_file,
     _restore_terminal,
@@ -72,11 +78,13 @@ from onoats.runtime import (  # noqa: E402
     _write_pid_file,
     flush_and_rotate,
     run_crash_recovery,
+    stop_pipeline_for_shutdown,
     stt_banner,
+    wait_or_force,
 )
 
 _input_dev_env = os.getenv("INPUT_DEVICE", "").strip()
-INPUT_DEVICE: Optional[int] = int(_input_dev_env) if _input_dev_env else None
+INPUT_DEVICE: int | None = int(_input_dev_env) if _input_dev_env else None
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +146,9 @@ async def run_onoats(
     _acquire_instance_lock(data_dir / ".active")
 
     from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.transports.local.audio import (
         LocalAudioTransport,
         LocalAudioTransportParams,
@@ -221,7 +229,19 @@ async def run_onoats(
     # ----------------------------------------------------------------
     # Step 6: Build transport (input-only for silent mode)
     # ----------------------------------------------------------------
-    stt = await _create_stt_service()
+    # `data_dir=None`: self-healing kickstart itself doesn't need it —
+    # `_create_stt_service` resolves `cfg.stt_launchd_label` unconditionally
+    # (kickstart works from a configured label alone). Passing the real
+    # `data_dir` here would additionally build a live `on_recovery`
+    # callback wired into the STT service for the rest of the session
+    # (`_create_stt_service`'s docstring: "None ... means build no
+    # callback"). This path never calls `write_running`/writes a status
+    # record of its own — unlike dual.py, no fresh record exists to claim
+    # `data_dir`'s status file — so that callback would just annotate
+    # whatever record happens to already be on disk (e.g. a stale, stopped
+    # record left by an earlier dual/socket-mode session on the same
+    # data_dir), misattributing an `stt:` warning to an unrelated session.
+    stt = (await _create_stt_service(data_dir=None)).service
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(

@@ -31,11 +31,19 @@ process env > config.toml/secrets.env > built-in default.
 from __future__ import annotations
 
 import argparse
+import io
 import os
+import re
 import sys
+import tomllib
 from pathlib import Path
 
-from onoats.config import config_toml_path, load_config, secrets_env_path
+from onoats.config import (
+    config_toml_path,
+    load_config,
+    normalize_launchd_label,
+    secrets_env_path,
+)
 
 # --- STT backend identifiers written into config.toml [stt].service ---------
 # "local" splits into "whisper" (MLX/CPU) or "websocket" (stt_server socket);
@@ -272,8 +280,134 @@ def _seed_dictionary(import_path: str | None) -> Path:
 # ---------------------------------------------------------------------------
 
 
+_TOML_CONTROL_ESCAPES = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape ``value`` for embedding in a TOML basic (quoted) string.
+
+    Must escape every character TOML's basic-string grammar forbids literal,
+    not just backslash and quote: `tomllib` hands back an *actual* control
+    character (e.g. a real newline) for any TOML string that itself used a
+    `\\n`/`\\t`/etc. escape. Round-tripping that character back out unescaped
+    (the previous behavior here) emits a raw newline into `config.toml`,
+    producing a file `tomllib` then refuses to parse on the next load —
+    silently losing the user's settings. Escape backslash first so later
+    replacements don't double-escape the backslashes they introduce, then
+    quote, then the named single-character TOML escapes, then any remaining
+    control character as `\\uXXXX` (covers e.g. NUL, ESC — TOML forbids them
+    literal but has no dedicated short escape).
+    """
+    out = value.replace("\\", "\\\\").replace('"', '\\"')
+    for ch, escape in _TOML_CONTROL_ESCAPES.items():
+        out = out.replace(ch, escape)
+    # TOML's basic-string grammar forbids U+0000-U+0008, U+000A-U+001F, AND
+    # U+007F (DEL) literal — not just the < 0x20 range. A DEL byte slipping
+    # through here round-trips into a `config.toml` `tomllib` then refuses to
+    # parse, the exact silent-settings-loss failure this helper exists to
+    # prevent, just for one more code point than the range check below names.
+    return "".join(
+        f"\\u{ord(c):04x}" if ord(c) < 0x20 or ord(c) == 0x7F else c for c in out
+    )
+
+
+# Captures the bracket interior so a header's *name* can be compared with
+# surrounding whitespace ignored — both TOML (`tomllib.loads("[ app ]\n...")`
+# parses fine) and the Swift `ConfigStore` reader (`readValue`/`writeValue`
+# in native/onoats-menubar/Sources/ConfigStore.swift both
+# `.trimmingCharacters` the bracket interior, comment: "tolerate hand-edited
+# [ stt ]") accept a hand-edited `[ app ]`. An exact-string header match
+# here disagreed with both and silently treated such a file as having no
+# `[app]` section at all, dropping the block (including `launch_at_login`)
+# on the next `onoats init` regeneration.
+_SECTION_HEADER_NAME_RE = re.compile(r"^\[\s*([^\]]*?)\s*\]\s*$")
+
+
+def _section_header_name(line: str) -> str | None:
+    """Return a stripped line's section name if it is a ``[...]`` header.
+
+    Whitespace-tolerant around the name (``[ app ]`` -> ``"app"``), matching
+    ``ConfigStore``'s own header parsing. Returns ``None`` for a non-header
+    line.
+    """
+    m = _SECTION_HEADER_NAME_RE.match(line)
+    return m.group(1) if m else None
+
+
+# One grammar for "this line is a `[...]` header", used by both the
+# start-of-section lookup and `_extract_raw_section`'s end-of-section scan.
+# They used to be two regexes that disagreed on the degenerate `[]`: the
+# end-of-section one required a non-empty interior, the start-of-section one
+# did not. Unreachable today (`[]` never names a section onoats writes), but
+# two grammars for one rule is how a reachable disagreement gets born.
+
+
+def _extract_raw_section(text: str, section: str) -> str | None:
+    """Return ``[section]``'s literal source lines from ``text`` verbatim
+    (header through the line before the next ``[...]`` header, or EOF), or
+    ``None`` if the section is absent.
+
+    Used for ``[app]`` (deep-review finding): it is Swift-only, and Python
+    re-rendering it from the parsed dict had to reason about
+    ``ConfigStore.readValue``'s (the Swift reader) exact quote- and
+    whitespace-trimming semantics to avoid corrupting a value Python does
+    not own — two independent parsers sharing an unversioned contract with
+    no shared schema. Round-tripping the original text instead removes that
+    cross-language coupling entirely: whatever the user's file said, byte
+    for byte (including any key besides ``launch_at_login`` a future Swift
+    version adds), survives every ``onoats init`` regeneration.
+
+    This is a lexical approximation of TOML (it ends the section at the
+    first line that merely *looks* like ``[...]``), not a real TOML parser —
+    only valid for a section holding single-line scalar assignments, which
+    is the only shape ``ConfigStore`` (the section's sole writer) ever
+    produces. A multi-line value (an array or triple-quoted string) whose
+    continuation line happens to look like a section header would end the
+    block early and splice a truncated fragment into the regenerated file.
+    Bounded here rather than left as a silent trap: the extracted block is
+    validated as a standalone TOML document before being returned, so a
+    future value shape this scanner can't handle degrades to "treat the
+    section as absent" (the caller re-renders `[app]` from the parsed dict
+    instead, or omits it) rather than silently corrupting `config.toml`.
+    """
+    lines = text.splitlines()
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if _section_header_name(line.strip()) == section
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if _section_header_name(lines[j].strip()) is not None:
+            end = j
+            break
+    # Trailing blank lines are re-added by the caller's own section spacing
+    # convention (one `lines.append("")` after every section) — stripping
+    # them here avoids doubling up.
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    block = "\n".join(lines[start:end])
+    try:
+        tomllib.loads(block)
+    except tomllib.TOMLDecodeError:
+        # The line-scan's section boundary doesn't line up with a real TOML
+        # section boundary (e.g. a multi-line value's continuation line was
+        # mistaken for the next header) — the extracted text is not
+        # trustworthy to splice verbatim. Report absence; the caller falls
+        # back to its own handling of a missing `[app]` section.
+        return None
+    return block
 
 
 def _render_config_toml(
@@ -285,6 +419,7 @@ def _render_config_toml(
     categories: list[str],
     tuning: dict,
     data_dir: str | None = None,
+    app_raw_block: str | None = None,
 ) -> str:
     lines: list[str] = [
         "# onoats configuration — written by `onoats init`.",
@@ -307,7 +442,24 @@ def _render_config_toml(
         lines.append(f'ws_socket = "{_toml_escape(stt["ws_socket"])}"')
     if stt.get("language"):
         lines.append(f'language = "{_toml_escape(stt["language"])}"')
+    if stt.get("launchd_label"):
+        lines.append(f'launchd_label = "{_toml_escape(stt["launchd_label"])}"')
     lines.append("")
+    # `[app]` is Swift-only (the Python config reader never reads it), but it
+    # still has to survive a regeneration — see the carry-over in `main()`,
+    # which extracts it via `_extract_raw_section`. Preserved as the
+    # original source text verbatim rather than re-rendered from a parsed
+    # dict: re-rendering used to require Python to model
+    # `ConfigStore.readValue`'s (the Swift reader) exact quote- and
+    # whitespace-trimming semantics, which is exactly the two-parsers-one-
+    # unversioned-contract coupling that once silently RE-ENABLED a login
+    # item the user had explicitly disabled (a `launch_at_login = "false"`
+    # spelling `tomllib` hands back as the string `"false"`, which an
+    # `isinstance(..., bool)` check rejected, dropping the whole section).
+    # Round-tripping the literal text needs no such model at all.
+    if app_raw_block is not None:
+        lines.extend(app_raw_block.split("\n"))
+        lines.append("")
     lines.append("[speakers]")
     lines.append(f'me = "{_toml_escape(speakers.get("me", "Me"))}"')
     lines.append(f'them = "{_toml_escape(speakers.get("them", "Them"))}"')
@@ -327,6 +479,38 @@ def _write_config_toml(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+# A POSIX-shell-safe env var name. A key is a bare, unquotable token on the
+# left of the `=`, so unlike a value it cannot be escaped into safety —
+# anything that is not a well-formed name is dropped rather than written.
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _env_quote(value: str) -> str:
+    """Render `value` as a dotenv double-quoted literal.
+
+    The writer below emits a ``KEY=value`` line per secret but never checked
+    that the value could *be* one. A secret carrying a newline — an argv
+    value (``--deepgram-key $'a\\nEVIL=1'``) or a mispaste — was written raw,
+    so the next :func:`dotenv_values` read of the 0600 file saw a second,
+    attacker-chosen ``KEY=value`` pair that no prompt ever accepted. Values
+    with an unquoted ``" #"`` were silently truncated at the comment marker
+    for the same reason: the value was assumed to be line-safe rather than
+    made so.
+
+    Double quotes, because that is the one dotenv form with escapes: both
+    readers of this file (``config._load_secrets`` and this module's own
+    merge step) go through ``dotenv_values``, which decodes ``\\n``, ``\\r``,
+    ``\\\\`` and ``\\"`` inside them, so every value round-trips byte-for-byte.
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
 def _write_secrets_env(path: Path, secrets: dict, *, merge_existing: bool) -> None:
     """Write ``secrets.env`` with mode 0600. Merges with existing values."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,21 +518,73 @@ def _write_secrets_env(path: Path, secrets: dict, *, merge_existing: bool) -> No
     if merge_existing and path.exists():
         from dotenv import dotenv_values
 
-        merged.update({k: v for k, v in dotenv_values(path).items() if v is not None})
+        # `interpolate=False`: see `_env_quote`. Double quotes are the one
+        # dotenv form that round-trips escapes, and they are also the one
+        # form `dotenv_values` expands `${VAR}` inside by default. A secret
+        # containing `${HOME}` would read back as the *environment's* value
+        # and then be rewritten with that substitution baked in by this very
+        # merge — silent, persistent corruption of the stored secret, and a
+        # channel for one env var's value to end up inside another's.
+        merged.update(
+            {
+                k: v
+                for k, v in dotenv_values(path, interpolate=False).items()
+                if v is not None
+            }
+        )
     merged.update({k: v for k, v in secrets.items() if v})
     # The file is always (re)created below with 0600 perms, even when empty,
     # so the path exists with correct perms for later edits.
+    writable = {k: v for k, v in merged.items() if _ENV_KEY_RE.match(k)}
     lines = [
         "# onoats STT secrets — 0600. NEVER commit. STT secrets only, NO LLM keys.",
-        *[f"{k}={v}" for k, v in merged.items()],
+        *[f"{k}={_env_quote(v)}" for k, v in writable.items()],
     ]
+    body = "\n".join(lines).rstrip() + "\n"
+    _assert_secrets_round_trip(body, writable)
     # Create with restrictive perms from the start (avoid a readable window).
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, ("\n".join(lines).rstrip() + "\n").encode("utf-8"))
+        os.write(fd, body.encode("utf-8"))
     finally:
         os.close(fd)
     os.chmod(path, 0o600)
+
+
+def _assert_secrets_round_trip(body: str, expected: dict[str, str]) -> None:
+    """Refuse to write a ``secrets.env`` the reader cannot read back.
+
+    :func:`_env_quote` has been the sole guarantee that a rendered line is
+    parseable, and it is the wrong shape of guarantee: it is a *claim* about
+    an escaping function, re-argued from scratch every time a new hostile
+    character is found, while the property that actually matters is a
+    property of the whole rendered file. The blast radius of being wrong once
+    is total and silent — ``dotenv_values`` abandons the file on a line it
+    cannot parse, so ``config._load_secrets`` returns ``{}``, every STT
+    credential vanishes at runtime with no error, and the next
+    ``onoats init`` merge reads the same ``{}`` and rewrites the file
+    *without* them, making the loss permanent.
+
+    So the invariant is checked rather than asserted: parse the bytes we are
+    about to write, with the same function and the same ``interpolate=False``
+    both readers use, and require every key and value back verbatim. A
+    mismatch raises before the 0600 file is truncated, which leaves the
+    existing secrets intact and turns a silent total loss into a loud one.
+    """
+    from dotenv import dotenv_values
+
+    parsed = dotenv_values(stream=io.StringIO(body), interpolate=False)
+    if dict(parsed) != expected:
+        missing = sorted(set(expected) - set(parsed))
+        wrong = sorted(k for k in expected if k in parsed and parsed[k] != expected[k])
+        extra = sorted(set(parsed) - set(expected))
+        raise RuntimeError(
+            "refusing to write secrets.env: the rendered file does not read "
+            "back as written and would silently lose every secret in it "
+            f"(unreadable keys: {missing}, corrupted: {wrong}, "
+            f"fabricated: {extra}). This is a bug in _env_quote; the "
+            "existing file has been left untouched."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +756,76 @@ def main(argv: list[str] | None = None) -> int:
         if args.deepgram_key:
             secrets["DEEPGRAM_API_KEY"] = args.deepgram_key
 
+    # Carry over config.toml keys `onoats init` never prompts for. The
+    # renderer rebuilds the file from scratch out of the prompted field set
+    # only, so re-running `onoats init` on an already-configured install used
+    # to silently DROP `[stt].launchd_label` and the whole `[app]` section —
+    # disabling STT self-healing and launch-at-login for a user who had set
+    # them up by hand. Applies to both the interactive and flag paths, neither
+    # of which offers these keys.
+    #
+    # Two carry-over mechanisms coexist here on purpose, not by accident.
+    # `[app]` (below) is copied as opaque raw text because Python never
+    # manages any key inside that section — Swift/`ConfigStore` owns it
+    # entirely, so this run never produces a "prompted" `[app]` value to
+    # merge against, and verbatim byte-for-byte round-tripping is both safe
+    # and the simplest correct thing (see `_extract_raw_section`'s
+    # docstring). `[stt]` is deliberately NOT copied the same way: Python
+    # actively re-renders several of its keys every run (`service`, `model`,
+    # `ws_socket`, `language`) from this run's prompts/flags, so a
+    # whole-section raw copy would silently discard those answers. Only
+    # `launchd_label` — the one `[stt]` key `onoats init` never prompts
+    # for — needs a carry-over, and it has to merge into the freshly-built
+    # `stt` dict below rather than overwrite the section, which the generic
+    # raw-block mechanism has no per-key granularity to do. So the generic
+    # mechanism cannot subsume this bespoke one; both stay.
+    #
+    # The carried value is re-validated, not copied blind: the runtime reader
+    # (`OnoatsConfig.stt_launchd_label`) already runs every label through
+    # `normalize_launchd_label` (strip -> empty-as-None -> allowlist-validate)
+    # and treats a non-conforming one as absent, so a schema-invalid value
+    # stored in config.toml is *already* inert at runtime. Copying it through
+    # unchecked let it reach `_toml_escape` (TypeError on a non-string — a
+    # TOML integer or array) or, for a string carrying a raw newline, corrupt
+    # the regenerated config.toml by breaking out of its own line. Calling
+    # the SAME shared helper the runtime reader uses (rather than hand-
+    # rolling the strip/empty/validate sequence here again) is what keeps
+    # this path from disagreeing with the runtime reader on "absent" vs
+    # "malformed" — the two independently drifted on that twice before
+    # (review-gauntlet rounds 5 and 6 on this branch).
+    carried_label = existing_stt.get("launchd_label")
+    if carried_label is not None and not stt.get("launchd_label"):
+        carried_str = carried_label if isinstance(carried_label, str) else None
+        validated_label = normalize_launchd_label(carried_str)
+        if validated_label:
+            stt["launchd_label"] = validated_label
+        elif not isinstance(carried_label, str) or carried_label.strip():
+            # Guarded on `carried_label` (what the user actually wrote), not
+            # on `carried_str` (the string-only projection above, which is
+            # `None` for exactly the typed-TOML case this note's own comment
+            # cites as its motivating example). A `launchd_label = true` or
+            # `= 42` therefore disappeared in silence — the one shape where
+            # the user is most likely to think self-healing is configured and
+            # be wrong. Only a genuinely blank string stays quiet: that is
+            # "absent", not "malformed".
+            print(
+                f"  note: ignoring malformed [stt].launchd_label "
+                f"{carried_label!r} — it is already inert at runtime and is "
+                "not carried into the regenerated config.toml."
+            )
+    # Verbatim, not re-rendered from `existing.raw["app"]` — see
+    # `_extract_raw_section`'s docstring, `_render_config_toml`'s `[app]`
+    # handling, and the comment above for why this section uses a different
+    # carry-over mechanism than `launchd_label`.
+    app_raw_block: str | None = None
+    if config_path.exists():
+        try:
+            app_raw_block = _extract_raw_section(
+                config_path.read_text(encoding="utf-8"), "app"
+            )
+        except OSError:
+            pass
+
     if not args.no_preflight:
         _run_preflight(stt, secrets)
 
@@ -581,6 +887,7 @@ def main(argv: list[str] | None = None) -> int:
         categories=categories,
         tuning=tuning,
         data_dir=data_dir,
+        app_raw_block=app_raw_block,
     )
     _write_config_toml(config_path, content)
     _write_secrets_env(secrets_path, secrets, merge_existing=True)

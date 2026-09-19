@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import textwrap
 
-from onoats.config import OnoatsConfig, load_config
+from onoats.config import OnoatsConfig, load_config, normalize_launchd_label
 
 _CONFIG = textwrap.dedent(
     """
@@ -85,3 +85,46 @@ def test_secrets_env_precedence(tmp_path, monkeypatch):
     # Process env wins when present.
     monkeypatch.setenv("DEEPGRAM_API_KEY", "from_env_yyyyyyyyyyyyyyyy")
     assert cfg.get_secret("DEEPGRAM_API_KEY") == "from_env_yyyyyyyyyyyyyyyy"
+
+
+def test_normalize_launchd_label_shared_strip_empty_validate_sequence():
+    """gauntlet round-4 finding 1: `OnoatsConfig.stt_launchd_label` and
+    `onoats init`'s config-carry-over (`init.py`) both need the exact same
+    strip -> empty-as-None -> allowlist-validate sequence for a *string*
+    label; extracted to `normalize_launchd_label` so the two callers can't
+    independently drift on "absent" vs "malformed" (they did, twice, in
+    rounds 5 and 6)."""
+    # Whitespace-padded but otherwise well-formed: strips, then validates.
+    assert (
+        normalize_launchd_label(" pipecat.stt-server.nemotron ")
+        == "pipecat.stt-server.nemotron"
+    )
+    # Empty/whitespace-only normalizes to absent, not "malformed".
+    assert normalize_launchd_label("") is None
+    assert normalize_launchd_label("   ") is None
+    assert normalize_launchd_label(None) is None
+    # Well-formed but with an interior character the allowlist rejects.
+    assert normalize_launchd_label("bad label;rm") is None
+
+
+def test_blank_stt_launchd_label_env_var_disables_kickstart(tmp_path, monkeypatch):
+    """Round-9 finding: `stt_launchd_label`'s docstring promises that an
+    empty/whitespace-only value "from either source" normalizes to `None`, but
+    `_env_or` reads a blank env var as *absent* and falls through to
+    config.toml — so `STT_LAUNCHD_LABEL=` in a plist or shell wrapper silently
+    kept kickstarting whatever label config.toml named, and there was no way
+    to turn self-healing off from the environment at all. Presence, not
+    truthiness, is the question an explicit override asks."""
+    from onoats.config import OnoatsConfig
+
+    cfg = OnoatsConfig(raw={"stt": {"launchd_label": "pipecat.stt-server"}})
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    assert cfg.stt_launchd_label == "pipecat.stt-server"
+
+    for blank in ("", "   ", "\t"):
+        monkeypatch.setenv("STT_LAUNCHD_LABEL", blank)
+        assert cfg.stt_launchd_label is None, blank
+
+    # A real env value still wins over config.toml, unchanged.
+    monkeypatch.setenv("STT_LAUNCHD_LABEL", "pipecat.stt-server.nemotron")
+    assert cfg.stt_launchd_label == "pipecat.stt-server.nemotron"

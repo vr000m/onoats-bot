@@ -276,7 +276,7 @@ _CAPTURER_ENV_POLICY = _CapturerEnvPolicy(
 
 
 def _build_capturer_env(
-    base_env: "os._Environ[str] | dict[str, str]",
+    base_env: os._Environ[str] | dict[str, str],
     *,
     mic_sock: str,
     system_sock: str,
@@ -373,7 +373,6 @@ async def _drain_capturer_stderr(
     """
     from onoats import status as status_file
 
-    active_warnings: dict[str, str] = {}
     while True:
         try:
             line = await stderr.readline()
@@ -401,18 +400,35 @@ async def _drain_capturer_stderr(
         branch = fields.get("branch", "?")
         try:
             if event_type == "zero-run-warning":
+                # `branch` comes straight from the capturer's stderr, unlike
+                # the launchd label (allowlist-validated at resolution), so
+                # it is checked here the same way the `device` branch below
+                # is: only "mic"/"system" are produced by the capturer's own
+                # `Resampler` labels. The reason is NOT that a branch key
+                # escapes sanitization — `status.format_warning_branch` does
+                # sanitize `branch` (via `sanitize_warning_branch`), same as
+                # `message`. It is that a branch key is an *identity*, not
+                # free text: it is the lookup key a later clear must match,
+                # and it names a row in the menu bar. Sanitizing an unknown
+                # key would preserve it as a real, permanent-looking
+                # pseudo-branch nobody clears, so an unrecognized key is
+                # dropped outright rather than made harmless.
+                #
+                # `hint` is NOT checked here. It is a `message`, and
+                # `status.format_warning_branch` is the documented single
+                # choke point that sanitizes the `"; "` entry delimiter out
+                # of both `branch` and `message`. Dropping the whole event
+                # here instead was a second, contradictory resolution of the
+                # same invariant — and the wrong one: it silently discarded
+                # a real zero-run warning (a capturer delivering silence)
+                # because of a delimiter the choke point would have made
+                # harmless.
                 hint = fields.get("hint", "no detail provided")
-                active_warnings[branch] = f"{branch}: {hint}"
-                status_file.set_warning(
-                    data_dir,
-                    "; ".join(active_warnings[b] for b in sorted(active_warnings)),
-                )
+                if branch in ("mic", "system"):
+                    status_file.set_warning_branch(data_dir, branch, hint)
             elif event_type == "zero-run-clear":
-                if active_warnings.pop(branch, None) is not None:
-                    merged = "; ".join(
-                        active_warnings[b] for b in sorted(active_warnings)
-                    )
-                    status_file.set_warning(data_dir, merged or None)
+                if branch in ("mic", "system"):
+                    status_file.set_warning_branch(data_dir, branch, None)
             elif event_type == "device":
                 desc = fields.get("hint", "")
                 if branch in ("mic", "system") and desc:
@@ -589,7 +605,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     os.environ["ONOATS_CAPTURER_NONCE"] = nonce
 
     capturer_proc: asyncio.subprocess.Process | None = None
-    stderr_task: "asyncio.Task[None] | None" = None
+    stderr_task: asyncio.Task[None] | None = None
     # Latest device description per branch ("mic"/"system"), written by the
     # stderr reader and applied to this session's status record by the
     # deferred task in _run_recorder_with_capturer (the events outrun the
@@ -738,7 +754,7 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             try:
                 # wait_for cancels (and awaits) the task itself on timeout.
                 await asyncio.wait_for(stderr_task, timeout=_STDERR_READER_GRACE_SEC)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         # Remove the private socket dir. Best-effort: a leftover here is harmless
         # (next generation mints a new one), but tidy up so private dirs don't
@@ -969,7 +985,7 @@ async def _run_recorder_with_capturer(
         )
         try:
             await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Socket supervisor: recorder did not finish draining within "
                 f"{_RECORDER_DRAIN_GRACE_SEC}s after capturer death — force-cancelling."
@@ -1089,7 +1105,7 @@ async def _stop_capturer(capturer_proc, logger) -> None:
                     drained = True
                     break
                 await asyncio.sleep(0.05)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
     if drained:
         return

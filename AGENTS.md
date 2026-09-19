@@ -218,6 +218,106 @@ Each item should map to a regression test that fails against the pre-fix code
 teardown: a spawned child PID is gone after stop). The supervisor's tests in
 `tests/test_socket_supervisor.py` are the worked example.
 
+## STT self-healing (`launchctl kickstart`) invariants
+
+`[stt].launchd_label` (absent by default) turns on self-healing: when the STT
+server is unreachable, onoats asks `launchd` to restart the *managed* job. These
+invariants are load-bearing — breaking any of them silently degrades the
+feature rather than failing a test you'd notice:
+
+- **The kickstart cooldown is process-wide and label-keyed**, not
+  per-`WebSocketSTTService`-instance. It lives in `src/onoats/stt/launchd.py`
+  (a leaf module: no `runtime`/`status`/`dual` imports) so both the startup
+  preflight (`runtime._preflight_stt_ws`) and the live reconnect path
+  (`websocket_stt_service._ensure_connected`) stamp the *same* registry.
+  `dual.py` builds two instances (mic + system) against one physical server,
+  so a per-instance cooldown cannot cap total kickstarts. `launchd.try_kickstart`
+  is the single owner of check-then-stamp-then-kickstart; the stamp lands with
+  no `await` between check and stamp, which is what makes "two instances
+  exhausting concurrently produce one kickstart" true.
+- **Two status-`warning` branch-key schemes, deliberately.** The startup
+  preflight recovery uses the shared `stt` branch (`status.stt_branch(None)`) —
+  one probe of one shared server, before either instance exists, so it cannot
+  clobber anything. Live-session recoveries are per-instance
+  (`stt-mic`/`stt-system`, `status.stt_branch("mic")`) because the two
+  instances recover independently and a shared key let one's clear erase the
+  other's still-unconfirmed warning. Branch keys are owned by `status.py`, not
+  `launchd.py`.
+- **"Recovered" means a confirmed handshake, never `launchctl`'s exit code.**
+  `kickstart_stt_server` returning `True` only means launchd accepted the
+  restart request. `on_recovery(<message>)` fires only after a post-kickstart
+  connect actually succeeds — and the claim expires after
+  `KICKSTART_CONFIRM_WINDOW_SEC` (deliberately larger than the cooldown: the
+  confirming reconnect is demand-driven and can burn the full ~15.5s backoff).
+- **The cooldown resets only on a confirmed `transcript.*` event**, never on a
+  bare successful connect and never on a timer. Because confirmation is
+  per-instance while the cooldown is shared, the reset is token-scoped: the
+  stamp drops only once *no* instance sharing the label is still
+  exhausted-and-unconfirmed (`launchd.REGISTRY`'s unhealthy set, keyed by the
+  typed `launchd.InstanceToken`). Otherwise mic confirming
+  health would re-arm system to SIGKILL the server mic is using. An instance
+  registers itself unhealthy on its **first failed connect attempt**, not at
+  backoff exhaustion — registering only at exhaustion left a ~15.5s hole in
+  which a sibling that had just started failing was invisible to the guard.
+  The **preflight** path deliberately never registers: it has no lifecycle on
+  which to clear a token, and is already gated by the cooldown itself.
+- **Kickstart triggers on reachability failures only** (`TimeoutError` /
+  `OSError`), on both paths. A protocol/auth failure (a 401 from a server that
+  is demonstrably up) means the config is wrong; SIGKILLing a healthy server
+  neither fixes it nor is harmless.
+- **The cooldown registry is process-scoped, not cross-process.**
+  `launchd.REGISTRY` is a single in-memory `KickstartRegistry` with no
+  persistence — a crash-restart loop (menu bar / socket supervisor relaunching
+  the recorder) starts each fresh `onoats bot` process with an EMPTY registry,
+  so the `KICKSTART_COOLDOWN_SEC` cooldown caps kickstarts only *within* one process's lifetime, not
+  across the relaunches that can follow a repeatedly-crashing session. This is
+  accepted, not a gap to silently work around: if cross-process capping is
+  ever needed, persist the stamp next to the status file in `data_dir` — don't
+  add a second, undocumented scope to the in-memory registry.
+
+Regression tests: `tests/test_stt_launchd.py`, `tests/test_runtime_preflight.py`,
+`tests/test_websocket_stt_reconnect.py`.
+
+## Leaf modules
+
+A recurring pattern in `src/onoats/`: two higher-level modules that must
+neither import each other (`runtime.py`, the startup/preflight path, and
+`stt/websocket_stt_service.py`, the live-session reconnect path) both need
+the same small piece of logic. Rather than one importing it from the other
+(inverting the dependency direction) or duplicating it, the logic moves into
+a small **leaf module** — one with no imports from `onoats` itself (stdlib,
+and third-party only) — that both sides import from as a shared meeting
+point with no cycle. Check a leaf module's own docstring before assuming
+its scope; this list is a pointer, not the contract itself.
+
+- `src/onoats/stt/launchd.py` — `kickstart_stt_server()` (the
+  `launchctl kickstart` shellout) and the shared, process-wide,
+  label-keyed kickstart cooldown/health registry.
+- `src/onoats/_redact.py` — `safe_exc_text()`/`redact_uri()`, stripping
+  `user:pass@` userinfo out of a third-party exception's `str()` (or a raw
+  connect URI) before it reaches a log line or user-visible error message,
+  plus `strip_query()` and `display_uri()` — the latter is the **single
+  owner** of the redact-then-strip-query composition every whole-URI
+  display site needs (`runtime._display_target`,
+  `websocket_stt_service._endpoint_label`); do not open-code the two steps
+  again, and note `safe_exc_text` composes the query strip itself.
+  **Read its docstring before touching it**: the scanner has been rewritten
+  or restructured in most review-gauntlet rounds to date, every tiered
+  version leaked, and the generated
+  sweep in `tests/test_redact.py` — not any hand-picked case list — is its
+  specification. Its failure modes come in two directions: a credential
+  *leak*, and a destructive *over-redaction* that removes the credential
+  correctly but fabricates a hostname out of text later in the string. The
+  sweep pins both.
+- `src/onoats/_closing.py` — bounded, best-effort teardown of a
+  `TranscriptionClient` (timeout + deadline cap + cancellation safety), so
+  a hung server's closing handshake can never block a caller forever, plus
+  `CancellationLedger` — the one implementation of the "attempt every step,
+  remember a cancellation, re-raise it once" invariant, composed by
+  `close_quietly` and by `_graceful_close` (which cannot use
+  `close_quietly` for its whole sequence because it must join the reader
+  task *between* the two closers).
+
 ## Wire-format contract
 
 `docs/audio-socket-contract.md` is the versioned (`v1`) capturer↔recorder

@@ -6,13 +6,59 @@ import AppKit
 import CoreAudio
 import SwiftUI
 
+/// App-lifecycle state that belongs to the launch itself, not to the recorder.
+///
+/// The login-item sync is an "every launch" checkpoint (dev plan Phase 5): it
+/// reconciles `config.toml`'s `launch_at_login` against `SMAppService`'s actual
+/// registration once, at startup. It has no relationship to recorder state, and
+/// living on `RecorderModel` — whose job is consuming the status file and
+/// backstopping pid-file liveness — was justified only by that class happening
+/// to be constructed once at startup. That is a coincidence of construction
+/// timing, not an ownership claim, and it put an unrelated `@Published` field
+/// in front of every view that observes recorder state.
+///
+/// Owned by `OnoatsMenuBarApp` via `@StateObject`, so it is created exactly
+/// once for the app's lifetime — the same "every launch" guarantee, from the
+/// object that actually represents the launch.
+@MainActor
+final class LaunchState: ObservableObject {
+    /// Login-item registration hint — set once at launch by
+    /// `LoginItemManager.sync()`, e.g. `.requiresApproval` or a registration
+    /// failure. nil once `launch_at_login` is absent, matches the registered
+    /// state already, or was never configured.
+    @Published var loginItemHint: String?
+
+    init() {
+        // `SMAppService`'s `.status`/`.register()`/`.unregister()` are
+        // synchronous XPC round-trips to the background-task-management daemon
+        // (up to 3 blocking calls) — right at login, when that daemon is
+        // busiest. Run off the main actor so a slow daemon can't stall the menu
+        // bar's first render; hop back only to publish the result.
+        Task.detached { [weak self] in
+            let hint = LoginItemManager.sync()
+            guard let self else { return }
+            await self.applyLoginItemHint(hint)
+        }
+    }
+
+    /// Publishes the login-item sync result. A dedicated `@MainActor`-isolated
+    /// method (rather than an inline `MainActor.run { self?...}` closure) so
+    /// the actor hop from `Task.detached` above doesn't recapture `self` in a
+    /// nested closure — that pattern is a warning today and an error under the
+    /// Swift 6 language mode (`self` isn't provably `Sendable`).
+    private func applyLoginItemHint(_ hint: String?) {
+        loginItemHint = hint
+    }
+}
+
 @main
 struct OnoatsMenuBarApp: App {
     @StateObject private var model = RecorderModel()
+    @StateObject private var launch = LaunchState()
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(model: model)
+            MenuContent(model: model, launch: launch)
         } label: {
             Image(systemName: menuSymbol)
         }
@@ -36,24 +82,61 @@ struct OnoatsMenuBarApp: App {
     }
 }
 
+/// Break one status-hint string into the caption lines the menu renders.
+///
+/// The one rendering policy for every long, delimiter-joined hint this menu
+/// shows, not just the schema-v2 `warning` field. It used to live inline in
+/// the `warning` branch alone, so `loginItemHint` — added later, built by
+/// `LoginItemManager` with the same `" — "` clause delimiter and carrying
+/// unbounded text (a user-edited `config.toml` value,
+/// `error.localizedDescription`) — rendered as a single unwrapped item and
+/// stretched the whole menu, which is the exact problem the `warning` split
+/// exists to prevent. Two producers of the same string shape must not get
+/// opposite rendering because only one call site knew the rule.
+///
+/// `status.set_warning_branch` can merge SEVERAL branches
+/// (mic/system/stt/stt-mic/stt-system) into one string, `"; "`-joined per
+/// `status.format_warning_branch`, so the outer split comes first and breaks
+/// per-branch entries apart; the inner `" — "` split then breaks each entry's
+/// own em-dash clauses. Native menu items render one line and never wrap, and
+/// a single hint can be ~200 chars (observed live, 2026-06-11).
+///
+/// The `"; "` literal here is under the lockstep convention documented in
+/// `status.py`'s header and checked by `tests/test_status_file.py::
+/// test_swift_menu_bar_splits_on_the_documented_warning_delimiter`, which
+/// reads this source. The parameter is named `warning` because that test
+/// matches the split structurally, against that name.
+func hintCaptionLines(_ warning: String) -> [String] {
+    return warning
+        .components(separatedBy: "; ")
+        .flatMap { $0.components(separatedBy: " — ") }
+}
+
 struct MenuContent: View {
     @ObservedObject var model: RecorderModel
+    /// Launch-lifecycle state, observed separately from recorder state — the
+    /// login-item hint is not a recorder field and must not arrive as one.
+    @ObservedObject var launch: LaunchState
+
+    /// One hint, rendered as stacked caption lines with a leading marker on
+    /// the first. Shared by every `⚠` hint in the menu.
+    @ViewBuilder
+    private func hintLines(_ text: String) -> some View {
+        let lines = hintCaptionLines(text)
+        ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+            Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
+        }
+    }
 
     var body: some View {
         Text(statusLine)
         // Live capture warning (schema-v2 `warning`): the branch-specific hint
-        // from the capturer's all-zero-input detector. Cleared automatically
-        // when real audio re-arms the detector. Native menu items render one
-        // line and never wrap, and the full hint is ~200 chars — rendered as
-        // ONE item it stretches the whole menu to its width (observed live,
-        // 2026-06-11). Split on the hint's em-dash clause breaks into stacked
-        // caption lines instead; the unsplit text stays in `onoats status`
-        // and the log.
+        // from the capturer's all-zero-input detector, or an STT
+        // kickstart-recovery message. Cleared automatically when the branch
+        // clears. The unsplit text stays in `onoats status` and the log; see
+        // `hintCaptionLines` for the splitting policy and why it is shared.
         if let warning = model.warning {
-            let lines = warning.components(separatedBy: " — ")
-            ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
-                Text(i == 0 ? "⚠ \(line)" : "   \(line)").font(.caption)
-            }
+            hintLines(warning)
         }
         if case .failed(let reason, let detail) = model.state {
             Text("Last session failed: \(reason)")
@@ -65,7 +148,14 @@ struct MenuContent: View {
             Text("⚠ status file schema drift — update onoats / this app")
         }
         if let note = model.flushNote {
-            Text("⚠ \(note)")
+            hintLines(note)
+        }
+        if let hint = launch.loginItemHint {
+            // `LoginItemManager` builds these with the same `" — "` clause
+            // delimiter the `warning` grammar uses, and interpolates
+            // unbounded text into them (a user-edited `config.toml` value,
+            // `error.localizedDescription`). Same shape, same rendering.
+            hintLines(hint)
         }
 
         Divider()

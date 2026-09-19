@@ -60,10 +60,25 @@ enum ConfigStore {
         return out
     }
 
-    /// Value of `key` inside `[section]`, unquoted/comment-stripped, or nil.
-    static func readValue(section: String, key: String) -> String? {
+    /// Presence-aware read result — distinguishes "key not present at all"
+    /// from "key present but its value is empty or its quoted string never
+    /// closed" (both of which `readValue` collapses into a bare `nil`,
+    /// which is fine for GUI-managed keys with a sensible default fallback
+    /// like `[stt].service`, but wrong for a key whose whole contract is
+    /// "absent = no-op, present = must be acted on or warned about", e.g.
+    /// `[app].launch_at_login` — see `LoginItemManager.sync()`).
+    enum ReadResult {
+        case absent
+        case malformed
+        case value(String)
+    }
+
+    /// Like `readValue`, but reports `.malformed` instead of silently
+    /// degrading a present-but-empty/unterminated-quote value to the same
+    /// `nil` an absent key would produce.
+    static func readValuePresence(section: String, key: String) -> ReadResult {
         guard let text = try? String(contentsOf: configURL, encoding: .utf8) else {
-            return nil
+            return .absent
         }
         var current = ""
         for rawLine in text.components(separatedBy: "\n") {
@@ -104,13 +119,25 @@ enum ConfigStore {
                         body.append(c)
                     }
                 }
-                value = closed ? unescape(body) : ""
+                if !closed { return .malformed }
+                value = unescape(body)
             } else if let hash = value.firstIndex(of: "#") {
                 value = String(value[..<hash]).trimmingCharacters(in: .whitespaces)
             }
-            return value.isEmpty ? nil : value
+            return value.isEmpty ? .malformed : .value(value)
         }
-        return nil
+        return .absent
+    }
+
+    /// Value of `key` inside `[section]`, unquoted/comment-stripped, or nil.
+    /// Collapses "key absent" and "key present but empty/malformed" into the
+    /// same `nil` — fine for a key with a sensible default fallback; use
+    /// `readValuePresence` instead when that distinction itself matters.
+    static func readValue(section: String, key: String) -> String? {
+        switch readValuePresence(section: section, key: key) {
+        case .value(let v): return v
+        case .absent, .malformed: return nil
+        }
     }
 
     /// Replace (or insert) `key = "value"` inside `[section]`. Creates the

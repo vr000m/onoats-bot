@@ -174,6 +174,11 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   gains a warning badge and the menu shows a hint naming the likely cause.
   The session keeps recording; the warning clears on its own once real audio
   arrives.
+- **Login item warning** — if `[app].launch_at_login` is set to something
+  other than `true`/`false`, or the `SMAppService` register/unregister call
+  fails, the menu shows a `⚠` hint naming the problem (e.g. an unrecognized
+  config value, or the register/unregister error). Syncing is best-effort on
+  every launch; the warning does not block Start/Stop.
 - **Logs** — recorder output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
 - **First run (TCC prompts)** — the first Start prompts for **Microphone**
   and records a **Screen & System Audio Recording** grant ("Onoats" appears
@@ -192,8 +197,26 @@ the terminal instead). It lives in the menu bar with no Dock icon.
 
 - `$XDG_CONFIG_HOME/onoats/config.toml` — `[storage]` (`data_dir`), `[devices]`
   (by name), `[stt]` (`service`, `model`, `language` — `"en"` default, `"auto"`
-  = detect; whisper + websocket backends only), `[speakers]` (render-only
-  display labels), `[categories]`, `[tuning]`.
+  = detect; whisper + websocket backends only; `launchd_label` — optional
+  (overridable via the `STT_LAUNCHD_LABEL` env var, which takes precedence
+  over the config.toml value), the `launchctl` label to kickstart when the
+  websocket STT server is unreachable at startup or drops mid-session;
+  absent by default, in which case self-healing is skipped and today's
+  plain-failure behavior is unchanged; must match
+  `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` — any other value is logged and treated
+  as absent), `[speakers]` (render-only display
+  labels), `[categories]`, `[tuning]`.
+- `[app].launch_at_login` (Onoats.app only — Python never reads this key) —
+  bare TOML `true`/`false` (a quoted `"true"`/`"false"` normalizes to the
+  same value, since `ConfigStore`'s reader strips surrounding quotes; any
+  other spelling, e.g. Python-style `True`, is treated the same as absent).
+  Checked once at every Onoats.app launch: absent means **no action at
+  all** — it will never silently opt you in, and it will never touch a
+  login item you registered out-of-band (e.g. directly in System Settings
+  ▸ Login Items). Explicit `false` unregisters. There is no menu toggle for
+  this — edit `config.toml` directly, then relaunch Onoats.app (or approve
+  it in System Settings ▸ Login Items if macOS holds it in
+  `.requiresApproval`) for the change to take effect.
 - `$XDG_CONFIG_HOME/onoats/secrets.env` — `0600`, STT secrets only
   (`DEEPGRAM_API_KEY` / `STT_WS_TOKEN`). **No LLM keys.**
 - `$XDG_CONFIG_HOME/onoats/dictionary.txt` — `wrong: correct` substitutions

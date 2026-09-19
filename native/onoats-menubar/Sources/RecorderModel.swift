@@ -67,7 +67,6 @@ final class RecorderModel: ObservableObject {
     /// Non-nil when the last Flush failed — shown in the menu, cleared on the
     /// next Flush or Start.
     @Published var flushNote: String?
-
     /// Cosmetic "external stop in flight" flag for a handle-less session. Set
     /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
     /// spawn, and the direct argument to the Stop button's `.disabled(...)` — so

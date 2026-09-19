@@ -32,10 +32,12 @@ The ``[speakers]`` labels are consumed ONLY at render time by the converter
 from __future__ import annotations
 
 import os
+import re
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from dotenv import dotenv_values
 from loguru import logger
@@ -49,6 +51,72 @@ def looks_like_bearer_token(v: str) -> bool:
     """Validator: value looks like an API key (20+ chars)."""
     # vendored from koda shared/config.py
     return len(v.strip()) >= 20
+
+
+# launchd labels are reverse-DNS-ish identifiers. Validate against an explicit
+# allowlist at resolution time (``OnoatsConfig.stt_launchd_label``) because the
+# value is env/config-sourced and lands in two places where stray characters
+# are load-bearing:
+#   * the ``gui/<uid>/<label>`` service target — a ``/`` would redirect the
+#     kickstart at a different job (or domain) in the same user's session;
+#   * the recovery warning message, which ``status.set_warning_branch`` merges
+#     into a ``"; "``-joined, ``": "``-keyed string — a label containing either
+#     delimiter forges extra pseudo-branch entries on the next parse.
+# A NUL byte would additionally reach ``subprocess.run`` and raise ValueError.
+# Non-conforming values are treated as absent (``None``), i.e. "self-healing
+# not configured", which is the plan's documented no-op default.
+#
+# Lives here, not in ``onoats.stt.launchd``: this is config-value validation
+# and its sole caller is the config resolver below. Importing the STT
+# subsystem from the module that *configures* it inverted the dependency
+# direction for no reason (no cycle ever forced it).
+_LAUNCHD_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def validate_launchd_label(value: str | None) -> str | None:
+    """Return ``value`` if it is a well-formed launchd label, else ``None``.
+
+    Called once at config-resolution time (``OnoatsConfig.stt_launchd_label``)
+    so every downstream consumer — the ``gui/<uid>/<label>`` service target,
+    the recovery warning message merged into the status ``warning`` string —
+    can trust the value. See :data:`_LAUNCHD_LABEL_RE` for why each rejected
+    character class matters. A non-conforming value is logged once and treated
+    as absent (self-healing off) rather than rejected loudly: an unusable
+    label must never be more disruptive than not configuring one at all.
+
+    Uses ``fullmatch``, not ``match`` with a ``$`` anchor: Python's ``$``
+    also matches immediately before a trailing newline, so ``"label\\n"`` would
+    pass an otherwise-identical ``match`` check. This validator documents
+    itself as a self-sufficient trust boundary, so it must not depend on every
+    caller stripping first.
+    """
+    if value is None:
+        return None
+    if _LAUNCHD_LABEL_RE.fullmatch(value):
+        return value
+    logger.warning(
+        f"STT: ignoring malformed launchd label {value!r} — expected "
+        "[A-Za-z0-9][A-Za-z0-9._-]{0,127}; self-healing kickstart disabled"
+    )
+    return None
+
+
+def normalize_launchd_label(value: str | None) -> str | None:
+    """Strip, treat empty-as-absent, then allowlist-validate a launchd label.
+
+    This is the exact strip -> empty-as-None -> validate sequence both the
+    runtime resolver (``OnoatsConfig.stt_launchd_label``, below) and
+    ``onoats init``'s config-carry-over path (``init.py``) need to apply to a
+    *string* label, extracted here so the two can't independently drift on
+    what counts as "absent" vs "malformed" for the same value (they did,
+    twice, in review-gauntlet rounds 5 and 6 on this branch). Callers that
+    must also reject a non-string raw value (e.g. a TOML `true`/`42`) do that
+    typecheck themselves before calling this — it only handles ``str | None``.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return validate_launchd_label(stripped) if stripped else None
 
 
 def _config_home() -> Path:
@@ -263,6 +331,54 @@ class OnoatsConfig:
     def stt_ws_uri(self) -> str | None:
         return _env_or("STT_WS_URI", self.raw.get("stt", {}).get("ws_uri"))
 
+    @property
+    def stt_launchd_label(self) -> str | None:
+        """launchd label to kickstart on preflight/reconnect failure.
+
+        env ``STT_LAUNCHD_LABEL`` > config.toml ``[stt].launchd_label`` >
+        ``None``. Absent, or an empty/whitespace-only value from either
+        source, normalizes to ``None`` (chosen behavior — unlike
+        ``stt_ws_socket``, callers treat "no label configured" as an exact
+        ``is None`` skip condition, so a stray `launchd_label = ""` in
+        config.toml must not be mistaken for a configured-but-empty label).
+        Absent means self-healing kickstart is skipped entirely — today's
+        plain-failure behavior is unchanged. No inference from socket path
+        or backend name: the two shipped plists
+        (``pipecat.stt-server.nemotron`` vs. ``pipecat.stt-server`` for a
+        bare ``mlx`` backend) prove no reliable derivation rule exists.
+        """
+        if "STT_LAUNCHD_LABEL" in os.environ:
+            # `_env_or` reads a blank env var as *absent* and falls through to
+            # config.toml. That is the right rule for every setting whose
+            # empty value means "use the default" — and the wrong one here,
+            # where this property's own docstring promises that an empty value
+            # "from either source" disables self-healing, and where disabling
+            # it is the only reason a user would export the variable empty in
+            # the first place. `STT_LAUNCHD_LABEL=` in a launchd plist or a
+            # shell wrapper silently kept kickstarting whatever label
+            # config.toml named. Presence, not truthiness, is the question an
+            # explicit override asks.
+            return normalize_launchd_label(os.environ["STT_LAUNCHD_LABEL"])
+        val = _env_or("STT_LAUNCHD_LABEL", self.raw.get("stt", {}).get("launchd_label"))
+        if val is not None and not isinstance(val, str):
+            # A typed config.toml value (bool `true`, int `42`, ...) must not
+            # be coerced into a string via `str(val)` — that would turn e.g.
+            # `launchd_label = true` into the string "True", which passes
+            # `_LAUNCHD_LABEL_RE` and silently enables kickstart against a
+            # value the user never intended as a label. Env vars are always
+            # strings already, so this branch only fires for config.toml.
+            logger.warning(
+                f"STT: ignoring non-string [stt].launchd_label {val!r} "
+                "(expected a TOML string); self-healing kickstart disabled"
+            )
+            val = None
+        # Allowlist-validate once, here, at the single resolution point: the
+        # label is interpolated into launchctl's `gui/<uid>/<label>` service
+        # target AND embedded in a status warning message whose merge format
+        # is delimiter-sensitive. A non-conforming value normalizes to None
+        # (self-healing off) — see `normalize_launchd_label`/`validate_launchd_label`.
+        return normalize_launchd_label(val)
+
     # ---- speakers (render-only display labels) ----
     @property
     def speaker_label_me(self) -> str:
@@ -380,7 +496,16 @@ def _load_secrets(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
     try:
-        return {k: v for k, v in dotenv_values(path).items() if v is not None}
+        # `interpolate=False`: `init._write_secrets_env` double-quotes every
+        # value (the only dotenv form that round-trips escapes), and
+        # `dotenv_values` expands `${VAR}` inside double quotes by default.
+        # A secret containing `${...}` must reach the client byte-for-byte as
+        # stored, not as whatever that env var happens to hold here.
+        return {
+            k: v
+            for k, v in dotenv_values(path, interpolate=False).items()
+            if v is not None
+        }
     except OSError as exc:
         logger.warning(f"config: could not read {path}: {exc}")
         return {}

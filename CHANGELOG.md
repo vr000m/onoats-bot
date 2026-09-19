@@ -15,6 +15,70 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **STT server self-healing.** New optional `[stt].launchd_label` (env
+  `STT_LAUNCHD_LABEL`) names the `launchctl` job onoats may restart when the
+  STT server is unreachable. When set, both the startup preflight and a live
+  session's exhausted reconnect backoff fire one
+  `launchctl kickstart -k gui/$UID/<label>`, capped by a process-wide,
+  label-keyed cooldown shared by the mic and system pipelines. Recovery is
+  reported only after a handshake actually succeeds (never on `launchctl`'s
+  exit code) and surfaces in `onoats status` / the menu bar via the `stt`,
+  `stt-mic` and `stt-system` warning branches. Absent by default — today's
+  behaviour is unchanged for existing installs.
+- **Onoats.app launch at login.** New optional `[app].launch_at_login` (Swift
+  side only; the Python config reader never reads it) registers or unregisters
+  the menu-bar app with `SMAppService` at launch. Absent means *no action at
+  all* — an out-of-band login-item registration is never touched; an explicit
+  `false` unregisters. A malformed config value or a failed register/unregister
+  call surfaces as a `⚠` login-item warning line in the menu bar (does not
+  block Start/Stop).
+
+### Changed
+
+- `status.warning` is now written per branch (`set_warning_branch`) instead of
+  whole-field, so the capturer's `mic`/`system` warnings and the new `stt*`
+  warnings coexist and clear independently. On-disk format and
+  `STATUS_SCHEMA_VERSION` are unchanged.
+- `onoats init` no longer drops `[stt].launchd_label` or the `[app]` section
+  when regenerating `config.toml` on a re-run.
+- **Credential redaction (`onoats._redact`) rewritten.** The tiered scanner
+  (three widening searches, each with its own accept conditions and its own
+  vetoes) is replaced by a single candidate scan behind positive gates.
+  Four credential leaks are closed — a veto added for one tier had been
+  silently disabling a protection another tier relied on, which is why each
+  previous round's patch reopened an older leak from a new angle. Also
+  closed: a password containing `://` leaked its username and password
+  prefix verbatim. The specification is now a generated sweep in
+  `tests/test_redact.py` (every combination of scheme, username shape,
+  password delimiter, host shape and trailing prose — ~2000 cases), not a
+  hand-picked case list; hand-picked lists are what missed every gap.
+- `safe_exc_text()` now drops a URI's query string as well as its userinfo,
+  matching what the whole-URI display call sites already did. A
+  `?token=...` in an operator-supplied `STT_WS_URI` was reaching the
+  reconnect warning and the status-file warnings verbatim inside
+  `websockets.InvalidURI`'s message. New `display_uri()` is the single
+  owner of the redact-then-strip-query composition both display call sites
+  had been open-coding.
+
+### Fixed
+
+- Redaction no longer destroys the hostname it was protecting. A ported,
+  path-and-query-bearing URI (`wss://host:443/v1?redirect=user@example.com`)
+  had its real host discarded and one fabricated from the query's tail; so
+  did any message where a real credential was followed by an unrelated
+  email address in trailing prose. Both reached `onoats status` and every
+  STT log line.
+- STT shutdown no longer burns the full reader-join timeout on every close.
+  `_graceful_close` cleared the reader's ownership handle before sending
+  `session.close`, so the reader discarded the `session.closed` ack the
+  close was waiting for — several seconds of dead shutdown time per
+  pipeline, doubled for the mic/system pair.
+- Cancelling an STT connect between the handshake and the `session.update`
+  ack no longer leaves the instance marked connected on an unconfigured
+  session.
+
 ## [1.2.0] - 2026-06-28
 
 ### Changed

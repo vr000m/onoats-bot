@@ -27,12 +27,30 @@ early-return once ``self._client is None``.
 The MLX V1 backend is commit-oriented, so we emit a single finalised
 ``TranscriptionFrame`` per segment. ``InterimTranscriptionFrame`` is a
 no-op in this path.
+
+**Live-session self-healing kickstart** (``launchd_label``/``on_recovery``
+constructor params): when the reconnect backoff in ``_ensure_connected`` is
+fully exhausted, and a label is configured, and the shared process-wide
+cooldown (``onoats.stt.launchd`` — the same registry the startup preflight
+path stamps) has elapsed for it, this fires one kickstart via that module's
+``try_kickstart`` primitive (the single owner of check-then-stamp-then-kick,
+shared with the preflight path), then lets the normal reconnect schedule
+continue on the caller's next attempt — no extra blocking wait here. Two
+instances racing the same exhaustion only ever produce one kickstart because
+``try_kickstart``'s check and stamp happen with no ``await`` between them.
+``on_recovery(<message>)`` fires only once a
+post-kickstart connect actually succeeds (never merely because
+``kickstart_stt_server`` returned ``True``); the cooldown itself is reset
+— and ``on_recovery(None)`` fired to clear the warning — only once that
+reconnected session sees its first ``transcript.completed``/
+``transcript.failed`` event, not on the bare connect.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncGenerator, Optional
+import time
+from collections.abc import AsyncGenerator, Callable
 
 from loguru import logger
 from pipecat.frames.frames import (
@@ -46,20 +64,61 @@ from pipecat.frames.frames import (
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
-
 from stt_server import TranscriptionClient
 from stt_server import protocol as P
+
+# Module reference, not `from ... import <names>`: attribute access through
+# the module object is what makes the registry monkeypatch-transparent
+# (tests patch `launchd.kickstart_stt_server`, `launchd.REGISTRY`'s methods,
+# ... and every read below goes through `launchd.<name>` at call time), which
+# is exactly what the four function-local imports this replaced were written
+# to achieve — they were never necessary. A top-level import is safe and
+# cycle-free: `launchd` is a leaf module that imports nothing from `onoats`.
+#
+# `safe_exc_text` lives in `onoats._redact`, a leaf module with no `onoats`
+# imports, so this is a top-level, cycle-free import of a *public* name —
+# not a private symbol reached across a module boundary (`runtime.py` only
+# ever imports this `stt` subpackage lazily, to avoid a cycle).
+# `_closing` is a leaf module for the same reason and holds the ONE bounded
+# teardown both this module and `runtime.py` use: the two construct and tear
+# down the same `TranscriptionClient`, and each used to own a teardown policy
+# (plus a near-duplicate 5.0s constant) with opposite rules.
+from onoats import _closing
+from onoats._redact import display_uri, safe_exc_text
+from onoats.stt import launchd
 
 # Wait at most this long for a decode round trip before surfacing an
 # error frame and giving up on the segment. Covers the 16 kHz / 60 s
 # server cap plus a little MLX decode slack.
 _DECODE_TIMEOUT_SECONDS = 90.0
 
-# Bounded wait for session.close to be acknowledged on pipeline shutdown.
-_CLOSE_TIMEOUT_SECONDS = 5.0
+# The client-close bound is NOT re-aliased here: every close in this module
+# goes through `onoats._closing.close_quietly`, which owns
+# `CLOSE_TIMEOUT_SEC`. The two modules bound the teardown of the same client
+# type, and a second, independently-edited 5.0 is exactly the drift review
+# found (one side bounded, one side not).
+#
+# Bounded wait for the reader task to observe `session.closed` during a
+# graceful close. Deliberately its OWN constant: joining a task is not
+# closing a client, so the same no-alias reasoning applies in the other
+# direction — retuning the client-close bound must not silently retune how
+# long shutdown waits on a reader coroutine.
+_READER_JOIN_TIMEOUT_SEC = 5.0
 
 # Bounded wait for session.updated after session.update.
 _SESSION_READY_TIMEOUT_SECONDS = 5.0
+
+# Bounded wait for `client.connect()` (the server.hello + session.created
+# handshake) per reconnect attempt. Without this, a server that accepts the
+# TCP/UDS connection but never emits its handshake frames (the event loop is
+# alive but its decode path is wedged — websockets' own ping/pong keepalive
+# does not catch this) hangs `_ensure_connected` forever: no attempt
+# advances, `_maybe_kickstart()` is never reached, and no ErrorFrame is ever
+# yielded, all while `_run_stt_lock` blocks every queued VAD segment behind
+# it. Mirrors the bound the preflight path already applies to the identical
+# call (`runtime._preflight_stt_ws`'s `asyncio.wait_for(client.connect(),
+# timeout=timeout_s)`).
+_CONNECT_TIMEOUT_SECONDS = 5.0
 
 # Reconnect back-off schedule. Doubles 0.5 → 8.0s before giving up, total
 # ~15.5s of wall clock. Sized to cover the LaunchAgent keepalive window
@@ -92,6 +151,10 @@ class WebSocketSTTService(SegmentedSTTService):
         uri: str | None = None,
         auth_token: str | None = None,
         language: str | None = "en",
+        launchd_label: str | None = None,
+        instance_name: str | None = None,
+        on_recovery: Callable[[str | None], None] | None = None,
+        on_preflight_confirmed: Callable[[], None] | None = None,
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
@@ -116,28 +179,99 @@ class WebSocketSTTService(SegmentedSTTService):
             auth_token=auth_token,
         )
         self._language = language
-        self._client: Optional[TranscriptionClient] = None
-        self._reader_task: Optional[asyncio.Task] = None
-        self._pending: Optional[asyncio.Future[str]] = None
+        self._client: TranscriptionClient | None = None
+        # The client `_graceful_close` is currently draining. `self._client`
+        # is deliberately cleared *before* the awaited teardown (see
+        # `_discard_stale`), which also revoked the reader's ownership — so
+        # the reader discarded the very `session.closed` event the graceful
+        # close was waiting for and the join always burned its full timeout.
+        # This is the reader's ownership handle across that window; nothing
+        # else reads it.
+        self._draining_client: TranscriptionClient | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._pending: asyncio.Future[str] | None = None
         # Resolved by the reader when a session.updated or error event arrives
         # after session.update; _ensure_connected awaits this before returning
         # so the first commit cannot race the language config.
-        self._session_ready: Optional[asyncio.Future[None]] = None
+        self._session_ready: asyncio.Future[None] | None = None
         self._run_stt_lock = asyncio.Lock()
         self._connected = False
         # Backend identity from the most recent server.hello. The model is
         # pinned server-side (launchd env), so the client cannot know it
         # until the handshake completes — these stay None until the first
         # successful connect, then reflect whatever ASR is actually serving.
-        self._backend_name: Optional[str] = None
-        self._backend_model: Optional[str] = None
+        self._backend_name: str | None = None
+        self._backend_model: str | None = None
+        # Self-healing kickstart (live-session path). ``launchd_label``/
+        # ``on_recovery`` mirror the preflight path's constructor-injected
+        # seam (never read from kwargs). Per-instance state tracks where in
+        # the "kickstarted, awaiting confirmation" sequence this instance is
+        # so each instance fires its own ``on_recovery`` independently even
+        # though the cooldown registry itself is process-wide/shared.
+        self._launchd_label = launchd_label
+        self._on_recovery = on_recovery
+        # Identifies this instance in the process-wide unhealthy registry
+        # (`onoats.stt.launchd.REGISTRY`), which gates the early cooldown
+        # reset so one instance's confirmed transcript is not mistaken for
+        # its sibling's health. Typed (`launchd.InstanceToken`) rather than a
+        # bare `str` so the registry protocol cannot be satisfied by an
+        # arbitrary string that happens to be lying around.
+        #
+        # Deliberately NOT `id(self)`: CPython reuses a freed object's memory
+        # address, so a token from an instance that leaked a registration
+        # (torn down without `cleanup()`) could be inherited wholesale by a
+        # later instance — silently either stealing or resurrecting an
+        # unhealthy mark. `instance_name` ("mic"/"system") is the stable
+        # identity the call site (`runtime._create_stt_service`) already has
+        # — an opaque identity token to this leaf service, which has no
+        # notion of status-warning branches (that concept is owned by
+        # `status.stt_branch()`/`format_warning_branch()`; the call site
+        # happens to reuse the same string for both purposes, but this class
+        # only ever uses it as a registry key). `self.name` (Pipecat's
+        # `<Class>#<monotonic counter>`) is the single-pipeline fallback and
+        # is never reused within a process.
+        self._instance_token = launchd.InstanceToken(instance_name or self.name)
+        # True from the moment this instance's own reconnect exhaustion
+        # triggers a kickstart until that instance's *next* successful
+        # connect — gates the one-time "server restarted automatically"
+        # on_recovery call.
+        self._kickstart_awaiting_connect = False
+        # Monotonic deadline for the flag above. Without it, a kickstart that
+        # launchd accepted but that never actually brought the server back
+        # leaves the flag armed indefinitely — a much later, wholly unrelated
+        # reconnect would then emit a stale "server restarted automatically"
+        # warning. The window is `KICKSTART_CONFIRM_WINDOW_SEC`, deliberately
+        # NOT the 30s cooldown: the confirming reconnect is demand-driven (the
+        # next VAD-triggered segment) and can itself burn ~15.5s of backoff, so
+        # a cooldown-sized window silently dropped genuine recoveries — and
+        # with them the arming of `_kickstart_awaiting_transcript`, so the
+        # cooldown never reset either.
+        self._kickstart_awaiting_connect_until = 0.0
+        # True from that successful post-kickstart connect until the first
+        # transcript.completed/transcript.failed event on it — gates the
+        # cooldown reset + on_recovery(None) clear.
+        self._kickstart_awaiting_transcript = False
+        # Separate gate for a recovery that happened during the STARTUP
+        # PREFLIGHT, against a throwaway ``TranscriptionClient`` before this
+        # instance existed — so this instance's own connect-triggered path
+        # above never runs for it. Without it, the warning the preflight
+        # recovery threads into the session's initial status record
+        # (``_create_stt_service`` / ``dual.py``) would linger in ``onoats
+        # status``/the menu bar for the whole session even once STT is
+        # healthy. It is a distinct gate (not a seed of the live one) because
+        # it clears a DIFFERENT status branch: the preflight recovery is one
+        # probe of one shared server, so it lands on the shared ``stt``
+        # branch, while this instance's own live recoveries land on its
+        # instance-scoped ``stt-mic``/``stt-system`` branch.
+        self._on_preflight_confirmed = on_preflight_confirmed
+        self._preflight_confirm_pending = on_preflight_confirmed is not None
 
     # ------------------------------------------------------------------
     # Backend identity (populated on connect from server.hello)
     # ------------------------------------------------------------------
 
     @property
-    def backend_name(self) -> Optional[str]:
+    def backend_name(self) -> str | None:
         """ASR backend the server reported on connect (e.g. ``parakeet``).
 
         ``None`` until the first successful handshake — the model is pinned
@@ -146,7 +280,7 @@ class WebSocketSTTService(SegmentedSTTService):
         return self._backend_name
 
     @property
-    def backend_model(self) -> Optional[str]:
+    def backend_model(self) -> str | None:
         """Model id the server reported on connect (e.g.
         ``mlx-community/parakeet-tdt-0.6b-v3``). ``None`` until connected."""
         return self._backend_model
@@ -194,6 +328,11 @@ class WebSocketSTTService(SegmentedSTTService):
             else:
                 await self._graceful_close()
         finally:
+            # Drop this instance's unhealthy registration so a stopped
+            # instance cannot hold its sibling's early cooldown reset hostage
+            # for the rest of the process's life.
+            if self._launchd_label is not None:
+                launchd.clear_unhealthy(self._launchd_label, self._instance_token)
             await super().cleanup()
 
     # ------------------------------------------------------------------
@@ -212,8 +351,17 @@ class WebSocketSTTService(SegmentedSTTService):
             try:
                 await self._ensure_connected()
             except Exception as exc:
-                logger.warning(f"WebSocketSTTService: connect failed: {exc}")
-                yield ErrorFrame(error=f"stt_server connect failed: {exc}")
+                # `_ensure_connected` can raise straight from
+                # `TranscriptionClient.connect()` (e.g. a malformed
+                # STT_WS_URI raises `websockets.exceptions.InvalidURI`,
+                # whose own message embeds the raw URI including userinfo)
+                # before any of runtime's own redaction ever sees it —
+                # sanitize before this reaches the log or a user-visible
+                # ErrorFrame. Same leak class as runtime.py's preflight
+                # error messages.
+                safe_exc = safe_exc_text(exc)
+                logger.warning(f"WebSocketSTTService: connect failed: {safe_exc}")
+                yield ErrorFrame(error=f"stt_server connect failed: {safe_exc}")
                 return
 
             assert self._client is not None
@@ -237,7 +385,7 @@ class WebSocketSTTService(SegmentedSTTService):
                 await self._client.commit()
                 try:
                     text = await asyncio.wait_for(self._pending, timeout=decode_timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # The server is still decoding; a late completed would
                     # otherwise resolve the NEXT segment's pending future with
                     # stale text (no item_id correlation in V1). Drop the
@@ -249,8 +397,10 @@ class WebSocketSTTService(SegmentedSTTService):
                     yield ErrorFrame(error="stt_server decode timed out")
                     return
             except Exception as exc:
-                logger.warning(f"{self.name}: decode failed: {exc}")
-                yield ErrorFrame(error=f"stt_server decode failed: {exc}")
+                logger.warning(f"{self.name}: decode failed: {safe_exc_text(exc)}")
+                yield ErrorFrame(
+                    error=f"stt_server decode failed: {safe_exc_text(exc)}"
+                )
                 return
             finally:
                 await self.stop_processing_metrics()
@@ -288,7 +438,32 @@ class WebSocketSTTService(SegmentedSTTService):
         for attempt in range(total_attempts):
             try:
                 client = TranscriptionClient(**self._connect_kwargs)
-                hello = await client.connect()
+                try:
+                    hello = await asyncio.wait_for(
+                        client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
+                    )
+                except BaseException:
+                    # `client` never became `self._client` (that assignment
+                    # is below, only on success), so it is invisible to
+                    # `_discard_stale()`'s cleanup — close it here or a
+                    # wedged server (TCP/UDS accepted, handshake frames never
+                    # sent, exactly the case `_CONNECT_TIMEOUT_SECONDS` exists
+                    # to catch) leaks one open websocket per attempt. Closing
+                    # is safe at any point mid-handshake: `client.close()`
+                    # no-ops on a `_ws` that never got set and closes it
+                    # otherwise, whether `connect()` timed out or raised
+                    # (e.g. the "expected server.hello" `RuntimeError`).
+                    # Bounded (`_closing.close_quietly`), not a bare
+                    # `await client.close()`: the wedged server this handler
+                    # exists for — socket accepted, handshake frames never
+                    # sent — is exactly the peer whose closing handshake also
+                    # never completes, so an unbounded close here would hang
+                    # the reconnect loop the connect timeout just rescued.
+                    # `TRANSPORT_ONLY`: no session exists yet to close.
+                    await _closing.close_quietly(
+                        client, closers=_closing.TRANSPORT_ONLY
+                    )
+                    raise
                 loop = asyncio.get_running_loop()
                 self._session_ready = loop.create_future()
                 self._client = client
@@ -299,15 +474,22 @@ class WebSocketSTTService(SegmentedSTTService):
                 self._reader_task = asyncio.create_task(
                     self._read_events(client), name=f"{self.name}:ws_reader"
                 )
-                await client.update_session(
-                    turn_detection=None, language=self._language
-                )
                 try:
-                    await asyncio.wait_for(
-                        self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    raise RuntimeError("stt_server did not ack session.update")
+                    await self._negotiate_session(client)
+                except asyncio.CancelledError:
+                    # `self._client`/`self._connected` are already set above
+                    # (the reader needs them), but the session is not usable
+                    # until `session.update` is acked. `CancelledError` is a
+                    # `BaseException`, so the attempt loop's `except
+                    # Exception` handler below — the one that calls
+                    # `_discard_stale()` — never sees it, and the instance
+                    # would be left marked "connected" on a session whose
+                    # turn-detection settings were never applied; the next
+                    # `_ensure_connected` then short-circuits on it. Same
+                    # reason the `connect()` handler above uses
+                    # `except BaseException`.
+                    await self._discard_stale()
+                    raise
                 # Backend identity from server.hello — surfaces an operational
                 # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
                 # and is stashed on the instance so callers (banner, metrics,
@@ -327,9 +509,39 @@ class WebSocketSTTService(SegmentedSTTService):
                     )
                 else:
                     logger.info(f"{self.name}: connected to {endpoint}{backend_desc}")
+                # A kickstart this instance itself triggered (on a prior
+                # exhaustion) is confirmed live only once we reach here —
+                # fire on_recovery's "restarted" message now, and arm the
+                # transcript-event gate that will actually reset the shared
+                # cooldown. A bare successful connect never resets the
+                # cooldown by itself (Requirements: no time-based fallback).
+                if self._kickstart_awaiting_connect:
+                    self._kickstart_awaiting_connect = False
+                    # A kickstart launchd accepted but that never actually
+                    # restored service leaves this pending; past the cooldown
+                    # window this connect is no longer attributable to it, so
+                    # drop the claim rather than emit a stale "restarted
+                    # automatically" message.
+                    if time.monotonic() <= self._kickstart_awaiting_connect_until:
+                        self._kickstart_awaiting_transcript = True
+                        self._fire_recovery(
+                            launchd.recovery_message(self._launchd_label)
+                        )
                 return
             except Exception as exc:
                 last_exc = exc
+                # Register this instance as unhealthy on its FIRST failed
+                # attempt, not at full-backoff exhaustion. The registration
+                # blocks a *sibling* instance's confirmed transcript from
+                # clearing the shared cooldown stamp early; registering only
+                # at exhaustion left a ~15.5s hole in which a sibling that
+                # had just started failing was invisible, so its own
+                # exhaustion moments later was free to SIGKILL the server the
+                # healthy instance was using (see `launchd.mark_unhealthy`).
+                # Idempotent (set add); cleared by this instance's next
+                # confirmed transcript or by `cleanup()`.
+                if self._launchd_label is not None:
+                    launchd.mark_unhealthy(self._launchd_label, self._instance_token)
                 # Tear down this attempt's client + reader before retrying so
                 # late events from the superseded socket can't poison the
                 # next attempt's _session_ready / _pending futures.
@@ -337,56 +549,296 @@ class WebSocketSTTService(SegmentedSTTService):
                 if attempt + 1 < total_attempts:
                     delay = _RECONNECT_BACKOFF_SECONDS[attempt]
                     logger.warning(
-                        f"{self.name}: connect attempt {attempt + 1} failed ({exc}) "
-                        f"[endpoint={endpoint}], retrying in {delay}s"
+                        f"{self.name}: connect attempt {attempt + 1} failed "
+                        f"({safe_exc_text(exc)}) [endpoint={endpoint}], "
+                        f"retrying in {delay}s"
                     )
                     await asyncio.sleep(delay)
-        assert last_exc is not None
+        if last_exc is None:
+            # Not an `assert`: `python -O` strips those, and this one guards
+            # the `raise last_exc` below — under `-O` a `None` here became
+            # `TypeError: exceptions must derive from BaseException`, losing
+            # the real connect failure. The loop cannot leave `last_exc`
+            # unset (every path through it either returns or records one), so
+            # reaching this is a bug in the loop, not a connect failure.
+            raise RuntimeError(
+                f"{self.name}: connect loop ended with no recorded exception"
+            )
         logger.error(
             f"{self.name}: giving up after {total_attempts} connect attempts to {endpoint}"
         )
+        # Only a *reachability* failure can plausibly be fixed by restarting
+        # the server. A protocol/auth failure (a 401 from a server that is
+        # demonstrably up and answering, a TLS error, an unexpected first
+        # frame) means the config is wrong, and SIGKILLing a healthy server
+        # neither fixes it nor is harmless. This mirrors the contract the
+        # preflight path already enforces (`runtime._preflight_stt_ws` only
+        # calls `_kickstart_and_retry` from its `TimeoutError`/`OSError`
+        # handlers, and `_kickstart_and_retry` only retries those shapes).
+        if isinstance(last_exc, (TimeoutError, OSError)):
+            await self._maybe_kickstart()
         raise last_exc
 
+    async def _negotiate_session(self, client: TranscriptionClient) -> None:
+        """Send ``session.update`` and wait for the server's ack.
+
+        Extracted so `_ensure_connected` can wrap exactly this window — the
+        one in which the instance is already marked connected but the
+        session is not yet usable — in its own `CancelledError` handler.
+        """
+        await client.update_session(turn_detection=None, language=self._language)
+        try:
+            await asyncio.wait_for(
+                self._session_ready, timeout=_SESSION_READY_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            # Re-raise as TimeoutError, not RuntimeError: a server that
+            # completes the websocket handshake but never acks
+            # session.update is a live-but-wedged server — exactly the
+            # reachability failure the `isinstance(last_exc, (TimeoutError,
+            # OSError))` kickstart gate in `_ensure_connected` exists to
+            # catch — not the auth/TLS/protocol misconfiguration that gate
+            # is meant to filter out. A RuntimeError here matched neither
+            # branch, so this path used to exhaust all attempts and raise
+            # without ever self-healing.
+            raise TimeoutError("stt_server did not ack session.update") from exc
+
+    def _fire_recovery(self, message: str | None) -> None:
+        """Invoke ``on_recovery`` without ever letting it escape.
+
+        The callback is a status-file writer supplied by the caller. It is
+        invoked from inside ``_ensure_connected``'s ``try`` (right after a
+        connect that *succeeded*) and from the reader task — in both places a
+        raising callback would be misattributed: ``_ensure_connected`` would
+        treat an already-established connection as a failed attempt and
+        discard the live client, and the reader would log a "reader crashed".
+        Recovery reporting is best-effort; the connection is not.
+        """
+        if self._on_recovery is None:
+            return
+        try:
+            self._on_recovery(message)
+        except Exception as exc:
+            logger.warning(
+                f"{self.name}: on_recovery callback failed: {safe_exc_text(exc)}"
+            )
+
+    async def _maybe_kickstart(self) -> None:
+        """Best-effort self-heal after the reconnect backoff is exhausted.
+
+        Called only for reachability exhaustion (``TimeoutError``/``OSError``)
+        — the caller filters; a protocol/auth failure never reaches here.
+
+        Fires at most once per process-wide cooldown window across every
+        ``WebSocketSTTService`` instance sharing ``launchd_label`` (and
+        across the startup preflight path, which stamps the same shared
+        registry in ``onoats.stt.launchd``) — never once-per-attempt, never
+        once-per-instance. The cooldown check and stamp happen back-to-back
+        with no ``await`` between them, so two instances exhausting
+        concurrently on the same event loop can't both pass the check
+        before either stamps.
+
+        Never blocks the caller's own reconnect schedule: this only asks
+        launchd to restart the job and stamps the cooldown, then returns.
+        The next ``_ensure_connected`` call (triggered by the caller's next
+        ``run_stt``) does the actual reconnecting on its normal backoff.
+        """
+        if self._launchd_label is None:
+            return
+        # `mark_unhealthy` is NOT called here: `_ensure_connected` already
+        # registered this instance on its first failed attempt, ~15.5s before
+        # this point (see `launchd.mark_unhealthy` for why the earlier
+        # registration matters).
+        if await launchd.try_kickstart(self._launchd_label):
+            self._kickstart_awaiting_connect = True
+            self._kickstart_awaiting_connect_until = (
+                time.monotonic() + launchd.KICKSTART_CONFIRM_WINDOW_SEC
+            )
+
     def _endpoint_label(self) -> str:
+        """Human-readable connect target for logs — never the raw `uri`.
+
+        `uri` may carry `user:pass@` userinfo (and a `?token=` query), and
+        this feeds both error logs and the happy-path "connected to
+        {endpoint}" line, so it must never return the raw kwarg verbatim.
+        Routed through the same `onoats._redact.display_uri`
+        `_display_target` uses, so there is one redaction owner, not two —
+        and one owner of the redact-then-strip-query *composition*, which
+        was previously open-coded identically in both places.
+        """
         kw = self._connect_kwargs
         if kw.get("socket_path"):
             return f"unix:{kw['socket_path']}"
         if kw.get("uri"):
-            return kw["uri"]
+            return display_uri(kw["uri"])
         host = kw.get("host") or "127.0.0.1"
         port = kw.get("port")
         return f"ws://{host}:{port}" if port else f"ws://{host}"
 
-    async def _discard_stale(self) -> None:
-        """Drop a dead client + reader without blocking on a broken socket."""
-        if self._reader_task is not None and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._reader_task = None
-        if self._client is not None:
-            try:
-                await self._client.close()
-            except Exception:
-                pass
+    def _detach_client(
+        self, *, draining: bool = False
+    ) -> tuple[object | None, asyncio.Task | None]:
+        """Take ownership of the live client + reader and clear the instance
+        state, returning both as locals.
+
+        The shared preamble of all three teardown paths (`_discard_stale`,
+        `_graceful_close`, `_cancel_and_close`), which each re-derived it
+        with its own ordering and its own copy of the rationale. The second
+        shared step is :meth:`_cancel_and_join_reader`; what legitimately
+        still differs between the three is listed on :meth:`_graceful_close`.
+
+        State is cleared BEFORE any awaited teardown, never in a `finally`
+        after it: `_closing.close_quietly` re-raises `CancelledError` by
+        contract, so every assignment sitting after that await is skipped on
+        the cancellation path (Ctrl+C, `CancelFrame`, task cancellation) —
+        leaving `_client` set and `_connected` True, and the next
+        `_ensure_connected` short-circuiting on a dead client. The objects
+        being torn down come back as locals, so the teardown is unaffected
+        by the early reset.
+
+        `draining=True` additionally hands the client to `_draining_client`.
+        The reader's ownership test is `client is self._client`, so clearing
+        `_client` here would otherwise silently revoke the reader's right to
+        act on the `session.closed` ack `close_session` is about to provoke,
+        and the bounded join would burn its full timeout on every close. Two
+        requirements collided — reset-before-await for cancellation safety,
+        and reader ownership across the drain — so they use two handles.
+        The caller must clear `_draining_client` when the drain window ends.
+        """
+        client = self._client
+        reader = self._reader_task
         self._client = None
+        if draining:
+            # Only ever *set* here, never cleared: a non-draining detach
+            # running while another path's drain window is open must not
+            # revoke that drain's reader ownership and strand its join on
+            # the full timeout.
+            self._draining_client = client
+        self._reader_task = None
         self._connected = False
+        return client, reader
+
+    @staticmethod
+    async def _cancel_and_join_reader(reader: asyncio.Task | None) -> None:
+        """Cancel the reader task and wait for it to finish unwinding.
+
+        The second shared step of the teardown paths, after
+        :meth:`_detach_client`. `_discard_stale` and `_cancel_and_close`
+        each hand-rolled it with its own copy of the rationale below;
+        `_graceful_close` deliberately does **not** use it — see the
+        teardown-divergence note on :meth:`_graceful_close` for why.
+
+        `asyncio.gather(..., return_exceptions=True)`, not a plain `await
+        reader` under `except (CancelledError, Exception): pass`: the plain
+        form cannot distinguish "the reader task I just cancelled finished
+        as cancelled" (the expected, benign outcome of the `.cancel()`
+        above) from "someone cancelled ME while I was awaiting it" — both
+        surface identically as `CancelledError` from the `await`. `gather`
+        absorbs the *awaited task's own* `CancelledError` into its result
+        list without raising, while still letting a genuine external
+        cancellation of the current coroutine propagate normally through
+        the `await gather(...)` itself.
+
+        The join is unconditional rather than guarded on `not reader.done()`:
+        a reader that already finished by raising still has to be awaited for
+        its exception to be retrieved, or asyncio logs "exception was never
+        retrieved" when the task is collected. `.cancel()` on a finished task
+        is a documented no-op.
+        """
+        if reader is None:
+            return
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+    async def _discard_stale(self) -> None:
+        """Drop a dead client + reader without blocking on a broken socket.
+
+        See :meth:`_detach_client` for why the state reset happens before
+        the awaited teardown rather than after it.
+        """
+        client, reader = self._detach_client()
+        await self._cancel_and_join_reader(reader)
+        if client is not None:
+            # Bounded: this runs on the reconnect path, i.e. precisely when
+            # the peer has already proven unreachable — an unbounded close
+            # would stall every subsequent reconnect attempt behind a dead
+            # server's closing handshake.
+            await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
+
+    def _maybe_confirm_kickstart_recovery(self) -> None:
+        """First transcript.completed/transcript.failed event following a
+        kickstart-triggered reconnect: reset the shared cooldown and clear
+        the warning. Never fires on a bare successful connect — only here, on
+        confirmed sustained health.
+
+        Two independent gates, because they clear two different status
+        branches: ``_preflight_confirm_pending`` clears the SHARED ``stt``
+        branch a startup-preflight recovery wrote (every instance is armed
+        for it, so whichever sees a transcript first clears it — a
+        system-audio-only session must not leave it pinned), while
+        ``_kickstart_awaiting_transcript`` clears this instance's own
+        ``stt-mic``/``stt-system`` branch.
+
+        The cooldown reset is attempted on EVERY confirmed transcript event,
+        not only behind those gates: only the instance that actually won the
+        kickstart arms them, so gating the reset on them left a sibling's
+        unhealthy registration (and with it the shared stamp) held until the
+        cooldown expired on its own. ``reset_cooldown`` is token-scoped and
+        drops the stamp only once no instance sharing the label is still
+        exhausted-and-unconfirmed, so this stays strictly stronger than the
+        plan's "confirmed transcript, never a bare connect" rule."""
+        if self._launchd_label is not None:
+            # Token-scoped: the cooldown is process-wide but confirmation is
+            # per-instance, so the stamp only drops once no sibling instance
+            # sharing this label is still exhausted-and-unconfirmed.
+            launchd.reset_cooldown(self._launchd_label, self._instance_token)
+        if not (self._preflight_confirm_pending or self._kickstart_awaiting_transcript):
+            return
+        if self._preflight_confirm_pending:
+            self._preflight_confirm_pending = False
+            if self._on_preflight_confirmed is not None:
+                try:
+                    self._on_preflight_confirmed()
+                except Exception as exc:
+                    logger.warning(
+                        f"{self.name}: on_preflight_confirmed callback failed: "
+                        f"{safe_exc_text(exc)}"
+                    )
+        if self._kickstart_awaiting_transcript:
+            self._kickstart_awaiting_transcript = False
+            self._fire_recovery(None)
 
     async def _read_events(self, client: TranscriptionClient) -> None:
         saw_session_closed = False
         try:
             async for ev in client.events():
-                # Ignore any event from a superseded client (e.g. a failed
-                # handshake that's still draining while a retry is in flight).
-                if client is not self._client:
-                    continue
                 etype = ev.get("type")
+                # Ignore any event from a superseded client (e.g. a failed
+                # handshake that's still draining while a retry is in
+                # flight). `_draining_client` is this same client during a
+                # `_graceful_close`, which clears `_client` before awaiting
+                # the teardown — without the exemption the `session.closed`
+                # that close is *waiting for* would be discarded here and
+                # the join would always time out.
+                #
+                # The exemption is for that ONE event type and no other. A
+                # blanket "draining clients are exempt" let a closing
+                # session's late `transcript.completed` set a result on
+                # `self._pending` (which by then belongs to the *next*
+                # client's decode) and its `transcript.failed` reach
+                # `_maybe_confirm_kickstart_recovery`, firing an
+                # `on_recovery` and a `launchd.reset_cooldown()` off a
+                # session already being torn down.
+                if client is not self._client and not (
+                    client is self._draining_client and etype == P.EVT_SESSION_CLOSED
+                ):
+                    continue
                 if etype == P.EVT_TRANSCRIPT_COMPLETED:
+                    self._maybe_confirm_kickstart_recovery()
                     if self._pending and not self._pending.done():
                         self._pending.set_result(ev.get("transcript", ""))
                 elif etype == P.EVT_TRANSCRIPT_FAILED:
+                    self._maybe_confirm_kickstart_recovery()
                     err = ev.get("error") or {}
                     msg = (
                         err.get("message")
@@ -434,7 +886,7 @@ class WebSocketSTTService(SegmentedSTTService):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(f"{self.name}: reader crashed: {exc}")
+            logger.warning(f"{self.name}: reader crashed: {safe_exc_text(exc)}")
             if client is self._client and self._pending and not self._pending.done():
                 self._pending.set_exception(exc)
         finally:
@@ -462,42 +914,136 @@ class WebSocketSTTService(SegmentedSTTService):
                     self._pending.set_exception(
                         ConnectionError("stt_server connection lost mid-decode")
                     )
+            elif client is self._draining_client and saw_session_closed:
+                # A graceful close already reset the instance state, so
+                # there is nothing to tear down here — but the ack it was
+                # waiting for did arrive, and saying so is the whole point
+                # of waiting for it.
+                logger.info(f"{self.name}: session closed cleanly by server")
 
     async def _graceful_close(self) -> None:
+        """Close the session cleanly, giving the reader a window to ack.
+
+        **What still differs between the three teardown paths, and why** —
+        the shared parts are :meth:`_detach_client` (the preamble),
+        :meth:`_cancel_and_join_reader` (the reader join) and the final
+        bounded `close_quietly(..., TRANSPORT_ONLY)`. Everything below is a
+        real requirement of this call site, not leftover duplication, and
+        should not be converged away:
+
+        * **The reader is waited for, not cancelled.** `_discard_stale` and
+          `_cancel_and_close` are tearing down a client that is dead or being
+          abandoned, so they cancel the reader outright. This path has just
+          asked the server to close the session and the reader is the only
+          thing that can observe the `session.closed` ack — cancelling it
+          first would throw away the very event this close exists to collect.
+          It therefore *waits*, bounded by `_READER_JOIN_TIMEOUT_SEC`, and
+          falls back to `reader.cancel()` only on timeout or on a genuine
+          cancellation of this coroutine. That is why it cannot call
+          :meth:`_cancel_and_join_reader`, which cancels first by definition.
+        * **`draining=True`.** Only this path holds `_draining_client`, for
+          the same reason: the reader's ownership test is
+          `client is self._client`, and clearing `_client` in the preamble
+          would silently revoke the reader's right to act on the ack it is
+          waiting for. The other two have no ack to wait for and no drain
+          window to keep open.
+        * **The `_closing.CancellationLedger`.** Two closers run here with a
+          reader join between them, so a cancellation arriving mid-sequence
+          must not skip the transport close. The other two paths have a
+          single closer in a `finally` and need no ledger.
+        * **`_discard_stale` logs no elapsed time.** It runs once per
+          reconnect attempt on the hot path; the other two run once per
+          session teardown, where the timing is what pins the blame for
+          Pipecat's opaque 20s `wait_for_cancel` warning.
+        """
         if self._client is None:
             return
-        client = self._client
+        client, reader = self._detach_client(draining=True)
         # Shutdown-phase timing: the Pipecat 20 s ``wait_for_cancel`` warning
         # is opaque by the time it fires — "STT close took Ns" from this
         # wrapper pins the blame here immediately instead.
         t0 = asyncio.get_running_loop().time()
+        # This sequence cannot be one `close_quietly` call — the reader join
+        # has to sit BETWEEN the two closers — but the "attempt every step,
+        # remember a cancellation, re-raise it once" invariant is the same
+        # one, so it is composed from `_closing.CancellationLedger` rather
+        # than hand-rolled a second time next to `close_quietly`'s copy.
+        ledger = _closing.CancellationLedger()
         try:
-            try:
-                await asyncio.wait_for(
-                    client.close_session(), timeout=_CLOSE_TIMEOUT_SECONDS
-                )
-            except Exception:
-                pass
+            await ledger.attempt(
+                _closing.close_quietly(client, closers=("close_session",))
+            )
             # Give the reader a bounded window to observe session.closed.
-            if self._reader_task is not None:
+            if reader is not None:
                 try:
+                    # `gather(..., return_exceptions=True)`, matching
+                    # `_cancel_and_join_reader`: a plain
+                    # `wait_for(reader, ...)` surfaces the READER task's own
+                    # cancellation and an external cancellation of
+                    # `_graceful_close` itself as the same `CancelledError`,
+                    # so a reader cancelled by anything else was recorded in
+                    # the ledger as a shutdown of *this* coroutine and
+                    # re-raised at the end — aborting the caller's close for
+                    # a cancellation it never received. `gather` absorbs the
+                    # awaited task's own cancellation into its result list;
+                    # only a genuine cancellation of this coroutine still
+                    # reaches the `except` below.
                     await asyncio.wait_for(
-                        self._reader_task, timeout=_CLOSE_TIMEOUT_SECONDS
+                        asyncio.gather(reader, return_exceptions=True),
+                        timeout=_READER_JOIN_TIMEOUT_SEC,
                     )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    self._reader_task.cancel()
+                except TimeoutError:
+                    # No join follows, unlike `_discard_stale` and
+                    # `_cancel_and_close`, and the asymmetry is apparent
+                    # rather than real: `asyncio.wait_for` cancels the
+                    # awaitable it wraps and **awaits that cancellation to
+                    # finish** before raising `TimeoutError`, and cancelling a
+                    # `gather` cancels its children — so `reader` is already
+                    # done and joined by the time this line runs, even when
+                    # its own cancellation cleanup is slow. The siblings need
+                    # an explicit join because their `.cancel()` is
+                    # standalone; here it is a defensive no-op on an
+                    # already-cancelled task. Pinned by
+                    # `test_graceful_close_has_no_live_reader_at_the_transport_close`,
+                    # which is what a refactor away from `wait_for` would trip.
+                    reader.cancel()
+                except asyncio.CancelledError as exc:
+                    # `ledger.remember`, not `ledger.attempt`: this step
+                    # needs a side effect (`reader.cancel()`) on the
+                    # cancellation path that the ledger cannot run for it.
+                    reader.cancel()
+                    ledger.remember(exc)
         finally:
-            await client.close()
-            self._client = None
-            self._reader_task = None
-            self._connected = False
+            # Ownership handed back before the transport close: the drain
+            # window is over, and a stale `_draining_client` would let a
+            # superseded reader act on a client this instance has finished
+            # with. Cleared first so the `close_quietly` below — which
+            # re-raises `CancelledError` — cannot skip it.
+            #
+            # `is client`, not unconditional: `_detach_client(draining=True)`
+            # only ever *sets* this field, deliberately, so that a
+            # non-draining detach cannot revoke an open drain window's reader
+            # ownership. Clearing it unconditionally here is the mirror-image
+            # of the same mistake — this close would revoke a drain window it
+            # does not own. No live path interleaves two drains today; the
+            # guard costs one comparison and keeps the asymmetry from
+            # becoming a real bug the first time one does.
+            if self._draining_client is client:
+                self._draining_client = None
+            await ledger.attempt(
+                _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
+            )
             elapsed = asyncio.get_running_loop().time() - t0
             logger.info(f"{self.name}: graceful close took {elapsed:.3f}s")
+        ledger.raise_if_cancelled()
 
     async def _cancel_and_close(self) -> None:
         if self._client is None:
             return
-        client = self._client
+        # Detached before the awaited teardown (see `_detach_client`) —
+        # doubly load-bearing here, since this is the method that runs
+        # *under* cancellation in the first place.
+        client, reader = self._detach_client()
         t0 = asyncio.get_running_loop().time()
         try:
             try:
@@ -506,16 +1052,10 @@ class WebSocketSTTService(SegmentedSTTService):
                 pass
             if self._pending and not self._pending.done():
                 self._pending.cancel()
-            if self._reader_task is not None:
-                self._reader_task.cancel()
-                try:
-                    await self._reader_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await self._cancel_and_join_reader(reader)
         finally:
-            await client.close()
-            self._client = None
-            self._reader_task = None
-            self._connected = False
+            # Bounded, and swallowing: see the module's teardown invariants
+            # in `onoats._closing`.
+            await _closing.close_quietly(client, closers=_closing.TRANSPORT_ONLY)
             elapsed = asyncio.get_running_loop().time() - t0
             logger.info(f"{self.name}: hard cancel took {elapsed:.3f}s")

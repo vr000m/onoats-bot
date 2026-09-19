@@ -16,3 +16,4 @@ dist/
 secrets.env
 .deep-review/
 .review-plan/
+.gauntlet/

@@ -37,19 +37,25 @@ from loguru import logger
 # STT_MODEL, and BOT_NAME at module load. onoats's consolidated config
 # (config.toml + secrets.env) is the source of truth; this dotenv load is a
 # convenience for a project-local .env in dev. Env vars still override.
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
+load_dotenv(
+    os.path.join(os.path.dirname(__file__), "..", ".env"),
+    override=False,
+    # Match the `dotenv_values` readers in `onoats.config`: a `$VAR`
+    # or `${VAR}` inside a value is a literal, not an interpolation.
+    # `.env` is dev-only (`secrets.env` is the real boundary), but one
+    # reader silently rewriting values another reader passes through is
+    # a divergence worth not having.
+    interpolate=False,
+)
 
 from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
-    RecorderAlreadyRunningError,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
+    RecorderAlreadyRunningError,
     SttPreflightError,
-    stop_pipeline_for_shutdown,
-    wait_or_force,
     _acquire_instance_lock,
     _create_stt_service,
-    log_stt_server_rss,
     _install_signal_handlers,
     _mark_status_rotation,
     _remove_pid_file,
@@ -60,8 +66,11 @@ from onoats.runtime import (  # noqa: E402
     _write_status_running,
     _write_status_stopped,
     flush_and_rotate,
+    log_stt_server_rss,
     run_crash_recovery,
+    stop_pipeline_for_shutdown,
     stt_banner,
+    wait_or_force,
 )
 
 
@@ -386,9 +395,9 @@ async def run_onoats_dual(
     data_dir: Path | None = None,
 ) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
-    from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.processors.audio.vad_processor import VADProcessor
 
     from onoats._vendor.store import onoats_data_dir
     from onoats.processors.dual_silence_detector import DualSilenceDetector
@@ -500,8 +509,32 @@ async def run_onoats_dual(
     system_vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE)
     )
-    mic_stt = await _create_stt_service()
-    system_stt = await _create_stt_service()
+    # Recovery message capture: only the *first* call's preflight actually
+    # probes the endpoint (the second is a `_preflight_cache` hit for the
+    # same resolved kwargs — see `_preflight_stt_ws`'s docstring), so at
+    # most one of the two calls returns a non-None message. Both calls read
+    # the SAME memoized outcome, though: `_preflight_cache` stores the
+    # recovery message (not just "a probe ran"), and a cache-hit call
+    # replays it into its own `on_recovery`, so neither call needs to be
+    # told about the other's result — no `preflight_recovered` relay here.
+    # `branch_instance` scopes each instance's LIVE-session status-warning
+    # branch (`stt-mic` / `stt-system`) so mic's and system's independent
+    # kickstart recoveries can't clear each other's still-unconfirmed
+    # warning. The startup preflight's own recovery stays on the shared
+    # `stt` branch (one probe, one server), so whichever instance's first
+    # transcript event lands first clears it — a system-audio-only session
+    # (no mic transcript ever) still clears the shared warning.
+    mic_result = await _create_stt_service(data_dir=data_dir, branch_instance="mic")
+    mic_stt = mic_result.service
+    system_result = await _create_stt_service(
+        data_dir=data_dir,
+        branch_instance="system",
+    )
+    system_stt = system_result.service
+    preflight_recovery_warning = (
+        mic_result.preflight_recovery_message
+        or system_result.preflight_recovery_message
+    )
     # RSS baseline for the stt_server at bot start. Pair with the
     # ``shutdown`` entry logged from `_run_shutdown` to get a free
     # soak datapoint out of every real-world session — no dedicated
@@ -548,7 +581,12 @@ async def run_onoats_dual(
     # Write ordering (status-file contract): pid file FIRST, then status. So a
     # reader that catches us mid-start sees pid-alive (backstop) before the rich
     # status record exists, never the reverse.
-    _write_status_running(data_dir, audio_source=audio_source, stt_label=stt_banner())
+    _write_status_running(
+        data_dir,
+        audio_source=audio_source,
+        stt_label=stt_banner(),
+        warning=preflight_recovery_warning,
+    )
 
     shutdown_started = False
     shutdown_complete = asyncio.Event()

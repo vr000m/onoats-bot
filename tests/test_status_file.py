@@ -13,6 +13,7 @@ Covers the five slices the dev plan calls for:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -22,11 +23,13 @@ from onoats.status import (
     STATUS_SCHEMA_VERSION,
     Liveness,
     StatusRecord,
+    _parse_warning_branches,
+    _write_warning_field,
     mark_rotation,
     read_status,
     resolve_liveness,
     set_devices,
-    set_warning,
+    set_warning_branch,
     stamp_supervisor_failure,
     status_path,
     write_prestart_waiting,
@@ -94,22 +97,432 @@ def test_round_trip_v2_fields(tmp_path: Path):
     assert (got.warning, got.mic_device, got.system_device) == (None, None, None)
 
 
-def test_set_warning_sets_and_clears(tmp_path: Path):
-    # No record yet → best-effort no-op (the event raced ahead of the start write).
-    assert set_warning(tmp_path, "early") is None
-    assert read_status(tmp_path) is None
-
+def test_write_warning_field_sets_and_clears(tmp_path: Path):
+    """Round-3 architecture finding: the public `set_warning` was a third,
+    unguarded whole-field writer bypassing the branch grammar
+    `format_warning_branch` is the choke point for, with zero production
+    callers left. It is now the private `_write_warning_field`, which takes
+    the record its single caller (`set_warning_branch`) has already read and
+    gated, and does nothing but write the field."""
     write_running(tmp_path, pid=4242, audio_source="socket", stt_label="mlx-whisper")
-    set_warning(tmp_path, "mic: only zero samples for ~30 s — check hardware mute")
+    current = read_status(tmp_path)
+    assert current is not None
+    _write_warning_field(
+        tmp_path, current, "mic: only zero samples for ~30 s — check hardware mute"
+    )
     got = read_status(tmp_path)
     assert got is not None
     assert got.warning == "mic: only zero samples for ~30 s — check hardware mute"
     # The annotate must not clobber the session detail.
     assert got.running is True and got.audio_source == "socket"
 
-    set_warning(tmp_path, None)
+    _write_warning_field(tmp_path, got, None)
     got = read_status(tmp_path)
     assert got is not None and got.warning is None
+
+
+def test_status_module_exposes_no_unbranched_warning_writer():
+    """The single-writer property is structural, not conventional: there must
+    be no public way to write the `warning` field outside the branch grammar
+    (`set_warning_branch`) and the preflight `write_running(warning=...)`
+    seam, which itself routes through `format_warning_branch`."""
+    import onoats.status as status_module
+
+    assert not hasattr(status_module, "set_warning")
+
+
+# ---------------------------------------------------------------------------
+# (a1) write_running's `warning` kwarg — Phase 3 recovery-warning race fix
+#
+# Dev plan Phase 3: the preflight kickstart's on_recovery message fires
+# BEFORE any running record exists (dual.py's preflight runs ahead of
+# _write_status_running), so set_warning_branch (which requires an existing
+# record) can't carry it — the message must be threaded straight into the
+# start-of-session write instead.
+# ---------------------------------------------------------------------------
+
+
+def test_write_running_accepts_warning_kwarg(tmp_path: Path):
+    write_running(
+        tmp_path,
+        pid=4242,
+        audio_source="socket",
+        stt_label="websocket",
+        warning="stt: server restarted automatically (kickstarted pipecat.stt-server)",
+    )
+    got = read_status(tmp_path)
+    assert got is not None
+    assert (
+        got.warning
+        == "stt: server restarted automatically (kickstarted pipecat.stt-server)"
+    )
+    # Session detail must be intact alongside the warning.
+    assert got.running is True and got.pid == 4242 and got.stt_label == "websocket"
+
+
+def test_write_running_warning_defaults_to_none(tmp_path: Path):
+    """No regression for the common (no kickstart) case: omitting `warning`
+    must produce the exact same record as before this kwarg existed."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+def test_write_running_warns_but_still_writes_a_malformed_warning(
+    tmp_path: Path, caplog
+):
+    """Round-4 finding 1: `write_running(warning=...)` is a second entry
+    point into the `warning` field that bypasses `set_warning_branch`'s
+    grammar, with nothing checking its shape. A caller that forgets to
+    pre-format through `format_warning_branch` (e.g. passes a bare message
+    with no `"<branch>: "` lead-in) must be logged as a defense-in-depth
+    signal — this pins that write_running does NOT silently accept a
+    malformed value, while still writing it (best-effort, never raises,
+    like every other producer in this module)."""
+    import logging
+
+    from loguru import logger
+
+    from onoats.status import _is_well_formed_warning
+
+    assert _is_well_formed_warning("not-branch-shaped") is False
+
+    bridge = logging.getLogger("loguru-bridge-round4-1")
+    sink_id = logger.add(lambda m: bridge.warning(str(m)))
+    try:
+        with caplog.at_level(logging.WARNING, logger="loguru-bridge-round4-1"):
+            write_running(
+                tmp_path, pid=1, audio_source="socket", stt_label="mlx", warning="oops"
+            )
+    finally:
+        logger.remove(sink_id)
+    assert any("write_running" in rec.message for rec in caplog.records)
+
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "oops"
+
+
+def test_write_running_well_formed_warning_does_not_warn(tmp_path: Path, caplog):
+    """No false positive: a properly pre-formatted message (the real
+    preflight call site's shape) must not trip the defense-in-depth log."""
+    import logging
+
+    from loguru import logger
+
+    bridge = logging.getLogger("loguru-bridge-round4-2")
+    sink_id = logger.add(lambda m: bridge.warning(str(m)))
+    try:
+        with caplog.at_level(logging.WARNING, logger="loguru-bridge-round4-2"):
+            write_running(
+                tmp_path,
+                pid=1,
+                audio_source="socket",
+                stt_label="mlx",
+                warning="stt: server restarted automatically (kickstarted my.label)",
+            )
+    finally:
+        logger.remove(sink_id)
+    assert not any("write_running" in rec.message for rec in caplog.records)
+
+
+def test_set_warning_branch_still_annotates_a_running_record_from_a_different_pid(
+    tmp_path: Path,
+):
+    """Round-4 finding 3: the cross-session pid guard is ANDed with
+    `not current.running`, so it only blocks a stale event landing on a
+    *stopped* different-session record — it does NOT (and, per its
+    docstring, is not meant to) block one landing on a *running*
+    different-pid record. Pinning this as documented, tested behaviour:
+    every real branch writer runs inside the same process that owns the
+    current running record (the pid-file lock elsewhere prevents two live
+    recorders), so this scope carve-out costs nothing in production, and
+    several existing tests already rely on it (e.g. `write_running(...,
+    pid=1, ...)` followed by a same-process `set_warning_branch` call)."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    got = set_warning_branch(tmp_path, "mic", "check hardware mute")
+    assert got is not None
+    after = read_status(tmp_path)
+    assert after is not None
+    assert after.running is True and after.pid == 1
+    assert after.warning == "mic: check hardware mute"
+
+
+def test_write_prestart_waiting_note_is_not_branch_grammar(tmp_path: Path):
+    """Round-4 finding 2 (quarantined as design-intent, not a bug): `note`
+    is a standalone freeform pre-session message, not a `"<branch>:
+    <message>"` entry — there is no branch and no session yet at this point.
+    Pinning current behaviour: `_parse_warning_branches` cannot find a
+    branch in it (dropped as malformed/legacy), and a subsequent
+    `set_warning_branch` merge on that record therefore treats the prior
+    note as if there were no prior warning, rather than clobbering or
+    corrupting it."""
+    note = "waiting for the system-audio permission prompt"
+    write_prestart_waiting(tmp_path, audio_source="socket", note=note)
+    before = read_status(tmp_path)
+    assert before is not None and before.warning == note
+    assert _parse_warning_branches(before.warning) == {}
+
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    after = read_status(tmp_path)
+    assert after is not None
+    assert after.warning == "mic: check hardware mute"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (self-healing plan): set_warning_branch — per-branch merge/replace
+# against the same `warning` field, sorted by branch name, so mic/system/stt
+# can be set and cleared independently without a whole-field overwrite.
+# ---------------------------------------------------------------------------
+
+
+def test_set_warning_branch_noop_without_record(tmp_path: Path):
+    # Same best-effort contract as mark_rotation: no record yet → no-op, no crash.
+    assert set_warning_branch(tmp_path, "stt", "server unreachable") is None
+    assert read_status(tmp_path) is None
+
+
+def test_set_warning_branch_sets_independently_in_sorted_order(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "mic: check hardware mute"
+
+    set_warning_branch(tmp_path, "system", "check the grant")
+    got = read_status(tmp_path)
+    assert got is not None
+    # Sorted branch-name order regardless of write order (matches
+    # cli.py's existing `sorted(active_warnings)` convention).
+    assert got.warning == "mic: check hardware mute; system: check the grant"
+
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == (
+        "mic: check hardware mute; stt: server unreachable; system: check the grant"
+    )
+
+
+def test_set_warning_branch_clear_preserves_other_branches(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    set_warning_branch(tmp_path, "system", "check the grant")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == (
+        "mic: check hardware mute; stt: server unreachable; system: check the grant"
+    )
+
+    # Clearing mic must not touch stt or system.
+    set_warning_branch(tmp_path, "mic", None)
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == "stt: server unreachable; system: check the grant"
+
+    # Clearing stt must not touch system.
+    set_warning_branch(tmp_path, "stt", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "system: check the grant"
+
+    # Clearing the last remaining branch empties the field entirely.
+    set_warning_branch(tmp_path, "system", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+def test_set_warning_branch_clear_unset_branch_is_a_noop(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    # Clearing a branch that was never set must leave the existing branch alone.
+    set_warning_branch(tmp_path, "stt", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "mic: check hardware mute"
+
+
+def test_set_warning_branch_replaces_existing_branch_message(tmp_path: Path):
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    set_warning_branch(tmp_path, "mic", "check hardware mute")
+    # A second set on the same branch replaces (not appends) its own message.
+    set_warning_branch(tmp_path, "stt", "server restarted automatically")
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.warning == (
+        "mic: check hardware mute; stt: server restarted automatically"
+    )
+
+
+def test_set_warning_branch_malformed_legacy_value_degrades_gracefully(
+    tmp_path: Path,
+):
+    """A pre-migration, non-branch-prefixed `warning` value (or any string the
+    `f"{branch}: "` parser can't cleanly split) must not raise — it degrades
+    gracefully rather than crashing the caller."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    seeded = read_status(tmp_path)
+    assert seeded is not None
+    _write_warning_field(
+        tmp_path, seeded, "legacy free-form warning with no branch prefix"
+    )
+
+    # Must not raise, and the new branch's message must still land.
+    set_warning_branch(tmp_path, "stt", "server unreachable")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert "stt: server unreachable" in got.warning
+
+
+def test_set_warning_branch_message_with_delimiter_does_not_forge_a_branch(
+    tmp_path: Path,
+):
+    """Deep-review finding: a `message` (or `branch`) containing the
+    parser's own `"; "` entry delimiter used to forge a second,
+    unclearable pseudo-branch entry on the next `_parse_warning_branches`
+    read — no subsequent `set_warning_branch(..., None)` call for the real
+    branch could ever remove it, since it parsed out under a different
+    key. `set_warning_branch` must sanitize at the single choke point so
+    the merged string always round-trips back to exactly the branches
+    that were actually set."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "capture callbacks stalled; system: forged")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    # Only the "mic" branch was ever set — parsing the merged string back
+    # must not reveal a second, forged "system" branch.
+    assert _parse_warning_branches(got.warning) == {
+        "mic": "capture callbacks stalled, system: forged"
+    }
+
+    # Clearing "mic" removes it completely — nothing forged survives.
+    set_warning_branch(tmp_path, "mic", None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+def test_recovery_message_is_prefixed_exactly_once_on_both_paths(
+    tmp_path: Path,
+):
+    """Round-2 fix (finding 1): the recovery message had three independent
+    owners and `set_warning_branch` defensively stripped a redundant
+    "<branch>: " lead-in as a band-aid. Now there is one message builder
+    (`launchd.recovery_message`, deliberately BARE) and one prefixer
+    (`status.format_warning_branch`), so the merge path and the raw
+    `write_running(warning=...)` preflight path produce byte-identical
+    text with exactly one prefix."""
+    from onoats.status import format_warning_branch, stt_branch
+    from onoats.stt.launchd import recovery_message
+
+    bare = recovery_message("pipecat.stt-server")
+    assert not bare.startswith("stt:")  # the builder never prefixes
+
+    # Path A: the merge path (live-session recovery).
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="websocket")
+    set_warning_branch(tmp_path, stt_branch(None), bare)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert got.warning == (
+        "stt: server restarted automatically (kickstarted pipecat.stt-server)"
+    )
+    assert "stt: stt:" not in got.warning
+
+    # Path B: the raw write_running(warning=...) preflight path, which does
+    # NOT go through the merge — same formatter, same result.
+    assert format_warning_branch(stt_branch(None), bare) == got.warning
+
+
+def test_set_warning_branch_noop_on_stopped_record_from_a_different_pid(
+    tmp_path: Path,
+):
+    """A branch event can race ahead of the NEXT session's write_running and
+    land while the on-disk record still belongs to a *different, previous*
+    session (a different pid) that has already stopped — annotating it would
+    mislabel history, so this must no-op exactly like set_devices does, not
+    silently mutate the stale record. `pid=1` here stands in for "some other
+    process" — real init/launchd pids notwithstanding, it can never equal
+    this test process's own `os.getpid()`."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    write_stopped(tmp_path, exit_reason="graceful")
+    before = read_status(tmp_path)
+    assert before is not None and before.running is False
+
+    assert set_warning_branch(tmp_path, "stt", "server unreachable") is None
+
+    after = read_status(tmp_path)
+    assert after == before
+
+
+def test_set_warning_branch_still_annotates_own_stopped_record(tmp_path: Path):
+    """A stopped record that still belongs to THIS process (pid matches) is
+    not a different session's history — it is this same session's terminal
+    record, and a trailing capturer/STT diagnostic arriving during the
+    shutdown grace-drain window (after write_stopped already ran) must still
+    land on it, exactly like the pre-branch-keying whole-field writer did. Gating
+    only on `running` (not `pid`) would silently drop that trailing
+    diagnostic — see cli.py's `_STDERR_READER_GRACE_SEC` drain, which keeps
+    consuming capturer stderr for a bounded window after the recorder
+    session has already been marked stopped."""
+    write_running(tmp_path, pid=os.getpid(), audio_source="socket", stt_label="mlx")
+    write_stopped(tmp_path, exit_reason="graceful")
+    before = read_status(tmp_path)
+    assert before is not None and before.running is False
+
+    got = set_warning_branch(tmp_path, "mic", "no audio detected")
+    assert got is not None
+
+    after = read_status(tmp_path)
+    assert after is not None
+    assert after.running is False
+    assert after.warning == "mic: no audio detected"
+
+
+def test_set_warning_branch_message_with_delimiter_is_sanitized(
+    tmp_path: Path,
+):
+    """Deep-review finding (superseding the prior "known limitation" pin):
+    `set_warning_branch` now strips the parser's own `"; "` entry
+    delimiter out of `message` at the single choke point, rather than
+    leaving every caller responsible for avoiding it — see
+    `test_set_warning_branch_message_with_delimiter_does_not_forge_a_branch`
+    for the forged-pseudo-branch scenario this prevents."""
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "stt", "server unreachable; retrying")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert got.warning == "stt: server unreachable, retrying"
+    assert _parse_warning_branches(got.warning) == {
+        "stt": "server unreachable, retrying"
+    }
+
+
+@pytest.mark.parametrize("delimiter", ("; ", ": "), ids=("entry", "field"))
+def test_a_branch_key_carrying_either_delimiter_stays_clearable(
+    tmp_path: Path, delimiter: str
+):
+    """Round-7 architecture finding: the *entry* delimiter (`"; "`) was
+    sanitized out of a branch key by both writers, but the *field* delimiter
+    (`": "`) was sanitized by neither and was a bare literal in the formatter
+    and the parser. A branch key containing `": "` therefore parsed back as a
+    different, shorter key than the one `set_warning_branch` looks up — so
+    the entry could never be cleared. Both delimiters now go through one
+    `sanitize_warning_branch`, which is also what makes the two writers agree
+    on the replacement character and not merely on what they strip."""
+    from onoats.status import sanitize_warning_branch
+
+    branch = f"stt{delimiter}forged"
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, branch, "server unreachable")
+
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    # Exactly one entry, keyed by the sanitized name — no forged second one.
+    key = sanitize_warning_branch(branch)
+    assert delimiter not in key
+    assert _parse_warning_branches(got.warning) == {key: "server unreachable"}
+    # The formatter and the lookup agree, so the entry clears.
+    assert set_warning_branch(tmp_path, branch, None) is not None
+    cleared = read_status(tmp_path)
+    assert cleared is not None and not cleared.warning
 
 
 def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):
@@ -145,7 +558,7 @@ def test_set_devices_sets_fields_without_clobbering(tmp_path: Path):
 def test_set_devices_noop_on_stopped_record(tmp_path: Path):
     """Device events fire within the capturer's first second, when the on-disk
     record may still be the PREVIOUS session's — a stopped record must never be
-    device-stamped (unlike set_warning, which only requires existence)."""
+    device-stamped (unlike set_warning_branch, which only requires existence)."""
     write_running(tmp_path, pid=4242, audio_source="socket", stt_label="x")
     write_stopped(tmp_path, exit_reason="graceful")
     assert set_devices(tmp_path, mic_device="Some Mic (uid=u1)") is None
@@ -250,6 +663,23 @@ def test_dual_wires_producers_at_start_rotation_stop():
     pid_write_idx = src.index("_write_pid_file(data_dir)")
     start_idx = src.index("_write_status_running(")
     assert pid_write_idx < start_idx, "pid file must be written before status (start)"
+
+
+def test_dual_threads_captured_recovery_warning_into_status_running():
+    """Phase 3 race fix: the preflight's on_recovery message fires before any
+    running record exists, so dual.py must capture it into a local variable
+    and pass it as `_write_status_running(..., warning=<captured>)` rather
+    than routing it through `set_warning_branch` (which requires a prior
+    record — see test_set_warning_branch_noop_without_record)."""
+    src = (Path(__file__).resolve().parents[1] / "src/onoats/dual.py").read_text()
+    start_idx = src.index("_write_status_running(")
+    # The call site passing the recovery message must be the one right
+    # before pipeline construction, not merely present anywhere in the file.
+    call_site = src[start_idx : start_idx + 400]
+    assert "warning=" in call_site, (
+        "dual.py's _write_status_running call site must thread the captured "
+        "recovery message via a `warning=` kwarg"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -754,3 +1184,248 @@ def test_instance_lock_blocks_then_frees_on_release(tmp_path):
         _fcntl.flock(other, _fcntl.LOCK_UN)
     finally:
         _os.close(other)
+
+
+def test_stt_mic_and_system_branches_do_not_clobber_each_other(tmp_path: Path):
+    """Finding 6: `dual.py` constructs two independent WebSocketSTTService
+    instances against one server. Sharing a single "stt" branch key let
+    system's kickstart-recovery clear erase mic's still-unconfirmed warning
+    even though mic's own health was never confirmed — the same hazard the
+    "mic"/"system" capture branches already avoid by being instance-scoped."""
+    from onoats.status import stt_branch
+    from onoats.stt.launchd import recovery_message
+
+    write_running(tmp_path, pid=1, audio_source="socket", stt_label="websocket")
+
+    set_warning_branch(tmp_path, stt_branch("mic"), recovery_message("label-a"))
+    set_warning_branch(tmp_path, stt_branch("system"), recovery_message("label-a"))
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert "stt-mic: " in got.warning
+    assert "stt-system: " in got.warning
+
+    # system confirms first; mic's warning must survive.
+    set_warning_branch(tmp_path, stt_branch("system"), None)
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    assert "stt-mic: " in got.warning
+    assert "stt-system: " not in got.warning
+
+    # And they coexist with the shared preflight branch and the capture
+    # branches, in sorted order.
+    set_warning_branch(tmp_path, stt_branch(None), recovery_message("label-a"))
+    set_warning_branch(tmp_path, "mic", "no input")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is not None
+    branches = [part.split(": ", 1)[0] for part in got.warning.split("; ")]
+    assert branches == sorted(branches)
+    assert set(branches) == {"mic", "stt", "stt-mic"}
+
+
+def test_stt_branch_keys_are_instance_scoped():
+    """Finding 6: mic and system are independent instances against one
+    server; a shared branch key let either one's clear erase the other's
+    still-unconfirmed warning."""
+    from onoats.status import stt_branch
+
+    assert stt_branch(None) == "stt"
+    assert stt_branch("mic") == "stt-mic"
+    assert stt_branch("system") == "stt-system"
+    assert stt_branch("mic") != stt_branch("system")
+
+
+def test_swift_menu_bar_splits_on_the_documented_warning_delimiter():
+    """Round-6 architecture finding: `status.py`'s header says the Swift
+    menu bar's outer split must change "in lockstep" with this module's
+    `warning` join delimiter, but nothing checked it — the delimiter was a
+    bare `"; "` literal in five places here and one `components(separatedBy:)`
+    call in Swift, and a change on either side would have silently produced a
+    menu bar that renders several branches as one unbroken line (or splits
+    mid-message).
+
+    This is the lockstep mechanism the convention lacked. It reads the Swift
+    source rather than importing it — the two languages cannot share a
+    constant, which is the whole reason the convention exists — and fails if
+    the Swift split string stops matching
+    `status.WARNING_ENTRY_DELIMITER`."""
+    from onoats.status import WARNING_ENTRY_DELIMITER
+
+    swift = (
+        Path(__file__).resolve().parents[1]
+        / "native"
+        / "onoats-menubar"
+        / "Sources"
+        / "OnoatsMenuBarApp.swift"
+    )
+    assert swift.is_file(), swift
+    source = swift.read_text(encoding="utf-8")
+
+    # The warning renderer's outer split. Matched structurally (the
+    # `components(separatedBy:)` call applied to `warning`), not by grepping
+    # for the literal anywhere in the file, so an unrelated `"; "` elsewhere
+    # in the Swift source cannot satisfy it.
+    m = re.search(
+        r"\bwarning\s*\n?\s*\.components\(separatedBy:\s*\"([^\"]*)\"\)", source
+    )
+    assert m is not None, (
+        "OnoatsMenuBarApp.swift no longer splits `warning` with "
+        "components(separatedBy:) — the status.py warning-grammar lockstep "
+        "convention has no reader to stay in step with."
+    )
+    assert m.group(1) == WARNING_ENTRY_DELIMITER, (
+        f"Swift splits `warning` on {m.group(1)!r} but "
+        f"status.WARNING_ENTRY_DELIMITER is {WARNING_ENTRY_DELIMITER!r}. "
+        "Change both in lockstep (see the status.py header)."
+    )
+
+
+def test_swift_menu_bar_shares_one_hint_splitter_across_every_hint():
+    """Round-9 architecture finding: two rendering policies for one kind of
+    string. `model.warning` was split on `"; "` then `" — "` inline in its own
+    branch, while the login-item hint — added later, built by
+    `LoginItemManager` with that same `" — "` delimiter and carrying unbounded
+    text (a user-edited config.toml value, `error.localizedDescription`) —
+    rendered unsplit and stretched the whole menu, the exact problem the split
+    exists to prevent.
+
+    The split now lives in one helper (`hintCaptionLines`) that every `⚠` hint
+    goes through. Checked here rather than left to convention because the
+    convention is what failed: the second producer inherited the wrong
+    behaviour by default, and nothing said so.
+    """
+    swift = (
+        Path(__file__).resolve().parents[1]
+        / "native"
+        / "onoats-menubar"
+        / "Sources"
+        / "OnoatsMenuBarApp.swift"
+    )
+    source = swift.read_text(encoding="utf-8")
+    assert "func hintCaptionLines(" in source, (
+        "the shared hint splitter is gone — each hint call site is free to "
+        "invent its own rendering again."
+    )
+    # No hint may be rendered as a bare, unsplit menu item.
+    for field in ("model.warning", "model.flushNote", "launch.loginItemHint"):
+        assert f'Text("⚠ \\({field}' not in source, field
+    for binding in ("warning", "note", "hint"):
+        assert f"hintLines({binding})" in source, binding
+
+
+def test_read_status_survives_a_non_utf8_status_file(tmp_path: Path):
+    """Round-9 finding: `read_status` promises "a partial/corrupt/drifted file
+    is 'no status', never an exception", and `Path.read_text` does the I/O and
+    the decode in one call — so a mojibake or mid-multibyte-truncated file
+    raised `UnicodeDecodeError`, a `ValueError` subclass that is not an
+    `OSError` and flew past both handlers. It escapes into `onoats status`,
+    the menu-bar poller, and `write_stopped`'s read-modify-write in the
+    shutdown tail."""
+    status_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    status_path(tmp_path).write_bytes(b'{"schema": 2, "pid": \xff\xfe}')
+    assert read_status(tmp_path) is None
+
+
+def test_write_running_carries_forward_a_branch_warning(tmp_path: Path):
+    """Round-9 finding: `write_running` builds a FRESH record, which is right
+    for every field except the one with a second, concurrent, *merging*
+    writer. The socket supervisor's capturer-event drain is live before the
+    recorder's start write, so a `zero-run-warning` (a mic delivering pure
+    silence) could land first and be erased a moment later — permanently,
+    because the branch is only emitted on the transition and nothing
+    re-asserts it. `cli.py`'s `active_warnings` dict used to absorb this by
+    accident and went away when `set_warning_branch` became the single
+    writer."""
+    write_running(tmp_path, pid=os.getpid(), audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "only zero samples for ~30 s")
+    # The recorder's own start write, landing after the supervisor's event.
+    write_running(
+        tmp_path,
+        pid=os.getpid(),
+        audio_source="socket",
+        stt_label="websocket",
+        warning="stt: server restarted automatically",
+    )
+    got = read_status(tmp_path)
+    assert got is not None
+    assert got.stt_label == "websocket"
+    branches = _parse_warning_branches(got.warning)
+    assert branches == {
+        "mic": "only zero samples for ~30 s",
+        "stt": "server restarted automatically",
+    }
+    # Still clearable through the normal single writer.
+    set_warning_branch(tmp_path, "mic", None)
+    got = read_status(tmp_path)
+    assert got is not None
+    assert _parse_warning_branches(got.warning) == {
+        "stt": "server restarted automatically"
+    }
+
+
+def test_write_running_does_not_inherit_a_stale_sessions_warning(tmp_path: Path):
+    """The other half: a crashed previous session leaves `running=true` on
+    disk. Its warnings describe a session that is gone and must not be
+    donated to the new one."""
+    write_status(tmp_path, _record(pid=999_999, warning="mic: stale from last time"))
+    write_running(tmp_path, pid=4242, audio_source="socket", stt_label="mlx")
+    got = read_status(tmp_path)
+    assert got is not None and got.warning is None
+
+
+def test_write_running_carry_forward_keeps_a_malformed_warning_visible(tmp_path: Path):
+    """A value the grammar cannot parse cannot be merged into the grammar
+    either — re-rendering would drop it, turning the logged misuse into a
+    silent one."""
+    write_running(tmp_path, pid=os.getpid(), audio_source="socket", stt_label="mlx")
+    set_warning_branch(tmp_path, "mic", "zero samples")
+    write_running(
+        tmp_path,
+        pid=os.getpid(),
+        audio_source="socket",
+        stt_label="mlx",
+        warning="not-branch-shaped",
+    )
+    got = read_status(tmp_path)
+    assert got is not None and got.warning == "not-branch-shaped"
+
+
+def test_login_item_sync_is_owned_by_app_lifecycle_not_the_recorder_model():
+    """Round-6 deferral, resolved in round 10.
+
+    `RecorderModel.init()` spawned the login-item sync and published the hint
+    as a `@Published` field, justified only by "RecorderModel is constructed
+    once, at OnoatsMenuBarApp startup". That is a coincidence of construction
+    timing, not an ownership claim: reconciling `config.toml`'s
+    `launch_at_login` against `SMAppService` has nothing to do with the status
+    file or pid-file liveness, which is what that class's own doc comment says
+    it is for. It now lives on `LaunchState`, owned by `OnoatsMenuBarApp` via
+    `@StateObject` — the same once-per-launch guarantee, from the object that
+    actually represents the launch.
+
+    Pinned here because this environment has no Xcode license, so nothing else
+    would notice the concern drifting back.
+    """
+    sources = (
+        Path(__file__).resolve().parents[1] / "native" / "onoats-menubar" / "Sources"
+    )
+    recorder = (sources / "RecorderModel.swift").read_text(encoding="utf-8")
+    app = (sources / "OnoatsMenuBarApp.swift").read_text(encoding="utf-8")
+
+    assert "LoginItemManager" not in recorder, (
+        "the login-item sync is back in RecorderModel; it belongs to app "
+        "lifecycle, not to the status-file consumer"
+    )
+    assert "loginItemHint" not in recorder
+
+    assert "final class LaunchState" in app
+    assert "LoginItemManager.sync()" in app
+    # Owned once per launch by the App, and observed by the menu separately
+    # from recorder state.
+    assert "@StateObject private var launch = LaunchState()" in app
+    assert "@ObservedObject var launch: LaunchState" in app
+    # The @MainActor isolation verified in round 8 is preserved: the sync runs
+    # off the main actor and hops back through a dedicated isolated method
+    # rather than a nested closure recapturing `self`.
+    assert "@MainActor\nfinal class LaunchState" in app
+    assert "Task.detached" in app
+    assert "private func applyLoginItemHint(" in app
