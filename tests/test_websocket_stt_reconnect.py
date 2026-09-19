@@ -37,11 +37,9 @@ def _clear_cooldown_registry():
     """Mirrors `test_stt_launchd.py`'s fixture — the registry is process-wide
     and module-level, shared with the Phase 3 preflight path; must not leak
     between tests (or between this file and other test modules)."""
-    launchd._last_kickstart.clear()
-    launchd._unhealthy.clear()
+    launchd.REGISTRY.clear()
     yield
-    launchd._last_kickstart.clear()
-    launchd._unhealthy.clear()
+    launchd.REGISTRY.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -200,8 +198,8 @@ def test_repeated_exhaustion_within_cooldown_window_kickstarts_once(monkeypatch)
     def fake_stamp(label, **kw):
         stamped_at[label] = fake_now["t"]
 
-    monkeypatch.setattr(launchd, "_cooldown_elapsed", fake_elapsed)
-    monkeypatch.setattr(launchd, "_stamp_cooldown", fake_stamp)
+    monkeypatch.setattr(launchd.REGISTRY, "cooldown_elapsed", fake_elapsed)
+    monkeypatch.setattr(launchd.REGISTRY, "stamp_cooldown", fake_stamp)
 
     kickstart_calls = []
     monkeypatch.setattr(
@@ -233,10 +231,10 @@ def test_repeated_exhaustion_within_cooldown_window_kickstarts_once(monkeypatch)
 
 def test_preflight_kickstart_stamp_blocks_live_path_exhaustion(monkeypatch):
     """The registry is shared with `runtime._preflight_stt_ws` (Phase 3).
-    Stamp it exactly as that path would (`launchd._stamp_cooldown`) and
+    Stamp it exactly as that path would (`launchd.REGISTRY.stamp_cooldown`) and
     assert the live reconnect path — running immediately after, well
     inside the real 30s window — reads the same stamp and skips."""
-    launchd._stamp_cooldown("shared-label")  # simulates the Phase 3 path
+    launchd.REGISTRY.stamp_cooldown("shared-label")  # simulates the Phase 3 path
 
     kickstart_calls = []
     monkeypatch.setattr(
@@ -353,7 +351,7 @@ def test_reset_path_clears_cooldown_and_fires_on_recovery_none_then_rekickstarts
     with pytest.raises(Exception):
         asyncio.run(svc._ensure_connected())
     assert len(kickstart_calls) == 1
-    assert "label-z" in launchd._last_kickstart
+    assert launchd.REGISTRY.is_stamped("label-z")
 
     # Bare successful connect confirms health (on_recovery fires with the
     # kickstart message) but must NOT itself reset the cooldown — only a
@@ -362,20 +360,20 @@ def test_reset_path_clears_cooldown_and_fires_on_recovery_none_then_rekickstarts
 
     async def _connect_then_complete():
         await svc._ensure_connected()
-        assert "label-z" in launchd._last_kickstart  # not reset by bare connect
+        assert launchd.REGISTRY.is_stamped("label-z")  # not reset by bare connect
         client = _FakeClient.instances[-1]
         await client.push_event(
             {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
         )
         # Give the reader task a beat to observe the pushed event.
         for _ in range(50):
-            if "label-z" not in launchd._last_kickstart:
+            if not launchd.REGISTRY.is_stamped("label-z"):
                 break
             await asyncio.sleep(0.01)
 
     asyncio.run(_connect_then_complete())
 
-    assert "label-z" not in launchd._last_kickstart  # reset by transcript.completed
+    assert not launchd.REGISTRY.is_stamped("label-z")  # reset by transcript.completed
     assert recovered.count(None) == 1
     # on_recovery(None) is the reset signal, distinct from and after the
     # "kickstarted <label>" confirmation message.
@@ -443,7 +441,7 @@ def test_preflight_confirm_callback_clears_on_first_transcript_event(monkeypatch
         )
         # Give the reader task a beat to observe the pushed event and run
         # _maybe_confirm_kickstart_recovery (the label was never stamped by
-        # THIS instance, so polling on _last_kickstart's membership — as
+        # THIS instance, so polling on the registry's stamped-labels membership — as
         # the sibling reset test does — can't distinguish "not yet
         # processed" from "nothing to reset"; poll on the callback instead).
         for _ in range(50):
@@ -461,8 +459,8 @@ def test_preflight_confirm_callback_clears_on_first_transcript_event(monkeypatch
     # `on_recovery` belongs to this instance's OWN live branch, which never
     # recovered — it must stay untouched.
     assert recovered == []
-    assert "label-preflight" not in launchd._last_kickstart
-    assert launchd._last_kickstart == {}
+    assert not launchd.REGISTRY.is_stamped("label-preflight")
+    assert launchd.REGISTRY.stamped_labels() == frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +576,7 @@ def test_sibling_instance_still_failing_blocks_the_shared_cooldown_reset(monkeyp
 
     asyncio.run(_both_exhaust())
     assert len(kickstart_calls) == 1
-    assert "shared-label" in launchd._last_kickstart
+    assert launchd.REGISTRY.is_stamped("shared-label")
 
     # mic reconnects and sees a real transcript; system is still down.
     exc_holder["exc"] = lambda: None
@@ -590,7 +588,9 @@ def test_sibling_instance_still_failing_blocks_the_shared_cooldown_reset(monkeyp
             {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
         )
         for _ in range(50):
-            if mic._instance_token not in launchd._unhealthy.get("shared-label", set()):
+            if mic._instance_token not in launchd.REGISTRY.unhealthy_tokens(
+                "shared-label"
+            ):
                 break
             await asyncio.sleep(0.01)
 
@@ -598,7 +598,7 @@ def test_sibling_instance_still_failing_blocks_the_shared_cooldown_reset(monkeyp
 
     # The shared stamp must SURVIVE: system has not confirmed health, so
     # its next exhaustion must not be free to restart the server mic is on.
-    assert "shared-label" in launchd._last_kickstart
+    assert launchd.REGISTRY.is_stamped("shared-label")
 
     # And once system confirms too, the stamp drops as before.
     async def _system_confirms():
@@ -608,12 +608,12 @@ def test_sibling_instance_still_failing_blocks_the_shared_cooldown_reset(monkeyp
             {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
         )
         for _ in range(50):
-            if "shared-label" not in launchd._last_kickstart:
+            if not launchd.REGISTRY.is_stamped("shared-label"):
                 break
             await asyncio.sleep(0.01)
 
     asyncio.run(_system_confirms())
-    assert "shared-label" not in launchd._last_kickstart
+    assert not launchd.REGISTRY.is_stamped("shared-label")
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +643,7 @@ def test_protocol_error_exhaustion_never_kickstarts(monkeypatch):
         asyncio.run(svc._ensure_connected())
 
     assert kickstart_calls == []
-    assert "label-auth" not in launchd._last_kickstart
+    assert not launchd.REGISTRY.is_stamped("label-auth")
 
     # A reachability failure on the same service still kickstarts — the
     # filter narrows the trigger, it does not disable it.
@@ -773,7 +773,7 @@ def test_discard_stale_does_not_swallow_external_cancellation():
 
 
 def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monkeypatch):
-    """Round-3 finding 2: round 2's `_unhealthy` guard registered an instance
+    """Round-3 finding 2: round 2's unhealthy-set guard registered an instance
     only when it EXHAUSTED its ~15.5s backoff, so an instance that had just
     begun failing was invisible to the guard. Concrete race: mic exhausts and
     kickstarts; system's socket dies a second later and it starts its own
@@ -799,7 +799,7 @@ def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monke
     with pytest.raises(Exception):
         asyncio.run(mic._ensure_connected())
     assert kickstart_calls == ["shared-label"]
-    assert "shared-label" in launchd._last_kickstart
+    assert launchd.REGISTRY.is_stamped("shared-label")
 
     # T0+1: system's socket dies too. It fails its first attempt and then
     # reconnects — so it NEVER exhausts its backoff, and under the old
@@ -813,7 +813,7 @@ def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monke
 
     _install_fake_client_factory(monkeypatch, fail_once_then_connect)
     asyncio.run(system._ensure_connected())
-    assert system._instance_token in launchd._unhealthy.get("shared-label", set())
+    assert system._instance_token in launchd.REGISTRY.unhealthy_tokens("shared-label")
 
     # T0+3: mic reconnects and sees a real transcript.
     _install_fake_client_factory(monkeypatch, lambda: None)
@@ -825,7 +825,9 @@ def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monke
             {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "hello"}
         )
         for _ in range(50):
-            if mic._instance_token not in launchd._unhealthy.get("shared-label", set()):
+            if mic._instance_token not in launchd.REGISTRY.unhealthy_tokens(
+                "shared-label"
+            ):
                 break
             await asyncio.sleep(0.01)
 
@@ -833,7 +835,7 @@ def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monke
 
     # The shared stamp must SURVIVE: system is still unconfirmed, so its next
     # exhaustion must not be free to restart the server mic is running on.
-    assert "shared-label" in launchd._last_kickstart
+    assert launchd.REGISTRY.is_stamped("shared-label")
 
     _install_fake_client_factory(monkeypatch, _always_refused)
     with pytest.raises(Exception):
@@ -843,20 +845,21 @@ def test_sibling_that_has_only_just_started_failing_blocks_the_early_reset(monke
 
 def test_instance_token_is_the_branch_name_not_a_memory_address():
     """Round-3 findings 5 + 12 (one fix): `id(self)` is reused by CPython
-    after GC, so a leaked `_unhealthy` registration could be inherited by an
+    after GC, so a leaked unhealthy registration could be inherited by an
     unrelated later instance. The call site already has the stable
     `"mic"`/`"system"` identity; `self.name` (Pipecat's monotonic
     `<Class>#<n>`) is the single-pipeline fallback and is never reused."""
     mic = _make_service(launchd_label="l", instance_name="mic")
-    assert mic._instance_token == "mic"
-    assert mic._instance_token != f"{id(mic):x}"
+    assert mic._instance_token == launchd.MIC
+    assert mic._instance_token.name == "mic"
+    assert mic._instance_token.name != f"{id(mic):x}"
 
     # No branch name (single-pipeline path): still unique, still not an
     # address.
     a = _make_service(launchd_label="l")
     b = _make_service(launchd_label="l")
     assert a._instance_token != b._instance_token
-    assert a._instance_token != f"{id(a):x}"
+    assert a._instance_token.name != f"{id(a):x}"
 
 
 def test_launchd_registry_is_imported_once_at_module_top_level(monkeypatch):

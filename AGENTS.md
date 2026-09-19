@@ -253,7 +253,8 @@ feature rather than failing a test you'd notice:
   bare successful connect and never on a timer. Because confirmation is
   per-instance while the cooldown is shared, the reset is token-scoped: the
   stamp drops only once *no* instance sharing the label is still
-  exhausted-and-unconfirmed (`launchd._unhealthy`). Otherwise mic confirming
+  exhausted-and-unconfirmed (`launchd.REGISTRY`'s unhealthy set, keyed by the
+  typed `launchd.InstanceToken`). Otherwise mic confirming
   health would re-arm system to SIGKILL the server mic is using. An instance
   registers itself unhealthy on its **first failed connect attempt**, not at
   backoff exhaustion — registering only at exhaustion left a ~15.5s hole in
@@ -265,10 +266,10 @@ feature rather than failing a test you'd notice:
   is demonstrably up) means the config is wrong; SIGKILLing a healthy server
   neither fixes it nor is harmless.
 - **The cooldown registry is process-scoped, not cross-process.**
-  `launchd._last_kickstart`/`_unhealthy` are plain module-level dicts with no
+  `launchd.REGISTRY` is a single in-memory `KickstartRegistry` with no
   persistence — a crash-restart loop (menu bar / socket supervisor relaunching
   the recorder) starts each fresh `onoats bot` process with an EMPTY registry,
-  so the 30s cooldown caps kickstarts only *within* one process's lifetime, not
+  so the `KICKSTART_COOLDOWN_SEC` cooldown caps kickstarts only *within* one process's lifetime, not
   across the relaunches that can follow a repeatedly-crashing session. This is
   accepted, not a gap to silently work around: if cross-process capping is
   ever needed, persist the stamp next to the status file in `data_dir` — don't

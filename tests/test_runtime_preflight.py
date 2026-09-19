@@ -22,6 +22,7 @@ import asyncio
 import pytest
 
 from onoats import _closing, runtime
+from onoats.stt import launchd
 from onoats.runtime import SttPreflightError, _preflight_stt_ws
 
 
@@ -250,11 +251,12 @@ def test_kickstart_attempted_only_after_handshake_unreachable_exhaustion(monkeyp
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
     stamped = []
     monkeypatch.setattr(
-        "onoats.stt.launchd._stamp_cooldown", lambda label, **kw: stamped.append(label)
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown",
+        lambda label, **kw: stamped.append(label),
     )
     monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
 
@@ -292,10 +294,10 @@ def test_cooldown_stamped_before_kickstart_await_not_after(monkeypatch):
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._stamp_cooldown",
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown",
         lambda label, **kw: events.append("stamped"),
     )
     monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
@@ -361,7 +363,7 @@ def test_cooldown_active_falls_straight_through_to_sttpreflighterror(monkeypatch
         lambda label, **kw: kickstart_calls.append(label) or True,
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: False
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: False
     )
     _install_fake_client(
         monkeypatch, connect_raises=lambda: ConnectionRefusedError("refused")
@@ -388,9 +390,11 @@ def test_kickstart_attempted_at_most_once_per_preflight_failure(monkeypatch):
         lambda label, **kw: kickstart_calls.append(label) or True,
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     _install_fake_client(
         monkeypatch, connect_raises=lambda: ConnectionRefusedError("refused")
     )
@@ -414,9 +418,11 @@ def test_kickstart_never_raises_from_preflight(monkeypatch):
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: False
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     _install_fake_client(
         monkeypatch, connect_raises=lambda: ConnectionRefusedError("refused")
     )
@@ -438,9 +444,11 @@ def test_successful_post_kickstart_retry_calls_on_recovery(monkeypatch):
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
 
     # First two attempts (the pre-existing schedule) fail; kickstart fires;
     # the post-kickstart retry then succeeds.
@@ -478,9 +486,11 @@ def test_on_recovery_not_called_when_post_kickstart_retry_also_fails(monkeypatch
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     _install_fake_client(
         monkeypatch, connect_raises=lambda: ConnectionRefusedError("still refused")
     )
@@ -533,9 +543,11 @@ def test_kickstart_call_uses_asyncio_to_thread(monkeypatch):
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     _install_fake_client(
         monkeypatch, connect_raises=lambda: ConnectionRefusedError("x")
     )
@@ -774,9 +786,11 @@ def test_post_kickstart_retry_uses_a_fresh_client_per_attempt(monkeypatch):
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
     # Two pre-kickstart attempts fail, then three post-kickstart ones.
     monkeypatch.setattr(runtime, "_POST_KICKSTART_DEADLINE_SEC", 5.0)
@@ -818,9 +832,11 @@ def test_post_kickstart_retry_budget_is_a_deadline_not_an_attempt_count(monkeypa
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
     monkeypatch.setattr(runtime, "_POST_KICKSTART_DEADLINE_SEC", 5.0)
     monkeypatch.setattr(runtime, "_POST_KICKSTART_SETTLE_SEC", 0.0)
@@ -858,9 +874,11 @@ def test_post_kickstart_deadline_expiry_raises_kickstart_noting_error(monkeypatc
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
     monkeypatch.setattr(runtime, "_POST_KICKSTART_DEADLINE_SEC", 0.05)
     monkeypatch.setattr(runtime, "_POST_KICKSTART_SETTLE_SEC", 0.01)
@@ -1011,9 +1029,11 @@ def _allow_kickstart(monkeypatch):
         "onoats.stt.launchd.kickstart_stt_server", lambda label, **kw: True
     )
     monkeypatch.setattr(
-        "onoats.stt.launchd._cooldown_elapsed", lambda label, **kw: True
+        "onoats.stt.launchd.REGISTRY.cooldown_elapsed", lambda label, **kw: True
     )
-    monkeypatch.setattr("onoats.stt.launchd._stamp_cooldown", lambda label, **kw: None)
+    monkeypatch.setattr(
+        "onoats.stt.launchd.REGISTRY.stamp_cooldown", lambda label, **kw: None
+    )
     monkeypatch.setattr(runtime, "_PREFLIGHT_RETRY_DELAY_SEC", 0.0)
 
 
@@ -1716,9 +1736,9 @@ def test_create_stt_service_gives_the_instance_a_stable_identity_token(
         return mic_result.service, system_result.service
 
     mic, system = asyncio.run(_build())
-    assert mic._instance_token == "mic"
-    assert system._instance_token == "system"
-    assert mic._instance_token != f"{id(mic):x}"
+    assert mic._instance_token == launchd.MIC
+    assert system._instance_token == launchd.SYSTEM
+    assert mic._instance_token.name != f"{id(mic):x}"
 
 
 # ---------------------------------------------------------------------------

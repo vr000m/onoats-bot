@@ -18,9 +18,10 @@ blocks the event loop.
 **Where the kickstart recovery state machine lives** (it is deliberately
 split across three layers; this is the map, since no single module owns it):
 
-- *Cross-instance, process-wide* — this module: ``_last_kickstart`` (the
-  label-keyed cooldown stamp, via ``try_kickstart``/``reset_cooldown``) and
-  ``_unhealthy`` (label -> instance tokens currently failing, via
+- *Cross-instance, process-wide* — this module: :class:`KickstartRegistry`,
+  a single object owning both the label-keyed cooldown stamp (via
+  ``try_kickstart``/``reset_cooldown``) and the label -> set of
+  :class:`InstanceToken` currently failing (via
   ``mark_unhealthy``/``clear_unhealthy``), plus the one recovery message
   text (``recovery_message``).
 - *Per-instance* — ``onoats.stt.websocket_stt_service.WebSocketSTTService``:
@@ -34,9 +35,29 @@ split across three layers; this is the map, since no single module owns it):
   ``"<branch>: "`` prefix. ``AGENTS.md``'s "STT self-healing invariants"
   section states the load-bearing rules across all three.
 
-Consolidating these into one owner is a worthwhile refactor but a
-human-sized design call (it crosses the leaf-module boundary this module
-exists to preserve), not a fixer's — see the dev plan's Findings.
+Round 6 quarantined the cross-instance layer as "a human-sized design call,
+not a fixer's" because it was two bare module-global dicts keyed by a bare
+``str``. Round 10 has that decision and made it: the state is now
+:data:`REGISTRY`, one :class:`KickstartRegistry` instance, and the instance
+identity is the typed :class:`InstanceToken` rather than a loose string.
+
+**What consolidating did *not* change**, and must not:
+
+- The registry is still **process-wide**, because the thing it guards is
+  process-wide: ``dual.py`` builds two ``WebSocketSTTService`` instances
+  against one physical server, and both must share one cooldown budget.
+  :data:`REGISTRY` being a module singleton is the point, not an accident —
+  what changed is that its state is now reachable only through one typed
+  surface instead of two dicts anyone could reach into.
+- The check-then-stamp atomicity of :meth:`KickstartRegistry.try_kickstart`
+  (see its docstring): no ``await`` between the two.
+- The preflight path's deliberate non-registration (see
+  :meth:`KickstartRegistry.mark_unhealthy`).
+- The two status-warning branch schemes (shared ``stt`` for preflight,
+  per-instance ``stt-mic``/``stt-system`` for live) stay owned by
+  ``onoats.status``; the registry knows nothing about them.
+- This module stays a leaf. :class:`InstanceToken` is defined here, not
+  imported from the STT service, precisely so that stays true.
 
 **GUI-domain caveat**: ``gui/$UID/<label>`` assumes ``onoats bot`` runs
 inside a GUI (Aqua) session, matching how the shipped LaunchAgents are
@@ -56,6 +77,7 @@ import os
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from loguru import logger
 
@@ -96,7 +118,7 @@ _LAUNCHCTL = "/bin/launchctl"
 # Deep-review finding: this window does NOT uniformly hold for the full 30s
 # across the preflight/live handoff. `mark_unhealthy` is deliberately never
 # called from the preflight path (see its docstring), so after a *preflight*
-# kickstart no instance is ever registered `_unhealthy` for the label — the
+# kickstart no instance is ever registered unhealthy for the label — the
 # live instances' very first `transcript.*` event then retires the stamp via
 # `reset_cooldown` immediately (potentially ~1s in), not after the full
 # window. This is accepted as correct, not a bug: a confirmed transcript
@@ -138,24 +160,218 @@ def _kickstart_env() -> dict[str, str]:
     return env
 
 
-# label -> last-kickstart monotonic time. Process-wide and label-keyed
-# (not per-WebSocketSTTService-instance): dual.py constructs two
-# independent instances (mic + system) against the same server, and the
-# startup preflight path stamps the same registry, so a preflight kickstart
-# counts against the live-session budget too.
-_last_kickstart: dict[str, float] = {}
+@dataclass(frozen=True, slots=True)
+class InstanceToken:
+    """Typed identity of one participant in the cross-instance registry.
 
-# label -> set of instance tokens currently in the "reconnect backoff
-# exhausted, not yet confirmed healthy again" state. Guards the EARLY cooldown
-# reset: the cooldown is process-wide, but confirmation is per-instance, so one
-# instance's confirmed transcript is not evidence that its sibling (the other
-# of dual.py's mic/system pair, against the same physical server) is healthy.
-# Without this, mic confirming recovery would clear the shared cooldown and let
-# system's very next exhaustion SIGKILL + restart the server mic is actively
-# using — the exact storm the shared cooldown exists to prevent. A lingering
-# token can only delay the early reset, never block kickstart forever: the
-# cooldown still expires on its own after ``KICKSTART_COOLDOWN_SEC``.
-_unhealthy: dict[str, set[str]] = {}
+    Replaces the bare ``token: str`` the registry protocol used through
+    round 9. It is *not* an enum: the known participants are ``"mic"`` and
+    ``"system"`` (:data:`MIC` / :data:`SYSTEM`, the names
+    ``runtime._create_stt_service`` passes), but a single-pipeline
+    ``WebSocketSTTService`` falls back to Pipecat's own generated
+    ``self.name`` (``<Class>#<counter>``), which cannot be enumerated ahead
+    of time. A frozen, hashable one-field wrapper gets the type safety an
+    enum would without closing the set.
+
+    Deliberately **opaque**: the registry only ever uses it as a set member.
+    It is not a status-warning branch key — ``onoats.status`` owns those and
+    happens to derive them from the same strings. Do not add formatting or
+    branch semantics here.
+
+    Also deliberately **not** ``id(instance)``: CPython reuses a freed
+    object's address, so a leaked registration could be inherited wholesale
+    by a later instance. See ``WebSocketSTTService._instance_token``.
+    """
+
+    name: str
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.name
+
+
+#: The two participants ``onoats.dual`` constructs against one server.
+MIC = InstanceToken("mic")
+SYSTEM = InstanceToken("system")
+
+
+class KickstartRegistry:
+    """The cross-instance, process-wide half of the kickstart state machine.
+
+    One object owning what were two module-global dicts:
+
+    * **the cooldown stamp** — label -> last-kickstart monotonic time.
+      Label-keyed rather than instance-keyed because ``dual.py`` constructs
+      two independent instances (mic + system) against the same server and
+      the startup preflight path stamps the same registry, so a preflight
+      kickstart counts against the live-session budget too.
+    * **the unhealthy set** — label -> the :class:`InstanceToken` s
+      currently in the "reconnect backoff exhausted, not yet confirmed
+      healthy again" state. Guards the EARLY cooldown reset: the cooldown is
+      process-wide but confirmation is per-instance, so one instance's
+      confirmed transcript is not evidence that its sibling (the other of
+      ``dual.py``'s mic/system pair, against the same physical server) is
+      healthy. Without it, mic confirming recovery would clear the shared
+      cooldown and let system's very next exhaustion SIGKILL + restart the
+      server mic is actively using — the exact storm the shared cooldown
+      exists to prevent. A lingering token can only *delay* the early reset,
+      never block kickstart forever: the cooldown still expires on its own
+      after :data:`KICKSTART_COOLDOWN_SEC`.
+
+    Instantiable so tests can build an isolated one, but production uses the
+    single module-level :data:`REGISTRY` — see this module's docstring for
+    why process-wide is the requirement and not an accident.
+    """
+
+    def __init__(self) -> None:
+        self._last_kickstart: dict[str, float] = {}
+        self._unhealthy: dict[str, set[InstanceToken]] = {}
+
+    # -- observation / isolation (the surface tests use) ----------------
+
+    def is_stamped(self, label: str) -> bool:
+        """True while ``label`` carries an un-expired, un-reset stamp."""
+        return label in self._last_kickstart
+
+    def stamped_labels(self) -> frozenset[str]:
+        """Every currently-stamped label. Empty iff nothing is on cooldown."""
+        return frozenset(self._last_kickstart)
+
+    def unhealthy_tokens(self, label: str) -> frozenset[InstanceToken]:
+        """The tokens currently registered unhealthy for ``label``."""
+        return frozenset(self._unhealthy.get(label, ()))
+
+    def clear(self) -> None:
+        """Drop all state. For test isolation only — never called in prod."""
+        self._last_kickstart.clear()
+        self._unhealthy.clear()
+
+    # -- cooldown ------------------------------------------------------
+
+    def cooldown_elapsed(
+        self, label: str, clock: Callable[[], float] = time.monotonic
+    ) -> bool:
+        """True if ``label`` has never been kickstarted, or its last
+        kickstart was more than ``KICKSTART_COOLDOWN_SEC`` ago."""
+        last = self._last_kickstart.get(label)
+        if last is None:
+            return True
+        return (clock() - last) >= KICKSTART_COOLDOWN_SEC
+
+    def stamp_cooldown(
+        self, label: str, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        """Record ``label`` as kickstarted now (per ``clock``)."""
+        self._last_kickstart[label] = clock()
+
+    async def try_kickstart(self, label: str) -> bool:
+        """Atomic "check cooldown, stamp it, kickstart" primitive. Never raises.
+
+        The single owner of the check-then-stamp-then-kickstart sequence both
+        call sites (``runtime._kickstart_and_retry`` for the preflight path,
+        ``WebSocketSTTService._maybe_kickstart`` for the live path) previously
+        hand-duplicated. Keeping it in one place is what makes the ordering
+        guarantee auditable: **the cooldown check and the stamp happen with no
+        ``await`` between them**, so two callers racing the same label on one
+        event loop can never both pass the check before either stamps. Any
+        future edit that introduces an ``await`` between
+        :meth:`cooldown_elapsed` and :meth:`stamp_cooldown` re-opens the
+        double-kickstart race this primitive exists to close.
+
+        The stamp lands even when ``launchctl`` subsequently fails — a failed
+        kickstart still counts against the window so a wedged label isn't
+        hammered once per reconnect cycle.
+
+        Returns ``True`` only when launchd accepted the restart request.
+        ``False`` covers both "cooldown still active" and "kickstart failed";
+        every caller treats those identically (fall through to today's
+        behavior), so they are deliberately not distinguished.
+        """
+        # Validate BEFORE stamping. The stamp deliberately survives a *failed*
+        # kickstart (a wedged label must not be hammered every reconnect), but
+        # a malformed label can never succeed, so burning the shared cooldown
+        # window on it would suppress the next legitimate kickstart for
+        # nothing.
+        if not _label_is_kickstartable(label):
+            return False
+        if not self.cooldown_elapsed(label):
+            return False
+        self.stamp_cooldown(label)
+        return await asyncio.to_thread(kickstart_stt_server, label)
+
+    # -- per-instance health -------------------------------------------
+
+    def mark_unhealthy(self, label: str, token: InstanceToken) -> None:
+        """Record that instance ``token`` is currently failing to connect.
+
+        Called from ``WebSocketSTTService._ensure_connected`` on that
+        instance's **first failed connect attempt** — deliberately *not* at
+        full-backoff exhaustion. Registering only at exhaustion left a ~15.5s
+        hole: a sibling that had just started failing was not yet registered,
+        so the *other* instance's confirmed transcript cleared the shared
+        cooldown stamp outright, and the sibling's own exhaustion moments
+        later was then free to SIGKILL and restart the server the healthy
+        instance was actively using — the exact double-kickstart storm the
+        shared cooldown exists to prevent, with the timing merely shifted.
+        Registering on first failure only widens the protected window; the
+        registration is cleared by that same instance's next confirmed
+        transcript (:meth:`reset_cooldown`) or by its ``cleanup()``
+        (:meth:`clear_unhealthy`), so nothing is narrowed.
+
+        The **preflight** path (``runtime._kickstart_and_retry``) deliberately
+        does *not* register: it runs once at startup against a throwaway probe
+        client, before any ``WebSocketSTTService`` exists, and has no lifecycle
+        on which to clear a token — a registration from there would linger for
+        the whole session and block every early cooldown reset. It is already
+        gated by the shared cooldown itself, which is the protection that
+        matters for the (startup-only, hence very narrow) preflight-vs-live
+        race. That exemption is a property of the *call sites*, not of this
+        method: there is deliberately no preflight ``InstanceToken``, so the
+        preflight path has nothing to pass and cannot register by accident.
+
+        Paired with :meth:`reset_cooldown`, which only performs the early
+        cooldown reset once *every* registered instance for the label has
+        confirmed health again.
+        """
+        self._unhealthy.setdefault(label, set()).add(token)
+
+    def clear_unhealthy(self, label: str, token: InstanceToken) -> None:
+        """Drop ``token``'s unhealthy registration without touching the
+        cooldown.
+
+        Used on teardown (``WebSocketSTTService.cleanup``) so a stopped
+        instance cannot hold its sibling's early cooldown reset hostage.
+        """
+        pending = self._unhealthy.get(label)
+        if pending is None:
+            return
+        pending.discard(token)
+        if not pending:
+            self._unhealthy.pop(label, None)
+
+    def reset_cooldown(self, label: str, token: InstanceToken | None = None) -> None:
+        """Clear ``label``'s cooldown stamp on confirmed sustained health.
+
+        Called from the live path on the first ``transcript.*`` event
+        following a kickstart — never on a bare successful connect. This is
+        the one production reset path.
+
+        ``token`` identifies the confirming ``WebSocketSTTService`` instance.
+        The cooldown is process-wide but confirmation is per-instance, so the
+        stamp is only dropped once no *other* instance sharing ``label`` is
+        still in the exhausted-and-unconfirmed state. With ``token`` omitted
+        (no instance context) the reset is unconditional, matching the
+        pre-guard behaviour.
+        """
+        if token is not None:
+            self.clear_unhealthy(label, token)
+            if self._unhealthy.get(label):
+                return
+        self._last_kickstart.pop(label, None)
+
+
+#: The process-wide registry. Singleton by requirement, not convenience —
+#: see this module's docstring.
+REGISTRY = KickstartRegistry()
 
 
 def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
@@ -259,50 +475,15 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
         return False
 
 
-def _cooldown_elapsed(label: str, clock: Callable[[], float] = time.monotonic) -> bool:
-    """True if ``label`` has never been kickstarted, or its last kickstart
-    was more than ``KICKSTART_COOLDOWN_SEC`` ago."""
-    last = _last_kickstart.get(label)
-    if last is None:
-        return True
-    return (clock() - last) >= KICKSTART_COOLDOWN_SEC
-
-
-def _stamp_cooldown(label: str, clock: Callable[[], float] = time.monotonic) -> None:
-    """Record ``label`` as kickstarted now (per ``clock``)."""
-    _last_kickstart[label] = clock()
-
-
 async def try_kickstart(label: str) -> bool:
-    """Atomic "check cooldown, stamp it, kickstart" primitive. Never raises.
+    """Delegate to :meth:`KickstartRegistry.try_kickstart` on :data:`REGISTRY`.
 
-    The single owner of the check-then-stamp-then-kickstart sequence both
-    call sites (``runtime._kickstart_and_retry`` for the preflight path,
-    ``WebSocketSTTService._maybe_kickstart`` for the live path) previously
-    hand-duplicated. Keeping it in one place is what makes the ordering
-    guarantee auditable: the cooldown check and the stamp happen with **no**
-    ``await`` between them, so two callers racing the same label on one event
-    loop can never both pass the check before either stamps.
-
-    The stamp lands even when ``launchctl`` subsequently fails — a failed
-    kickstart still counts against the window so a wedged label isn't
-    hammered once per reconnect cycle.
-
-    Returns ``True`` only when launchd accepted the restart request. ``False``
-    covers both "cooldown still active" and "kickstart failed"; every caller
-    treats those identically (fall through to today's behavior), so they are
-    deliberately not distinguished.
+    The module-level name is the documented cross-module entry point (both
+    ``runtime._kickstart_and_retry`` and
+    ``WebSocketSTTService._maybe_kickstart`` call it); the sequence and its
+    atomicity guarantee live on the registry.
     """
-    # Validate BEFORE stamping. The stamp deliberately survives a *failed*
-    # kickstart (a wedged label must not be hammered every reconnect), but a
-    # malformed label can never succeed, so burning the shared cooldown
-    # window on it would suppress the next legitimate kickstart for nothing.
-    if not _label_is_kickstartable(label):
-        return False
-    if not _cooldown_elapsed(label):
-        return False
-    _stamp_cooldown(label)
-    return await asyncio.to_thread(kickstart_stt_server, label)
+    return await REGISTRY.try_kickstart(label)
 
 
 def _label_is_kickstartable(label: str) -> bool:
@@ -336,68 +517,16 @@ def recovery_message(label: str) -> str:
     return f"server restarted automatically (kickstarted {label})"
 
 
-def mark_unhealthy(label: str, token: str) -> None:
-    """Record that instance ``token`` is currently failing to connect.
-
-    Called from ``WebSocketSTTService._ensure_connected`` on that instance's
-    **first failed connect attempt** — deliberately *not* at full-backoff
-    exhaustion. Registering only at exhaustion left a ~15.5s hole: a sibling
-    that had just started failing was not yet registered, so the *other*
-    instance's confirmed transcript cleared the shared cooldown stamp
-    outright, and the sibling's own exhaustion moments later was then free to
-    SIGKILL and restart the server the healthy instance was actively using —
-    the exact double-kickstart storm the shared cooldown exists to prevent,
-    with the timing merely shifted. Registering on first failure only widens
-    the protected window; the registration is cleared by that same instance's
-    next confirmed transcript (:func:`reset_cooldown`) or by its
-    ``cleanup()`` (:func:`clear_unhealthy`), so nothing is narrowed.
-
-    The **preflight** path (``runtime._kickstart_and_retry``) deliberately
-    does *not* register: it runs once at startup against a throwaway probe
-    client, before any ``WebSocketSTTService`` exists, and has no lifecycle
-    on which to clear a token — a registration from there would linger for
-    the whole session and block every early cooldown reset. It is already
-    gated by the shared cooldown itself, which is the protection that matters
-    for the (startup-only, hence very narrow) preflight-vs-live race.
-
-    Paired with :func:`reset_cooldown`, which only performs the early
-    cooldown reset once *every* registered instance for the label has
-    confirmed health again.
-    """
-    _unhealthy.setdefault(label, set()).add(token)
+def mark_unhealthy(label: str, token: InstanceToken) -> None:
+    """Delegate to :meth:`KickstartRegistry.mark_unhealthy` on :data:`REGISTRY`."""
+    REGISTRY.mark_unhealthy(label, token)
 
 
-def clear_unhealthy(label: str, token: str) -> None:
-    """Drop ``token``'s unhealthy registration without touching the cooldown.
-
-    Used on teardown (``WebSocketSTTService.cleanup``) so a stopped instance
-    cannot hold its sibling's early cooldown reset hostage.
-    """
-    pending = _unhealthy.get(label)
-    if pending is None:
-        return
-    pending.discard(token)
-    if not pending:
-        _unhealthy.pop(label, None)
+def clear_unhealthy(label: str, token: InstanceToken) -> None:
+    """Delegate to :meth:`KickstartRegistry.clear_unhealthy` on :data:`REGISTRY`."""
+    REGISTRY.clear_unhealthy(label, token)
 
 
-def reset_cooldown(label: str, token: str | None = None) -> None:
-    """Clear ``label``'s cooldown stamp on confirmed sustained health.
-
-    Called from the live path on the first ``transcript.*`` event following a
-    kickstart — never on a bare successful connect. This is the one production
-    reset path (Phase 4); public (not ``_reset_cooldown``) because it is a
-    documented cross-module entry point like :func:`try_kickstart`.
-
-    ``token`` identifies the confirming ``WebSocketSTTService`` instance. The
-    cooldown is process-wide but confirmation is per-instance, so the stamp is
-    only dropped once no *other* instance sharing ``label`` is still in the
-    exhausted-and-unconfirmed state (see :data:`_unhealthy`). With ``token``
-    omitted (no instance context) the reset is unconditional, matching the
-    pre-guard behaviour.
-    """
-    if token is not None:
-        clear_unhealthy(label, token)
-        if _unhealthy.get(label):
-            return
-    _last_kickstart.pop(label, None)
+def reset_cooldown(label: str, token: InstanceToken | None = None) -> None:
+    """Delegate to :meth:`KickstartRegistry.reset_cooldown` on :data:`REGISTRY`."""
+    REGISTRY.reset_cooldown(label, token)

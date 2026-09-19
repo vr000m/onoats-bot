@@ -164,9 +164,9 @@ def _clear_cooldown_registry():
     """The cooldown registry is module-level (label -> last-kickstart time),
     shared across every caller (preflight here, Phase 4 live path later) —
     must not leak between tests."""
-    launchd._last_kickstart.clear()
+    launchd.REGISTRY.clear()
     yield
-    launchd._last_kickstart.clear()
+    launchd.REGISTRY.clear()
 
 
 def _clock(seq):
@@ -175,25 +175,27 @@ def _clock(seq):
 
 
 def test_cooldown_elapsed_true_when_label_never_stamped():
-    assert launchd._cooldown_elapsed("never-stamped", clock=lambda: 1000.0) is True
+    assert (
+        launchd.REGISTRY.cooldown_elapsed("never-stamped", clock=lambda: 1000.0) is True
+    )
 
 
 def test_stamp_then_immediately_check_is_not_elapsed():
     clock = _clock([100.0, 100.0])
-    launchd._stamp_cooldown("label-a", clock=clock)
-    assert launchd._cooldown_elapsed("label-a", clock=clock) is False
+    launchd.REGISTRY.stamp_cooldown("label-a", clock=clock)
+    assert launchd.REGISTRY.cooldown_elapsed("label-a", clock=clock) is False
 
 
 def test_cooldown_elapsed_after_window():
     clock = _clock([0.0, 0.0 + launchd.KICKSTART_COOLDOWN_SEC])
-    launchd._stamp_cooldown("label-a", clock=clock)
-    assert launchd._cooldown_elapsed("label-a", clock=clock) is True
+    launchd.REGISTRY.stamp_cooldown("label-a", clock=clock)
+    assert launchd.REGISTRY.cooldown_elapsed("label-a", clock=clock) is True
 
 
 def test_cooldown_not_elapsed_just_under_window():
     clock = _clock([0.0, launchd.KICKSTART_COOLDOWN_SEC - 0.01])
-    launchd._stamp_cooldown("label-a", clock=clock)
-    assert launchd._cooldown_elapsed("label-a", clock=clock) is False
+    launchd.REGISTRY.stamp_cooldown("label-a", clock=clock)
+    assert launchd.REGISTRY.cooldown_elapsed("label-a", clock=clock) is False
 
 
 def test_cooldown_is_keyed_per_label():
@@ -201,8 +203,8 @@ def test_cooldown_is_keyed_per_label():
     registry is shared across two call sites (preflight, Phase 4 live
     reconnect) that may kickstart different labels concurrently."""
     clock = _clock([0.0])
-    launchd._stamp_cooldown("label-a", clock=clock)
-    assert launchd._cooldown_elapsed("label-b", clock=lambda: 0.0) is True
+    launchd.REGISTRY.stamp_cooldown("label-a", clock=clock)
+    assert launchd.REGISTRY.cooldown_elapsed("label-b", clock=lambda: 0.0) is True
 
 
 def test_kickstart_cooldown_covers_the_full_reconnect_cycle():
@@ -281,7 +283,7 @@ def test_try_kickstart_checks_stamps_and_kickstarts_in_order(monkeypatch):
 
     events: list[str] = []
     monkeypatch.setattr(
-        launchd, "_stamp_cooldown", lambda label, **kw: events.append("stamped")
+        launchd.REGISTRY, "stamp_cooldown", lambda label, **kw: events.append("stamped")
     )
     monkeypatch.setattr(
         launchd,
@@ -303,9 +305,9 @@ def test_try_kickstart_returns_false_without_stamping_when_cooldown_active(monke
     import asyncio
 
     stamped: list[str] = []
-    monkeypatch.setattr(launchd, "_cooldown_elapsed", lambda label, **kw: False)
+    monkeypatch.setattr(launchd.REGISTRY, "cooldown_elapsed", lambda label, **kw: False)
     monkeypatch.setattr(
-        launchd, "_stamp_cooldown", lambda label, **kw: stamped.append(label)
+        launchd.REGISTRY, "stamp_cooldown", lambda label, **kw: stamped.append(label)
     )
     monkeypatch.setattr(
         launchd,
@@ -324,7 +326,7 @@ def test_try_kickstart_stamps_even_when_kickstart_fails(monkeypatch):
 
     monkeypatch.setattr(launchd, "kickstart_stt_server", lambda label, **kw: False)
     assert asyncio.run(launchd.try_kickstart("label-a")) is False
-    assert "label-a" in launchd._last_kickstart
+    assert launchd.REGISTRY.is_stamped("label-a")
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +382,9 @@ def test_reset_cooldown_is_public():
 
 
 def test_reset_cooldown_untokened_is_unconditional():
-    launchd._stamp_cooldown("label-a")
+    launchd.REGISTRY.stamp_cooldown("label-a")
     launchd.reset_cooldown("label-a")
-    assert "label-a" not in launchd._last_kickstart
+    assert not launchd.REGISTRY.is_stamped("label-a")
 
 
 def test_sibling_instance_still_failing_blocks_the_early_cooldown_reset():
@@ -390,34 +392,34 @@ def test_sibling_instance_still_failing_blocks_the_early_cooldown_reset():
     per-instance. mic confirming a transcript used to clear the shared stamp
     outright, re-arming system's very next exhaustion to SIGKILL + restart the
     server mic was actively, successfully using."""
-    launchd._unhealthy.clear()
-    launchd._stamp_cooldown("shared")
-    launchd.mark_unhealthy("shared", "mic")
-    launchd.mark_unhealthy("shared", "system")
+    launchd.REGISTRY.clear()
+    launchd.REGISTRY.stamp_cooldown("shared")
+    launchd.mark_unhealthy("shared", launchd.MIC)
+    launchd.mark_unhealthy("shared", launchd.SYSTEM)
 
     # mic confirms health first — system is still exhausted and unconfirmed,
     # so the shared stamp must survive.
-    launchd.reset_cooldown("shared", "mic")
-    assert "shared" in launchd._last_kickstart
+    launchd.reset_cooldown("shared", launchd.MIC)
+    assert launchd.REGISTRY.is_stamped("shared")
 
     # Once system confirms too, the stamp drops.
-    launchd.reset_cooldown("shared", "system")
-    assert "shared" not in launchd._last_kickstart
-    launchd._unhealthy.clear()
+    launchd.reset_cooldown("shared", launchd.SYSTEM)
+    assert not launchd.REGISTRY.is_stamped("shared")
+    launchd.REGISTRY.clear()
 
 
 def test_clear_unhealthy_releases_a_stopped_instances_hold():
     """A torn-down instance (`cleanup()`) must not hold its sibling's early
     cooldown reset hostage for the rest of the process's life."""
-    launchd._unhealthy.clear()
-    launchd._stamp_cooldown("shared")
-    launchd.mark_unhealthy("shared", "mic")
-    launchd.mark_unhealthy("shared", "system")
+    launchd.REGISTRY.clear()
+    launchd.REGISTRY.stamp_cooldown("shared")
+    launchd.mark_unhealthy("shared", launchd.MIC)
+    launchd.mark_unhealthy("shared", launchd.SYSTEM)
 
-    launchd.clear_unhealthy("shared", "system")  # system's pipeline stopped
-    launchd.reset_cooldown("shared", "mic")
-    assert "shared" not in launchd._last_kickstart
-    launchd._unhealthy.clear()
+    launchd.clear_unhealthy("shared", launchd.SYSTEM)  # system's pipeline stopped
+    launchd.reset_cooldown("shared", launchd.MIC)
+    assert not launchd.REGISTRY.is_stamped("shared")
+    launchd.REGISTRY.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -498,22 +500,21 @@ def test_mark_unhealthy_documents_the_first_failure_registration_point():
     registered before any kickstart still blocks a sibling's early cooldown
     reset — the guard must not depend on the registering instance having
     exhausted its full backoff first."""
-    launchd._last_kickstart.clear()
-    launchd._unhealthy.clear()
+    launchd.REGISTRY.clear()
 
-    launchd._stamp_cooldown("shared")
+    launchd.REGISTRY.stamp_cooldown("shared")
     # "mic" exhausted and won the kickstart; "system" has only just started
     # failing (one refused connect, no exhaustion yet).
-    launchd.mark_unhealthy("shared", "mic")
-    launchd.mark_unhealthy("shared", "system")
+    launchd.mark_unhealthy("shared", launchd.MIC)
+    launchd.mark_unhealthy("shared", launchd.SYSTEM)
 
-    launchd.reset_cooldown("shared", "mic")
-    assert "shared" in launchd._last_kickstart  # system still unconfirmed
+    launchd.reset_cooldown("shared", launchd.MIC)
+    assert launchd.REGISTRY.is_stamped("shared")  # system still unconfirmed
 
-    launchd.reset_cooldown("shared", "system")
-    assert "shared" not in launchd._last_kickstart
+    launchd.reset_cooldown("shared", launchd.SYSTEM)
+    assert not launchd.REGISTRY.is_stamped("shared")
 
-    launchd._unhealthy.clear()
+    launchd.REGISTRY.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +536,123 @@ def test_try_kickstart_rejects_a_bad_label_without_consuming_the_cooldown():
     label can never succeed — burning the shared window on it would suppress
     the next legitimate kickstart. Validation therefore runs before the
     stamp, and `try_kickstart` still never raises."""
-    launchd._last_kickstart.clear()
+    launchd.REGISTRY.clear()
     assert asyncio.run(launchd.try_kickstart("has/slash")) is False
     assert asyncio.run(launchd.try_kickstart(None)) is False  # type: ignore[arg-type]
-    assert launchd._last_kickstart == {}
+    assert launchd.REGISTRY.stamped_labels() == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Round 10: the kickstart registry is one object, not two module-global dicts.
+# The three tests below pin the invariants the round-6 quarantine named as the
+# reason not to consolidate. They are the acceptance criteria for the
+# consolidation, not decoration.
+# ---------------------------------------------------------------------------
+
+
+def test_registry_owns_all_cross_instance_state():
+    """No module-global dict survives the consolidation.
+
+    The old `_last_kickstart` / `_unhealthy` globals were reachable (and
+    mutable) from anywhere that imported the module, which is why five rounds
+    of tests reached into them for isolation. State now lives on
+    `KickstartRegistry` instances and is observed through `is_stamped`,
+    `stamped_labels` and `unhealthy_tokens`.
+    """
+    assert not hasattr(launchd, "_last_kickstart")
+    assert not hasattr(launchd, "_unhealthy")
+    assert isinstance(launchd.REGISTRY, launchd.KickstartRegistry)
+
+    # Instantiable and genuinely independent -- the singleton is a
+    # requirement of the problem, not a limitation of the class.
+    other = launchd.KickstartRegistry()
+    other.stamp_cooldown("only-mine")
+    assert other.is_stamped("only-mine")
+    assert not launchd.REGISTRY.is_stamped("only-mine")
+
+
+def test_try_kickstart_has_no_await_between_the_check_and_the_stamp():
+    """The atomicity invariant, asserted against the source rather than only
+    against an observed event order.
+
+    `try_kickstart` is the only reason two instances exhausting concurrently
+    on one event loop cannot both pass the cooldown check: the check and the
+    stamp run in a single synchronous stretch. An `await` inserted between
+    them yields to the loop and re-opens the double-kickstart race, and no
+    behavioural test catches that reliably because it only fires under a
+    real interleaving.
+    """
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(launchd.KickstartRegistry.try_kickstart))
+    body = src[src.index("def try_kickstart") :]
+    check = body.index("self.cooldown_elapsed(")
+    stamp = body.index("self.stamp_cooldown(")
+    assert check < stamp, "the cooldown check must precede the stamp"
+    assert "await" not in body[check:stamp], (
+        "an `await` between the cooldown check and the stamp re-opens the "
+        "double-kickstart race try_kickstart exists to close"
+    )
+    # ...and the kickstart itself is still off-loop, after the stamp.
+    assert body.index("await asyncio.to_thread") > stamp
+
+
+def test_preflight_path_registers_no_unhealthy_token(monkeypatch):
+    """The preflight exemption, pinned at both layers.
+
+    `runtime._kickstart_and_retry` runs once at startup against a throwaway
+    probe client with no lifecycle on which to clear a token, so a
+    registration from there would linger for the whole session and block
+    every early cooldown reset. The exemption is enforced by the call sites
+    having nothing to pass -- there is deliberately no preflight
+    `InstanceToken` -- so this asserts both that the source never registers
+    and that a preflight-shaped `try_kickstart` leaves the unhealthy set
+    empty while still consuming the shared cooldown.
+    """
+    import pathlib
+
+    runtime_src = pathlib.Path(launchd.__file__).parent.parent / "runtime.py"
+    text = runtime_src.read_text()
+    assert "mark_unhealthy" not in text, (
+        "the preflight path must never register an unhealthy token"
+    )
+    # No constant exists for it to register with, either.
+    assert not hasattr(launchd, "PREFLIGHT")
+
+    monkeypatch.setattr(launchd, "kickstart_stt_server", lambda label, **kw: True)
+    assert asyncio.run(launchd.try_kickstart("label-preflight")) is True
+    assert launchd.REGISTRY.is_stamped("label-preflight")  # cooldown consumed
+    assert launchd.REGISTRY.unhealthy_tokens("label-preflight") == frozenset()
+
+    # And with nothing registered, the live path's first confirmed transcript
+    # retires the stamp immediately -- the documented, accepted consequence.
+    launchd.reset_cooldown("label-preflight", launchd.MIC)
+    assert not launchd.REGISTRY.is_stamped("label-preflight")
+
+
+def test_instance_token_is_typed_hashable_and_not_a_bare_string():
+    """The stringly-typed `token: str` protocol is gone.
+
+    A bare string was satisfiable by anything lying around -- including, by
+    accident, a status-warning branch key, which is a different concept owned
+    by a different module. `InstanceToken` is frozen (so it can live in the
+    registry's sets), compares by name, and never equals the raw string.
+    """
+    assert launchd.MIC == launchd.InstanceToken("mic")
+    assert launchd.MIC != "mic"
+    assert launchd.MIC != launchd.SYSTEM
+    assert {launchd.MIC, launchd.InstanceToken("mic")} == {launchd.MIC}
+    with pytest.raises(AttributeError):
+        launchd.MIC.name = "system"  # type: ignore[misc]
+
+    # Distinct tokens are tracked separately by the registry.
+    reg = launchd.KickstartRegistry()
+    reg.stamp_cooldown("shared")
+    reg.mark_unhealthy("shared", launchd.MIC)
+    reg.mark_unhealthy("shared", launchd.SYSTEM)
+    assert reg.unhealthy_tokens("shared") == frozenset({launchd.MIC, launchd.SYSTEM})
+    reg.reset_cooldown("shared", launchd.MIC)
+    assert reg.is_stamped("shared")
+    reg.reset_cooldown("shared", launchd.SYSTEM)
+    assert not reg.is_stamped("shared")

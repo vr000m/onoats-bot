@@ -69,7 +69,7 @@ from stt_server import protocol as P
 
 # Module reference, not `from ... import <names>`: attribute access through
 # the module object is what makes the registry monkeypatch-transparent
-# (tests patch `launchd.kickstart_stt_server`, `launchd._cooldown_elapsed`,
+# (tests patch `launchd.kickstart_stt_server`, `launchd.REGISTRY`'s methods,
 # ... and every read below goes through `launchd.<name>` at call time), which
 # is exactly what the four function-local imports this replaced were written
 # to achieve — they were never necessary. A top-level import is safe and
@@ -211,9 +211,11 @@ class WebSocketSTTService(SegmentedSTTService):
         self._launchd_label = launchd_label
         self._on_recovery = on_recovery
         # Identifies this instance in the process-wide unhealthy registry
-        # (`onoats.stt.launchd._unhealthy`), which gates the early cooldown
+        # (`onoats.stt.launchd.REGISTRY`), which gates the early cooldown
         # reset so one instance's confirmed transcript is not mistaken for
-        # its sibling's health.
+        # its sibling's health. Typed (`launchd.InstanceToken`) rather than a
+        # bare `str` so the registry protocol cannot be satisfied by an
+        # arbitrary string that happens to be lying around.
         #
         # Deliberately NOT `id(self)`: CPython reuses a freed object's memory
         # address, so a token from an instance that leaked a registration
@@ -228,7 +230,7 @@ class WebSocketSTTService(SegmentedSTTService):
         # only ever uses it as a registry key). `self.name` (Pipecat's
         # `<Class>#<monotonic counter>`) is the single-pipeline fallback and
         # is never reused within a process.
-        self._instance_token = instance_name or self.name
+        self._instance_token = launchd.InstanceToken(instance_name or self.name)
         # True from the moment this instance's own reconnect exhaustion
         # triggers a kickstart until that instance's *next* successful
         # connect — gates the one-time "server restarted automatically"
