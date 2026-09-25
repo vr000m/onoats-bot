@@ -71,6 +71,13 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Fixed
 
+- **Capturer mic no longer wedges when the first CoreAudio bind stalls.** The
+  first `bind()` runs off the main thread with a 5 s bounded wait, so the
+  capturer reaches `streaming` and handles signals even if `AudioDeviceStart`
+  blocks in coreaudiod (seen 60+ s on the built-in mic). While unbound it
+  retries on fresh threads (every 10 s, up to 3); a late bind that loses the race
+  discards its own IOProc. A bound mic that delivers no real data for 10 s is
+  rebound (mic only — the system tap legitimately goes quiet).
 - Redaction no longer destroys the hostname it was protecting. A ported,
   path-and-query-bearing URI (`wss://host:443/v1?redirect=user@example.com`)
   had its real host discarded and one fabricated from the query's tail; so

@@ -38,3 +38,11 @@ Let the user mark the next recording as a seminars from the menu bar. Other cate
 ## Bundled diagnostic
 
 This branch also carries the capturer mic-bind timing diagnostic (`native/onoats-capturer/Sources/MicCapture.swift`, `BindWatch`), so the seminar toggle and the startup-stall investigation can be exercised in one installed app. A 2026-09-25 session with the built-in mic as default input logged only `pacing silence` for 40+ s before `mic: capturing from …`, meaning `bind()` was blocked in a CoreAudio call. The diagnostic logs any step over 1 s, warns if `bind()` is still blocked after 5 s, and appends the total bind time to the `capturing from` line. Log-only; behaviour is unchanged. Next stall: read `~/Library/Logs/Onoats/onoats-bot.log` for `bind step` / `bind still blocked`.
+
+### Mic-stall fix (same branch)
+
+The diagnostic reproduced the stall on 2026-09-25 21:31: `WARNING mic: bind still blocked in 'AudioDeviceStart' after 5s`, still blocked 60+ s later, with the built-in mic as default input and no Bluetooth device connected. A process sample showed the main thread parked in `AudioDeviceStart` → `HALB_IOThread::StartAndWaitForState` (waiting on coreaudiod; it had been up ~6 days). Fix in `MicCapture.swift`/`Resampler.swift`: first bind on a fresh thread with a 5 s bounded wait; background retries (10 s, max 3) while unbound; `bindLock` so a late bind discards itself instead of double-feeding; device-change listener installed before the first bind; `FrameChunker.onStale` rebinds a *bound* mic after 10 s with no real data (30 s cooldown; mic only). Pinned by `tests/test_capturer_mic_liveness.py` (source-shape tests; the stall itself cannot be triggered deterministically).
+
+- [ ] Not verified against a real stall: the retry path is untested until it recurs. Watch `~/Library/Logs/Onoats/onoats-bot.log` for `retry N/3`, `discarded a superseded bind`, `rebound after no capture data`.
+- Known limit: a rebind/retry that itself blocks in `AudioDeviceStart` can still park `rebindQueue`, making `stop()`'s `rebindQueue.sync` wait; the supervisor's SIGTERM→SIGKILL bound covers it.
+
