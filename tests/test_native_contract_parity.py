@@ -532,8 +532,8 @@ def test_configstore_write_crlf_absent_key_inserts_lf_line():
     _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=1, inserted=True)
 
 
-def test_seminar_toggle_passes_a_category_the_cli_accepts():
-    """The menu-bar Seminar toggle spawns `onoats bot --category seminar`.
+def test_seminars_toggle_passes_a_category_the_cli_accepts():
+    """The menu-bar Seminar toggle spawns `onoats bot --category seminars`.
 
     Pins the three restatements of that contract: the Swift category literal,
     the `--category` argv the Start path builds, and Python's real validator

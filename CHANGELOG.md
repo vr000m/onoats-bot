@@ -22,8 +22,8 @@ Annotated tags exist from `v0.9.0` forward.
   if a CoreAudio call has not returned, and the total bind time on the
   `mic: capturing from …` line. Diagnostic only; bind behaviour is unchanged.
 - **Menu-bar Seminar toggle.** A "Seminar (next recording)" toggle makes the
-  next Start run `onoats bot --category seminar`; it resets when that session
-  ends. Requires `seminar` in `config.toml` `[categories] set`.
+  next Start run `onoats bot --category seminars`; it resets when that session
+  ends. Requires `seminars` in `config.toml` `[categories] set`.
 - **STT server self-healing.** New optional `[stt].launchd_label` (env
   `STT_LAUNCHD_LABEL`) names the `launchctl` job onoats may restart when the
   STT server is unreachable. When set, both the startup preflight and a live

@@ -64,7 +64,7 @@ final class RecorderModel: ObservableObject {
     /// from `sttLabel`, which is what the *running* session reports).
     @Published var sttService = "whisper"
     /// "Seminar" toggle: when on, the NEXT Start locks the session to the
-    /// `seminar` category (`onoats bot --category seminar`). Deliberately
+    /// `seminars` category (`onoats bot --category seminars`). Deliberately
     /// in-memory and per-session, not persisted or written to config.toml: a
     /// forgotten toggle would otherwise mislabel every later recording (other
     /// categories are classified downstream, so "off" is the safe default).
@@ -104,8 +104,8 @@ final class RecorderModel: ObservableObject {
 
     /// Category the Seminar toggle passes to `onoats bot --category`. Python
     /// validates it against `[categories] set` in config.toml and rejects an
-    /// unknown name with a non-zero exit, so `seminar` must be in that set.
-    static let seminarCategory = "seminar"
+    /// unknown name with a non-zero exit, so `seminars` must be in that set.
+    static let seminarCategory = "seminars"
 
     private var proc: Process?
     private var userRequestedStop = false

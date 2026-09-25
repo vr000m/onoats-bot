@@ -182,7 +182,7 @@ struct MenuContent: View {
         }
 
         // Applies to the next Start only; resets when that session ends.
-        // Needs "seminar" in config.toml [categories] set (else Start fails
+        // Needs "seminars" in config.toml [categories] set (else Start fails
         // with the CLI's "--category must be one of" error).
         Toggle("Seminar (next recording)", isOn: $model.seminarMode)
             .disabled({
