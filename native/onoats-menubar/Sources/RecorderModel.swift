@@ -63,6 +63,13 @@ final class RecorderModel: ObservableObject {
     /// Configured STT service from config.toml (next-start value, distinct
     /// from `sttLabel`, which is what the *running* session reports).
     @Published var sttService = "whisper"
+    /// "Seminar" toggle: when on, the NEXT Start locks the session to the
+    /// `seminar` category (`onoats bot --category seminar`). Deliberately
+    /// in-memory and per-session, not persisted or written to config.toml: a
+    /// forgotten toggle would otherwise mislabel every later recording (other
+    /// categories are classified downstream, so "off" is the safe default).
+    /// Reset by `handleExit` once the session it applied to ends.
+    @Published var seminarMode = false
     @Published var dataDirDisplay = ""
     /// Non-nil when the last Flush failed — shown in the menu, cleared on the
     /// next Flush or Start.
@@ -94,6 +101,11 @@ final class RecorderModel: ObservableObject {
     /// `VALID_STT_SERVICES` (parity-checked by
     /// tests/test_native_contract_parity.py).
     static let sttServices = ["whisper", "websocket", "deepgram"]
+
+    /// Category the Seminar toggle passes to `onoats bot --category`. Python
+    /// validates it against `[categories] set` in config.toml and rejects an
+    /// unknown name with a non-zero exit, so `seminar` must be in that set.
+    static let seminarCategory = "seminar"
 
     private var proc: Process?
     private var userRequestedStop = false
@@ -321,6 +333,7 @@ final class RecorderModel: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cliPath)
         p.arguments = ["bot"]
+        if seminarMode { p.arguments? += ["--category", Self.seminarCategory] }
         var env = ProcessInfo.processInfo.environment
         env["AUDIO_SOURCE"] = "socket"
         env["ONOATS_CAPTURER_BIN"] = capturerPath
@@ -523,6 +536,7 @@ final class RecorderModel: ObservableObject {
             state = .failed(reason: reason, detail: status?.last_error)
         }
         userRequestedStop = false
+        seminarMode = false
         // Cleared LAST: refresh() treats a non-nil exited proc as
         // "exit-in-flight" and leaves state alone, so the poll timer can
         // never clobber the .failed assignment above with .stopped.
