@@ -81,6 +81,70 @@ func defaultInputDeviceFieldDescription() -> String {
     return "\(dev.name) (uid=\(dev.uid))"
 }
 
+/// Times the steps of `MicCapture.bind()` so a HAL stall is attributable.
+///
+/// `bind()` can block for 40+ s inside a CoreAudio call (observed 2026-09-25:
+/// default input = built-in mic, no `capturing from` line until the default
+/// input changed), and the capturer's log carries no timestamps, so the stall
+/// was visible only as a long run of `pacing silence`. This logs (a) any step
+/// slower than `slowStepSec` when it finishes, and (b) a WARNING naming the
+/// step still in flight once `stallWarnSec` passes, which is the only signal
+/// when a call never returns. Diagnostic only: it never changes bind behaviour.
+private final class BindWatch {
+    static let slowStepSec = 1.0
+    static let stallWarnSec = 5.0
+
+    private let lock = NSLock()
+    private let begin = MonotonicClock.nowNanos()
+    private var stepStart = MonotonicClock.nowNanos()
+    private var current = "start"
+    private var finished = false
+
+    init() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.stallWarnSec) { [self] in
+            lock.lock()
+            defer { lock.unlock() }
+            if !finished {
+                logLine(
+                    "WARNING mic: bind still blocked in '\(current)' after "
+                        + "\(Int(Self.stallWarnSec))s")
+            }
+        }
+    }
+
+    /// Close the previous step (logging it if slow) and open `name`.
+    func step(_ name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        closeStep()
+        current = name
+    }
+
+    /// Idempotent; returns total seconds spent in bind().
+    @discardableResult
+    func finish() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        if !finished {
+            closeStep()
+            finished = true
+        }
+        return Self.seconds(since: begin)
+    }
+
+    private func closeStep() {
+        let sec = Self.seconds(since: stepStart)
+        if sec >= Self.slowStepSec {
+            logLine("mic: bind step '\(current)' took \(String(format: "%.1f", sec))s")
+        }
+        stepStart = MonotonicClock.nowNanos()
+    }
+
+    private static func seconds(since start: UInt64) -> Double {
+        Double(MonotonicClock.nowNanos() - start) / 1e9
+    }
+}
+
 final class MicCapture {
     private var deviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
@@ -159,12 +223,16 @@ final class MicCapture {
 
     /// Bind an IOProc to the CURRENT default input device.
     private func bind() throws {
+        let watch = BindWatch()
+        defer { watch.finish() }
+        watch.step("default input lookup")
         let device = defaultInputDeviceID()
         guard device != kAudioObjectUnknown else {
             throw CapturerError("no default input device")
         }
 
         // The device's input-side stream format (what the IOProc will deliver).
+        watch.step("stream format")
         var fmtAddr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamFormat,
             mScope: kAudioDevicePropertyScopeInput,
@@ -182,11 +250,13 @@ final class MicCapture {
         // closure and travelling with each chunk it enqueues — never stored on
         // the instance, so a rebind cannot retroactively change how chunks
         // already in the queue are decoded.
+        watch.step("resampler init")
         let resampler = try Resampler16k(inputFormat: format)
 
         let sampleRate = format.sampleRate
         let bytesPerFrame = asbd.mBytesPerFrame
         var newProcID: AudioDeviceIOProcID?
+        watch.step("create IOProc")
         let procErr = AudioDeviceCreateIOProcIDWithBlock(&newProcID, device, nil) {
             [weak self] _, inInputData, inInputTime, _, _ in
             guard let self else { return }
@@ -209,6 +279,7 @@ final class MicCapture {
             throw CapturerError(
                 "mic AudioDeviceCreateIOProcIDWithBlock failed (OSStatus \(fourCC(procErr)))")
         }
+        watch.step("AudioDeviceStart")
         let startErr = AudioDeviceStart(device, proc)
         guard startErr == noErr else {
             AudioDeviceDestroyIOProcID(device, proc)
@@ -216,9 +287,11 @@ final class MicCapture {
         }
         deviceID = device
         ioProcID = proc
+        let bindSec = watch.finish()
         logLine(
             "mic: capturing from \(defaultInputDeviceDescription()) at "
-                + "\(Int(format.sampleRate)) Hz / \(format.channelCount) ch")
+                + "\(Int(format.sampleRate)) Hz / \(format.channelCount) ch "
+                + "(bind \(String(format: "%.2f", bindSec))s)")
         // Re-emitted on every successful bind (initial + rebind) so a mid-session
         // default-input change updates the status file's mic_device.
         emitEvent("device", "branch=mic hint=\(defaultInputDeviceFieldDescription())")

@@ -17,6 +17,10 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Added
 
+- **Capturer mic-bind timing diagnostic.** The capturer now logs any `bind()`
+  step slower than 1 s, a `WARNING mic: bind still blocked in '<step>'` after 5 s
+  if a CoreAudio call has not returned, and the total bind time on the
+  `mic: capturing from …` line. Diagnostic only; bind behaviour is unchanged.
 - **STT server self-healing.** New optional `[stt].launchd_label` (env
   `STT_LAUNCHD_LABEL`) names the `launchctl` job onoats may restart when the
   STT server is unreachable. When set, both the startup preflight and a live
