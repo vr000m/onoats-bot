@@ -34,3 +34,7 @@ Let the user mark the next recording as a seminars from the menu bar. Other cate
 
 - [x] `swiftc -typecheck` clean; parity test added and passing
 - [ ] Manual: `make -C native install`, add `seminars` to `[categories] set`, toggle on, Start, confirm the queue file's `session_meta` line says `seminars`; confirm the toggle is off after Stop; confirm Start fails visibly when `seminars` is not in the set
+
+## Bundled diagnostic
+
+This branch also carries the capturer mic-bind timing diagnostic (`native/onoats-capturer/Sources/MicCapture.swift`, `BindWatch`), so the seminar toggle and the startup-stall investigation can be exercised in one installed app. A 2026-09-25 session with the built-in mic as default input logged only `pacing silence` for 40+ s before `mic: capturing from …`, meaning `bind()` was blocked in a CoreAudio call. The diagnostic logs any step over 1 s, warns if `bind()` is still blocked after 5 s, and appends the total bind time to the `capturing from` line. Log-only; behaviour is unchanged. Next stall: read `~/Library/Logs/Onoats/onoats-bot.log` for `bind step` / `bind still blocked`.
