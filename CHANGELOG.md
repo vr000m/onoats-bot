@@ -17,6 +17,16 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Added
 
+- **Capturer mic stalled for tens of seconds at start.** `AudioDeviceStart` on the
+  built-in mic blocks when a system-audio tap already exists in the process, so the
+  capturer now starts the mic before the tap.
+- **Capturer mic-bind timing diagnostic.** The capturer now logs any `bind()`
+  step slower than 1 s, a `WARNING mic: bind still blocked in '<step>'` after 5 s
+  if a CoreAudio call has not returned, and the total bind time on the
+  `mic: capturing from …` line. Diagnostic only (the fixes below change behaviour separately).
+- **Menu-bar Seminar toggle.** A "Seminar (next recording)" toggle makes the
+  next Start run `onoats bot --category seminars`; it resets when that session
+  ends. Requires `seminars` in `config.toml` `[categories] set`.
 - **STT server self-healing.** New optional `[stt].launchd_label` (env
   `STT_LAUNCHD_LABEL`) names the `launchctl` job onoats may restart when the
   STT server is unreachable. When set, both the startup preflight and a live
@@ -64,6 +74,13 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Fixed
 
+- **Capturer mic no longer wedges when the first CoreAudio bind stalls.** The
+  first `bind()` runs off the main thread with a 5 s bounded wait, so the
+  capturer reaches `streaming` and handles signals even if `AudioDeviceStart`
+  blocks in coreaudiod (seen 60+ s on the built-in mic). While unbound it
+  retries on fresh threads (every 10 s, up to 3); a late bind that loses the race
+  discards its own IOProc. A bound mic that delivers no real data for 10 s is
+  rebound (mic only — the system tap legitimately goes quiet).
 - Redaction no longer destroys the hostname it was protecting. A ported,
   path-and-query-bearing URI (`wss://host:443/v1?redirect=user@example.com`)
   had its real host discarded and one fabricated from the query's tail; so

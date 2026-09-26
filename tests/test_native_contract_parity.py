@@ -530,3 +530,30 @@ def test_configstore_write_crlf_absent_key_inserts_lf_line():
     assert out_lines[1] == 'data_dir = "/new"'
     assert out_lines[2] == "max_files = 5\r"
     _assert_untouched_lines_byte_identical(doc, out, touched_after_idx=1, inserted=True)
+
+
+def test_seminars_toggle_passes_a_category_the_cli_accepts():
+    """The menu-bar Seminar toggle spawns `onoats bot --category seminars`.
+
+    Pins the three restatements of that contract: the Swift category literal,
+    the `--category` argv the Start path builds, and Python's real validator
+    accepting the name once it is in `[categories] set` (and rejecting it
+    when it is not, which is what an unconfigured install sees).
+    """
+    from onoats.categories import InvalidCategoryError, validate_category
+    from onoats.config import OnoatsConfig
+
+    swift = RECORDER_MODEL.read_text()
+    category = re.search(r'seminarCategory\s*=\s*"([^"]+)"', swift)
+    assert category, "RecorderModel.seminarCategory literal not found"
+    assert re.search(
+        r'if seminarMode \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
+        swift,
+    ), "start() no longer passes --category when seminarMode is on"
+
+    configured = OnoatsConfig(
+        {"categories": {"set": ["uncategorized", category.group(1)]}}
+    )
+    assert validate_category(category.group(1), config=configured) == category.group(1)
+    with pytest.raises(InvalidCategoryError):
+        validate_category(category.group(1), config=OnoatsConfig(raw={}))

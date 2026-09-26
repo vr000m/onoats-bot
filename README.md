@@ -153,6 +153,10 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   native capturer); Stop ends the session gracefully (the recorder drains
   in-flight audio before rotating the buffer into the queue); Flush rotates
   the current buffer into the queue mid-session.
+- **Seminar toggle** — turns on `--category seminars` for the *next* Start only
+  (other categories are classified downstream). It resets when that session ends.
+  Add `seminars` to `[categories] set` in `config.toml` first, or Start fails with
+  the CLI's "--category must be one of" error.
 - **Mic (me) picker** — the submenu lists input devices; selecting one sets
   the macOS **default input device** (system-wide — disclosed in the submenu),
   because the capturer binds the system default at Start. A running session

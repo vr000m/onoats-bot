@@ -98,6 +98,17 @@ final class FrameChunker {
 
     /// Fill after 100 ms without real data (~5 missed tap callbacks).
     private let silenceAfterNs: UInt64 = 100_000_000
+
+    /// Optional liveness hook: called (off the chunker lock, from the pacer
+    /// thread) when no REAL data has arrived for `staleAfterNs`, then at most
+    /// once per `staleCooldownNs` while the stall persists. The mic sets it to
+    /// rebind a device whose IOProc silently stopped delivering; the system
+    /// branch leaves it nil because a process tap legitimately delivers nothing
+    /// while no tapped process renders audio.
+    var onStale: (() -> Void)?
+    private let staleAfterNs: UInt64 = 10_000_000_000
+    private let staleCooldownNs: UInt64 = 30_000_000_000
+    private var lastStaleFireNs: UInt64 = 0
     private static let silentFrame = Data(count: BYTES_PER_FRAME)
 
     init(label: String, zeroHint: String, emit: @escaping (Data, UInt64) -> Void) {
@@ -198,6 +209,13 @@ final class FrameChunker {
                 return
             }
             let now = MonotonicClock.nowNanos()
+            var staleFire: (() -> Void)?
+            if let cb = onStale, now > lastRealDataWallNs + staleAfterNs,
+                now > lastStaleFireNs + staleCooldownNs
+            {
+                lastStaleFireNs = now
+                staleFire = cb
+            }
             if now > lastRealDataWallNs + silenceAfterNs {
                 // Emit silence up to (now - silenceAfterNs): trail the live
                 // edge so resumed real data doesn't collide with filler.
@@ -229,6 +247,7 @@ final class FrameChunker {
                 }
             }
             lock.unlock()
+            staleFire?()
         }
     }
 }

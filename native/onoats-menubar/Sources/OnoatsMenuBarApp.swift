@@ -181,6 +181,16 @@ struct MenuContent: View {
                 .disabled(!model.cliAvailable)
         }
 
+        // Applies to the next Start only; resets when that session ends.
+        // Needs "seminars" in config.toml [categories] set (else Start fails
+        // with the CLI's "--category must be one of" error).
+        Toggle("Seminar (next recording)", isOn: $model.seminarMode)
+            .disabled({
+                if case .stopped = model.state { return false }
+                if case .failed = model.state { return false }
+                return true
+            }())
+
         Divider()
 
         // Flat inline pickers (no submenus — SwiftUI MenuBarExtra submenus
