@@ -17,6 +17,9 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Added
 
+- **Capturer mic stalled for tens of seconds at start.** `AudioDeviceStart` on the
+  built-in mic blocks when a system-audio tap already exists in the process, so the
+  capturer now starts the mic before the tap.
 - **Capturer mic-bind timing diagnostic.** The capturer now logs any `bind()`
   step slower than 1 s, a `WARNING mic: bind still blocked in '<step>'` after 5 s
   if a CoreAudio call has not returned, and the total bind time on the

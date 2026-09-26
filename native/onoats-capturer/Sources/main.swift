@@ -24,9 +24,11 @@
 //      the recorder's handshake read is bounded tighter than the barrier
 //   6. attach the system writer + start the mic capture: mic → mic socket,
 //      system tap → system socket — exactly one source per socket, never
-//      mixed (keystone). The mic engine still starts strictly AFTER the tap
-//      (Milestone B: tap creation while the engine runs was flaky), which the
-//      preflight makes structural.
+//      mixed (keystone). The mic capture is STARTED BEFORE the tap (step 2):
+//      a HAL AudioDeviceStart on the built-in mic blocks for minutes when a
+//      process tap already exists in the same process (2026-09-26 bisect:
+//      tap→mic stalled every run, mic→tap bound in 0.04 s). Its frames are
+//      dropped by a LateBoundWriter until step 6 attaches the mic writer.
 //
 // Error ordering after the reorder (restated for the supervisor's mapping):
 // rc=10 (mic denied) and rc=11 (tap API failure, AFTER the ×3@500 ms retry)
@@ -94,6 +96,12 @@ final class Teardown {
     /// long before the writers exist, so every later failure path (socket
     /// creation, accept barrier, mic start) must already find it here and tear
     /// the Core Audio chain down.
+    func registerMic(_ mic: MicCapture) {
+        lock.lock()
+        self.mic = mic
+        lock.unlock()
+    }
+
     func registerSystem(_ system: SystemCapture) {
         lock.lock()
         self.system = system
@@ -107,9 +115,8 @@ final class Teardown {
     /// after every field assignment by this method's body — callers cannot get
     /// it wrong. (The system capture is registered earlier, by the tap
     /// preflight, via registerSystem.)
-    func registerAndStart(mic: MicCapture, writers: [FrameWriter]) {
+    func registerAndStart(writers: [FrameWriter]) {
         lock.lock()
-        self.mic = mic
         self.writers = writers
         lock.unlock()
         for writer in writers { writer.start() }
@@ -297,8 +304,8 @@ if cliArgs.contains("--selftest-concurrent") {
     let sys = SystemCapture { _, _ in sysFrames += 1 }
     let mic = MicCapture { _, _ in micFrames += 1 }
     do {
-        try sys.start()
         try mic.start()
+        try sys.start()
     } catch {
         logLine("selftest: \(error)")
         exit(1)
@@ -358,6 +365,21 @@ emitEvent(
     "branch=system hint=creating the system-audio tap — a pending Screen & "
         + "System Audio Recording prompt blocks here until answered")
 
+// Mic FIRST: AudioDeviceStart on the mic stalls (minutes) if a process tap
+// already exists in this process. Registered before start() so a failure
+// anywhere later tears it down; frames before attach() are pre-session and
+// dropped by design (same as the system branch).
+let micWriterBox = LateBoundWriter()
+let micCapture = MicCapture { pcm, ns in
+    micWriterBox.enqueue(pcm: pcm, capturedMonotonicNs: ns)
+}
+Teardown.shared.registerMic(micCapture)
+do {
+    try micCapture.start()
+} catch {
+    fail(ExitCode.captureFailed, "mic capture: \(error)")
+}
+
 let systemWriterBox = LateBoundWriter()
 let systemCapture = SystemCapture { pcm, ns in
     systemWriterBox.enqueue(pcm: pcm, capturedMonotonicNs: ns)
@@ -414,29 +436,19 @@ let micWriter = FrameWriter(label: "mic", fd: micFd) { rc, reason in
 let systemWriter = FrameWriter(label: "system", fd: systemFd) { rc, reason in
     Teardown.shared.trigger(rc: rc, reason: reason)
 }
-let micCapture = MicCapture { pcm, ns in
-    micWriter.enqueue(pcm: pcm, capturedMonotonicNs: ns)
-}
-// Register the mic capture + writers with Teardown, then start the writer
-// threads — a writer hitting a terminal error must find a fully-populated
+// Register the writers with Teardown, then start the writer threads — a writer hitting a terminal error must find a fully-populated
 // Teardown, never a half-registered one (stop() on a never-started capture is
 // a safe no-op; the system capture was registered by the preflight above).
 // registerAndStart makes that ordering structural rather than comment-enforced.
-Teardown.shared.registerAndStart(mic: micCapture, writers: [micWriter, systemWriter])
+Teardown.shared.registerAndStart(writers: [micWriter, systemWriter])
 
 // Attach the system writer only after its thread is started: system frames
 // begin streaming here — the same point they did pre-reorder.
 systemWriterBox.attach(systemWriter)
 
-// Mic engine strictly AFTER the tap (started in the preflight) — the
-// spike-proven order. Creating the tap while an AVAudioEngine is already
-// running was intermittently flaky (AudioHardwareCreateProcessTap returning
-// noErr + kAudioObjectUnknown); the preflight makes the order structural.
-do {
-    try micCapture.start()
-} catch {
-    fail(ExitCode.captureFailed, "mic capture: \(error)")
-}
+// Attach the mic writer last: mic frames begin streaming here (the mic
+// capture itself has been running since before the tap preflight).
+micWriterBox.attach(micWriter)
 
 // MARK: - signals → graceful teardown
 

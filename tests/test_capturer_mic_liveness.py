@@ -59,3 +59,16 @@ def test_stale_data_rebind_is_mic_only_and_requires_a_committed_bind():
     hook = MIC[MIC.index("chunker.onStale = ") :].split("chunker.activate()")[0]
     assert "ioProcID != nil" in hook
     assert "guard bound else { return }" in hook
+
+
+def test_mic_starts_before_the_system_tap() -> None:
+    """AudioDeviceStart on the mic stalls for minutes when a process tap already
+    exists in the same process (2026-09-26 bisect); the mic must start first in
+    both the production path and the concurrent selftest."""
+    main = (SOURCES / "main.swift").read_text()
+    assert main.index("try micCapture.start()") < main.index(
+        "try systemCapture.start()"
+    )
+    assert main.index("try mic.start()") < main.index("try sys.start()")
+    # its frames are dropped until the mic writer exists, then attached
+    assert "micWriterBox.attach(micWriter)" in main
