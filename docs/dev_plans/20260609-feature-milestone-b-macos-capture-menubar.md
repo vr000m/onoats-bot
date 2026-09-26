@@ -702,6 +702,9 @@ denial smoke, PR description refresh, un-draft, merge.
     on attempt 2). The spike had seen this only unsigned.
   - **Capture start order:** tap+aggregate first, mic engine second (creating
     the tap while AVAudioEngine runs correlated with the flaky creation).
+    **Superseded 2026-09-26:** the mic is now a HAL IOProc and starts BEFORE the
+    tap — AudioDeviceStart stalls for minutes if a tap already exists (see
+    `20260925-feature-menubar-seminar-toggle.md`).
   - **Agent-shell limitation:** mic capture delivers zero callbacks under the
     Claude/sandboxed shell context regardless of code (the known TCC-attribution
     confound — the spike's own `concurrent` mode also reports mic=0 there), and

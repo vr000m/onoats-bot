@@ -23,7 +23,7 @@ Annotated tags exist from `v0.9.0` forward.
 - **Capturer mic-bind timing diagnostic.** The capturer now logs any `bind()`
   step slower than 1 s, a `WARNING mic: bind still blocked in '<step>'` after 5 s
   if a CoreAudio call has not returned, and the total bind time on the
-  `mic: capturing from …` line. Diagnostic only; bind behaviour is unchanged.
+  `mic: capturing from …` line. Diagnostic only (the fixes below change behaviour separately).
 - **Menu-bar Seminar toggle.** A "Seminar (next recording)" toggle makes the
   next Start run `onoats bot --category seminars`; it resets when that session
   ends. Requires `seminars` in `config.toml` `[categories] set`.

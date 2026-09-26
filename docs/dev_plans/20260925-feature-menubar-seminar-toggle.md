@@ -1,10 +1,10 @@
 # Task: Menu-bar "Seminar" toggle
 
-**Status**: Implemented, pending manual build verification
+**Status**: Implemented (seminar toggle, mic-bind diagnostic, mic-before-tap fix); pending signed-app install verification
 **Component**: recorder, macos
 **Assigned to**: Claude
 **Priority**: Low
-**Branch**: feature/menubar-seminars-toggle
+**Branch**: feature/seminar-toggle-and-mic-diagnostic
 **Created**: 2026-09-25
 **Review Gates**: none
 

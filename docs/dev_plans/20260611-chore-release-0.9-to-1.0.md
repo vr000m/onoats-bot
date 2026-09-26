@@ -517,7 +517,7 @@ starts once the recorder connects, so a prompt answered at human speed costs
 nothing once sockets appear after the tap. Constraints from Milestone B
 findings: capture start order must remain tap+aggregate **before** mic
 engine (tap creation while the engine runs correlated with flaky creation),
-and the bounded tap-create retry (×3 @ 500 ms) must be preserved. rc=11
+and the bounded tap-create retry (×3 @ 500 ms) must be preserved. [Superseded 2026-09-26: the mic now starts before the tap; see `20260925-feature-menubar-seminar-toggle.md`.] rc=11
 semantics pinned in-phase: fires on genuine tap API failure only — TCC
 denial never produces it (denied taps deliver zeros).
 
@@ -605,7 +605,7 @@ retrieval is `git checkout spike-archive -- native/spike`.
   changelog entry
 - [ ] Every phase merged via its own reviewed PR (regular merge, no squash)
 
-<!-- reviewed: 2026-06-12 @ 6bfbf1b3d7c8ee2879c68f666afc965607709e5c -->
+<!-- reviewed: 2026-09-26 @ 7172c0d8bf02bc9e50bfe47f077e9f6244ffaf3a -->
 ## Issues & Solutions
 
 *(populated during implementation)*
