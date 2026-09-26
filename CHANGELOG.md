@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-26
+
 ### Added
 
 - **Capturer mic stalled for tens of seconds at start.** `AudioDeviceStart` on the
