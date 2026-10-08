@@ -10,6 +10,9 @@
 #   2. uv.lock         onoats package entry version == X.Y.Z
 #   3. Info.plist      CFBundleShortVersionString == X.Y.Z (menu-bar app)
 #   4. CHANGELOG.md    has a "## [X.Y.Z] - YYYY-MM-DD" entry
+#   5. mlx_audio diarization contract (working tree, `--extra diarization`):
+#      tests/test_diarization_contract.py, hard-fail (not skip) if the
+#      optional dep is missing or drifted (ONOATS_REQUIRE_DIARIZATION_CONTRACT=1)
 set -euo pipefail
 
 tag="${1:?usage: release_check.sh vX.Y.Z [commit-ish]}"
@@ -68,6 +71,15 @@ if grep -Eq "^## \[$(printf '%s' "$version" | sed 's/\./\\./g')\] - [0-9]{4}-[0-
     check "CHANGELOG.md entry for $version" 1 ""
 else
     check "CHANGELOG.md entry for $version" 0 "no '## [$version] - YYYY-MM-DD' heading"
+fi
+
+# Unlike checks 1-4 this runs against the working tree (it imports the
+# installed mlx-audio), so it must be run from a checkout of <commit-ish>.
+if ONOATS_REQUIRE_DIARIZATION_CONTRACT=1 \
+    uv run --extra diarization pytest tests/test_diarization_contract.py -q; then
+    check "mlx_audio diarization contract" 1 ""
+else
+    check "mlx_audio diarization contract" 0 "tests/test_diarization_contract.py failed under ONOATS_REQUIRE_DIARIZATION_CONTRACT=1"
 fi
 
 if [ "$fail" -ne 0 ]; then

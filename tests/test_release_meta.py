@@ -125,3 +125,61 @@ def test_version_surfaces_agree():
     assert m.group(1) == version, (
         f"Info.plist has {m.group(1)}, pyproject has {version}"
     )
+
+
+# --- diarization contract wiring (Phase 8) ---------------------------------
+
+CONTRACT_TEST = "tests/test_diarization_contract.py"
+CONTRACT_ENV = "ONOATS_REQUIRE_DIARIZATION_CONTRACT"
+
+
+def test_release_check_runs_diarization_contract_hard_fail():
+    script = (REPO_ROOT / "scripts/release_check.sh").read_text(encoding="utf-8")
+    assert CONTRACT_TEST in script
+    assert CONTRACT_ENV in script
+
+
+def _run_contract_with_mlx_blocked(tmp_path: Path, env_value: str | None):
+    import os
+    import subprocess
+    import sys
+
+    (tmp_path / "sitecustomize.py").write_text(
+        "import sys\nsys.modules['mlx_audio'] = None\n", encoding="utf-8"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in (CONTRACT_ENV, "PYTHONPATH")}
+    env["PYTHONPATH"] = str(tmp_path)
+    if env_value is not None:
+        env[CONTRACT_ENV] = env_value
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            CONTRACT_TEST,
+            "-p",
+            "no:cacheprovider",
+            "-rs",
+            "-q",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_contract_hard_fails_when_required_and_mlx_missing(tmp_path):
+    proc = _run_contract_with_mlx_blocked(tmp_path, "1")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "failed" in out or "error" in out, out
+
+
+def test_contract_skips_when_not_required_and_mlx_missing(tmp_path):
+    proc = _run_contract_with_mlx_blocked(tmp_path, None)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "skipped" in out, out
+    assert "failed" not in out, out

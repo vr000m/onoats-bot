@@ -54,6 +54,12 @@ macos = [
     "mlx-whisper>=0.4.0",
     "kokoro-onnx>=0.4.0",
 ]
+# Optional them-channel speaker diarization (mlx-audio). macOS / Apple-Silicon
+# only. NOT in the baseline. Install with `uv sync --extra diarization`
+# (or `uv tool install 'onoats[diarization]'`).
+diarization = [
+    "mlx-audio>=0.5.8,<0.6",
+]
 
 [project.scripts]
 onoats = "onoats.cli:main"

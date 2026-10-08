@@ -1057,7 +1057,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [x] Phase 5: Labeler
 - [x] Phase 6: Persistence + render
 - [x] Phase 7: Wiring
-- [ ] Phase 8: Dependency + contract
+- [x] Phase 8: Dependency + contract
 - [ ] Phase 8b: Real-pipeline validation gate
 - [ ] Phase 9: Integration + smoke
 - [ ] Phase 10: Docs
@@ -1091,6 +1091,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 4 advisory review (opus)**: fixed — a second `VADUserStartedSpeakingFrame` while a span is open now logs ERROR and keeps the first start (pipecat decodes from the first). **Open, for Phase 8b/9 to measure:** VAD start/stop events fire `start_secs`/`stop_secs` (~0.2 s default) after the speech edges, so the stamp (counter value at the event) misses ~0.2 s of leading speech and includes ~0.2 s of trailing audio; subtracting `frame.start_secs*16000` / `frame.stop_secs*16000` (clamped) would tighten it but changes the Req 3 "stamp == VAD-event position" contract, so it is not applied without a measured accuracy case.
 - **Phase 5 advisory review (opus)**: all fixed with regression tests — the stall streak now resets on the in-line covered release too; it counts distinct `hold_sec` windows (not expired frames), so one hiccup with two parked finals cannot degrade; the release task fails open (one ERROR, degrade, deliver in-flight + pending unlabelled FIFO). The stall WARNING is the timeline's single `mark_degraded` line (the labeler adds none).
 - **Phase 7 (found by the wired-pipeline matrix tests, not by Phase 5's unit tests)**: `DiarizationLabeler` stored its injectable clock as `self._clock`, which pipecat's `FrameProcessor.setup()` overwrites with a `SystemClock`, so every stamped `them` transcript raised `'SystemClock' object is not callable` in a real pipeline. Renamed to `self._now`; swept the other new processors for FrameProcessor-attribute collisions (none). Lesson for Phase 8b/9: unit tests that bypass `setup()` cannot catch framework-attribute shadowing.
+- **Phase 8**: `uv.lock` adds exactly `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6` (+ `provides-extras`); **`mlx`/`mlx-metal` unchanged at 0.31.2, so no mlx-whisper re-smoke and no CHANGELOG mlx note is triggered.** The local uv (0.12.23) also tried to rewrite the lock `revision` 3->5 and drop `sys_platform` markers on 10 nvidia edges; that churn was reverted by hand (diff is additions only; `uv lock --check` passes). The contract test ran green against the real installed package with `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` (also confirms mlx-audio 0.5.8 runs on mlx 0.31.2 for load/feed with cached weights). The contract test purges `mlx_audio*` from `sys.modules` on module teardown, because other tests assert it is absent. Full suite with the extra installed: 6737 passed.
 
 ### Review Waivers
 
