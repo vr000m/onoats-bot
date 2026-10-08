@@ -1,6 +1,6 @@
 # Task: Live speaker diarization on the "them" channel
 
-**Status**: Not Started
+**Status**: In Progress
 **Component**: recorder, stt
 **Assigned to**: Claude
 **Priority**: Medium
@@ -220,7 +220,7 @@ attribute. Two preflight/config touch points sit outside the pipeline.
         |                               - re-anchors on each chunk's start_sample
         |                                 (discontinuity -> timeline GAP);
         |                                 pipeline position of an output frame
-        |                                 = anchor + frame index * 160
+        |                                 = (piecewise) anchor + frame index * 160
         |                               - sole timeline WRITER; runtime
         |                                 failure -> degrade (Req 9)
         v                                        |
@@ -355,9 +355,12 @@ contract is "never a hang"; precedent:
      `anchor + fed_samples`; a mismatch (queue drop) calls
      `record_gap(prev_end, start_sample)` and advances `anchor` by the gap
      length. Pipeline position of an output frame is then
-     `anchor + frame_index * 160` (read `frames_processed` from the returned
-     state rather than keeping a second counter — Phase 0 confirms the
-     field). The model's lookahead affects *availability*, not alignment.
+     `anchor + frame_index * 160`, **where `anchor` is piecewise**: it is
+     applied per output row by model-input offset (a breakpoint list), not to
+     a whole batch, because the `low` preset's ~1 s lookahead emits pre-gap
+     rows after a gap has re-anchored (read `frames_processed` from the
+     returned state rather than keeping a second counter — Phase 0 confirms
+     the field). The model's lookahead affects *availability*, not alignment.
      Coverage for a position is "available" only once the worker has
      recorded it. Pinned by a Phase 3 test: drop one queued chunk, assert a
      later window still labels against the feeder clock.
@@ -479,6 +482,12 @@ contract is "never a hang"; precedent:
    consecutive `HOLD_SEC` expiries during which `coverage_high_water()` did
    not advance; after `STALL_CONSECUTIVE_TIMEOUTS` it calls
    `timeline.mark_degraded(reason="stalled")` (one WARNING) and stops holding.
+   Two refinements keep the guard from false-tripping: expiries do not count
+   while the model is still loading (`not timeline.is_ready`, within
+   `MODEL_LOAD_GRACE_SEC` = 60 s of the labeler starting — a cold load
+   publishes no coverage until its first feed finishes), and the streak
+   resets whenever coverage has advanced since the last counted stall, so
+   only genuinely back-to-back stalled windows degrade.
 5. **`TranscriptBuffer`** (`src/onoats/processors/transcript_buffer.py`):
    `_handle_transcription` reads `onoats_speakers` / `onoats_overlap` (if
    present) and `_utterance_entry` (the JSONL **writer**) persists optional
@@ -1043,7 +1052,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 8395ce3cc8bc489e17fd3d06f1b33ae77770ae7f -->
+<!-- reviewed: 2026-10-08 @ fb8f8bdcfc5ea15396f3495b233091d95dd0c7a1 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1096,6 +1105,9 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amends the Req 4 stall-guard text above the marker (not edited: marker intact). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; `DIARIZATION_REPO_ID` == `DIARIZATION_MODEL_ID` pinned by a test.
 - **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; `_pending_span` clear in `_detach_client` (plan-specified, fail-safe); contract-test weights skip under `REQUIRE`.
 - **Still open (Phase 8b/9)**: VAD-span edge offset (see Phase 4 note). Facts for the decision: the STT decodes pipecat's `_audio_buffer` (<= 1 s pre-roll + everything to the VAD-stop event), the server returns no timestamps onoats consumes, and `VADUserStartedSpeakingFrame.start_secs` / `VADUserStoppedSpeakingFrame.stop_secs` carry the confirmation delays.
+
+- **Marker refreshed administratively (2026-10-08, owner-approved during the first review-gauntlet round)**: the above-marker text was amended to match shipped, advisory-reviewed behaviour — `Status` now In Progress; the worker's anchor mapping is stated as piecewise (per-row breakpoints, Phase 3 advisory review item 1); the Req 4 stall guard carries the model-load grace and the coverage-advance streak reset. No requirement was added or relaxed; the hash was recomputed per the AGENTS.md recipe rather than via `/review-plan`.
+- **Loader (gauntlet round 1, owner-approved)**: the production loader passes the *cached snapshot directory* (resolved via `try_to_load_from_cache`, no network) to `mlx_audio.vad.load(..., strict=True)` instead of the bare repo id, which `mlx_audio` first tests as a CWD-relative path and otherwise `snapshot_download`s on every start. A missing cache fails loud with the `hf download` hint. Revision pinning was deliberately not added. pipecat's lower bound is now `>=1.3.0` (the inline-`run_stt` stamping hook is verified only there).
 
 ### Review Waivers
 
