@@ -150,6 +150,11 @@ class DiarizerWorker:
             self._queue.clear()
             self._cond.notify_all()
 
+    @property
+    def shutdown_requested(self) -> bool:
+        """``finish()`` or ``abort()`` has been called."""
+        return self._finish or self._abort
+
     def join(self, timeout: float | None = None) -> bool:
         """Bounded join. True if the thread is gone (or never started)."""
         t = self._thread
@@ -353,13 +358,28 @@ class DiarizationFeeder(FrameProcessor):
             if not self._timeline.is_degraded:
                 self.worker.enqueue(start, frame.audio)
         elif isinstance(frame, EndFrame):
+            # Post the finish sentinel, then forward at once: the STT's own
+            # drain of its final segment must not queue behind the worker, and
+            # the labeler already bounds its wait on ``is_flushed`` by HOLD_SEC.
+            # The thread is reaped (bounded) in ``cleanup()``.
             self.worker.finish()
-            await self._bounded_join()
         elif isinstance(frame, CancelFrame):
             self.worker.abort()
-            await self._bounded_join()
 
         await self.push_frame(frame, direction)
+
+    async def cleanup(self) -> None:
+        """Backstop: reap the worker however the pipeline ended.
+
+        After a terminal frame the worker is already finishing/aborting, so
+        this only joins (bounded). With no terminal frame (runner exception,
+        teardown without Cancel/End) it aborts first, so the daemon thread
+        cannot sit parked in ``_cond.wait()`` holding the model.
+        """
+        await super().cleanup()
+        if not self.worker.shutdown_requested:
+            self.worker.abort()
+        await self._bounded_join()
 
     async def _bounded_join(self) -> None:
         try:

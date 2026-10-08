@@ -158,8 +158,12 @@ def make_feeder(timeline, model, *, worker=None, join=JOIN, **kw):
     )
 
 
-def drive(feeder, frames, monkeypatch):
-    """Push `frames` through the feeder; return the frames it pushed on."""
+def drive(feeder, frames, monkeypatch, *, cleanup=True):
+    """Push `frames` through the feeder; return the frames it pushed on.
+
+    `cleanup` mirrors the pipeline task reaping processors after the terminal
+    frame (the feeder joins its worker there, not on EndFrame/CancelFrame).
+    """
     out = []
 
     async def _base(self, frame, direction):
@@ -174,6 +178,8 @@ def drive(feeder, frames, monkeypatch):
     async def _run():
         for f in frames:
             await feeder.process_frame(f, FrameDirection.DOWNSTREAM)
+        if cleanup:
+            await feeder.cleanup()
 
     asyncio.run(_run())
     return out
@@ -774,3 +780,53 @@ def test_blocked_feed_cannot_hang_cancelframe(monkeypatch):
     finally:
         release.set()
         feeder.worker.join(JOIN)
+
+
+def test_terminal_frames_are_forwarded_without_waiting_for_the_worker(monkeypatch):
+    """EndFrame/CancelFrame must reach the STT while the worker is still stuck
+    in ``feed()``: the join is deferred to ``cleanup()`` so it cannot eat the
+    shutdown budget."""
+    for terminal in (EndFrame, CancelFrame):
+        release = threading.Event()
+        model = StubDiarizer([], block=release)
+        tl = RecordingTimeline()
+        feeder = make_feeder(tl, model, join=30.0)  # a join here would hang
+        out = []
+
+        async def _base(self, frame, direction):
+            return None
+
+        async def _push(frame, direction=FrameDirection.DOWNSTREAM):
+            out.append(frame)
+
+        monkeypatch.setattr(df.FrameProcessor, "process_frame", _base)
+        feeder.push_frame = _push  # type: ignore[method-assign]
+        term = terminal()
+
+        async def go():
+            await feeder.process_frame(start_frame(), FrameDirection.DOWNSTREAM)
+            await feeder.process_frame(audio_frame(), FrameDirection.DOWNSTREAM)
+            while not model.feed_calls:  # worker is now parked inside feed()
+                await asyncio.sleep(0.005)
+            await asyncio.wait_for(
+                feeder.process_frame(term, FrameDirection.DOWNSTREAM), 5.0
+            )
+            assert out[-1] is term
+            assert feeder.worker.thread.is_alive()
+            assert not tl.is_degraded
+
+        try:
+            asyncio.run(go())
+        finally:
+            release.set()
+            feeder.worker.join(JOIN)
+
+
+def test_cleanup_without_terminal_frame_aborts_the_worker(monkeypatch):
+    model = StubDiarizer([])
+    tl = RecordingTimeline()
+    feeder = make_feeder(tl, model)
+    drive(feeder, [start_frame(), audio_frame()], monkeypatch)  # cleanup only
+    assert not feeder.worker.thread.is_alive()
+    assert not tl.is_flushed and not tl.is_degraded
+    assert not any(c[2] for c in model.feed_calls)  # aborted, no final flush
