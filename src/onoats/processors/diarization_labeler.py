@@ -272,7 +272,7 @@ class DiarizationLabeler(FrameProcessor):
             while self._pending:
                 head = self._pending[0]
                 if self._timeline.is_degraded:
-                    await self._pop_and_push(labelled=False)
+                    await self._pop_and_push()
                     continue
                 hw = self._timeline.coverage_high_water()
                 if hw >= head.end:
@@ -335,15 +335,21 @@ class DiarizationLabeler(FrameProcessor):
         )
         assert self._release_lock is not None
         async with self._release_lock:
-            await self._deliver_held(
-                self._take_held(), labelled=False, context="fail-open"
-            )
+            await self._deliver_held(self._take_held(), context="fail-open")
 
     # ----------------------------------------------------------------- release
 
     async def _push_labelled(self, entry: _Pending) -> None:
-        """Label ``entry.frame`` with current coverage and push it. Lock held."""
-        if not self._timeline.is_degraded:
+        """Label ``entry.frame`` with current coverage and push it. Lock held.
+
+        The one owner of "degraded means no label attributes": once the
+        timeline is degraded the frame is pushed with any label attributes
+        stripped (an in-flight frame retried after a failed push may carry
+        them from that attempt) instead of labelled.
+        """
+        if self._timeline.is_degraded:
+            _strip_labels(entry.frame)
+        else:
             try:
                 label = self._timeline.label_for(entry.start, entry.end)
             except Exception as exc:  # never lose a transcript over a label
@@ -354,14 +360,7 @@ class DiarizationLabeler(FrameProcessor):
                 entry.frame.onoats_overlap = bool(label.overlap)
         await self.push_frame(entry.frame, entry.direction)
 
-    async def _push_entry(self, entry: _Pending, *, labelled: bool) -> None:
-        """Push labelled (current coverage) or exactly as-is. Lock held."""
-        if labelled:
-            await self._push_labelled(entry)
-        else:
-            await self.push_frame(entry.frame, entry.direction)
-
-    async def _pop_and_push(self, *, labelled: bool = True) -> None:
+    async def _pop_and_push(self) -> None:
         """Pop the head of ``_pending`` and push it. Lock held.
 
         The one way a single frame leaves ``_pending``: it sits in
@@ -370,7 +369,7 @@ class DiarizationLabeler(FrameProcessor):
         ``_fail_open`` instead of losing it.
         """
         entry = self._in_flight = self._pending.popleft()
-        await self._push_entry(entry, labelled=labelled)
+        await self._push_labelled(entry)
         self._in_flight = None
 
     async def _drain_all(self) -> None:
@@ -388,18 +387,11 @@ class DiarizationLabeler(FrameProcessor):
         self._pending.clear()
         return entries
 
-    async def _deliver_held(
-        self, entries: list[_Pending], *, labelled: bool, context: str
-    ) -> None:
-        """Push each taken frame once; log, never raise, a push failure.
-
-        Unlabelled delivery strips any label attributes first. Lock held.
-        """
+    async def _deliver_held(self, entries: list[_Pending], *, context: str) -> None:
+        """Push each taken frame once; log, never raise, a push failure. Lock held."""
         for entry in entries:
-            if not labelled:
-                _strip_labels(entry.frame)
             try:
-                await self._push_entry(entry, labelled=labelled)
+                await self._push_labelled(entry)
             except Exception as exc:
                 logger.error(
                     "DiarizationLabeler: dropped a transcript during "
@@ -430,7 +422,7 @@ class DiarizationLabeler(FrameProcessor):
                     f"DiarizationLabeler: releasing {len(entries)} held "
                     "transcript(s) at cleanup (no EndFrame/CancelFrame)"
                 )
-            await self._deliver_held(entries, labelled=True, context="cleanup")
+            await self._deliver_held(entries, context="cleanup")
 
     async def _on_end(self) -> None:
         """Graceful shutdown: wait <= hold_sec for the final flush, then drain."""
