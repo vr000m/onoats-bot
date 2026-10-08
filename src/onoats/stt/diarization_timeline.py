@@ -66,8 +66,8 @@ RING_HEADROOM_SEC = 10.0
 #: (no coverage is possible yet) before a no-progress expiry counts toward the
 #: labeler's stall guard. A cold model load is not a hung ``feed()``.
 MODEL_LOAD_GRACE_SEC = 60.0
-#: Same factor as ``websocket_stt_service`` (``max(_DECODE_TIMEOUT_SECONDS,
-#: 1.5 * audio_seconds)``); pinned by a parity test.
+#: Decode-timeout factor; ``websocket_stt_service`` imports it for
+#: ``max(_DECODE_TIMEOUT_SECONDS, DECODE_TIMEOUT_RATIO * audio_seconds)``.
 DECODE_TIMEOUT_RATIO = 1.5
 
 try:  # the STT server's own cap on one uncommitted turn

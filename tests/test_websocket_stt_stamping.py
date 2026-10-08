@@ -507,3 +507,38 @@ def test_inline_run_stt_within_a_single_process_frame_call(monkeypatch):
     out = _run(svc, _segment(pre=1, speech=1))
     assert seen == ["run_stt"]
     assert len(out) == 1
+
+
+# --------------------------------------------------- decode-timeout ratio owner
+
+
+def test_decode_timeout_uses_the_timeline_ratio(monkeypatch):
+    """``run_stt`` scales its decode timeout by the timeline's
+    ``DECODE_TIMEOUT_RATIO`` (one owner; the ring capacity is sized from the
+    same constant), not a local literal: patching the imported binding changes
+    the timeout actually passed to ``asyncio.wait_for``."""
+    from onoats.stt import diarization_timeline as dt
+
+    assert wss_module.DECODE_TIMEOUT_RATIO is dt.DECODE_TIMEOUT_RATIO
+
+    ratio = 7.25
+    monkeypatch.setattr(wss_module, "DECODE_TIMEOUT_RATIO", ratio)
+    monkeypatch.setattr(wss_module, "_DECODE_TIMEOUT_SECONDS", 0.001)
+    audio = b"\x01\x00" * CHUNK
+    audio_seconds = len(audio) / (P.AUDIO_SAMPLE_RATE_HZ * P.AUDIO_SAMPLE_WIDTH_BYTES)
+    timeouts: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _spy(aw, timeout=None):
+        timeouts.append(timeout)
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(wss_module.asyncio, "wait_for", _spy)
+    svc = _svc(stamp=False)
+
+    async def _go():
+        return [f async for f in svc.run_stt(audio)]
+
+    out = asyncio.run(_go())
+    assert any(isinstance(f, TranscriptionFrame) for f in out)
+    assert pytest.approx(ratio * audio_seconds) in timeouts

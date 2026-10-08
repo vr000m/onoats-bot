@@ -90,7 +90,7 @@ from stt_server import protocol as P
 from onoats import _closing
 from onoats._redact import display_uri, safe_exc_text
 from onoats.stt import launchd
-from onoats.stt.diarization_timeline import SampleCounter
+from onoats.stt.diarization_timeline import DECODE_TIMEOUT_RATIO, SampleCounter
 
 # Wait at most this long for a decode round trip before surfacing an
 # error frame and giving up on the segment. Covers the 16 kHz / 60 s
@@ -451,7 +451,9 @@ class WebSocketSTTService(SegmentedSTTService):
             audio_seconds = len(audio) / (
                 P.AUDIO_SAMPLE_RATE_HZ * P.AUDIO_SAMPLE_WIDTH_BYTES
             )
-            decode_timeout = max(_DECODE_TIMEOUT_SECONDS, 1.5 * audio_seconds)
+            decode_timeout = max(
+                _DECODE_TIMEOUT_SECONDS, DECODE_TIMEOUT_RATIO * audio_seconds
+            )
             try:
                 await self.start_processing_metrics()
                 # Chunk under MAX_APPEND_BYTES (1 MiB) so long VAD turns

@@ -105,12 +105,6 @@ def test_constants_exist_and_sane():
     assert dt.HOLD_SEC > 0 and dt.RING_HEADROOM_SEC > 0
 
 
-def test_decode_timeout_ratio_parity_with_websocket_stt_service():
-    src = Path(dt.__file__).with_name("websocket_stt_service.py").read_text()
-    line = next(ln for ln in src.splitlines() if "decode_timeout = max(" in ln)
-    assert f"{dt.DECODE_TIMEOUT_RATIO} * audio_seconds" in line
-
-
 def test_max_turn_sec_parity_with_stt_server_protocol():
     protocol = pytest.importorskip("stt_server.protocol")
     assert dt.MAX_TURN_SEC == protocol.MAX_UNCOMMITTED_SECONDS
