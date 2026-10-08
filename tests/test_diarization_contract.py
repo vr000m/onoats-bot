@@ -46,8 +46,13 @@ def _purge_mlx_audio_after_module():
 # --- always-on (no mlx_audio needed) ---------------------------------------
 
 
-def test_production_loader_uses_pinned_symbols_and_kwargs(monkeypatch):
-    """The loader must call ``mlx_audio.vad.load(MODEL_ID, strict=True)``."""
+def test_production_loader_uses_pinned_symbols_and_kwargs(monkeypatch, tmp_path):
+    """The loader must call ``mlx_audio.vad.load(<cached snapshot dir>, strict=True)``.
+
+    The snapshot directory (not the bare repo id) is passed so the load neither
+    consults the CWD for a shadowing ``mlx-community/...`` directory nor hits
+    the hub on every start.
+    """
     calls: list[tuple] = []
     sentinel = object()
 
@@ -62,9 +67,29 @@ def test_production_loader_uses_pinned_symbols_and_kwargs(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_audio", fake_pkg)
     monkeypatch.setitem(sys.modules, "mlx_audio.vad", fake_vad)
 
+    snap = tmp_path / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    probed: list[tuple] = []
+
+    def fake_probe(repo_id, filename):
+        probed.append((repo_id, filename))
+        return str(snap / filename)
+
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", fake_probe)
+
     assert diarization_feeder.DIARIZATION_MODEL_ID == MODEL_ID
     assert diarization_feeder.load_mlx_diarizer() is sentinel
-    assert calls == [((MODEL_ID,), {"strict": True})]
+    assert probed == [(MODEL_ID, "config.json")]
+    assert calls == [((str(snap),), {"strict": True})]
+
+
+def test_production_loader_fails_loud_when_weights_not_cached(monkeypatch):
+    """No silent fall back to a hub download / bare-repo-id load."""
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache", lambda repo_id, filename: None
+    )
+    with pytest.raises(RuntimeError, match="hf download"):
+        diarization_feeder.load_mlx_diarizer()
 
 
 # --- real-package contract --------------------------------------------------
@@ -104,7 +129,9 @@ def _weights_cached() -> bool:
 def model(mlx_vad):
     if not _weights_cached():
         pytest.skip(f"{MODEL_ID} weights not in the local HF cache")
-    return mlx_vad.load(MODEL_ID, strict=True)
+    # The production loader (cached snapshot dir), so the contract pins the
+    # exact path the worker takes.
+    return diarization_feeder.load_mlx_diarizer()
 
 
 @pytest.fixture(scope="module")

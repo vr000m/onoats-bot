@@ -73,11 +73,36 @@ DEFAULT_JOIN_TIMEOUT_SEC = 5.0
 DiarizerFactory = Callable[[], Any]
 
 
+def _cached_snapshot_dir() -> str:
+    """Absolute path of the locally cached model snapshot (no network).
+
+    ``mlx_audio.vad.load`` given a bare repo id first tests it as a path
+    relative to the CWD (a directory of that name would shadow the model) and
+    otherwise calls ``snapshot_download``, i.e. checks the hub on every start.
+    Loading from the resolved cache directory avoids both; the startup
+    preflight (``runtime._preflight_diarization``) already guarantees the
+    weights are cached, so a miss here is a fail-loud worker error.
+    """
+    import os
+
+    from huggingface_hub import try_to_load_from_cache
+
+    cfg = try_to_load_from_cache(DIARIZATION_MODEL_ID, "config.json")
+    if not isinstance(cfg, str):
+        raise RuntimeError(
+            f"diarization weights ({DIARIZATION_MODEL_ID}) are not in the local "
+            "Hugging Face cache; run: hf download " + DIARIZATION_MODEL_ID
+        )
+    # abspath, not resolve(): the files inside a snapshot are symlinks into
+    # ``blobs/``, and resolving would walk out of the snapshot directory.
+    return os.path.dirname(os.path.abspath(cfg))
+
+
 def load_mlx_diarizer() -> Any:
     """Production ``diarizer_factory``; the only place ``mlx_audio`` is imported."""
     from mlx_audio.vad import load as load_diarization
 
-    return load_diarization(DIARIZATION_MODEL_ID, strict=True)
+    return load_diarization(_cached_snapshot_dir(), strict=True)
 
 
 class DiarizerWorker:
