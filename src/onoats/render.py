@@ -63,6 +63,23 @@ def _label_for(source: str | None, labels: dict[str, str]) -> str:
     return "Unknown"
 
 
+def compose_speaker_label(
+    display_label: str, speakers: list[str] | None, overlap: bool
+) -> str:
+    """Compose the display label with the diarization suffix.
+
+    Shared by ``render_session`` and the live terminal (value-based so both
+    call sites can pass plain values). No speakers -> ``display_label``
+    unchanged; ``["S1"]`` -> ``Them (S1)``; overlap with 2+ speakers ->
+    ``Them (S1 / S2, overlapping)``. Display strings are never persisted.
+    """
+    if not speakers:
+        return display_label
+    if overlap and len(speakers) > 1:
+        return f"{display_label} ({' / '.join(speakers)}, overlapping)"
+    return f"{display_label} ({' / '.join(speakers)})"
+
+
 def render_session(
     session: Session,
     *,
@@ -92,7 +109,9 @@ def render_session(
             text = entry.text.strip()
             if not text:
                 continue
-            label = _label_for(entry.source, labels)
+            label = compose_speaker_label(
+                _label_for(entry.source, labels), entry.speakers, entry.overlap
+            )
             lines.append(f"**{label}:** {text}")
             lines.append("")
 

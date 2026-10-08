@@ -1055,7 +1055,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [x] Phase 3: Feeder + worker
 - [x] Phase 4: STT segment-sample stamping
 - [x] Phase 5: Labeler
-- [ ] Phase 6: Persistence + render
+- [x] Phase 6: Persistence + render
 - [ ] Phase 7: Wiring
 - [ ] Phase 8: Dependency + contract
 - [ ] Phase 8b: Real-pipeline validation gate

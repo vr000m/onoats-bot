@@ -27,6 +27,8 @@ class Utterance:
     time: str
     text: str
     source: str | None = None
+    speakers: list[str] | None = None
+    overlap: bool = False
 
 
 @dataclass
@@ -72,10 +74,20 @@ def read_session_file(path: str | Path) -> Session:
                 if isinstance(category, str) and category.strip():
                     session.category = category.strip()
             elif etype == "utterance":
+                raw_speakers = entry.get("speakers")
+                speakers = (
+                    list(raw_speakers)
+                    if isinstance(raw_speakers, list)
+                    and raw_speakers
+                    and all(isinstance(s, str) for s in raw_speakers)
+                    else None
+                )
                 utt = Utterance(
                     time=str(entry.get("time", "")),
                     text=str(entry.get("text", "")),
                     source=entry.get("source"),
+                    speakers=speakers,
+                    overlap=entry.get("overlap") is True,
                 )
                 session.utterances.append(utt)
                 session.entries.append(utt)

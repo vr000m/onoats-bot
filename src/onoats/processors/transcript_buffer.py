@@ -68,6 +68,8 @@ def _utterance_entry(
     source_order: int | None = None,
     branch_sequence: int | None = None,
     timestamp: str | None = None,
+    speakers: list[str] | None = None,
+    overlap: bool | None = None,
 ) -> dict:
     # Prefer the STT-supplied timestamp (ISO8601) when available; branches
     # can finalize at different speeds, so wall-clock arrival time would
@@ -84,6 +86,12 @@ def _utterance_entry(
         entry["source_order"] = source_order
     if isinstance(branch_sequence, int):
         entry["branch_sequence"] = branch_sequence
+    # Canonical diarization label (never a display string); keys are omitted
+    # entirely when the labeler did not stamp the frame.
+    if speakers:
+        entry["speakers"] = list(speakers)
+    if isinstance(overlap, bool):
+        entry["overlap"] = overlap
     return entry
 
 
@@ -321,6 +329,16 @@ class TranscriptBuffer(FrameProcessor):
             if isinstance(raw_branch_sequence, int):
                 branch_sequence = raw_branch_sequence
 
+        speakers = None
+        raw_speakers = getattr(frame, "onoats_speakers", None)
+        if isinstance(raw_speakers, (list, tuple)) and all(
+            isinstance(s, str) for s in raw_speakers
+        ):
+            speakers = list(raw_speakers)
+        overlap = getattr(frame, "onoats_overlap", None)
+        if not isinstance(overlap, bool):
+            overlap = None
+
         frame_timestamp = getattr(frame, "timestamp", None)
         frame_timestamp = str(frame_timestamp) if frame_timestamp else None
 
@@ -331,6 +349,8 @@ class TranscriptBuffer(FrameProcessor):
                 source_order=source_order,
                 branch_sequence=branch_sequence,
                 timestamp=frame_timestamp,
+                speakers=speakers,
+                overlap=overlap,
             )
             self._buffer.append(entry)
             idx = len(self._buffer) - 1
