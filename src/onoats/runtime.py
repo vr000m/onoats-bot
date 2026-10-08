@@ -81,6 +81,14 @@ class SttPreflightError(RuntimeError):
     """
 
 
+class DiarizationPreflightError(SttPreflightError):
+    """Raised at startup when ``diarization`` is on but cannot work.
+
+    Subclasses :class:`SttPreflightError` so every entrypoint's existing
+    ``except SttPreflightError`` boundary maps it to a clean rc=1.
+    """
+
+
 class RecorderAlreadyRunningError(RuntimeError):
     """Raised at startup when an identity-verified live recorder already owns the
     pid file.
@@ -1847,6 +1855,82 @@ def _refuse_if_live_recorder(pid_path: Path) -> None:
                 "file) — refusing to start over a possibly-live recorder. Stop it "
                 "(`onoats stop`) or remove the stale pid file, then retry."
             )
+
+
+DIARIZATION_REPO_ID = "mlx-community/Nemotron-3-Diarization"
+# The two files ``mlx_audio``'s loader fetches (Phase 0).
+_DIARIZATION_WEIGHT_FILES = ("config.json", "model.safetensors")
+_DIARIZATION_INSTALL_HINT = "uv sync --extra diarization"
+_DIARIZATION_DOWNLOAD_HINT = f"hf download {DIARIZATION_REPO_ID}"
+
+# Memoized successful preflights (keyed by repo id) so the socket-mode double
+# call (supervisor, then ``run_onoats_dual``) is a no-op.
+_diarization_preflight_done: set[str] = set()
+
+
+def _diarization_extra_installed() -> bool:
+    """``find_spec`` only: never imports ``mlx_audio`` (no MLX state)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("mlx_audio") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _diarization_weights_cached(repo_id: str) -> bool:
+    """Non-downloading local-cache probe for every weight file.
+
+    ``try_to_load_from_cache`` never touches the network; it returns a path
+    str when cached and ``None`` (or a sentinel for a known-missing file)
+    otherwise. Deliberately NOT ``snapshot_download(local_files_only=True)``,
+    which raises ``IncompleteSnapshotError`` on a fully cached repo.
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    for filename in _DIARIZATION_WEIGHT_FILES:
+        if not isinstance(try_to_load_from_cache(repo_id, filename), str):
+            return False
+    return True
+
+
+def _preflight_diarization(cfg) -> None:
+    """Fail loud (before any capture side effect) if diarization can't run.
+
+    Import-free and non-downloading: ``find_spec`` for the extra plus a local
+    cache probe for the weights; no ``mlx_audio`` import, no model held, no
+    network. Called right after ``_acquire_instance_lock`` and ONLY when the
+    flag is on. Memoized on success. The worker does the real model load.
+
+    Raises :class:`DiarizationPreflightError` (an ``SttPreflightError``, so
+    callers map it to rc=1) after logging an ERROR with the remedy.
+    """
+    if DIARIZATION_REPO_ID in _diarization_preflight_done:
+        return
+
+    def _fail(message: str) -> None:
+        logger.error(message)
+        raise DiarizationPreflightError(message)
+
+    if cfg.stt_service != "websocket":
+        _fail(
+            "diarization is enabled but STT_SERVICE="
+            f"{cfg.stt_service!r}: only the 'websocket' backend can stamp "
+            "segment samples, so the flag would silently do nothing. Set "
+            "STT_SERVICE=websocket or disable ONOATS_DIARIZATION / "
+            "[stt].diarization."
+        )
+    if not _diarization_extra_installed():
+        _fail(
+            "diarization is enabled but the 'mlx_audio' package is not "
+            f"installed. Install the extra: {_DIARIZATION_INSTALL_HINT}"
+        )
+    if not _diarization_weights_cached(DIARIZATION_REPO_ID):
+        _fail(
+            f"diarization is enabled but the model weights ({DIARIZATION_REPO_ID}) "
+            f"are not downloaded; run: {_DIARIZATION_DOWNLOAD_HINT}"
+        )
+    _diarization_preflight_done.add(DIARIZATION_REPO_ID)
 
 
 def _acquire_instance_lock(active_dir: Path) -> None:

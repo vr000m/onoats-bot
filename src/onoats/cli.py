@@ -572,6 +572,18 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # on exit (so the slot stays ours through the capturer teardown in `finally`).
     _acquire_instance_lock(data_dir / ".active")
 
+    # Diarization config-time gate: right after the lock, before the capturer
+    # spawn (no TCC prompt / device touch for a doomed start). Import-free and
+    # non-downloading; only when the flag is on. A failure raises
+    # DiarizationPreflightError (an SttPreflightError → rc=1 in
+    # _run_socket_supervisor). Memoized, so run_onoats_dual's call is a no-op.
+    from onoats.config import load_config as _load_config
+    from onoats.runtime import _preflight_diarization
+
+    _diar_cfg = _load_config()
+    if _diar_cfg.diarization:
+        _preflight_diarization(_diar_cfg)
+
     # 1. Private, supervisor-owned socket dir (0700). mkdtemp already creates the
     # dir 0700 and owner-only; a fresh per-generation dir means any stale socket
     # from a prior generation lives at a path the new recorder never references

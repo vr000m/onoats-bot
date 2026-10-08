@@ -422,6 +422,14 @@ async def run_onoats_dual(
     cfg = load_config()
     audio_source = cfg.audio_source
 
+    # Diarization config-time gate: right after the lock, before PortAudio opens
+    # or the socket transports are built. Only when the flag is on; memoized, so
+    # the socket supervisor's earlier call makes this a no-op.
+    if cfg.diarization:
+        from onoats.runtime import _preflight_diarization
+
+        _preflight_diarization(cfg)
+
     # Build the two capture-branch transports. The branch is the AUDIO_SOURCE
     # swap seam: `portaudio` keeps today's LocalAudioTransport path verbatim;
     # `socket` reads framed PCM16 from per-branch unix sockets. The socket

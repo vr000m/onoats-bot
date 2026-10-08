@@ -2318,3 +2318,311 @@ def test_failed_preflight_teardown_does_not_outlast_the_quoted_budget(monkeypatc
     # Budget is ~0.1s. Unbounded, the final teardown alone added
     # `_closing.CLOSE_TIMEOUT_SEC` (5s) on top.
     assert elapsed < 2.0, elapsed
+
+
+# --- Diarization preflight (import-free, non-downloading, memoized) ----------
+
+
+@pytest.fixture
+def _diar_cfg(monkeypatch):
+    from onoats.config import OnoatsConfig
+
+    monkeypatch.setattr(runtime, "_diarization_preflight_done", set())
+    return OnoatsConfig(raw={"stt": {"service": "websocket", "diarization": True}})
+
+
+def test_diarization_preflight_missing_extra_fails_loud(_diar_cfg, monkeypatch):
+    monkeypatch.setattr(runtime, "_diarization_extra_installed", lambda: False)
+    monkeypatch.setattr(
+        runtime,
+        "_diarization_weights_cached",
+        lambda repo: pytest.fail("weights probed despite missing extra"),
+    )
+    with pytest.raises(runtime.DiarizationPreflightError) as ei:
+        runtime._preflight_diarization(_diar_cfg)
+    assert "--extra diarization" in str(ei.value)
+
+
+def test_diarization_preflight_cold_cache_names_download_and_never_downloads(
+    _diar_cfg, monkeypatch
+):
+    import huggingface_hub
+
+    monkeypatch.setattr(runtime, "_diarization_extra_installed", lambda: True)
+    # Cold cache: the real probe returns None for a missing file. Any download
+    # entry point being touched is a failure.
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda repo_id, filename: None
+    )
+    for name in ("snapshot_download", "hf_hub_download"):
+        monkeypatch.setattr(
+            huggingface_hub,
+            name,
+            lambda *a, **k: pytest.fail("preflight must not download"),
+        )
+    with pytest.raises(runtime.DiarizationPreflightError) as ei:
+        runtime._preflight_diarization(_diar_cfg)
+    msg = str(ei.value)
+    assert "not downloaded" in msg and "hf download" in msg
+    assert runtime.DIARIZATION_REPO_ID in msg
+
+
+def test_diarization_weights_probe_requires_both_files(monkeypatch):
+    import huggingface_hub
+
+    seen: list[str] = []
+
+    def _probe(repo_id, filename):
+        seen.append(filename)
+        return "/cache/x" if filename == "config.json" else None
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _probe)
+    assert runtime._diarization_weights_cached("r/m") is False
+    assert seen == ["config.json", "model.safetensors"]
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda repo_id, filename: "/p"
+    )
+    assert runtime._diarization_weights_cached("r/m") is True
+
+
+def test_diarization_preflight_is_memoized_and_import_free(_diar_cfg, monkeypatch):
+    import sys
+
+    calls = {"spec": 0, "weights": 0}
+
+    def _spec():
+        calls["spec"] += 1
+        return True
+
+    def _weights(repo):
+        calls["weights"] += 1
+        return True
+
+    monkeypatch.setattr(runtime, "_diarization_extra_installed", _spec)
+    monkeypatch.setattr(runtime, "_diarization_weights_cached", _weights)
+    runtime._preflight_diarization(_diar_cfg)
+    runtime._preflight_diarization(_diar_cfg)  # socket-mode double call
+    assert calls == {"spec": 1, "weights": 1}
+    assert "mlx_audio" not in sys.modules
+
+
+def test_diarization_extra_probe_does_not_import(monkeypatch):
+    import importlib.util
+    import sys
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    assert runtime._diarization_extra_installed() is False
+    assert "mlx_audio" not in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (them-channel diarization): `_preflight_diarization` — import-free,
+# non-downloading, memoized. find_spec and the cache probe are monkeypatched so
+# the result is identical in CI (extra absent) and on a dev Mac (extra present).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def diar_env(monkeypatch):
+    """Patch the two hooks `_preflight_diarization` may use; return a state dict."""
+    import importlib.util
+    import sys
+
+    import huggingface_hub
+
+    runtime._diarization_preflight_done.clear()
+    state: dict = {
+        "spec_present": True,
+        "spec_calls": [],
+        "cached": {"config.json", "model.safetensors"},
+        "probed": [],
+        "downloads": [],
+    }
+    real_find_spec = importlib.util.find_spec
+
+    def _find_spec(name, *a, **k):
+        if name == "mlx_audio":
+            state["spec_calls"].append(name)
+            return object() if state["spec_present"] else None
+        return real_find_spec(name, *a, **k)
+
+    def _probe(repo_id, filename, *a, **k):
+        state["probed"].append(filename)
+        return f"/cache/{filename}" if filename in state["cached"] else None
+
+    def _no_download(*a, **k):
+        state["downloads"].append((a, k))
+        raise AssertionError("preflight must never download")
+
+    monkeypatch.setattr(importlib.util, "find_spec", _find_spec)
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _probe)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _no_download)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _no_download)
+    state["modules_before"] = "mlx_audio" in sys.modules
+    yield state
+    runtime._diarization_preflight_done.clear()
+
+
+def _ws_cfg():
+    from onoats.config import OnoatsConfig
+
+    return OnoatsConfig(raw={"stt": {"service": "websocket", "diarization": True}})
+
+
+def test_diarization_preflight_hooks_happy_path_no_import_no_download(diar_env):
+    import sys
+
+    runtime._preflight_diarization(_ws_cfg())
+    assert set(diar_env["probed"]) == {"config.json", "model.safetensors"}
+    assert diar_env["downloads"] == []
+    if not diar_env["modules_before"]:
+        assert "mlx_audio" not in sys.modules, "preflight must be import-free"
+
+
+def test_diarization_preflight_hooks_missing_extra_fails_loud(diar_env):
+    diar_env["spec_present"] = False
+    with pytest.raises(SttPreflightError, match="mlx_audio"):
+        runtime._preflight_diarization(_ws_cfg())
+    assert diar_env["downloads"] == []
+
+
+def test_diarization_preflight_hooks_cold_cache_gives_download_hint_no_download(
+    diar_env,
+):
+    diar_env["cached"] = set()
+    with pytest.raises(SttPreflightError, match="not downloaded"):
+        runtime._preflight_diarization(_ws_cfg())
+    assert diar_env["downloads"] == []
+
+
+def test_diarization_preflight_hooks_partial_cache_fails(diar_env):
+    """Only one of the two files cached is still a cold cache."""
+    diar_env["cached"] = {"config.json"}
+    with pytest.raises(SttPreflightError, match="not downloaded"):
+        runtime._preflight_diarization(_ws_cfg())
+    diar_env["cached"] = {"model.safetensors"}
+    with pytest.raises(SttPreflightError, match="not downloaded"):
+        runtime._preflight_diarization(_ws_cfg())
+
+
+def test_diarization_preflight_hooks_offline_cold_cache_no_download(
+    diar_env, monkeypatch
+):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    diar_env["cached"] = set()
+    with pytest.raises(SttPreflightError, match="not downloaded"):
+        runtime._preflight_diarization(_ws_cfg())
+    assert diar_env["downloads"] == []
+
+
+def test_diarization_preflight_hooks_rejects_non_websocket(diar_env):
+    from onoats.config import OnoatsConfig
+
+    cfg = OnoatsConfig(raw={"stt": {"service": "whisper", "diarization": True}})
+    with pytest.raises(SttPreflightError, match="websocket"):
+        runtime._preflight_diarization(cfg)
+
+
+def test_diarization_preflight_hooks_memoized_second_call_is_noop(diar_env):
+    runtime._preflight_diarization(_ws_cfg())
+    spec_calls, probed = len(diar_env["spec_calls"]), len(diar_env["probed"])
+    assert spec_calls >= 1 and probed >= 1
+    # Second call (socket-mode: supervisor then run_onoats_dual) does no work,
+    # even if the environment has since degraded.
+    diar_env["spec_present"] = False
+    diar_env["cached"] = set()
+    runtime._preflight_diarization(_ws_cfg())
+    assert len(diar_env["spec_calls"]) == spec_calls
+    assert len(diar_env["probed"]) == probed
+
+
+def test_diarization_preflight_hooks_failure_is_not_memoized(diar_env):
+    diar_env["cached"] = set()
+    with pytest.raises(SttPreflightError):
+        runtime._preflight_diarization(_ws_cfg())
+    diar_env["cached"] = {"config.json", "model.safetensors"}
+    runtime._preflight_diarization(_ws_cfg())  # recovers once weights exist
+
+
+@pytest.fixture
+def _no_pyaudio_leak():
+    """`run_onoats` imports the PortAudio transport; don't leak pyaudio into
+    later tests that assert it was never imported (socket-mode guard)."""
+    import sys
+
+    had = "pyaudio" in sys.modules
+    yield
+    if not had:
+        sys.modules.pop("pyaudio", None)
+
+
+def test_single_input_mode_logs_ignored_warning_once(
+    _no_pyaudio_leak, tmp_path, monkeypatch
+):
+    """`__main__.run_onoats` (bot-single) has no them arm: flag on logs one
+    "ignored" WARNING and never calls `_preflight_diarization`."""
+    from loguru import logger
+
+    import onoats.__main__ as main_mod
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setattr(main_mod, "_acquire_instance_lock", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        runtime,
+        "_preflight_diarization",
+        lambda *_a, **_k: pytest.fail("single-input must not preflight diarization"),
+    )
+
+    class _Stop(Exception):
+        pass
+
+    # Cut the run off right after the flag check: the next step imports the
+    # audio-device selector, which we make raise.
+    import onoats.config.audio_devices as audio_devices
+
+    def _stop(*_a, **_k):
+        raise _Stop
+
+    monkeypatch.setattr(audio_devices, "select_input_device", _stop)
+
+    records: list[str] = []
+    sink_id = logger.add(lambda m: records.append(m.record["message"]), level="WARNING")
+    try:
+        with pytest.raises(_Stop):
+            asyncio.run(main_mod.run_onoats())
+    finally:
+        logger.remove(sink_id)
+    ignored = [m for m in records if "diarization" in m and "ignored" in m]
+    assert len(ignored) == 1, records
+
+
+def test_single_input_mode_flag_off_logs_nothing(
+    _no_pyaudio_leak, tmp_path, monkeypatch
+):
+    from loguru import logger
+
+    import onoats.__main__ as main_mod
+    import onoats.config.audio_devices as audio_devices
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setattr(main_mod, "_acquire_instance_lock", lambda *_a, **_k: None)
+
+    class _Stop(Exception):
+        pass
+
+    def _stop(*_a, **_k):
+        raise _Stop
+
+    monkeypatch.setattr(audio_devices, "select_input_device", _stop)
+    records: list[str] = []
+    sink_id = logger.add(lambda m: records.append(m.record["message"]), level="WARNING")
+    try:
+        with pytest.raises(_Stop):
+            asyncio.run(main_mod.run_onoats())
+    finally:
+        logger.remove(sink_id)
+    assert not [m for m in records if "diarization" in m]

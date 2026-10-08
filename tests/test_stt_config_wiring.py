@@ -534,3 +534,67 @@ def test_validate_launchd_label_rejects_trailing_newline():
     it without depending on every caller stripping first."""
     assert validate_launchd_label("pipecat.stt-server\n") is None
     assert validate_launchd_label("pipecat.stt-server\n\n") is None
+
+
+# --- D. diarization flag + non-websocket backend fails loud ------------------
+
+
+def test_diarization_with_non_websocket_backend_fails_loud(monkeypatch):
+    from onoats.runtime import DiarizationPreflightError, SttPreflightError
+
+    monkeypatch.setattr(runtime, "_diarization_preflight_done", set())
+    # Even with the extra + weights "present", the backend check must refuse.
+    monkeypatch.setattr(runtime, "_diarization_extra_installed", lambda: True)
+    monkeypatch.setattr(runtime, "_diarization_weights_cached", lambda repo: True)
+    for backend in ("whisper", "deepgram"):
+        cfg = OnoatsConfig(raw={"stt": {"service": backend, "diarization": True}})
+        with pytest.raises(DiarizationPreflightError) as ei:
+            runtime._preflight_diarization(cfg)
+        assert isinstance(ei.value, SttPreflightError)  # => rc=1 at every boundary
+        assert "websocket" in str(ei.value)
+
+
+def test_diarization_with_websocket_backend_passes(monkeypatch):
+    monkeypatch.setattr(runtime, "_diarization_preflight_done", set())
+    monkeypatch.setattr(runtime, "_diarization_extra_installed", lambda: True)
+    monkeypatch.setattr(runtime, "_diarization_weights_cached", lambda repo: True)
+    cfg = OnoatsConfig(raw={"stt": {"service": "websocket", "diarization": True}})
+    runtime._preflight_diarization(cfg)
+
+
+# --- Phase 1: diarization flag + non-websocket STT backend fails loud -------
+
+
+def test_diarization_flag_with_non_websocket_backend_fails_loud(monkeypatch):
+    """Flag on + a backend that cannot stamp segment samples must raise a
+    startup error (SttPreflightError, which every entrypoint maps to rc=1)
+    rather than silently doing nothing. find_spec / cache probe are patched to
+    "present" so ONLY the backend mismatch can be the cause."""
+    import importlib.util
+
+    import huggingface_hub
+
+    runtime._diarization_preflight_done.clear()
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda *a, **k: "/cached/path"
+    )
+    for service in ("whisper", "deepgram"):
+        cfg = OnoatsConfig(raw={"stt": {"service": service, "diarization": True}})
+        with pytest.raises(runtime.SttPreflightError, match="websocket"):
+            runtime._preflight_diarization(cfg)
+
+
+def test_diarization_flag_with_websocket_backend_passes(monkeypatch):
+    import importlib.util
+
+    import huggingface_hub
+
+    runtime._diarization_preflight_done.clear()
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda *a, **k: "/cached/path"
+    )
+    cfg = OnoatsConfig(raw={"stt": {"service": "websocket", "diarization": True}})
+    runtime._preflight_diarization(cfg)  # must not raise
+    runtime._diarization_preflight_done.clear()

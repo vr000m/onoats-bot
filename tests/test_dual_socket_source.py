@@ -637,3 +637,192 @@ def test_dual_main_invalid_category_short_circuits_before_run(
     rc = dual_mod.main(["--category", "definitely-not-a-category"])
     assert rc == 1
     assert "Error:" in capsys.readouterr().err
+
+
+# --- Diarization preflight at the run_onoats_dual entrypoint -----------------
+
+
+def _diar_dual_env(monkeypatch, tmp_path, *, flag):
+    from onoats import dual as dual_mod
+    from onoats import runtime
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ONOATS_DIARIZATION", flag)
+    monkeypatch.setenv("AUDIO_SOURCE", "portaudio")
+    order: list[str] = []
+    monkeypatch.setattr(
+        dual_mod, "_acquire_instance_lock", lambda d: order.append("lock")
+    )
+
+    def _boom(name):
+        def _f(*a, **k):
+            order.append(name)
+            raise RuntimeError(f"{name} reached")
+
+        return _f
+
+    monkeypatch.setattr(dual_mod, "_build_portaudio_transports", _boom("portaudio"))
+    monkeypatch.setattr(dual_mod, "_build_socket_transports", _boom("socket"))
+    return dual_mod, runtime, order
+
+
+def test_run_onoats_dual_diarization_preflight_failure_is_rc1_before_capture(
+    monkeypatch, tmp_path
+):
+    dual_mod, runtime, order = _diar_dual_env(monkeypatch, tmp_path, flag="1")
+
+    def _preflight(cfg):
+        order.append("preflight")
+        raise runtime.DiarizationPreflightError("diarization: extra missing")
+
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    rc = dual_mod.main([])
+    assert rc == 1
+    assert order == ["lock", "preflight"]  # no transport builder / PortAudio call
+
+
+def test_run_onoats_dual_flag_off_never_calls_preflight(monkeypatch, tmp_path):
+    dual_mod, runtime, order = _diar_dual_env(monkeypatch, tmp_path, flag="0")
+    monkeypatch.setattr(
+        runtime,
+        "_preflight_diarization",
+        lambda cfg: pytest.fail("preflight must not run with the flag off"),
+    )
+    with pytest.raises(RuntimeError, match="portaudio reached"):
+        dual_mod.main([])
+    assert order == ["lock", "portaudio"]
+
+
+def test_single_input_logs_ignored_warning_once(monkeypatch, tmp_path):
+    from loguru import logger
+
+    from onoats import __main__ as main_mod
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    monkeypatch.setattr(main_mod, "_acquire_instance_lock", lambda d: None)
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
+    try:
+        # Stop right after the flag check: the next import-heavy step is the
+        # native deps; force a controlled failure there.
+        import onoats.config as cfgmod
+
+        orig = cfgmod.load_config
+        calls = {"n": 0}
+
+        def _load():
+            calls["n"] += 1
+            return orig()
+
+        monkeypatch.setattr(cfgmod, "load_config", _load)
+        import pipecat.audio.vad.silero as silero
+
+        monkeypatch.setattr(
+            silero,
+            "SileroVADAnalyzer",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")),
+            raising=False,
+        )
+        with pytest.raises(Exception):
+            asyncio.run(main_mod.run_onoats())
+    finally:
+        logger.remove(sink)
+    ignored = [r for r in records if "ignored in single-input" in r]
+    assert len(ignored) == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (them-channel diarization): hoisted `_preflight_diarization` in
+# `run_onoats_dual` — after `_acquire_instance_lock`, before PortAudio opens /
+# socket transports are built; never called when the flag is off.
+# ---------------------------------------------------------------------------
+
+
+class _Stop(Exception):
+    """Sentinel raised by the builder spies to cut run_onoats_dual short."""
+
+
+def _dual_spies(monkeypatch, tmp_path, *, preflight_raises: bool):
+    import onoats.config.audio_devices as audio_devices
+    import onoats.dual as dual_mod
+    from onoats import runtime
+    from onoats.runtime import SttPreflightError
+
+    calls: list[str] = []
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("STT_SERVICE", "websocket")
+
+    def _lock(*_a, **_k):
+        calls.append("lock")
+
+    def _preflight(*_a, **_k):
+        calls.append("preflight")
+        if preflight_raises:
+            raise SttPreflightError("diarization: weights not downloaded")
+
+    def _builder(name):
+        def _b(*_a, **_k):
+            calls.append(name)
+            raise _Stop
+
+        return _b
+
+    monkeypatch.setattr(dual_mod, "_acquire_instance_lock", _lock)
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    monkeypatch.setattr(dual_mod, "_build_socket_transports", _builder("socket"))
+    monkeypatch.setattr(dual_mod, "_build_portaudio_transports", _builder("portaudio"))
+    monkeypatch.setattr(
+        audio_devices, "select_dual_input_devices", _builder("select_devices")
+    )
+    return dual_mod, calls
+
+
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
+def test_dual_diarization_preflight_failure_blocks_capture(
+    source, tmp_path, monkeypatch
+):
+    from onoats.runtime import SttPreflightError
+
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    dual_mod, calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=True)
+
+    with pytest.raises(SttPreflightError):  # mapped to rc=1 by dual.main
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    assert calls == ["lock", "preflight"], (
+        "no transport builder / select_dual_input_devices may run once "
+        f"preflight fails; saw {calls}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "builder"), [("portaudio", "portaudio"), ("socket", "socket")]
+)
+def test_dual_diarization_lock_then_preflight_precede_capture(
+    source, builder, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    dual_mod, calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=False)
+
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    assert calls[:3] == ["lock", "preflight", builder], calls
+
+
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
+def test_dual_diarization_flag_off_never_preflights(source, tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    dual_mod, calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=True)
+
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    assert "preflight" not in calls
+    assert calls[0] == "lock"

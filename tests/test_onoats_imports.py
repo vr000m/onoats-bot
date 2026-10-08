@@ -11,7 +11,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
-_FORBIDDEN = ["shared", "anthropic", "fastapi", "aiosqlite", "mlx_whisper"]
+_FORBIDDEN = ["shared", "anthropic", "fastapi", "aiosqlite", "mlx_whisper", "mlx_audio"]
 
 
 def _import_in_subprocess(module: str, forbidden: list[str]) -> None:

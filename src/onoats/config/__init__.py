@@ -379,6 +379,33 @@ class OnoatsConfig:
         # (self-healing off) — see `normalize_launchd_label`/`validate_launchd_label`.
         return normalize_launchd_label(val)
 
+    @property
+    def diarization(self) -> bool:
+        """Live "them"-channel speaker diarization flag (default off).
+
+        env ``ONOATS_DIARIZATION`` > config.toml ``[stt].diarization`` >
+        ``False``. Accepts a TOML bool, or a string/int in the usual
+        truthy/falsy vocabulary (``1/true/yes/on`` / ``0/false/no/off``,
+        case-insensitive). An unrecognised value logs a WARNING and resolves
+        to ``False`` (the flag gates a heavyweight optional feature; guessing
+        "on" from garbage would fail loud at startup for a typo).
+        """
+        val = _env_or("ONOATS_DIARIZATION", self.raw.get("stt", {}).get("diarization"))
+        if val is None or val == "":
+            return False
+        if isinstance(val, bool):
+            return val
+        text = str(val).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+        logger.warning(
+            f"STT: ignoring unrecognised diarization value {val!r} "
+            "(expected true/false); diarization disabled"
+        )
+        return False
+
     # ---- speakers (render-only display labels) ----
     @property
     def speaker_label_me(self) -> str:
