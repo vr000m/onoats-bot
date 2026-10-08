@@ -21,9 +21,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 from loguru import logger
-from onoats.stt.diarization_timeline import DiarizationTimeline
 
 from onoats.stt import diarization_timeline as dt
+from onoats.stt.diarization_timeline import DiarizationTimeline
 
 SR = 16000
 HOP = 160
@@ -395,42 +395,58 @@ def test_concurrent_writer_and_readers(tl):
 
 
 def test_record_interleaved_into_in_progress_label_for(tl):
-    """Deterministic: a `record` lands while `label_for` holds the lock.
+    """Deterministic: a `record` from another thread, issued while `label_for`
+    is mid-iteration over the segment list, must not leak into that snapshot.
 
-    Needs the timeline's lock at `_lock` and re-entrant; skipped otherwise
-    (impl-internal hook, flagged in the phase report)."""
-    real = getattr(tl, "_lock", None)
-    if real is None or not hasattr(real, "_is_owned"):
-        pytest.skip("timeline has no re-entrant `_lock` to interpose on")
-    tl.record(0, probs(frames(2), s0=ON))
+    The late write targets the queried window and would turn its label from
+    S1 into an S1+S2 overlap; with the lock held across the snapshot the
+    writer blocks until `label_for` has finished iterating. Impl-internal hook
+    (`_segments`), so skipped if the timeline's storage changes shape."""
+    if not isinstance(getattr(tl, "_segments", None), list):
+        pytest.skip("timeline has no `_segments` list to interpose on")
+    tl.record(0, probs(frames(2), s0=ON))  # [0, 2s): S1
+    tl.record(seconds(4), probs(frames(1), s1=ON))  # [4s, 5s): maps slot 1 -> S2
+    window = (0, seconds(4))
+    before = tl.label_for(*window)
+    assert before is not None and before.speakers == ["S1"] and not before.overlap
 
-    fired = []
+    mid_iter = threading.Event()
+    write_done = threading.Event()
 
-    class Proxy:
-        def __enter__(self_inner):
-            real.acquire()
-            if not fired:
-                fired.append(True)
-                tl.record(seconds(2), probs(frames(2), s0=ON))
-            return self_inner
+    class PausingList(list):
+        """Index-based iteration that pauses after the first element so a
+        concurrent insert (if the lock let one in) would be observed."""
 
-        def __exit__(self_inner, *exc):
-            real.release()
+        def __iter__(self):
+            i = 0
+            while i < len(self):
+                yield self[i]
+                if i == 0 and not mid_iter.is_set():
+                    mid_iter.set()
+                    # Give a write that is NOT blocked by the lock time to land.
+                    write_done.wait(0.5)
+                i += 1
 
-        def acquire(self_inner, *a, **k):
-            return real.acquire(*a, **k)
+    tl._segments = PausingList(tl._segments)
 
-        def release(self_inner):
-            return real.release()
+    def writer():
+        mid_iter.wait(5)
+        tl.record(seconds(2), probs(frames(2), s1=ON))  # [2s, 4s): S2
+        write_done.set()
 
-    tl._lock = Proxy()
     result = {}
-    th = threading.Thread(
-        target=lambda: result.setdefault("l", tl.label_for(0, seconds(2))),
-        daemon=True,
+    wt = threading.Thread(target=writer, daemon=True)
+    rt = threading.Thread(
+        target=lambda: result.setdefault("l", tl.label_for(*window)), daemon=True
     )
-    th.start()
-    th.join(5)
-    assert not th.is_alive()
-    assert result["l"] is not None and result["l"].speakers == ["S1"]
-    assert fired
+    wt.start()
+    rt.start()
+    rt.join(5)
+    wt.join(5)
+    assert not rt.is_alive() and not wt.is_alive()
+    assert mid_iter.is_set() and write_done.is_set()
+    # The in-progress read saw the pre-write snapshot only...
+    assert result["l"] == before
+    # ...and the write really does change this window once it lands.
+    after = tl.label_for(*window)
+    assert after is not None and after.overlap and after.speakers == ["S1", "S2"]
