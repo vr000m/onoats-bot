@@ -1050,7 +1050,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 ## Progress
 
 - [x] Phase 0: Verify (no code lands) — 2026-10-08, see Findings
-- [ ] Phase 1: Config flag + preflight
+- [x] Phase 1: Config flag + preflight
 - [ ] Phase 2: Leaf module (`diarization_timeline.py`)
 - [ ] Phase 3: Feeder + worker
 - [ ] Phase 4: STT segment-sample stamping
