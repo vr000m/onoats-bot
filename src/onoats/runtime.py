@@ -1875,8 +1875,10 @@ _DIARIZATION_INSTALL_HINT = (
 )
 _DIARIZATION_DOWNLOAD_HINT = _diarization_model.DOWNLOAD_HINT
 
-# Memoized successful preflights (keyed by repo id) so the socket-mode double
-# call (supervisor, then ``run_onoats_dual``) is a no-op.
+# Repo ids whose config-independent probes (extra installed + weights cached)
+# passed, so the socket-mode double call (supervisor, then ``run_onoats_dual``)
+# skips them. The cfg-dependent backend check is never memoized: config is
+# reloaded between the two calls.
 _diarization_preflight_done: set[str] = set()
 
 
@@ -1900,13 +1902,13 @@ def _preflight_diarization(cfg) -> None:
     Import-free and non-downloading: ``find_spec`` for the extra plus a local
     cache probe for the weights; no ``mlx_audio`` import, no model held, no
     network. Called right after ``_acquire_instance_lock`` and ONLY when the
-    flag is on. Memoized on success. The worker does the real model load.
+    flag is on. The backend check reads ``cfg`` and runs on every call; the
+    extra + weights probes are memoized on success. The worker does the real
+    model load.
 
     Raises :class:`DiarizationPreflightError` (an ``SttPreflightError``, so
     callers map it to rc=1) after logging an ERROR with the remedy.
     """
-    if DIARIZATION_REPO_ID in _diarization_preflight_done:
-        return
 
     def _fail(message: str) -> None:
         logger.error(message)
@@ -1920,6 +1922,8 @@ def _preflight_diarization(cfg) -> None:
             "STT_SERVICE=websocket or disable ONOATS_DIARIZATION / "
             "[stt].diarization."
         )
+    if DIARIZATION_REPO_ID in _diarization_preflight_done:
+        return
     if not _diarization_extra_installed():
         _fail(
             "diarization is enabled but the 'mlx_audio' package is not "

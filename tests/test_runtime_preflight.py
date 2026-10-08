@@ -20,10 +20,9 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from onoats import _closing, runtime
-from onoats.stt import launchd
 from onoats.runtime import SttPreflightError, _preflight_stt_ws
+from onoats.stt import launchd
 
 
 @pytest.fixture(autouse=True)
@@ -2536,6 +2535,18 @@ def test_diarization_preflight_hooks_memoized_second_call_is_noop(diar_env):
     assert len(diar_env["probed"]) == probed
 
 
+def test_diarization_preflight_memo_does_not_skip_backend_check(diar_env):
+    """M1: the memo covers only the config-independent probes (extra + weights);
+    a later call whose config switched off the websocket backend (socket mode
+    reloads config after the capturer wait) must still fail loud."""
+    from onoats.config import OnoatsConfig
+
+    runtime._preflight_diarization(_ws_cfg())
+    cfg = OnoatsConfig(raw={"stt": {"service": "whisper", "diarization": True}})
+    with pytest.raises(runtime.DiarizationPreflightError, match="websocket"):
+        runtime._preflight_diarization(cfg)
+
+
 def test_diarization_preflight_hooks_failure_is_not_memoized(diar_env):
     diar_env["cached"] = set()
     with pytest.raises(SttPreflightError):
@@ -2561,9 +2572,8 @@ def test_single_input_mode_logs_ignored_warning_once(
 ):
     """`__main__.run_onoats` (bot-single) has no them arm: flag on logs one
     "ignored" WARNING and never calls `_preflight_diarization`."""
-    from loguru import logger
-
     import onoats.__main__ as main_mod
+    from loguru import logger
 
     monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("ONOATS_DIARIZATION", "1")
@@ -2580,7 +2590,7 @@ def test_single_input_mode_logs_ignored_warning_once(
 
     # Cut the run off right after the flag check: the next step imports the
     # audio-device selector, which we make raise.
-    import onoats.config.audio_devices as audio_devices
+    from onoats.config import audio_devices
 
     def _stop(*_a, **_k):
         raise _Stop
@@ -2601,10 +2611,9 @@ def test_single_input_mode_logs_ignored_warning_once(
 def test_single_input_mode_flag_off_logs_nothing(
     _no_pyaudio_leak, tmp_path, monkeypatch
 ):
-    from loguru import logger
-
     import onoats.__main__ as main_mod
-    import onoats.config.audio_devices as audio_devices
+    from loguru import logger
+    from onoats.config import audio_devices
 
     monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
