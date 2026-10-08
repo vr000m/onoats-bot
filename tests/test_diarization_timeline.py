@@ -141,6 +141,13 @@ def test_two_counters_over_same_stream_agree():
 # ---------------------------------------------------------------------------
 
 
+def test_is_ready_tracks_slot_count():
+    t = DiarizationTimeline()
+    assert not t.is_ready  # worker still loading the model
+    t.set_slot_count(8)
+    assert t.is_ready
+
+
 def test_label_none_until_slot_count_set():
     t = DiarizationTimeline()
     t.record(0, probs(frames(1), s0=ON))

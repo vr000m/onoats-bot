@@ -21,7 +21,10 @@ with no hold and no attributes.
 Stall guard: a hung ``feed()`` never trips the worker's own degrade triggers,
 so the labeler counts consecutive ``hold_sec`` **windows** whose expiries saw
 no ``coverage_high_water()`` advance and, after ``STALL_CONSECUTIVE_TIMEOUTS``,
-calls ``timeline.mark_degraded("stalled")``. Several frames expiring within one
+calls ``timeline.mark_degraded("stalled")``. Expiries while the worker is still
+loading the model (``not timeline.is_ready``, within ``MODEL_LOAD_GRACE_SEC`` of
+the labeler starting) are expected and never count: a cold load is not a hung
+``feed()``. Several frames expiring within one
 window count once (a no-progress expiry counts only if it lands >= ``hold_sec``
 after the previously counted one), and every coverage-driven release - in-line
 or from the task - resets the streak, so only back-to-back stalled windows
@@ -51,7 +54,11 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from onoats._redact import safe_exc_text
-from onoats.stt.diarization_timeline import HOLD_SEC, DiarizationTimeline
+from onoats.stt.diarization_timeline import (
+    HOLD_SEC,
+    MODEL_LOAD_GRACE_SEC,
+    DiarizationTimeline,
+)
 
 #: Consecutive ``HOLD_SEC`` expiries with no ``coverage_high_water()`` progress
 #: after which the labeler declares the diarizer stalled (a Metal hang rather
@@ -98,6 +105,8 @@ class DiarizationLabeler(FrameProcessor):
         self._stall_streak = 0
         #: Clock time of the last expiry counted toward ``_stall_streak``.
         self._last_stall_at: float | None = None
+        #: Clock time of the first ``_ensure_started`` (model-load grace anchor).
+        self._started_at: float | None = None
         #: Frame popped by the release task but not yet successfully pushed.
         self._in_flight: _Pending | None = None
 
@@ -169,6 +178,7 @@ class DiarizationLabeler(FrameProcessor):
         if self._closed:
             return
         if self._release_lock is None:
+            self._started_at = self._now()
             self._release_lock = asyncio.Lock()
             self._wake_event = asyncio.Event()
             self._progress_event = asyncio.Event()
@@ -226,6 +236,14 @@ class DiarizationLabeler(FrameProcessor):
             except TimeoutError:
                 pass
 
+    def _model_loading(self, now: float) -> bool:
+        """True while the worker is still loading the model (within the grace)."""
+        return (
+            not self._timeline.is_ready
+            and self._started_at is not None
+            and now - self._started_at < MODEL_LOAD_GRACE_SEC
+        )
+
     def _reset_stall(self) -> None:
         self._stall_streak = 0
         self._last_stall_at = None
@@ -257,7 +275,7 @@ class DiarizationLabeler(FrameProcessor):
                 # several frames expiring in one slow window count once.
                 self._in_flight = self._pending.popleft()
                 if hw <= head.hw_at_park:
-                    if (
+                    if not self._model_loading(now) and (
                         self._last_stall_at is None
                         or now - self._last_stall_at >= self._hold_sec
                     ):

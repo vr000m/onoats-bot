@@ -17,8 +17,8 @@ It is the **single owner** of:
   ring-bounded record of per-frame speaker probabilities. The **worker is
   the sole coverage writer** (``record``, ``record_gap``, ``set_slot_count``,
   ``mark_flushed``, ``mark_degraded``); the event loop only reads
-  (``label_for``, ``coverage_high_water``, ``is_degraded``, ``is_flushed``,
-  ``add_progress_listener``). ``mark_degraded`` is the one idempotent flag
+  (``label_for``, ``coverage_high_water``, ``is_ready``, ``is_degraded``,
+  ``is_flushed``, ``add_progress_listener``). ``mark_degraded`` is the one idempotent flag
   either side may set (the loop only from the labeler's stall guard).
 * **The label policy** (:meth:`DiarizationTimeline.label_for`) and its named
   constants.
@@ -62,6 +62,10 @@ HOLD_SEC = (
 )
 #: Queue / segment-serialisation slack added to the ring capacity.
 RING_HEADROOM_SEC = 10.0
+#: How long after the labeler starts the worker may still be loading the model
+#: (no coverage is possible yet) before a no-progress expiry counts toward the
+#: labeler's stall guard. A cold model load is not a hung ``feed()``.
+MODEL_LOAD_GRACE_SEC = 60.0
 #: Same factor as ``websocket_stt_service`` (``max(_DECODE_TIMEOUT_SECONDS,
 #: 1.5 * audio_seconds)``); pinned by a parity test.
 DECODE_TIMEOUT_RATIO = 1.5
@@ -210,6 +214,12 @@ class DiarizationTimeline:
             self._listeners.append(cb)
 
     # ------------------------------------------------------------------- reads
+
+    @property
+    def is_ready(self) -> bool:
+        """True once the worker has loaded the model and published its slot count."""
+        with self._lock:
+            return self._slot_count is not None
 
     @property
     def is_degraded(self) -> bool:

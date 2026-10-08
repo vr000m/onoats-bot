@@ -30,7 +30,11 @@ from pipecat.processors.frame_processor import FrameDirection
 
 from onoats.config.audio_devices import PIPELINE_SAMPLE_RATE
 from onoats.processors import diarization_labeler as dl
-from onoats.stt.diarization_timeline import FRAME_SAMPLES, DiarizationTimeline
+from onoats.stt.diarization_timeline import (
+    FRAME_SAMPLES,
+    MODEL_LOAD_GRACE_SEC,
+    DiarizationTimeline,
+)
 
 SLOTS = 2
 HOLD = 0.05  # real-time hold used with the fake clock
@@ -553,6 +557,37 @@ def test_single_expiry_below_threshold_does_not_degrade(monkeypatch):
     run(go())
 
 
+def test_expiries_while_model_loads_do_not_count_as_stall(monkeypatch, warnings_seen):
+    """A cold model load (no slot count yet) is not a hung feed(): expiries
+    inside MODEL_LOAD_GRACE_SEC never degrade, but a load that outlasts the
+    grace re-arms the guard."""
+    tl = DiarizationTimeline()  # worker still loading: set_slot_count not called
+    assert not tl.is_ready
+    h, clock = make(monkeypatch, tl)
+    never = 10**9
+
+    async def go():
+        await h.start()
+        n = dl.STALL_CONSECUTIVE_TIMEOUTS + 2
+        for i in range(n):
+            await h.send(tframe(f"l{i}", 0, never))
+            clock.advance(HOLD + 0.01)
+            await h.settle()
+        assert len(h.out) == n  # every frame released unlabelled...
+        assert not tl.is_degraded  # ...but the load never tripped the guard
+        # Load never finishes: past the grace the guard counts again.
+        clock.advance(MODEL_LOAD_GRACE_SEC)
+        for i in range(dl.STALL_CONSECUTIVE_TIMEOUTS):
+            await h.send(tframe(f"g{i}", 0, never))
+            clock.advance(HOLD + 0.01)
+            await h.settle()
+        assert tl.is_degraded
+        await h.close()
+
+    run(go())
+    assert len(warnings_seen) == 1, warnings_seen
+
+
 def test_expiry_with_coverage_progress_does_not_count_as_stall(monkeypatch):
     tl = make_timeline()
     h, clock = make(monkeypatch, tl)
@@ -725,3 +760,4 @@ def test_release_task_fails_open_on_push_error(monkeypatch, warnings_seen, error
     assert "boom" in errors_seen[0]
     assert len(warnings_seen) == 2  # the ERROR + mark_degraded's one WARNING
     assert sum("degraded" in m for m in warnings_seen) == 1
+

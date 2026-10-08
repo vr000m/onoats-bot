@@ -209,6 +209,18 @@ def test_pipeline_rate_matches_model_rate():
     assert PIPELINE_SAMPLE_RATE == 16000 == dt.SAMPLE_RATE_HZ
 
 
+def test_preflight_repo_id_matches_loader_model_id():
+    """The startup preflight must probe the repo the worker's loader fetches.
+
+    The two constants live in different modules (``runtime`` cannot import the
+    feeder without pulling pipecat/numpy into the CLI import graph), so drift
+    is pinned here rather than by a shared owner.
+    """
+    from onoats import runtime
+
+    assert runtime.DIARIZATION_REPO_ID == df.DIARIZATION_MODEL_ID
+
+
 def test_model_rate_mismatch_degrades(monkeypatch, warnings_seen):
     log = []
     m = StubDiarizer(log)
