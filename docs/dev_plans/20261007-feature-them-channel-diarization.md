@@ -963,7 +963,7 @@ lock), not Phase 0.
 
 ## Progress
 
-- [ ] Phase 0: Verify (no code lands)
+- [x] Phase 0: Verify (no code lands) — 2026-10-08, see Findings
 - [ ] Phase 1: Config flag + preflight
 - [ ] Phase 2: Leaf module (`diarization_timeline.py`)
 - [ ] Phase 3: Feeder + worker
@@ -983,6 +983,20 @@ contract, `frames_processed`, non-downloading cache-probe call, scratch
 estimates, advisory `uv lock` outcome, 0-300 s slot stability). Phase 8b
 records the real-pipeline numbers (latency/stall/contention, long-recording
 slot stability).
+
+### Phase 0 results (2026-10-08, scratch venv, `mlx-audio==0.5.8`, mlx 0.32.3, transformers 5.19.0, Apple Silicon)
+
+All checked against the **installed** package, load+feed on a non-main daemon thread. **Go. No above-marker value changes; marker untouched.**
+
+- **Presets** (`set_streaming_config`): `offline`=(340,40), `low`=(9,4), `very_low`=(6,2), `ultra_low`=(3,1) as (chunk_len, right_context). Shipped default config is (340,40) = offline. `low` accepted; unknown preset raises `ValueError`. With `low`, the first non-empty output arrived after **1.1 s** of audio fed (72 frames = `chunk_len*8`).
+- **Contract**: `model.feed(audio, state, sample_rate=16000, *, final=False, threshold, min_duration, merge_gap)` returns `(DiarizationOutput, state)`. `sample_rate != 16000` raises `ValueError("feed requires 16000 Hz audio...")`; 2-D input raises `ValueError("feed expects one-dimensional mono audio")`. It cannot detect a mis-rated array (as planned). `model.sample_rate == 16000`, `hop_length == 160`, `output_subsampling_factor == 1`.
+- **Position source**: `StreamingState.frames_processed` (native 10 ms frames). Over 300 chunks x 100 ms (30 s) the total emitted `speaker_probs` rows == `frames_processed` == 2952, and after `final=True` 3000 (== `samples_received / 160`). So output rows are 1:1 with 10 ms frames; row index of a call = `frames_processed` before the call.
+- **Output types**: `output.speaker_probs` is an `mx.array` shape `(n, 8)` (not numpy; worker must `np.array()` it). **Trap:** `output.num_speakers` is the per-call count of distinct speakers in that call's *segments* (an `int`), NOT the slot cap. The cap is `model.config.num_speakers` (**8**), which is what `set_slot_count` must read.
+- **Worker thread**: load, `set_streaming_config`, `init_streaming_state`, 300 `feed()` calls and the final flush all ran on one `diar-worker` thread with no MLX stream error.
+- **Non-downloading cache probe**: `huggingface_hub.try_to_load_from_cache(repo_id, filename)` returns the snapshot path when cached and `None` when not (no network). `load()` fetches exactly two files: `config.json` and `model.safetensors`; probe both. **Do not** use `snapshot_download(local_files_only=True)`: on a fully cached repo it raised `IncompleteSnapshotError` (hub 1.33) and on a missing repo `LocalEntryNotFoundError`. `try_to_load_from_cache` and `huggingface_hub.errors.LocalEntryNotFoundError` both import under the repo-locked `huggingface-hub 1.18.0`. Probe `.cache/huggingface` honours `HF_HOME`/`HF_HUB_CACHE` automatically.
+- **Advisory `uv lock`** (throwaway copy, extra `diarization = ["mlx-audio==0.5.8"]`): adds `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6`. **`mlx` stays 0.31.2** (no bump). Not yet verified: that mlx-audio 0.5.8 runs against mlx 0.31.2 (Phase 0 ran on mlx 0.32.3); Phase 8's committed lock + Phase 8b must confirm. Repo `pyproject.toml`/`uv.lock` untouched (`git status` clean).
+- **Scratch speed** (300 s clip, 100 ms chunks, bare thread, no asyncio loop): 8.7 s wall = RTF 0.029 (consistent with retained RTF 0.026-0.038). Not an acceptance number; Phase 8b measures with the real pipeline.
+- **Slot behaviour on the retained 0-300 s clip** (3 real speakers, `low` preset, threshold 0.5): slots activate in first-speech order (slot 0 at 3.5 s = narration, slot 1 at 17.3 s, slot 2 at 26.2 s), only 3 of 8 ever active, so first-activity -> `S1..S3` mapping works. **But slot stability is imperfect:** `guest` frames split between slot 1 (5911) and slot 2 (7292), and slot 2 is also `varun`'s (16948). So ~55% of one speaker's active frames land in another speaker's slot (overlap or a real identity swap; not disambiguated here). A 0-300 s, 3-speaker clip is **not sufficient** to bound this; the 20-60 min multi-speaker run at Phase 8b is required, and the dominant-slot-wins label policy should be expected to mislabel such stretches. Surface in the final docs as a known accuracy limit, not a blocker.
 
 ### Review Waivers
 
