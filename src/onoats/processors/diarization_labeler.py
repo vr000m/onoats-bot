@@ -15,8 +15,11 @@ range (the fail-loud case) and every other frame pass through immediately.
 ``EndFrame`` waits up to ``hold_sec`` for ``timeline.is_flushed`` /
 ``is_degraded``, releases every pending frame in FIFO order (labelled with the
 coverage available then), and only then is forwarded. ``CancelFrame`` releases
-immediately without waiting. Once ``timeline.is_degraded`` frames are forwarded
-with no hold and no attributes.
+immediately without waiting. A teardown with neither (``cleanup()`` after a
+pipeline exception) stops the release task, then releases the in-flight frame
+and every pending frame the same way, FIFO, logging (never raising) a push
+failure. Once ``timeline.is_degraded`` frames are forwarded with no hold and no
+attributes.
 
 Stall guard: a hung ``feed()`` never trips the worker's own degrade triggers,
 so the labeler counts consecutive ``hold_sec`` **windows** whose expiries saw
@@ -134,8 +137,13 @@ class DiarizationLabeler(FrameProcessor):
             await self.push_frame(frame, direction)
 
     async def cleanup(self) -> None:
-        await super().cleanup()
+        # Stop the release task first: it can no longer push concurrently, and
+        # a push it was cancelled mid-way through leaves its frame in
+        # ``_in_flight`` for recovery below. ``super().cleanup()`` cancels our
+        # process task, so nothing still holds ``_release_lock`` after it.
         await self._stop_task()
+        await super().cleanup()
+        await self._release_on_cleanup()
 
     # ------------------------------------------------------------ transcription
 
@@ -154,7 +162,9 @@ class DiarizationLabeler(FrameProcessor):
                 return
             async with self._release_lock:
                 while self._pending:
-                    await self._push_labelled(self._pending.popleft())
+                    self._in_flight = self._pending.popleft()
+                    await self._push_labelled(self._in_flight)
+                    self._in_flight = None
                 await self.push_frame(frame, direction)
             return
 
@@ -357,7 +367,41 @@ class DiarizationLabeler(FrameProcessor):
             return
         async with self._release_lock:
             while self._pending:
-                await self._push_labelled(self._pending.popleft())
+                self._in_flight = self._pending.popleft()
+                await self._push_labelled(self._in_flight)
+                self._in_flight = None
+
+    async def _release_on_cleanup(self) -> None:
+        """Teardown without EndFrame/CancelFrame: never lose a transcript.
+
+        Runs after the release task and process task are stopped. Delivers the
+        in-flight frame (popped, push interrupted) and every pending frame in
+        FIFO order, labelled with the coverage available now. A push failure is
+        logged and never raised out of cleanup. After End/CancelFrame both are
+        already empty, so this is a no-op on the normal paths.
+        """
+        if self._release_lock is None:
+            return
+        async with self._release_lock:
+            entries: list[_Pending] = []
+            if self._in_flight is not None:
+                entries.append(self._in_flight)
+                self._in_flight = None
+            entries.extend(self._pending)
+            self._pending.clear()
+            if entries:
+                logger.debug(
+                    f"DiarizationLabeler: releasing {len(entries)} held "
+                    "transcript(s) at cleanup (no EndFrame/CancelFrame)"
+                )
+            for entry in entries:
+                try:
+                    await self._push_labelled(entry)
+                except Exception as exc:
+                    logger.error(
+                        "DiarizationLabeler: dropped a transcript during "
+                        f"cleanup ({type(exc).__name__}: {safe_exc_text(exc)})"
+                    )
 
     async def _on_end(self) -> None:
         """Graceful shutdown: wait <= hold_sec for the final flush, then drain."""

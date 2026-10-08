@@ -797,3 +797,107 @@ def test_passthrough_frame_waits_for_inflight_head_fifo(monkeypatch):
         await h.close()
 
     run(go())
+
+
+# ------------------------------------------- teardown without End/CancelFrame
+
+
+def test_cleanup_without_end_or_cancel_releases_pending_fifo(monkeypatch):
+    """F1: a teardown with no EndFrame/CancelFrame (pipeline exception) must
+    release every parked transcript, labelled with current coverage, FIFO."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10 * FRAME_SAMPLES)
+    b = tframe("b", 10 * FRAME_SAMPLES, 10**9)
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        await h.settle(0.05)
+        assert h.out == [] and len(h.labeler._pending) == 2
+        await h.close()
+        assert h.out == [a, b]
+        assert not h.labeler._pending
+        assert label_of(b) == (None, None)  # uncovered -> unlabelled
+
+    run(go())
+
+
+def test_cleanup_recovers_in_flight_frame_once(monkeypatch):
+    """F1: a frame the release task popped but whose push was interrupted by
+    the teardown cancel is delivered by cleanup, then the rest, FIFO."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10 * FRAME_SAMPLES)
+    b = tframe("b", 10 * FRAME_SAMPLES, 10**9)
+    real_push = h.labeler.push_frame
+    entered = asyncio.Event()
+    hang = [True]
+
+    async def hung_push(frame, direction=FrameDirection.DOWNSTREAM):
+        if frame is a and hang[0]:
+            hang[0] = False
+            entered.set()
+            await asyncio.Event().wait()  # never returns: cancelled by cleanup
+        await real_push(frame, direction)
+
+    h.labeler.push_frame = hung_push  # type: ignore[method-assign]
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        tl.record(0, rows(10, 0))  # covers a -> task pops it and hangs in push
+        await asyncio.wait_for(entered.wait(), 2.0)
+        assert h.labeler._in_flight is not None
+        await asyncio.wait_for(h.close(), 2.0)
+        assert h.out == [a, b]  # each exactly once, FIFO
+        assert label_of(a) == (["S1"], False)
+        assert h.labeler._in_flight is None and not h.labeler._pending
+
+    run(go())
+
+
+def test_cleanup_tolerates_push_failure(monkeypatch, errors_seen):
+    """F1: a raising push during cleanup is logged, never raised, and does not
+    stop the remaining frames from being released."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10**9)
+    b = tframe("b", 0, 10**9)
+    real_push = h.labeler.push_frame
+
+    async def flaky_push(frame, direction=FrameDirection.DOWNSTREAM):
+        if frame is a:
+            raise RuntimeError("downstream gone")
+        await real_push(frame, direction)
+
+    h.labeler.push_frame = flaky_push  # type: ignore[method-assign]
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        await h.settle(0.05)
+        await h.close()  # must not raise
+        assert h.out == [b]
+
+    run(go())
+    assert len(errors_seen) == 1 and "downstream gone" in errors_seen[0]
+
+
+def test_cleanup_after_endframe_does_not_repush(monkeypatch):
+    """F1: the normal EndFrame path already drained; cleanup is a no-op."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=0.01)
+    a = tframe("a", 0, 10**9)
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(EndFrame())
+        await h.close()
+        assert h.texts() == ["a", "EndFrame"]
+
+    run(go())
