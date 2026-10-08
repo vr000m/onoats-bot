@@ -294,7 +294,7 @@ audio (Req 1's shared-clock premise); a Phase 7 test asserts the adjacency.
 finish sentinel (worker runs the final flush, sets `timeline.mark_flushed()`
 and exits) *before* forwarding the frame; on `CancelFrame` it posts an
 abort sentinel; it also overrides `cleanup()` as a backstop. Thread joins are
-bounded (`WORKER_JOIN_TIMEOUT_SEC`) and the thread is `daemon=True`, so a
+bounded (`DEFAULT_JOIN_TIMEOUT_SEC`) and the thread is `daemon=True`, so a
 worker blocked in `feed()` can never hang `onoats stop` (the shutdown
 contract is "never a hang"; precedent:
 `SmartTurnShadowObserver._drain_pending_task`).
@@ -399,7 +399,8 @@ contract is "never a hang"; precedent:
    simply a missing `start_sample` range; the feeder never writes the
    timeline — the worker detects the discontinuity, Req 1). The **worker
    thread** invokes `diarizer_factory` (production: loads
-   `mlx-community/Nemotron-3-Diarization`), calls
+   `mlx-community/Nemotron-3-Diarization` from its locally cached snapshot
+   directory), calls
    `set_streaming_config("low")` **before the first `feed()`**, publishes
    `model.config.num_speakers` (**not** the per-call `output.num_speakers`,
    which counts distinct segment speakers) via `timeline.set_slot_count`,
@@ -1052,7 +1053,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ fb8f8bdcfc5ea15396f3495b233091d95dd0c7a1 -->
+<!-- reviewed: 2026-10-08 @ 3dcaea186879db25fe7be1f12ecba01f78b96631 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1102,12 +1103,14 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 7 (found by the wired-pipeline matrix tests, not by Phase 5's unit tests)**: `DiarizationLabeler` stored its injectable clock as `self._clock`, which pipecat's `FrameProcessor.setup()` overwrites with a `SystemClock`, so every stamped `them` transcript raised `'SystemClock' object is not callable` in a real pipeline. Renamed to `self._now`; swept the other new processors for FrameProcessor-attribute collisions (none). Lesson for Phase 8b/9: unit tests that bypass `setup()` cannot catch framework-attribute shadowing.
 - **Phase 8**: `uv.lock` adds exactly `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6` (+ `provides-extras`); **`mlx`/`mlx-metal` unchanged at 0.31.2, so no mlx-whisper re-smoke and no CHANGELOG mlx note is triggered.** The local uv (0.12.23) also tried to rewrite the lock `revision` 3->5 and drop `sys_platform` markers on 10 nvidia edges; that churn was reverted by hand (diff is additions only; `uv lock --check` passes). The contract test ran green against the real installed package with `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` (also confirms mlx-audio 0.5.8 runs on mlx 0.31.2 for load/feed with cached weights). The contract test purges `mlx_audio*` from `sys.modules` on module teardown, because other tests assert it is absent. Full suite with the extra installed: 6737 passed.
 
-- **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amends the Req 4 stall-guard text above the marker (not edited: marker intact). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; `DIARIZATION_REPO_ID` == `DIARIZATION_MODEL_ID` pinned by a test.
+- **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amended the Req 4 stall-guard text above the marker (done in the later administrative marker refresh recorded below). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; `DIARIZATION_REPO_ID` == `DIARIZATION_MODEL_ID` pinned by a test.
 - **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; `_pending_span` clear in `_detach_client` (plan-specified, fail-safe); contract-test weights skip under `REQUIRE`.
 - **Still open (Phase 8b/9)**: VAD-span edge offset (see Phase 4 note). Facts for the decision: the STT decodes pipecat's `_audio_buffer` (<= 1 s pre-roll + everything to the VAD-stop event), the server returns no timestamps onoats consumes, and `VADUserStartedSpeakingFrame.start_secs` / `VADUserStoppedSpeakingFrame.stop_secs` carry the confirmation delays.
 
 - **Marker refreshed administratively (2026-10-08, owner-approved during the first review-gauntlet round)**: the above-marker text was amended to match shipped, advisory-reviewed behaviour — `Status` now In Progress; the worker's anchor mapping is stated as piecewise (per-row breakpoints, Phase 3 advisory review item 1); the Req 4 stall guard carries the model-load grace and the coverage-advance streak reset. No requirement was added or relaxed; the hash was recomputed per the AGENTS.md recipe rather than via `/review-plan`.
 - **Loader (gauntlet round 1, owner-approved)**: the production loader passes the *cached snapshot directory* (resolved via `try_to_load_from_cache`, no network) to `mlx_audio.vad.load(..., strict=True)` instead of the bare repo id, which `mlx_audio` first tests as a CWD-relative path and otherwise `snapshot_download`s on every start. A missing cache fails loud with the `hf download` hint. Revision pinning was deliberately not added. pipecat's lower bound is now `>=1.3.0` (the inline-`run_stt` stamping hook is verified only there).
+
+- **release_check.sh check 5 guard (gauntlet round 1)**: beyond "working-tree dependent" (Files to Modify, above the marker), the shipped check now *fails* unless `HEAD` equals the resolved commit and the tree is clean, so it can never validate a different checkout than checks 1-4 inspected; checks 1-4 are unchanged.
 
 ### Review Waivers
 
