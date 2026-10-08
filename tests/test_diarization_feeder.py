@@ -215,16 +215,22 @@ def test_pipeline_rate_matches_model_rate():
     assert PIPELINE_SAMPLE_RATE == 16000 == dt.SAMPLE_RATE_HZ
 
 
-def test_preflight_repo_id_matches_loader_model_id():
-    """The startup preflight must probe the repo the worker's loader fetches.
+def test_preflight_and_loader_share_one_model_owner():
+    """The startup preflight must probe exactly what the worker's loader needs.
 
-    The two constants live in different modules (``runtime`` cannot import the
-    feeder without pulling pipecat/numpy into the CLI import graph), so drift
-    is pinned here rather than by a shared owner.
+    Both sides alias the single owner, ``onoats.stt.diarization_model`` (a
+    leaf, so ``runtime`` need not import the feeder and its pipecat/numpy
+    graph): same repo-id object, same cache probe.
     """
     from onoats import runtime
+    from onoats.stt import diarization_model as dm
 
-    assert runtime.DIARIZATION_REPO_ID == df.DIARIZATION_MODEL_ID
+    assert runtime.DIARIZATION_REPO_ID is dm.REPO_ID
+    assert df.DIARIZATION_MODEL_ID is dm.REPO_ID
+    assert runtime._diarization_weights_cached is dm.weights_cached
+    assert df.diarization_model is dm
+    assert not hasattr(df, "_cached_snapshot_dir")
+    assert not hasattr(runtime, "_DIARIZATION_WEIGHT_FILES")
 
 
 def test_model_rate_mismatch_degrades(monkeypatch, warnings_seen):

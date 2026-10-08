@@ -56,6 +56,7 @@ from onoats._vendor.pid import (  # noqa: F401
 from onoats._vendor.pid import (
     read_pid_file as _read_pid_file,
 )
+from onoats.stt import diarization_model as _diarization_model
 
 # termios/tty/fcntl are Unix-only — guard for Windows compatibility
 if sys.platform != "win32":
@@ -1864,15 +1865,15 @@ def _refuse_if_live_recorder(pid_path: Path) -> None:
             )
 
 
-DIARIZATION_REPO_ID = "mlx-community/Nemotron-3-Diarization"
-# The two files ``mlx_audio``'s loader fetches (Phase 0).
-_DIARIZATION_WEIGHT_FILES = ("config.json", "model.safetensors")
+# Aliases of the single owner (``onoats.stt.diarization_model``), shared with
+# the worker's loader so the preflight probes exactly what the loader needs.
+DIARIZATION_REPO_ID = _diarization_model.REPO_ID
 _DIARIZATION_INSTALL_HINT = (
     "`uv sync --extra diarization` (checkout) or "
     "`uv tool install 'onoats[macos,diarization]'` (tool install; "
     "repeat any extras you already have)"
 )
-_DIARIZATION_DOWNLOAD_HINT = f"hf download {DIARIZATION_REPO_ID}"
+_DIARIZATION_DOWNLOAD_HINT = _diarization_model.DOWNLOAD_HINT
 
 # Memoized successful preflights (keyed by repo id) so the socket-mode double
 # call (supervisor, then ``run_onoats_dual``) is a no-op.
@@ -1889,20 +1890,8 @@ def _diarization_extra_installed() -> bool:
         return False
 
 
-def _diarization_weights_cached(repo_id: str) -> bool:
-    """Non-downloading local-cache probe for every weight file.
-
-    ``try_to_load_from_cache`` never touches the network; it returns a path
-    str when cached and ``None`` (or a sentinel for a known-missing file)
-    otherwise. Deliberately NOT ``snapshot_download(local_files_only=True)``,
-    which raises ``IncompleteSnapshotError`` on a fully cached repo.
-    """
-    from huggingface_hub import try_to_load_from_cache
-
-    for filename in _DIARIZATION_WEIGHT_FILES:
-        if not isinstance(try_to_load_from_cache(repo_id, filename), str):
-            return False
-    return True
+# Module attribute (not a direct call into the leaf) so tests can patch it.
+_diarization_weights_cached = _diarization_model.weights_cached
 
 
 def _preflight_diarization(cfg) -> None:

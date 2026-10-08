@@ -309,6 +309,11 @@ its scope; this list is a pointer, not the contract itself.
   *leak*, and a destructive *over-redaction* that removes the credential
   correctly but fabricates a hostname out of text later in the string. The
   sweep pins both.
+- `src/onoats/stt/diarization_model.py` — the diarization model's repo id,
+  weight-file tuple and non-downloading HF-cache probes (`weights_cached()`
+  for `runtime`'s startup preflight, `cached_snapshot_dir()` for the
+  feeder's loader), so both check the same files; `huggingface_hub` is
+  imported lazily inside the functions.
 - `src/onoats/_closing.py` — bounded, best-effort teardown of a
   `TranscriptionClient` (timeout + deadline cap + cancellation safety), so
   a hung server's closing handshake can never block a caller forever, plus

@@ -79,7 +79,8 @@ def test_production_loader_uses_pinned_symbols_and_kwargs(monkeypatch, tmp_path)
 
     assert diarization_feeder.DIARIZATION_MODEL_ID == MODEL_ID
     assert diarization_feeder.load_mlx_diarizer() is sentinel
-    assert probed == [(MODEL_ID, "config.json")]
+    # Every weight file is verified (same check as the startup preflight).
+    assert probed == [(MODEL_ID, "config.json"), (MODEL_ID, "model.safetensors")]
     assert calls == [((str(snap),), {"strict": True})]
 
 
