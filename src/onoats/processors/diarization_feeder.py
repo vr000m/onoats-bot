@@ -100,9 +100,10 @@ def _cached_snapshot_dir() -> str:
 
 def load_mlx_diarizer() -> Any:
     """Production ``diarizer_factory``; the only place ``mlx_audio`` is imported."""
+    snapshot = _cached_snapshot_dir()  # cheap and clearer to fail first
     from mlx_audio.vad import load as load_diarization
 
-    return load_diarization(_cached_snapshot_dir(), strict=True)
+    return load_diarization(snapshot, strict=True)
 
 
 class DiarizerWorker:
