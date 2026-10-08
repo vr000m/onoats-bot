@@ -55,8 +55,11 @@ macos = [
     "kokoro-onnx>=0.4.0",
 ]
 # Optional them-channel speaker diarization (mlx-audio). macOS / Apple-Silicon
-# only. NOT in the baseline. Install with `uv sync --extra diarization`
-# (or `uv tool install 'onoats[diarization]'`).
+# by convention only: there is no platform marker. NOT in the baseline.
+# Install with `uv sync --extra diarization` (checkout) or
+# `uv tool install 'onoats[macos,diarization]'` (tool install; extras are not
+# merged, so repeat any you already have). Keep in sync with
+# `runtime._DIARIZATION_INSTALL_HINT`.
 diarization = [
     "mlx-audio>=0.5.8,<0.6",
 ]

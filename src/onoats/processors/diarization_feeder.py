@@ -1,8 +1,10 @@
 """Them-channel diarization: pass-through feeder + single worker thread.
 
 ``DiarizationFeeder`` sits in ``system_arm`` before ``system_stt``. It is a pure
-observer: every frame is forwarded unchanged and undelayed (the only bounded
-wait is the ``EndFrame``/``CancelFrame`` join). It counts 16 kHz PCM16 samples
+observer: every frame is forwarded unchanged and undelayed - ``EndFrame`` and
+``CancelFrame`` included, which only signal the worker to flush/abort; the one
+bounded wait, the worker join, happens later in ``cleanup()``, off the frame
+path. It counts 16 kHz PCM16 samples
 with the shared :class:`SampleCounter` (the same clock ``WebSocketSTTService``
 counts independently) and enqueues ``(start_sample, pcm_bytes)`` onto a bounded
 drop-oldest queue. A drop is simply a missing ``start_sample`` range; the
@@ -65,7 +67,7 @@ BUDGET_OVERRUN_CONSECUTIVE = 5
 
 #: Drop-oldest queue bound, in chunks (~30 s at 10 ms chunks).
 DEFAULT_QUEUE_MAX = 3000
-#: Bounded wait for the worker at EndFrame / CancelFrame.
+#: Bounded wait for the worker join in ``cleanup()``.
 DEFAULT_JOIN_TIMEOUT_SEC = 5.0
 
 DiarizerFactory = Callable[[], Any]
