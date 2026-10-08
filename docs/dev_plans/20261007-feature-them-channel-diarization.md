@@ -398,7 +398,9 @@ contract is "never a hang"; precedent:
    thread** invokes `diarizer_factory` (production: loads
    `mlx-community/Nemotron-3-Diarization`), calls
    `set_streaming_config("low")` **before the first `feed()`**, publishes
-   `num_speakers` via `timeline.set_slot_count`, converts PCM16 →
+   `model.config.num_speakers` (**not** the per-call `output.num_speakers`,
+   which counts distinct segment speakers) via `timeline.set_slot_count`,
+   converts each `output.speaker_probs` (an `mx.array`) to numpy, converts PCM16 →
    float32/32768, and is the only thread that ever touches the model (load,
    `feed()`, final flush) and the only thread that writes the timeline.
    `mlx_audio` is imported lazily **inside the worker's loader**, never at
@@ -513,10 +515,11 @@ contract is "never a hang"; precedent:
      effect: non-zero exit, ERROR log, install hint. Implemented by
      `runtime._preflight_diarization(cfg)`: **import-free and
      non-downloading** — `importlib.util.find_spec("mlx_audio")` plus a
-     local-cache probe for the model weights (e.g.
-     `huggingface_hub` — a baseline dependency — with
-     `local_files_only=True`; Phase 0 records which `huggingface_hub` call
-     gives a non-downloading resolve; no `mlx_audio` import), so no MLX state is ever created
+     local-cache probe for the model weights (`huggingface_hub` — a baseline
+     dependency — `try_to_load_from_cache(repo_id, filename)` for both
+     `config.json` and `model.safetensors`, per Phase 0; **not**
+     `snapshot_download(local_files_only=True)`, which raises
+     `IncompleteSnapshotError` on a fully cached repo; no `mlx_audio` import), so no MLX state is ever created
      on the main thread and a cold cache / offline machine fails loud with an
      explicit "weights not downloaded; run <command>" hint rather than
      stalling startup on a network fetch. It is memoized (mirror
@@ -819,7 +822,7 @@ lock), not Phase 0.
   trigger)
 - `tests/test_diarization_contract.py` (new) — pins the exact
   `mlx_audio` symbols/kwargs used, the preset names, the input contract
-  and the Phase 0-recorded `num_speakers`; skip-unless `mlx_audio`
+  the Phase 0-recorded `model.config.num_speakers` (8), and `speaker_probs`/`frames_processed` row-parity (rows == `frames_processed`); skip-unless `mlx_audio`
   importable, **but hard-fails instead of skipping when
   `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`**; local-only, not a CI gate
 - `scripts/release_check.sh` — new step that exports
@@ -875,6 +878,89 @@ lock), not Phase 0.
   with stall guard and EndFrame flush-wait, canonical persistence)
 - `README.md`, `CHANGELOG.md` (include the `mlx` bump note if Phase 8's
   `uv.lock` showed one)
+
+## Implementation Checklist
+
+Conduct-compatible index of Phases 1-8 (Phase 0 is done; see `## Findings`).
+**Phases 8b, 9 and 10 are intentionally NOT listed:** 8b needs an interactive Mac
+session with the real model, 9 consumes 8b's measured bounds, and 10 is docs.
+The authoritative spec for every phase is its block under `## Files to Modify`;
+the slots below only drive `/skein:conduct` (test files listed are the new/edited
+test modules; edits to other existing test files named in the spec are in scope).
+The `Review Gates: full` auto-chain is deferred until 8b-10 land (the operator
+runs the gates by hand after the final phase).
+
+### Phase 1: Config flag + preflight
+
+**Goal:** Add the `diarization` flag and a hoisted, import-free, non-downloading `_preflight_diarization`, called right after `_acquire_instance_lock` in both entrypoints and only when the flag is on.
+**Impl files:** src/onoats/config/__init__.py, src/onoats/runtime.py, src/onoats/cli.py, src/onoats/dual.py, src/onoats/__main__.py
+**Test files:** tests/test_onoats_imports.py, tests/test_config.py, tests/test_stt_config_wiring.py, tests/test_runtime_preflight.py, tests/test_socket_supervisor.py, tests/test_dual_socket_source.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_onoats_imports.py tests/test_config.py tests/test_stt_config_wiring.py tests/test_runtime_preflight.py tests/test_socket_supervisor.py tests/test_dual_socket_source.py -q`
+
+Spec: the "Phase 1" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 2: Leaf module (`diarization_timeline.py`)
+
+**Goal:** A leaf module (no onoats imports, no mlx_audio) owning the single correlation clock, the worker-written/loop-read DiarizationTimeline, label policy and constants.
+**Impl files:** src/onoats/stt/diarization_timeline.py
+**Test files:** tests/test_diarization_timeline.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_diarization_timeline.py -q`
+
+Spec: the "Phase 2" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 3: Feeder + worker
+
+**Goal:** Pass-through feeder tags chunks with start_sample; one daemon worker thread owns model load, every feed(), final flush and all timeline writes; degrade never raises a fatal ErrorFrame.
+**Impl files:** src/onoats/processors/diarization_feeder.py
+**Test files:** tests/test_diarization_feeder.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_diarization_feeder.py -q`
+
+Spec: the "Phase 3" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 4: STT segment-sample stamping
+
+**Goal:** Stamp each them-arm TranscriptionFrame with its VAD span via a single pending span slot set before delegating VAD-stop to super(); me arm never stamped.
+**Impl files:** src/onoats/stt/websocket_stt_service.py, src/onoats/runtime.py, src/onoats/dual.py
+**Test files:** tests/test_websocket_stt_reconnect.py, tests/test_websocket_stt_stamping.py, tests/test_stt_config_wiring.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_websocket_stt_reconnect.py tests/test_websocket_stt_stamping.py tests/test_stt_config_wiring.py -q`
+
+Spec: the "Phase 4" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 5: Labeler
+
+**Goal:** Downstream labeler holds stamped TranscriptionFrames in a pending deque until timeline coverage or HOLD_SEC, with EndFrame flush-wait, immediate CancelFrame release and a stall guard.
+**Impl files:** src/onoats/processors/diarization_labeler.py
+**Test files:** tests/test_diarization_labeler.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_diarization_labeler.py -q`
+
+Spec: the "Phase 5" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 6: Persistence + render
+
+**Goal:** Persist canonical speakers/overlap on utterances and compose the display suffix at render time through one shared helper.
+**Impl files:** src/onoats/processors/transcript_buffer.py, src/onoats/jsonl.py, src/onoats/render.py, src/onoats/processors/live_terminal.py
+**Test files:** tests/test_speaker_labels.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_speaker_labels.py -q`
+
+Spec: the "Phase 6" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 7: Wiring
+
+**Goal:** Insert feeder (immediately before system_stt) and labeler into the system arm only, gated on the flag, with a diarizer_factory kwarg for stub injection; mic arm unchanged.
+**Impl files:** src/onoats/dual.py
+**Test files:** tests/test_dual_socket_source.py, tests/test_onoats_imports.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_dual_socket_source.py tests/test_onoats_imports.py -q`
+
+Spec: the "Phase 7" block under `## Files to Modify` and the Requirements it cites.
+
+### Phase 8: Dependency + contract
+
+**Goal:** Add the optional `diarization` extra, regenerate uv.lock, pin the mlx_audio contract in a skip-unless test that hard-fails under ONOATS_REQUIRE_DIARIZATION_CONTRACT=1, and wire release_check.sh.
+**Impl files:** pyproject.toml, uv.lock, scripts/release_check.sh
+**Test files:** tests/test_diarization_contract.py, tests/test_release_meta.py
+**Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_diarization_contract.py tests/test_release_meta.py -q`
+
+Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cites.
 
 ## Testing Notes
 
@@ -957,7 +1043,7 @@ lock), not Phase 0.
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ c8a17b6a44631efa5249055006e10a08b01cf8e1 -->
+<!-- reviewed: 2026-10-08 @ 8395ce3cc8bc489e17fd3d06f1b33ae77770ae7f -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
