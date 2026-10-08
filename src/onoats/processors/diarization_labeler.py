@@ -159,7 +159,7 @@ class DiarizationLabeler(FrameProcessor):
             # Unstamped (fail-loud upstream) or degraded: no hold, no attributes.
             # Serialise behind the release task (it pops the head and pushes it
             # while holding the lock, so ``_pending`` can be empty mid-push) and
-            # drain anything parked first, so FIFO order is preserved.
+            # drain everything still held first, so FIFO order is preserved.
             if self._release_lock is None:
                 await self.push_frame(frame, direction)
                 return
@@ -176,10 +176,12 @@ class DiarizationLabeler(FrameProcessor):
         async with self._release_lock:
             if self._timeline.is_degraded:
                 # Degraded while we waited for the lock (e.g. release-task
-                # fail-open): never park, forward unlabelled in line.
+                # fail-open, queued behind us): never park; deliver what is
+                # still held first (FIFO), then forward unlabelled in line.
+                await self._drain_all()
                 await self.push_frame(frame, direction)
                 return
-            if not self._pending and hw >= entry.end:
+            if not self._has_held() and hw >= entry.end:
                 # Already covered and nothing ahead of it: release in line.
                 # Coverage-driven release => the worker is producing.
                 self._reset_stall()
@@ -269,15 +271,20 @@ class DiarizationLabeler(FrameProcessor):
         """Release head-first while the head is covered or past its deadline."""
         assert self._release_lock is not None
         async with self._release_lock:
-            while self._pending:
+            while self._has_held():
+                if self._in_flight is not None:
+                    # An earlier push of it raised: it is the oldest held
+                    # frame, so it goes first, before any head decision.
+                    await self._push_next()
+                    continue
                 head = self._pending[0]
                 if self._timeline.is_degraded:
-                    await self._pop_and_push()
+                    await self._push_next()
                     continue
                 hw = self._timeline.coverage_high_water()
                 if hw >= head.end:
                     self._reset_stall()
-                    await self._pop_and_push()
+                    await self._push_next()
                     continue
                 now = self._now()
                 if now < head.deadline:
@@ -286,7 +293,7 @@ class DiarizationLabeler(FrameProcessor):
                 # not advance at all while this frame was held AND it starts a
                 # new hold window (>= hold_sec after the last counted expiry):
                 # several frames expiring in one slow window count once. The
-                # head stays in ``_pending`` until ``_pop_and_push`` (no await
+                # head stays in ``_pending`` until ``_push_next`` (no await
                 # in between, so nothing can observe the difference).
                 if hw <= head.hw_at_park:
                     if (
@@ -305,7 +312,7 @@ class DiarizationLabeler(FrameProcessor):
                         self._hw_at_last_stall = hw
                 else:
                     self._reset_stall()
-                await self._pop_and_push()
+                await self._push_next()
                 if (
                     self._stall_streak >= STALL_CONSECUTIVE_TIMEOUTS
                     and not self._timeline.is_degraded
@@ -323,7 +330,9 @@ class DiarizationLabeler(FrameProcessor):
 
         One ERROR, degrade the timeline (so nothing is held from now on), then
         deliver the in-flight frame (popped, not yet pushed) and every pending
-        frame unlabelled in FIFO order. Each frame is pushed at most once.
+        frame unlabelled in FIFO order. Each frame is pushed at most once; one
+        not yet delivered when this is cancelled (``cleanup``) stays held for
+        ``_release_on_cleanup``.
         """
         logger.error(
             "DiarizationLabeler: release task failed "
@@ -335,7 +344,7 @@ class DiarizationLabeler(FrameProcessor):
         )
         assert self._release_lock is not None
         async with self._release_lock:
-            await self._deliver_held(self._take_held(), context="fail-open")
+            await self._deliver_held(context="fail-open")
 
     # ----------------------------------------------------------------- release
 
@@ -360,39 +369,42 @@ class DiarizationLabeler(FrameProcessor):
                 entry.frame.onoats_overlap = bool(label.overlap)
         await self.push_frame(entry.frame, entry.direction)
 
-    async def _pop_and_push(self) -> None:
-        """Pop the head of ``_pending`` and push it. Lock held.
+    def _has_held(self) -> bool:
+        """True while any frame is held (in flight or pending)."""
+        return self._in_flight is not None or bool(self._pending)
 
-        The one way a single frame leaves ``_pending``: it sits in
-        ``_in_flight`` across the push (left set if the push is cancelled or
-        raises), so ``_take_held`` hands it to ``_release_on_cleanup`` /
-        ``_fail_open`` instead of losing it.
+    async def _push_next(self) -> None:
+        """Push the oldest held frame, labelled. Lock held; ``_has_held()``.
+
+        The one way a frame leaves the held state. The oldest held frame is
+        ``_in_flight`` when an earlier push of it raised, else the head of
+        ``_pending``, which moves into ``_in_flight`` before the push. It is
+        cleared only once the push returns, so a push that is cancelled or
+        raises leaves it - and everything behind it in ``_pending`` -
+        recoverable by the next release, and a delivered frame is never
+        pushed again.
         """
-        entry = self._in_flight = self._pending.popleft()
-        await self._push_labelled(entry)
+        if self._in_flight is None:
+            self._in_flight = self._pending.popleft()
+        await self._push_labelled(self._in_flight)
         self._in_flight = None
 
     async def _drain_all(self) -> None:
-        """Release every pending frame, FIFO, labelled. Lock held."""
-        while self._pending:
-            await self._pop_and_push()
+        """Release every held frame, FIFO, labelled. Lock held."""
+        while self._has_held():
+            await self._push_next()
 
-    def _take_held(self) -> list[_Pending]:
-        """Take the in-flight frame, then every pending one (FIFO). Lock held."""
-        entries: list[_Pending] = []
-        if self._in_flight is not None:
-            entries.append(self._in_flight)
-            self._in_flight = None
-        entries.extend(self._pending)
-        self._pending.clear()
-        return entries
+    async def _deliver_held(self, *, context: str) -> None:
+        """``_drain_all`` that logs, never raises, a push failure. Lock held.
 
-    async def _deliver_held(self, entries: list[_Pending], *, context: str) -> None:
-        """Push each taken frame once; log, never raise, a push failure. Lock held."""
-        for entry in entries:
+        A frame whose push raised is dropped (logged) and the rest still go;
+        a cancellation propagates with the undelivered frames still held.
+        """
+        while self._has_held():
             try:
-                await self._push_labelled(entry)
+                await self._push_next()
             except Exception as exc:
+                self._in_flight = None  # definitively failed: never re-pushed
                 logger.error(
                     "DiarizationLabeler: dropped a transcript during "
                     f"{context} ({type(exc).__name__}: {safe_exc_text(exc)})"
@@ -416,17 +428,17 @@ class DiarizationLabeler(FrameProcessor):
         if self._release_lock is None:
             return
         async with self._release_lock:
-            entries = self._take_held()
-            if entries:
+            held = (self._in_flight is not None) + len(self._pending)
+            if held:
                 logger.debug(
-                    f"DiarizationLabeler: releasing {len(entries)} held "
+                    f"DiarizationLabeler: releasing {held} held "
                     "transcript(s) at cleanup (no EndFrame/CancelFrame)"
                 )
-            await self._deliver_held(entries, context="cleanup")
+            await self._deliver_held(context="cleanup")
 
     async def _on_end(self) -> None:
         """Graceful shutdown: wait <= hold_sec for the final flush, then drain."""
-        if self._pending and self._progress_event is not None:
+        if self._has_held() and self._progress_event is not None:
             deadline = self._now() + self._hold_sec
             while not (self._timeline.is_flushed or self._timeline.is_degraded):
                 remaining = deadline - self._now()

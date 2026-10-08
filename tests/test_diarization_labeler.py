@@ -19,6 +19,13 @@ import time
 import numpy as np
 import pytest
 from loguru import logger
+from onoats.config.audio_devices import PIPELINE_SAMPLE_RATE
+from onoats.processors import diarization_labeler as dl
+from onoats.stt.diarization_timeline import (
+    FRAME_SAMPLES,
+    MODEL_LOAD_GRACE_SEC,
+    DiarizationTimeline,
+)
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -27,14 +34,6 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-
-from onoats.config.audio_devices import PIPELINE_SAMPLE_RATE
-from onoats.processors import diarization_labeler as dl
-from onoats.stt.diarization_timeline import (
-    FRAME_SAMPLES,
-    MODEL_LOAD_GRACE_SEC,
-    DiarizationTimeline,
-)
 
 SLOTS = 2
 HOLD = 0.05  # real-time hold used with the fake clock
@@ -859,6 +858,139 @@ def test_cleanup_recovers_in_flight_frame_once(monkeypatch):
     run(go())
 
 
+def test_cleanup_during_blocked_fail_open_recovers_undelivered_frames(
+    monkeypatch, errors_seen
+):
+    """H1: cleanup cancelling fail-open while its retry push of the in-flight
+    frame is blocked must not lose that frame or the pending ones behind it:
+    each stays held until its own push completes, so cleanup delivers both,
+    once each, FIFO, unlabelled (the timeline is degraded by then)."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10 * FRAME_SAMPLES)
+    b = tframe("b", 10 * FRAME_SAMPLES, 10**9)
+    real_push = h.labeler.push_frame
+    attempts = []
+    retry_entered = asyncio.Event()
+
+    async def push(frame, direction=FrameDirection.DOWNSTREAM):
+        if frame is a and len(attempts) < 2:
+            attempts.append(frame)
+            if len(attempts) == 1:
+                raise RuntimeError("boom")  # release task -> fail-open
+            retry_entered.set()
+            await asyncio.Event().wait()  # fail-open retry: cancelled by cleanup
+        await real_push(frame, direction)
+
+    h.labeler.push_frame = push  # type: ignore[method-assign]
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        tl.record(0, rows(10, 0))  # covers a -> push raises -> fail-open
+        await asyncio.wait_for(retry_entered.wait(), 2.0)
+        assert tl.is_degraded and h.out == []
+        await asyncio.wait_for(h.close(), 2.0)
+        assert h.out == [a, b]  # each exactly once, FIFO
+        assert label_of(a) == (None, None) and label_of(b) == (None, None)
+        assert h.labeler._in_flight is None and not h.labeler._pending
+
+    run(go())
+    assert len(errors_seen) == 1 and "boom" in errors_seen[0]
+
+
+def test_passthrough_drain_after_failed_push_delivers_in_flight_first(
+    monkeypatch, errors_seen
+):
+    """H1 sibling: a pass-through frame that wins the lock between a failed
+    release-task push and fail-open must deliver the in-flight frame first,
+    not pop the next pending frame over it (losing it)."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10 * FRAME_SAMPLES)
+    b = tframe("b", 10 * FRAME_SAMPLES, 10**9)
+    u = tframe("u")  # unstamped -> pass-through path
+    real_push = h.labeler.push_frame
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    raised = []
+
+    async def push(frame, direction=FrameDirection.DOWNSTREAM):
+        if frame is a and not raised:
+            raised.append(frame)
+            entered.set()
+            await gate.wait()
+            raise RuntimeError("boom")
+        await real_push(frame, direction)
+
+    h.labeler.push_frame = push  # type: ignore[method-assign]
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        tl.record(0, rows(10, 0))  # covers a -> release task pushes it
+        await asyncio.wait_for(entered.wait(), 2.0)
+        sender = asyncio.create_task(h.send(u))  # queues on the lock
+        await h.settle(0.05)
+        gate.set()  # a's push raises; u wins the lock ahead of fail-open
+        await asyncio.wait_for(sender, 2.0)
+        await h.settle(0.05)
+        assert h.out == [a, b, u]  # each exactly once, FIFO
+        assert label_of(a) == (None, None)  # delivered while degraded
+        assert h.labeler._in_flight is None and not h.labeler._pending
+        await h.close()
+
+    run(go())
+    assert len(errors_seen) == 1 and "boom" in errors_seen[0]
+
+
+def test_stamped_frame_degraded_while_waiting_does_not_overtake_held(
+    monkeypatch, errors_seen
+):
+    """H1 sibling: a stamped frame that finds the timeline degraded once it
+    gets the lock (fail-open is queued behind it) must deliver the frames
+    still held ahead of it first, not overtake them."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10 * FRAME_SAMPLES)
+    b = tframe("b", 10 * FRAME_SAMPLES, 10**9)
+    c = tframe("c", 10**9, 2 * 10**9)
+    real_push = h.labeler.push_frame
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    raised = []
+
+    async def push(frame, direction=FrameDirection.DOWNSTREAM):
+        if frame is a and not raised:
+            raised.append(frame)
+            entered.set()
+            await gate.wait()
+            raise RuntimeError("boom")
+        await real_push(frame, direction)
+
+    h.labeler.push_frame = push  # type: ignore[method-assign]
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        tl.record(0, rows(10, 0))  # covers a -> release task pushes it
+        await asyncio.wait_for(entered.wait(), 2.0)
+        sender = asyncio.create_task(h.send(c))  # stamped, queues on the lock
+        await h.settle(0.05)
+        gate.set()  # a's push raises; c wins the lock ahead of fail-open
+        await asyncio.wait_for(sender, 2.0)
+        await h.settle(0.05)
+        assert h.out == [a, b, c]  # each exactly once, FIFO
+        assert h.labeler._in_flight is None and not h.labeler._pending
+        await h.close()
+
+    run(go())
+    assert len(errors_seen) == 1 and "boom" in errors_seen[0]
+
+
 def test_cleanup_tolerates_push_failure(monkeypatch, errors_seen):
     """F1: a raising push during cleanup is logged, never raised, and does not
     stop the remaining frames from being released."""
@@ -945,8 +1077,8 @@ def test_error_in_expiry_stall_accounting_fails_open_head_once_fifo(
 ):
     """An exception in the expiry branch's stall accounting (between choosing
     the head and pushing it) must deliver the head exactly once, first: the
-    head stays in ``_pending`` until ``_pop_and_push`` takes it, and
-    ``_take_held`` returns in-flight-then-pending, so fail-open sees FIFO."""
+    head stays in ``_pending`` until ``_push_next`` takes it, and
+    ``_push_next`` serves in-flight-then-pending, so fail-open sees FIFO."""
     tl = make_timeline()
     h, clock = make(monkeypatch, tl)
     a = tframe("a", 0, 10**9)
