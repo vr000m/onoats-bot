@@ -818,21 +818,24 @@ def main(argv: list[str] | None = None) -> int:
                 "not carried into the regenerated config.toml."
             )
     # `diarization`: parsed with the runtime reader's own helper
-    # (`parse_diarization_value`, shared with `OnoatsConfig.diarization`) and
-    # rendered back as a TOML bool. Blank is "absent" and stays quiet; an
-    # unrecognised value already resolves to off at runtime, so it is dropped
-    # with a note rather than carried (mirrors `launchd_label` above).
+    # (`parse_diarization_value`, shared with `OnoatsConfig.diarization`, which
+    # also owns what counts as absent) and rendered back as a TOML bool. Absent
+    # (missing or blank) stays quiet; an unrecognised value already resolves
+    # to off at runtime, so it is dropped with a note rather than carried
+    # (mirrors `launchd_label` above).
     carried_diar = existing_stt.get("diarization")
-    if carried_diar is not None and "diarization" not in stt:
-        parsed_diar = parse_diarization_value(carried_diar)
-        if parsed_diar is None:
+    if "diarization" not in stt:
+        try:
+            parsed_diar = parse_diarization_value(carried_diar)
+        except ValueError:
             print(
                 f"  note: ignoring unrecognised [stt].diarization "
                 f"{carried_diar!r} — it already resolves to off at runtime and "
                 "is not carried into the regenerated config.toml."
             )
-        elif not (isinstance(carried_diar, str) and not carried_diar.strip()):
-            stt["diarization"] = parsed_diar
+        else:
+            if parsed_diar is not None:
+                stt["diarization"] = parsed_diar
     # Verbatim, not re-rendered from `existing.raw["app"]` — see
     # `_extract_raw_section`'s docstring, `_render_config_toml`'s `[app]`
     # handling, and the comment above for why this section uses a different

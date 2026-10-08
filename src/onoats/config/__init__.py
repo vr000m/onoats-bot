@@ -120,24 +120,28 @@ def normalize_launchd_label(value: str | None) -> str | None:
 
 
 def parse_diarization_value(value: Any) -> bool | None:
-    """Map a raw ``diarization`` value to a bool; ``None`` if unrecognised.
+    """Map a raw ``diarization`` value to a bool; ``None`` if absent.
 
-    Absent (``None`` / ``""``) is ``False``. Accepts a TOML bool, or a
-    string/int in the truthy/falsy vocabulary (``1/true/yes/on`` /
-    ``0/false/no/off``, case-insensitive). Shared by the runtime reader
+    Absent is ``None`` or a blank/whitespace-only string; each caller decides
+    what absent means (the runtime reader: off; ``onoats init``: nothing to
+    carry). Accepts a TOML bool, or a string/int in the truthy/falsy
+    vocabulary (``1/true/yes/on`` / ``0/false/no/off``, case-insensitive);
+    anything else raises ``ValueError``. Shared by the runtime reader
     (``OnoatsConfig.diarization``) and ``onoats init``'s carry-over so the two
-    cannot drift on which values count as on, off, or garbage.
+    cannot drift on which values count as absent, on, off, or garbage.
     """
-    if value is None or value == "":
-        return False
+    if value is None:
+        return None
     if isinstance(value, bool):
         return value
     text = str(value).strip().lower()
+    if not text:
+        return None
     if text in ("1", "true", "yes", "on"):
         return True
-    if text in ("0", "false", "no", "off", ""):
+    if text in ("0", "false", "no", "off"):
         return False
-    return None
+    raise ValueError(f"unrecognised diarization value {value!r}")
 
 
 def _config_home() -> Path:
@@ -416,9 +420,10 @@ class OnoatsConfig:
         "on" from garbage would fail loud at startup for a typo).
         """
         val = _env_or("ONOATS_DIARIZATION", self.raw.get("stt", {}).get("diarization"))
-        parsed = parse_diarization_value(val)
-        if parsed is not None:
-            return parsed
+        try:
+            return bool(parse_diarization_value(val))  # absent (None) is off
+        except ValueError:
+            pass
         text = str(val).strip().lower()
         # The property is read at several startup sites, each often on its own
         # OnoatsConfig; warn once per process per value, not once per read.

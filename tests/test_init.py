@@ -884,6 +884,23 @@ def test_rerun_drops_an_unrecognised_diarization_with_note(
     assert "[stt].diarization" in out and "'maybe'" in out
 
 
+def test_rerun_drops_a_blank_diarization_quietly(_isolate_env, monkeypatch, capsys):
+    """Blank is "absent", not off: not carried, and no malformed-value note."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(path.read_text().replace("[stt]\n", '[stt]\ndiarization = "  "\n'))
+
+    _force_tty(monkeypatch, value=False)
+    capsys.readouterr()
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    assert "diarization" not in _load_toml(config_toml_path())["stt"]
+    assert "[stt].diarization" not in capsys.readouterr().out
+
+
 def test_rerun_without_diarization_does_not_add_it(_isolate_env, monkeypatch):
     assert init_mod.main(["--no-preflight"]) == 0
     _force_tty(monkeypatch, value=False)

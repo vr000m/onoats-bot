@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import textwrap
 
+import pytest
+
 from onoats.config import OnoatsConfig, load_config, normalize_launchd_label
 
 _CONFIG = textwrap.dedent(
@@ -238,3 +240,19 @@ def test_diarization_resolves_from_config_file(tmp_path, monkeypatch):
     )
     cfg = load_config(config_path=cfg_path, secrets_path=tmp_path / "secrets.env")
     assert cfg.diarization is True
+
+
+def test_parse_diarization_value_distinguishes_absent_off_and_garbage():
+    """One owner of the absent-vs-off rule for both the runtime reader and
+    `onoats init`: absent (None / blank) is None, off is False, garbage raises."""
+    from onoats.config import parse_diarization_value
+
+    for absent in (None, "", "   "):
+        assert parse_diarization_value(absent) is None, absent
+    for off in (False, 0, "0", "false", " OFF ", "no"):
+        assert parse_diarization_value(off) is False, off
+    for on in (True, 1, "1", "true", " Yes ", "on"):
+        assert parse_diarization_value(on) is True, on
+    for garbage in ("maybe", "ture", 2, 1.0):
+        with pytest.raises(ValueError):
+            parse_diarization_value(garbage)
