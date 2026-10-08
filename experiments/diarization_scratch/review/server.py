@@ -60,7 +60,8 @@ def cut_clip(start, end):
 
 
 def make_handler(segments, labels_path, index_html, port):
-    allowed_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed_origins = {f"http://{h}" for h in allowed_hosts}
 
     def label_state():
         state = {}
@@ -81,7 +82,16 @@ def make_handler(segments, labels_path, index_html, port):
             self.end_headers()
             self.wfile.write(body)
 
+        def _host_ok(self):
+            # Reject DNS-rebinding: a rebound page keeps its attacker Host.
+            if self.headers.get("Host") in allowed_hosts:
+                return True
+            self._send(403, b"forbidden host", "text/plain")
+            return False
+
         def do_GET(self):
+            if not self._host_ok():
+                return None
             url = urlparse(self.path)
             if url.path == "/":
                 return self._send(200, index_html.encode(), "text/html; charset=utf-8")
@@ -98,6 +108,8 @@ def make_handler(segments, labels_path, index_html, port):
             self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            if not self._host_ok():
+                return None
             if urlparse(self.path).path != "/api/verdict":
                 return self._send(404, b"not found", "text/plain")
             origin = self.headers.get("Origin")
