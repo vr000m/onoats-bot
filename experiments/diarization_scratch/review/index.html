@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diarization review</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #111; }
+  header { position: sticky; top: 0; background: #fafafa; padding-bottom: 8px; border-bottom: 1px solid #ddd; margin-bottom: 8px; }
+  .row { display: grid; grid-template-columns: 90px 110px 1fr auto; gap: 10px; align-items: center; padding: 8px; border-bottom: 1px solid #eee; background: #fff; }
+  .row.done { opacity: 0.55; }
+  .row.cur { outline: 2px solid #4a7dff; }
+  .time { font-variant-numeric: tabular-nums; color: #555; }
+  .spk { font-weight: 600; }
+  .text { color: #222; }
+  .overlap { color: #b45309; font-size: 12px; }
+  button { font: inherit; padding: 4px 9px; border: 1px solid #bbb; border-radius: 4px; background: #fff; cursor: pointer; }
+  button.on-check { background: #d1fae5; border-color: #059669; }
+  button.on-q { background: #fef3c7; border-color: #b45309; }
+  button.on-x { background: #fee2e2; border-color: #b91c1c; }
+  .actions { display: flex; gap: 4px; flex-wrap: wrap; }
+  select { font: inherit; }
+  .hint { color: #666; font-size: 12px; }
+  @media (max-width: 640px) {
+    .row { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div><strong id="progress">loading…</strong> <span class="hint">keys: space = play/pause · c = check · q = ? · x = wrong · j/k = next/prev</span></div>
+  <div class="hint">Verdict ✓ = model speaker correct · ? = ambiguous · ✗ = wrong (pick the right speaker)</div>
+  <label><input type="checkbox" id="hide"> hide reviewed</label>
+  <label><input type="checkbox" id="onlyOverlap"> overlap only</label>
+</header>
+<audio id="player"></audio>
+<main id="list"></main>
+<script>
+const player = document.getElementById("player");
+const list = document.getElementById("list");
+const progress = document.getElementById("progress");
+let segments = [];
+let choices = [];
+let cur = 0;
+
+function fmt(t) {
+  const m = Math.floor(t / 60), s = (t % 60).toFixed(1).padStart(4, "0");
+  return `${m}:${s}`;
+}
+
+function visible(s) {
+  if (document.getElementById("hide").checked && s.review) return false;
+  if (document.getElementById("onlyOverlap").checked && !s.overlap) return false;
+  return true;
+}
+
+function render() {
+  list.innerHTML = "";
+  const done = segments.filter(s => s.review).length;
+  progress.textContent = `${done} / ${segments.length} reviewed`;
+  for (const s of segments) {
+    if (!visible(s)) continue;
+    const row = document.createElement("div");
+    row.className = "row" + (s.review ? " done" : "") + (s.id === cur ? " cur" : "");
+    row.dataset.id = s.id;
+    const verdict = s.review ? s.review.verdict : null;
+    const spkText = s.overlap ? `${s.model_speaker}` : s.model_speaker;
+    row.innerHTML = `
+      <div class="time">${fmt(s.start)}–${fmt(s.end)}</div>
+      <div class="spk">${spkText}${s.overlap ? '<div class="overlap">overlap</div>' : ""}</div>
+      <div class="text">${escapeHtml(s.text)}
+        <div class="actions" style="margin-top:6px">
+          <button data-act="play">▶ play</button>
+          <button data-act="check" class="${verdict === "check" ? "on-check" : ""}">✓</button>
+          <button data-act="question" class="${verdict === "question" ? "on-q" : ""}">?</button>
+          <button data-act="cross" class="${verdict === "cross" ? "on-x" : ""}">✗ wrong</button>
+          <select data-act="correct">
+            <option value="">correct speaker…</option>
+            ${choices.map(c => `<option ${s.review && s.review.correct === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div class="hint">${s.review ? escapeHtml(s.review.verdict + (s.review.correct ? " → " + s.review.correct : "")) : ""}</div>`;
+    list.appendChild(row);
+  }
+}
+
+function escapeHtml(t) {
+  return t.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function play(id) {
+  cur = id;
+  player.src = `/api/clip?id=${id}`;
+  player.play();
+  highlight();
+}
+
+function highlight() {
+  document.querySelectorAll(".row.cur").forEach(r => r.classList.remove("cur"));
+  const r = document.querySelector(`.row[data-id="${cur}"]`);
+  if (r) { r.classList.add("cur"); r.scrollIntoView({ block: "center" }); }
+}
+
+async function save(id, verdict, correct) {
+  const s = segments[id];
+  const rec = { id, start: s.start, end: s.end, model_speaker: s.model_speaker, text: s.text, verdict, correct: correct || null };
+  await fetch("/api/verdict", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rec) });
+  s.review = { ...rec, at: new Date().toISOString() };
+  render();
+  highlight();
+}
+
+list.addEventListener("click", e => {
+  const btn = e.target.closest("button");
+  const row = e.target.closest(".row");
+  if (!row) return;
+  const id = Number(row.dataset.id);
+  if (!btn) { cur = id; highlight(); return; }
+  const act = btn.dataset.act;
+  if (act === "play") play(id);
+  else if (act === "check") save(id, "check", null);
+  else if (act === "question") save(id, "question", null);
+  else if (act === "cross") save(id, "cross", null);
+});
+
+list.addEventListener("change", e => {
+  if (e.target.matches("select[data-act=correct]")) {
+    const row = e.target.closest(".row");
+    const id = Number(row.dataset.id);
+    if (e.target.value) save(id, "cross", e.target.value);
+  }
+});
+
+document.getElementById("hide").addEventListener("change", render);
+document.getElementById("onlyOverlap").addEventListener("change", render);
+
+function step(d) {
+  const vis = segments.filter(visible);
+  const idx = vis.findIndex(s => s.id === cur);
+  const next = vis[Math.min(vis.length - 1, Math.max(0, idx + d))];
+  if (next) { cur = next.id; highlight(); }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+  const k = e.key;
+  if (k === " ") { e.preventDefault(); if (player.paused) play(cur); else player.pause(); }
+  else if (k === "j") step(1);
+  else if (k === "k") step(-1);
+  else if (k === "c") save(cur, "check", null);
+  else if (k === "q") save(cur, "question", null);
+});
+
+fetch("/api/segments").then(r => r.json()).then(d => {
+  segments = d.segments;
+  choices = d.choices;
+  const first = segments.find(s => !s.review);
+  cur = first ? first.id : 0;
+  render();
+  highlight();
+});
+</script>
+</body>
+</html>
