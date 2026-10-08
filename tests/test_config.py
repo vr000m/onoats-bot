@@ -154,7 +154,10 @@ def test_diarization_flag_resolution(monkeypatch):
 def test_diarization_flag_garbage_is_false_with_warning(monkeypatch):
     from loguru import logger
 
+    import onoats.config as cfgmod
+
     monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    monkeypatch.setattr(cfgmod, "_warned_diarization_values", set())
     records: list[str] = []
     sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
     try:
@@ -162,6 +165,28 @@ def test_diarization_flag_garbage_is_false_with_warning(monkeypatch):
     finally:
         logger.remove(sink)
     assert len(records) == 1 and "diarization" in records[0]
+
+
+def test_diarization_flag_garbage_warns_once_across_reads_and_configs(monkeypatch):
+    """The flag is read at several startup sites (each often on its own config
+    object): one WARNING per process per bad value, not one per read."""
+    from loguru import logger
+
+    import onoats.config as cfgmod
+
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    monkeypatch.setattr(cfgmod, "_warned_diarization_values", set())
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
+    try:
+        for _ in range(3):
+            cfg = OnoatsConfig(raw={"stt": {"diarization": "ture"}})
+            assert cfg.diarization is False
+            assert cfg.diarization is False
+        OnoatsConfig(raw={"stt": {"diarization": "tuer"}}).diarization  # new value
+    finally:
+        logger.remove(sink)
+    assert len(records) == 2
 
 
 # --- diarization flag: env ONOATS_DIARIZATION > [stt] diarization > False ---

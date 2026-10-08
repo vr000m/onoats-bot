@@ -1867,7 +1867,11 @@ def _refuse_if_live_recorder(pid_path: Path) -> None:
 DIARIZATION_REPO_ID = "mlx-community/Nemotron-3-Diarization"
 # The two files ``mlx_audio``'s loader fetches (Phase 0).
 _DIARIZATION_WEIGHT_FILES = ("config.json", "model.safetensors")
-_DIARIZATION_INSTALL_HINT = "uv sync --extra diarization"
+_DIARIZATION_INSTALL_HINT = (
+    "`uv sync --extra diarization` (checkout) or "
+    "`uv tool install 'onoats[macos,diarization]'` (tool install; "
+    "repeat any extras you already have)"
+)
 _DIARIZATION_DOWNLOAD_HINT = f"hf download {DIARIZATION_REPO_ID}"
 
 # Memoized successful preflights (keyed by repo id) so the socket-mode double

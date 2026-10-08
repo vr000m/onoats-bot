@@ -177,6 +177,10 @@ def _source_of(env_name: str, file_value: Any) -> str:
     return _env_or_with_source(env_name, file_value)[1]
 
 
+#: Unrecognised ``diarization`` values already warned about (warn-once dedupe).
+_warned_diarization_values: set[str] = set()
+
+
 @dataclass(frozen=True)
 class OnoatsConfig:
     """Resolved configuration, env-overridden over config.toml over defaults."""
@@ -400,10 +404,14 @@ class OnoatsConfig:
             return True
         if text in ("0", "false", "no", "off", ""):
             return False
-        logger.warning(
-            f"STT: ignoring unrecognised diarization value {val!r} "
-            "(expected true/false); diarization disabled"
-        )
+        # The property is read at several startup sites, each often on its own
+        # OnoatsConfig; warn once per process per value, not once per read.
+        if text not in _warned_diarization_values:
+            _warned_diarization_values.add(text)
+            logger.warning(
+                f"STT: ignoring unrecognised diarization value {val!r} "
+                "(expected true/false); diarization disabled"
+            )
         return False
 
     # ---- speakers (render-only display labels) ----
