@@ -23,7 +23,11 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from onoats.frames import resolve_frame_source
+from onoats.frames import (
+    resolve_frame_overlap,
+    resolve_frame_source,
+    resolve_frame_speakers,
+)
 
 # Reserved source key used in dual mode when a VAD frame arrives without
 # a branch tag. Treating it as a distinct source keeps it inside the
@@ -329,15 +333,8 @@ class TranscriptBuffer(FrameProcessor):
             if isinstance(raw_branch_sequence, int):
                 branch_sequence = raw_branch_sequence
 
-        speakers = None
-        raw_speakers = getattr(frame, "onoats_speakers", None)
-        if isinstance(raw_speakers, (list, tuple)) and all(
-            isinstance(s, str) for s in raw_speakers
-        ):
-            speakers = list(raw_speakers)
-        overlap = getattr(frame, "onoats_overlap", None)
-        if not isinstance(overlap, bool):
-            overlap = None
+        speakers = resolve_frame_speakers(frame)
+        overlap = resolve_frame_overlap(frame)
 
         frame_timestamp = getattr(frame, "timestamp", None)
         frame_timestamp = str(frame_timestamp) if frame_timestamp else None

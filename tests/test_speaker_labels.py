@@ -376,3 +376,52 @@ def test_live_terminal_suffix_parity_with_render(capsys, speakers, overlap):
     out = _live_line(frame, capsys)
     expected = compose_speaker_label("Them", speakers, bool(overlap))
     assert f"] {expected}: live" in out
+
+
+@pytest.mark.parametrize(
+    ("speakers", "overlap", "expected"),
+    [
+        ("S1", None, "Them"),  # a bare string is not a speaker list
+        ([1, 2], None, "Them"),  # non-str entries
+        (["S1", "S2"], "false", "Them (S1 / S2)"),  # non-bool overlap ignored
+        (["S1", "S2"], 1, "Them (S1 / S2)"),
+    ],
+)
+def test_live_terminal_ignores_malformed_label_attributes(
+    capsys, speakers, overlap, expected
+):
+    """The live terminal validates `onoats_speakers` / `onoats_overlap` the
+    same way TranscriptBuffer does (shared resolvers in `onoats.frames`)."""
+    frame = _them_frame("live", speakers=speakers, overlap=overlap)
+    frame.finalized = True
+    out = _live_line(frame, capsys)
+    assert f"] {expected}: live" in out
+
+
+def test_transcript_buffer_ignores_malformed_label_attributes(tmp_path):
+    path = _write_frames(
+        tmp_path,
+        [
+            _them_frame("a", speakers="S1", overlap="yes"),
+            _them_frame("b", speakers=["S1", 2], overlap=1),
+            _them_frame("c", speakers=("S1",), overlap=False),
+        ],
+    )
+    a, b, c = _utterances(path)
+    assert "speakers" not in a and "overlap" not in a
+    assert "speakers" not in b and "overlap" not in b
+    assert c["speakers"] == ["S1"] and c["overlap"] is False
+
+
+def test_frame_label_resolvers():
+    from types import SimpleNamespace
+
+    from onoats.frames import resolve_frame_overlap, resolve_frame_speakers
+
+    assert resolve_frame_speakers(SimpleNamespace()) is None
+    assert resolve_frame_speakers(SimpleNamespace(onoats_speakers="S1")) is None
+    assert resolve_frame_speakers(SimpleNamespace(onoats_speakers=["S1", 2])) is None
+    assert resolve_frame_speakers(SimpleNamespace(onoats_speakers=("S1",))) == ["S1"]
+    assert resolve_frame_overlap(SimpleNamespace()) is None
+    assert resolve_frame_overlap(SimpleNamespace(onoats_overlap=1)) is None
+    assert resolve_frame_overlap(SimpleNamespace(onoats_overlap=True)) is True
