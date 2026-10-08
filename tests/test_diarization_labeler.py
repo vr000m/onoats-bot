@@ -761,3 +761,39 @@ def test_release_task_fails_open_on_push_error(monkeypatch, warnings_seen, error
     assert len(warnings_seen) == 2  # the ERROR + mark_degraded's one WARNING
     assert sum("degraded" in m for m in warnings_seen) == 1
 
+
+def test_passthrough_frame_waits_for_inflight_head_fifo(monkeypatch):
+    """An unstamped frame arriving while the release task is mid-push of the
+    head (``_pending`` already empty) must queue behind it, not overtake it."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=30.0)
+    a = tframe("a", 0, 10 * FRAME_SAMPLES)
+    u = tframe("u")  # unstamped -> pass-through path
+    real_push = h.labeler.push_frame
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def gated_push(frame, direction=FrameDirection.DOWNSTREAM):
+        if frame is a:
+            entered.set()
+            await gate.wait()
+        await real_push(frame, direction)
+
+    h.labeler.push_frame = gated_push  # type: ignore[method-assign]
+
+    async def go():
+        await h.start()
+        await h.send(a)  # parked: not covered yet
+        tl.record(0, rows(20, 0))  # covers a -> release task starts pushing it
+        await asyncio.wait_for(entered.wait(), 2.0)
+        assert not h.labeler._pending  # the head is in flight, deque empty
+        sender = asyncio.create_task(h.send(u))
+        await h.settle(0.05)
+        assert h.out == []  # u did not overtake a
+        gate.set()
+        await asyncio.wait_for(sender, 2.0)
+        await h.settle(0.05)
+        assert h.out == [a, u]
+        await h.close()
+
+    run(go())

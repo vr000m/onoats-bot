@@ -146,10 +146,16 @@ class DiarizationLabeler(FrameProcessor):
         end = getattr(frame, "onoats_segment_end_sample", None)
         if start is None or end is None or self._timeline.is_degraded:
             # Unstamped (fail-loud upstream) or degraded: no hold, no attributes.
-            # Drain anything parked first so FIFO order is preserved.
-            if self._pending:
-                await self._release_all()
-            await self.push_frame(frame, direction)
+            # Serialise behind the release task (it pops the head and pushes it
+            # while holding the lock, so ``_pending`` can be empty mid-push) and
+            # drain anything parked first, so FIFO order is preserved.
+            if self._release_lock is None:
+                await self.push_frame(frame, direction)
+                return
+            async with self._release_lock:
+                while self._pending:
+                    await self._push_labelled(self._pending.popleft())
+                await self.push_frame(frame, direction)
             return
 
         self._ensure_started()
