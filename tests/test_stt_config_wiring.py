@@ -598,3 +598,111 @@ def test_diarization_flag_with_websocket_backend_passes(monkeypatch):
     cfg = OnoatsConfig(raw={"stt": {"service": "websocket", "diarization": True}})
     runtime._preflight_diarization(cfg)  # must not raise
     runtime._diarization_preflight_done.clear()
+
+
+# --- Phase 4: stamp_segment_samples kwarg wiring ----------------------------
+
+
+def _ws_service(monkeypatch, *, raw, **kwargs):
+    """Build the websocket service through the real `_create_stt_service` with
+    the network preflight stubbed out."""
+    import asyncio
+
+    monkeypatch.setattr("onoats.config.load_config", lambda: OnoatsConfig(raw=raw))
+    monkeypatch.delenv("STT_SERVICE", raising=False)
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+
+    async def _no_preflight(*a, **k):
+        return None
+
+    monkeypatch.setattr(runtime, "_preflight_stt_ws", _no_preflight)
+    result = asyncio.run(runtime._create_stt_service(**kwargs))
+    return result.service
+
+
+def test_create_stt_service_stamp_kwarg_threads_through(monkeypatch):
+    raw = {"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
+    svc = _ws_service(monkeypatch, raw=raw, stamp_segment_samples=True)
+    assert svc._stamp_segment_samples is True
+
+
+def test_create_stt_service_stamp_kwarg_defaults_false(monkeypatch):
+    raw = {"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
+    svc = _ws_service(monkeypatch, raw=raw)
+    assert svc._stamp_segment_samples is False
+
+
+def test_create_stt_service_never_derives_stamp_from_config(monkeypatch):
+    """Diarization flag ON in config but no explicit kwarg -> still False: the
+    caller (dual.py, system arm only) decides, never `_create_stt_service`."""
+    raw = {
+        "stt": {
+            "service": "websocket",
+            "ws_socket": "/tmp/x.sock",
+            "diarization": True,
+        }
+    }
+    svc = _ws_service(monkeypatch, raw=raw)
+    assert svc._stamp_segment_samples is False
+    svc = _ws_service(monkeypatch, raw=raw, branch_instance="system")
+    assert svc._stamp_segment_samples is False
+
+
+def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
+    """Run `run_onoats_dual` up to the two `_create_stt_service` calls and
+    return `[(branch_instance, stamp_segment_samples), ...]`."""
+    import asyncio
+
+    import pipecat.audio.vad.silero as silero
+    import pipecat.processors.audio.vad_processor as vadp
+
+    from onoats import dual as dual_mod
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ONOATS_DIARIZATION", flag)
+    monkeypatch.setenv("AUDIO_SOURCE", "portaudio")
+    monkeypatch.setattr(dual_mod, "_acquire_instance_lock", lambda d: None)
+    monkeypatch.setattr(runtime, "_preflight_diarization", lambda cfg: None)
+    monkeypatch.setattr(
+        dual_mod,
+        "_build_portaudio_transports",
+        lambda cfg: (object(), object(), "mic", "sys"),
+    )
+
+    async def _noop_recovery(**kw):
+        return None
+
+    monkeypatch.setattr(dual_mod, "run_crash_recovery", _noop_recovery)
+    monkeypatch.setattr(silero, "SileroVADAnalyzer", lambda *a, **k: object())
+    monkeypatch.setattr(vadp, "VADProcessor", lambda *a, **k: object())
+
+    class _Stop(Exception):
+        pass
+
+    calls: list[tuple] = []
+
+    async def _spy(**kw):
+        calls.append((kw.get("branch_instance"), kw.get("stamp_segment_samples")))
+        if len(calls) == 2:
+            raise _Stop
+        return runtime.SttServiceResult(object(), None)
+
+    monkeypatch.setattr(dual_mod, "_create_stt_service", _spy)
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path))
+    return calls
+
+
+def test_dual_passes_stamp_true_on_system_arm_only_when_flag_on(monkeypatch, tmp_path):
+    calls = _run_dual_until_stt(monkeypatch, tmp_path, flag="1")
+    by_branch = dict(calls)
+    assert by_branch["system"] is True
+    # mic never stamps: the kwarg is absent (default False) or explicitly False
+    assert not by_branch["mic"]
+
+
+def test_dual_passes_stamp_false_on_both_arms_when_flag_off(monkeypatch, tmp_path):
+    calls = _run_dual_until_stt(monkeypatch, tmp_path, flag="0")
+    by_branch = dict(calls)
+    assert not by_branch["system"]
+    assert not by_branch["mic"]

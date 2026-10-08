@@ -54,13 +54,17 @@ from collections.abc import AsyncGenerator, Callable
 
 from loguru import logger
 from pipecat.frames.frames import (
+    AudioRawFrame,
     CancelFrame,
     EndFrame,
     ErrorFrame,
     Frame,
     StartFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
@@ -86,6 +90,7 @@ from stt_server import protocol as P
 from onoats import _closing
 from onoats._redact import display_uri, safe_exc_text
 from onoats.stt import launchd
+from onoats.stt.diarization_timeline import SampleCounter
 
 # Wait at most this long for a decode round trip before surfacing an
 # error frame and giving up on the segment. Covers the 16 kHz / 60 s
@@ -155,6 +160,7 @@ class WebSocketSTTService(SegmentedSTTService):
         instance_name: str | None = None,
         on_recovery: Callable[[str | None], None] | None = None,
         on_preflight_confirmed: Callable[[], None] | None = None,
+        stamp_segment_samples: bool = False,
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
@@ -265,6 +271,17 @@ class WebSocketSTTService(SegmentedSTTService):
         # instance-scoped ``stt-mic``/``stt-system`` branch.
         self._on_preflight_confirmed = on_preflight_confirmed
         self._preflight_confirm_pending = on_preflight_confirmed is not None
+        # Segment-sample stamping (them-channel diarization; system arm only).
+        # ``_sample_counter`` is the same helper the upstream feeder uses, so
+        # both count the 16 kHz sample clock identically. pipecat 1.3.0 runs
+        # ``run_stt`` INLINE inside ``process_frame(VADUserStoppedSpeakingFrame)``
+        # so at most one span is outstanding: ``_pending_span`` is a single slot
+        # (no queue), written BEFORE delegating the VAD-stop frame to ``super()``
+        # and consumed/cleared at the head of ``run_stt``.
+        self._stamp_segment_samples = stamp_segment_samples
+        self._sample_counter = SampleCounter()
+        self._vad_start_sample: int | None = None
+        self._pending_span: tuple[int, int] | None = None
 
     # ------------------------------------------------------------------
     # Backend identity (populated on connect from server.hello)
@@ -336,10 +353,71 @@ class WebSocketSTTService(SegmentedSTTService):
             await super().cleanup()
 
     # ------------------------------------------------------------------
+    # Segment-sample stamping
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if self._stamp_segment_samples:
+            self._track_segment_span(frame)
+        await super().process_frame(frame, direction)
+
+    def _track_segment_span(self, frame: Frame) -> None:
+        """Count samples and capture the VAD span BEFORE ``super()`` runs.
+
+        The slot must be written here, ahead of ``super().process_frame``:
+        that call runs ``run_stt`` inline for a VAD-stop frame, so a slot
+        written afterwards would be empty when ``run_stt`` consumes it.
+        """
+        counter = self._sample_counter
+        if isinstance(frame, StartFrame):
+            counter.reset()
+            self._vad_start_sample = None
+            self._pending_span = None
+        elif isinstance(frame, AudioRawFrame):
+            counter.add_pcm16_bytes(len(frame.audio))
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            if self._vad_start_sample is not None:
+                # pipecat keeps decoding from the FIRST start while the user is
+                # still "speaking"; keep that start so the stamp is not narrower
+                # than the decoded audio.
+                logger.error(
+                    f"{self.name}: VAD start while a span is already open; "
+                    "keeping the first start"
+                )
+            else:
+                self._vad_start_sample = counter.samples
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            start, self._vad_start_sample = self._vad_start_sample, None
+            end = counter.samples
+            if self._pending_span is not None:
+                logger.error(
+                    f"{self.name}: second VAD span captured while one is "
+                    "pending; leaving this segment unstamped"
+                )
+                self._pending_span = None
+            elif start is None:
+                logger.error(
+                    f"{self.name}: VAD stop without a recorded VAD start; "
+                    "leaving this segment unstamped"
+                )
+            else:
+                self._pending_span = (start, end)
+
+    # ------------------------------------------------------------------
     # STTService contract
     # ------------------------------------------------------------------
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        # Consume the span slot first, before any early return, so a stale span
+        # can never be attributed to a later segment.
+        span: tuple[int, int] | None = None
+        if self._stamp_segment_samples:
+            span, self._pending_span = self._pending_span, None
+            if span is None:
+                logger.error(
+                    f"{self.name}: run_stt found no pending VAD span; "
+                    "transcription will be unstamped"
+                )
         if not audio:
             return
 
@@ -408,12 +486,16 @@ class WebSocketSTTService(SegmentedSTTService):
 
         text = (text or "").strip()
         if text:
-            yield TranscriptionFrame(
+            out = TranscriptionFrame(
                 text,
                 self._user_id,
                 time_now_iso8601(),
                 self._language,
             )
+            if span is not None:
+                out.onoats_segment_start_sample = span[0]
+                out.onoats_segment_end_sample = span[1]
+            yield out
 
     # ------------------------------------------------------------------
     # Internals
@@ -708,6 +790,8 @@ class WebSocketSTTService(SegmentedSTTService):
         client = self._client
         reader = self._reader_task
         self._client = None
+        # A reconnect/discard invalidates any outstanding span.
+        self._pending_span = None
         if draining:
             # Only ever *set* here, never cleared: a non-draining detach
             # running while another path's drain window is open must not

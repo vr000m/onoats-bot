@@ -1295,6 +1295,7 @@ async def _create_stt_service(
     *,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
+    stamp_segment_samples: bool = False,
 ) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -1343,6 +1344,11 @@ async def _create_stt_service(
     transcript first clears the shared ``stt`` warning (a session where
     only the second instance ever produces transcripts, e.g. system-audio
     only, would otherwise leave that warning pinned for the whole session).
+
+    ``stamp_segment_samples`` (websocket backend only) makes the service stamp
+    each ``TranscriptionFrame`` with its VAD span for them-channel diarization.
+    It is passed explicitly by the caller (system arm only) and is never
+    derived from config here.
     """
     from onoats.config import load_config
 
@@ -1461,6 +1467,7 @@ async def _create_stt_service(
             # token from `id(self)`, a memory address CPython reuses after
             # GC.
             instance_name=branch_instance,
+            stamp_segment_samples=stamp_segment_samples,
             on_recovery=live_on_recovery,
             on_preflight_confirmed=(
                 on_preflight_confirmed if recovered_in_preflight else None

@@ -534,9 +534,13 @@ async def run_onoats_dual(
     # (no mic transcript ever) still clears the shared warning.
     mic_result = await _create_stt_service(data_dir=data_dir, branch_instance="mic")
     mic_stt = mic_result.service
+    # Resolved once; Phase 7 reuses this bool for `_build_dual_pipeline`. Only
+    # the system ("them") arm stamps VAD spans; the mic arm never does.
+    diarization_on = bool(cfg.diarization)
     system_result = await _create_stt_service(
         data_dir=data_dir,
         branch_instance="system",
+        stamp_segment_samples=diarization_on,
     )
     system_stt = system_result.service
     preflight_recovery_warning = (
