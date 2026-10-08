@@ -938,3 +938,37 @@ def test_stall_then_unobserved_coverage_advance_then_stall_does_not_degrade(
 
     run(go())
     assert warnings_seen == []
+
+
+def test_error_in_expiry_stall_accounting_fails_open_head_once_fifo(
+    monkeypatch, errors_seen
+):
+    """An exception in the expiry branch's stall accounting (between choosing
+    the head and pushing it) must deliver the head exactly once, first: the
+    head stays in ``_pending`` until ``_pop_and_push`` takes it, and
+    ``_take_held`` returns in-flight-then-pending, so fail-open sees FIFO."""
+    tl = make_timeline()
+    h, clock = make(monkeypatch, tl)
+    a = tframe("a", 0, 10**9)
+    b = tframe("b", 10**9, 2 * 10**9)
+
+    def _boom(now):
+        raise RuntimeError("stall accounting broke")
+
+    monkeypatch.setattr(h.labeler, "_model_loading", _boom)
+
+    async def go():
+        await h.start()
+        await h.send(a)
+        await h.send(b)
+        assert h.out == []
+        clock.advance(HOLD + 0.01)  # a expires with no coverage progress
+        h.labeler._wake()
+        await h.settle()
+        assert h.out == [a, b]  # each exactly once, FIFO
+        assert h.labeler._in_flight is None and not h.labeler._pending
+        assert tl.is_degraded
+        await h.close()
+
+    run(go())
+    assert len(errors_seen) == 1 and "stall accounting broke" in errors_seen[0]

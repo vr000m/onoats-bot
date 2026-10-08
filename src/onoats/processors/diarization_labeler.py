@@ -164,10 +164,7 @@ class DiarizationLabeler(FrameProcessor):
                 await self.push_frame(frame, direction)
                 return
             async with self._release_lock:
-                while self._pending:
-                    self._in_flight = self._pending.popleft()
-                    await self._push_labelled(self._in_flight)
-                    self._in_flight = None
+                await self._drain_all()
                 await self.push_frame(frame, direction)
             return
 
@@ -275,16 +272,12 @@ class DiarizationLabeler(FrameProcessor):
             while self._pending:
                 head = self._pending[0]
                 if self._timeline.is_degraded:
-                    self._in_flight = self._pending.popleft()
-                    await self.push_frame(head.frame, head.direction)
-                    self._in_flight = None
+                    await self._pop_and_push(labelled=False)
                     continue
                 hw = self._timeline.coverage_high_water()
                 if hw >= head.end:
                     self._reset_stall()
-                    self._in_flight = self._pending.popleft()
-                    await self._push_labelled(head)
-                    self._in_flight = None
+                    await self._pop_and_push()
                     continue
                 now = self._now()
                 if now < head.deadline:
@@ -292,8 +285,9 @@ class DiarizationLabeler(FrameProcessor):
                 # Expiry. It counts toward the stall streak only if coverage did
                 # not advance at all while this frame was held AND it starts a
                 # new hold window (>= hold_sec after the last counted expiry):
-                # several frames expiring in one slow window count once.
-                self._in_flight = self._pending.popleft()
+                # several frames expiring in one slow window count once. The
+                # head stays in ``_pending`` until ``_pop_and_push`` (no await
+                # in between, so nothing can observe the difference).
                 if hw <= head.hw_at_park:
                     if (
                         self._hw_at_last_stall is not None
@@ -311,8 +305,7 @@ class DiarizationLabeler(FrameProcessor):
                         self._hw_at_last_stall = hw
                 else:
                     self._reset_stall()
-                await self._push_labelled(head)
-                self._in_flight = None
+                await self._pop_and_push()
                 if (
                     self._stall_streak >= STALL_CONSECUTIVE_TIMEOUTS
                     and not self._timeline.is_degraded
@@ -342,22 +335,9 @@ class DiarizationLabeler(FrameProcessor):
         )
         assert self._release_lock is not None
         async with self._release_lock:
-            entries: list[_Pending] = []
-            if self._in_flight is not None:
-                entries.append(self._in_flight)
-                self._in_flight = None
-            entries.extend(self._pending)
-            self._pending.clear()
-            for entry in entries:
-                _strip_labels(entry.frame)
-                try:
-                    await self.push_frame(entry.frame, entry.direction)
-                except Exception as push_exc:
-                    logger.error(
-                        "DiarizationLabeler: dropped a transcript during "
-                        f"fail-open ({type(push_exc).__name__}: "
-                        f"{safe_exc_text(push_exc)})"
-                    )
+            await self._deliver_held(
+                self._take_held(), labelled=False, context="fail-open"
+            )
 
     # ----------------------------------------------------------------- release
 
@@ -374,14 +354,63 @@ class DiarizationLabeler(FrameProcessor):
                 entry.frame.onoats_overlap = bool(label.overlap)
         await self.push_frame(entry.frame, entry.direction)
 
+    async def _push_entry(self, entry: _Pending, *, labelled: bool) -> None:
+        """Push labelled (current coverage) or exactly as-is. Lock held."""
+        if labelled:
+            await self._push_labelled(entry)
+        else:
+            await self.push_frame(entry.frame, entry.direction)
+
+    async def _pop_and_push(self, *, labelled: bool = True) -> None:
+        """Pop the head of ``_pending`` and push it. Lock held.
+
+        The one way a single frame leaves ``_pending``: it sits in
+        ``_in_flight`` across the push (left set if the push is cancelled or
+        raises), so ``_take_held`` hands it to ``_release_on_cleanup`` /
+        ``_fail_open`` instead of losing it.
+        """
+        entry = self._in_flight = self._pending.popleft()
+        await self._push_entry(entry, labelled=labelled)
+        self._in_flight = None
+
+    async def _drain_all(self) -> None:
+        """Release every pending frame, FIFO, labelled. Lock held."""
+        while self._pending:
+            await self._pop_and_push()
+
+    def _take_held(self) -> list[_Pending]:
+        """Take the in-flight frame, then every pending one (FIFO). Lock held."""
+        entries: list[_Pending] = []
+        if self._in_flight is not None:
+            entries.append(self._in_flight)
+            self._in_flight = None
+        entries.extend(self._pending)
+        self._pending.clear()
+        return entries
+
+    async def _deliver_held(
+        self, entries: list[_Pending], *, labelled: bool, context: str
+    ) -> None:
+        """Push each taken frame once; log, never raise, a push failure.
+
+        Unlabelled delivery strips any label attributes first. Lock held.
+        """
+        for entry in entries:
+            if not labelled:
+                _strip_labels(entry.frame)
+            try:
+                await self._push_entry(entry, labelled=labelled)
+            except Exception as exc:
+                logger.error(
+                    "DiarizationLabeler: dropped a transcript during "
+                    f"{context} ({type(exc).__name__}: {safe_exc_text(exc)})"
+                )
+
     async def _release_all(self) -> None:
         if self._release_lock is None:
             return
         async with self._release_lock:
-            while self._pending:
-                self._in_flight = self._pending.popleft()
-                await self._push_labelled(self._in_flight)
-                self._in_flight = None
+            await self._drain_all()
 
     async def _release_on_cleanup(self) -> None:
         """Teardown without EndFrame/CancelFrame: never lose a transcript.
@@ -395,25 +424,13 @@ class DiarizationLabeler(FrameProcessor):
         if self._release_lock is None:
             return
         async with self._release_lock:
-            entries: list[_Pending] = []
-            if self._in_flight is not None:
-                entries.append(self._in_flight)
-                self._in_flight = None
-            entries.extend(self._pending)
-            self._pending.clear()
+            entries = self._take_held()
             if entries:
                 logger.debug(
                     f"DiarizationLabeler: releasing {len(entries)} held "
                     "transcript(s) at cleanup (no EndFrame/CancelFrame)"
                 )
-            for entry in entries:
-                try:
-                    await self._push_labelled(entry)
-                except Exception as exc:
-                    logger.error(
-                        "DiarizationLabeler: dropped a transcript during "
-                        f"cleanup ({type(exc).__name__}: {safe_exc_text(exc)})"
-                    )
+            await self._deliver_held(entries, labelled=True, context="cleanup")
 
     async def _on_end(self) -> None:
         """Graceful shutdown: wait <= hold_sec for the final flush, then drain."""
