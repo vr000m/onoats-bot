@@ -54,9 +54,6 @@ from onoats.stt.diarization_timeline import (
     SampleCounter,
 )
 
-#: Alias of the single owner (``diarization_model.REPO_ID``).
-DIARIZATION_MODEL_ID = diarization_model.REPO_ID
-
 STREAMING_PRESET = "low"
 
 #: Processing time must stay under ``BUDGET_RATIO`` x audio duration, measured

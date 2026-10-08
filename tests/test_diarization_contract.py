@@ -25,6 +25,7 @@ import types
 import pytest
 
 from onoats.processors import diarization_feeder
+from onoats.stt import diarization_model
 
 REQUIRE_ENV = "ONOATS_REQUIRE_DIARIZATION_CONTRACT"
 MODEL_ID = "mlx-community/Nemotron-3-Diarization"
@@ -77,7 +78,7 @@ def test_production_loader_uses_pinned_symbols_and_kwargs(monkeypatch, tmp_path)
 
     monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", fake_probe)
 
-    assert diarization_feeder.DIARIZATION_MODEL_ID == MODEL_ID
+    assert diarization_model.REPO_ID == MODEL_ID
     assert diarization_feeder.load_mlx_diarizer() is sentinel
     # Every weight file is verified (same check as the startup preflight).
     assert probed == [(MODEL_ID, "config.json"), (MODEL_ID, "model.safetensors")]

@@ -218,7 +218,7 @@ def test_pipeline_rate_matches_model_rate():
 def test_preflight_and_loader_share_one_model_owner():
     """The startup preflight must probe exactly what the worker's loader needs.
 
-    Both sides alias the single owner, ``onoats.stt.diarization_model`` (a
+    Both sides use the single owner, ``onoats.stt.diarization_model`` (a
     leaf, so ``runtime`` need not import the feeder and its pipecat/numpy
     graph): same repo-id object, same cache probe.
     """
@@ -226,7 +226,7 @@ def test_preflight_and_loader_share_one_model_owner():
     from onoats.stt import diarization_model as dm
 
     assert runtime.DIARIZATION_REPO_ID is dm.REPO_ID
-    assert df.DIARIZATION_MODEL_ID is dm.REPO_ID
+    assert not hasattr(df, "DIARIZATION_MODEL_ID")  # no second name to drift
     assert runtime._diarization_weights_cached is dm.weights_cached
     assert df.diarization_model is dm
     assert not hasattr(df, "_cached_snapshot_dir")
