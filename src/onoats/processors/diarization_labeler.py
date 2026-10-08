@@ -30,8 +30,9 @@ the labeler starting) are expected and never count: a cold load is not a hung
 ``feed()``. Several frames expiring within one
 window count once (a no-progress expiry counts only if it lands >= ``hold_sec``
 after the previously counted one), and every coverage-driven release - in-line
-or from the task - resets the streak, so only back-to-back stalled windows
-degrade.
+or from the task - resets the streak, as does coverage that advanced since the
+last counted expiry with no held frame observing it, so only back-to-back
+stalled windows degrade.
 
 Fail-open: an unexpected exception in the release task logs one ERROR,
 delivers the in-flight frame and every pending frame unlabelled (FIFO, never
@@ -108,6 +109,8 @@ class DiarizationLabeler(FrameProcessor):
         self._stall_streak = 0
         #: Clock time of the last expiry counted toward ``_stall_streak``.
         self._last_stall_at: float | None = None
+        #: ``coverage_high_water()`` at the last counted expiry.
+        self._hw_at_last_stall: int | None = None
         #: Clock time of the first ``_ensure_started`` (model-load grace anchor).
         self._started_at: float | None = None
         #: Frame popped by the release task but not yet successfully pushed.
@@ -263,6 +266,7 @@ class DiarizationLabeler(FrameProcessor):
     def _reset_stall(self) -> None:
         self._stall_streak = 0
         self._last_stall_at = None
+        self._hw_at_last_stall = None
 
     async def _drain_ready(self) -> None:
         """Release head-first while the head is covered or past its deadline."""
@@ -291,12 +295,20 @@ class DiarizationLabeler(FrameProcessor):
                 # several frames expiring in one slow window count once.
                 self._in_flight = self._pending.popleft()
                 if hw <= head.hw_at_park:
+                    if (
+                        self._hw_at_last_stall is not None
+                        and hw > self._hw_at_last_stall
+                    ):
+                        # Coverage advanced since the last counted stall with
+                        # no held frame observing it: not back-to-back.
+                        self._reset_stall()
                     if not self._model_loading(now) and (
                         self._last_stall_at is None
                         or now - self._last_stall_at >= self._hold_sec
                     ):
                         self._stall_streak += 1
                         self._last_stall_at = now
+                        self._hw_at_last_stall = hw
                 else:
                     self._reset_stall()
                 await self._push_labelled(head)

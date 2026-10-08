@@ -901,3 +901,40 @@ def test_cleanup_after_endframe_does_not_repush(monkeypatch):
         assert h.texts() == ["a", "EndFrame"]
 
     run(go())
+
+
+def test_stall_then_unobserved_coverage_advance_then_stall_does_not_degrade(
+    monkeypatch, warnings_seen
+):
+    """F2: stall, coverage advances with no frame held, stall -> not degraded.
+
+    Coverage advancing between two counted stalls proves the worker produced in
+    between, even if no held frame observed it: the stalls are not back-to-back.
+    """
+    tl = make_timeline()
+    h, clock = make(monkeypatch, tl)
+    never = 10**9
+
+    async def go():
+        await h.start()
+        first = tframe("first", 0, never)
+        await h.send(first)
+        clock.advance(HOLD + 0.01)
+        await h.settle()
+        assert h.out == [first]  # no progress -> streak 1
+
+        # Them-silence: the worker keeps up, nothing is held to observe it.
+        tl.record(0, rows(20, 0))
+        await h.settle(0.05)
+        clock.advance(100 * HOLD)
+
+        lone = tframe("lone", 0, never)  # one transient no-progress expiry
+        await h.send(lone)
+        clock.advance(HOLD + 0.01)
+        await h.settle()
+        assert h.out[-1] is lone
+        assert not tl.is_degraded
+        await h.close()
+
+    run(go())
+    assert warnings_seen == []
