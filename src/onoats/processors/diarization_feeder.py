@@ -8,12 +8,13 @@ path. It counts 16 kHz PCM16 samples
 with the shared :class:`SampleCounter` (the same clock ``WebSocketSTTService``
 counts independently) and enqueues ``(start_sample, pcm_bytes)`` onto a bounded
 drop-oldest queue. A drop is simply a missing ``start_sample`` range; the
-feeder never writes the timeline.
+feeder never writes timeline coverage (its only timeline call is the
+idempotent ``mark_degraded`` when the worker fails to start or to join).
 
 ``DiarizerWorker`` owns **one daemon thread** that performs the model load
 (``diarizer_factory()``), ``set_streaming_config("low")`` before the first
 ``feed()``, ``timeline.set_slot_count(model.config.num_speakers)``, every
-``feed()``, the final flush, and every timeline write. ``mlx_audio`` is only
+``feed()``, the final flush, and every timeline coverage write. ``mlx_audio`` is only
 imported inside :func:`load_mlx_diarizer` (the production factory), never at
 module top level.
 

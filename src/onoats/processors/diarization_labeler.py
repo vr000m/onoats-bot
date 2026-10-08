@@ -374,9 +374,11 @@ class DiarizationLabeler(FrameProcessor):
         return self._in_flight is not None or bool(self._pending)
 
     async def _push_next(self) -> None:
-        """Push the oldest held frame, labelled. Lock held; ``_has_held()``.
+        """``_push_labelled`` the oldest held frame. Lock held; ``_has_held()``.
 
-        The one way a frame leaves the held state. The oldest held frame is
+        The one way a held frame is delivered (the only other exit from the
+        held state is ``_deliver_held`` dropping a frame whose push raised).
+        The oldest held frame is
         ``_in_flight`` when an earlier push of it raised, else the head of
         ``_pending``, which moves into ``_in_flight`` before the push. It is
         cleared only once the push returns, so a push that is cancelled or

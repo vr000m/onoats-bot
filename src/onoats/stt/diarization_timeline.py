@@ -16,10 +16,12 @@ It is the **single owner** of:
 * **:class:`DiarizationTimeline`** - a session-scoped, thread-safe,
   ring-bounded record of per-frame speaker probabilities. The **worker is
   the sole coverage writer** (``record``, ``record_gap``, ``set_slot_count``,
-  ``mark_flushed``, ``mark_degraded``); the event loop only reads
-  (``label_for``, ``coverage_high_water``, ``is_ready``, ``is_degraded``,
-  ``is_flushed``, ``add_progress_listener``). ``mark_degraded`` is the one idempotent flag
-  either side may set (the loop only from the labeler's stall guard).
+  ``mark_flushed``); the event loop otherwise only reads (``label_for``,
+  ``coverage_high_water``, ``is_ready``, ``is_degraded``, ``is_flushed``,
+  ``add_progress_listener``). ``mark_degraded`` is the one idempotent,
+  thread-safe flag either thread may set: the worker on its own failures, the
+  loop from the labeler (stall guard, release-task fail-open) and the feeder
+  (worker start failure, worker join timeout).
 * **The label policy** (:meth:`DiarizationTimeline.label_for`) and its named
   constants.
 
@@ -57,9 +59,9 @@ OVERLAP_MIN_FRACTION = 0.2
 #: Minimum fraction of the window that must be recorded (not GAP/evicted/pending).
 MIN_COVERAGE_FRACTION = 0.5
 #: Max time the labeler holds a TranscriptionFrame waiting for coverage.
-HOLD_SEC = (
-    1.5  # `low` preset lag (~1.04 s) + margin; LATENCY_BUDGET_SEC (2.0) = this + margin
-)
+#: `low` preset lag (~1.04 s) + margin. The dev plan's ``LATENCY_BUDGET_SEC``
+#: (2.0 s) is this + margin - a plan acceptance threshold, not a code constant.
+HOLD_SEC = 1.5
 #: Queue / segment-serialisation slack added to the ring capacity.
 RING_HEADROOM_SEC = 10.0
 #: How long after the labeler starts the worker may still be loading the model
