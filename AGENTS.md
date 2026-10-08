@@ -419,3 +419,14 @@ should NOT re-flag go here, one per line:
   without them. Deliberate (owner decision): the cache is never a hard-fail and
   nothing in the test downloads; cache the weights on the release machine
   (`hf download mlx-community/Nemotron-3-Diarization`). (2026-10-08)
+- **[Logic] won't-fix**: `DiarizationLabeler._fail_open` re-pushing the
+  in-flight frame after a raising `push_frame` could in theory duplicate a
+  transcript. pipecat's `push_frame` only enqueues into the next processor's
+  queue (`__internal_push_frame` -> `self._next.queue_frame`), so downstream side
+  effects cannot raise back into the pusher; plan Req 4 deliberately prefers
+  at-least-once over losing a transcript. (2026-10-08)
+- **[Architecture] won't-fix**: module-level memos
+  `runtime._diarization_preflight_done` and `config._warned_diarization_values`
+  are deliberate process-wide dedupe (socket mode preflights twice: supervisor,
+  then `run_onoats_dual`; one warning per bad value across several
+  `OnoatsConfig` instances). Tests reset them explicitly. (2026-10-08)
