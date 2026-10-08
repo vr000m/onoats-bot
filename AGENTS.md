@@ -401,3 +401,21 @@ should NOT re-flag go here, one per line:
   which is the supported edit path, and `ConfigStore` round-trips arbitrary
   keys without code changes. A GUI picker would be a separate feature.
   (2026-06-12)
+- **[Logic] won't-fix**: a continuation flush (SIGUSR1 / Ctrl+T) does not drain
+  `DiarizationLabeler`'s held frames (<= `HOLD_SEC`), so a parked `them` line can
+  land in the next session file. In-flight STT transcripts already cross a
+  continuation flush the same way (decode latency exceeds the hold), each entry
+  keeps its own `frame.timestamp`, and the plan accepts cross-arm arrival-order
+  skew; coupling `_rotate_flush` to the labeler is not worth the plumbing.
+  (2026-10-08)
+- **[Logic] won't-fix**: `WebSocketSTTService._detach_client` clears
+  `_pending_span` — dead/harmful-looking (a detach between VAD-stop capture and
+  `run_stt`'s first line drops a valid stamp), but the plan's Req 3 specifies the
+  clear on reconnect/discard and the failure mode is fail-safe: one ERROR and an
+  unstamped (unlabelled) line, never a wrong label. (2026-10-08)
+- **[Testing] won't-fix**: `tests/test_diarization_contract.py` skips its
+  weights-dependent checks when the model is not in the HF cache, even under
+  `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`, so `release_check.sh` can report ok
+  without them. Deliberate (owner decision): the cache is never a hard-fail and
+  nothing in the test downloads; cache the weights on the release machine
+  (`hf download mlx-community/Nemotron-3-Diarization`). (2026-10-08)
