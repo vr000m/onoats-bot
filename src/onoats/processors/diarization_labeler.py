@@ -18,8 +18,8 @@ coverage available then), and only then is forwarded. ``CancelFrame`` releases
 immediately without waiting. A teardown with neither (``cleanup()`` after a
 pipeline exception) stops the release task, then releases the in-flight frame
 and every pending frame the same way, FIFO, logging (never raising) a push
-failure. Once ``timeline.is_degraded`` frames are forwarded with no hold and no
-attributes.
+failure. Once ``timeline.is_degraded``, the labeler forwards transcriptions
+immediately with no hold and no attributes.
 
 Stall guard: a hung ``feed()`` never trips the worker's own degrade triggers,
 so the labeler counts consecutive ``hold_sec`` **windows** whose expiries saw
