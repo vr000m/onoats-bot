@@ -832,3 +832,62 @@ def test_rerun_notes_a_non_string_launchd_label(
     assert "malformed [stt].launchd_label" in out, out
     cfg = _load_toml(config_toml_path())
     assert "launchd_label" not in cfg["stt"]
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [("true", True), ("false", False), ('"yes"', True), ('"off"', False)],
+)
+def test_rerun_preserves_diarization(_isolate_env, monkeypatch, written, expected):
+    """A hand-set `[stt].diarization` (TOML bool or the truthy/falsy string
+    vocabulary `OnoatsConfig.diarization` accepts) survives an `onoats init`
+    re-run, rendered back as a TOML bool. The renderer used to rebuild `[stt]`
+    from the prompted keys only, silently turning diarization back off."""
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import OnoatsConfig, config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace("[stt]\n", f"[stt]\ndiarization = {written}\n")
+    )
+
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["stt"]["diarization"] is expected
+    # Round-trips through the runtime reader to the same value.
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    assert OnoatsConfig(raw=cfg).diarization is expected
+
+
+def test_rerun_drops_an_unrecognised_diarization_with_note(
+    _isolate_env, monkeypatch, capsys
+):
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace("[stt]\n", '[stt]\ndiarization = "maybe"\n')
+    )
+
+    _force_tty(monkeypatch, value=False)
+    capsys.readouterr()
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert "diarization" not in cfg["stt"]
+    out = capsys.readouterr().out
+    assert "[stt].diarization" in out and "'maybe'" in out
+
+
+def test_rerun_without_diarization_does_not_add_it(_isolate_env, monkeypatch):
+    assert init_mod.main(["--no-preflight"]) == 0
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+    from onoats.config import config_toml_path
+
+    assert "diarization" not in _load_toml(config_toml_path())["stt"]
