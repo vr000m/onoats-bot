@@ -1051,8 +1051,8 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 
 - [x] Phase 0: Verify (no code lands) — 2026-10-08, see Findings
 - [x] Phase 1: Config flag + preflight
-- [ ] Phase 2: Leaf module (`diarization_timeline.py`)
-- [ ] Phase 3: Feeder + worker
+- [x] Phase 2: Leaf module (`diarization_timeline.py`)
+- [x] Phase 3: Feeder + worker
 - [ ] Phase 4: STT segment-sample stamping
 - [ ] Phase 5: Labeler
 - [ ] Phase 6: Persistence + render
@@ -1083,6 +1083,11 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Advisory `uv lock`** (throwaway copy, extra `diarization = ["mlx-audio==0.5.8"]`): adds `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6`. **`mlx` stays 0.31.2** (no bump). Not yet verified: that mlx-audio 0.5.8 runs against mlx 0.31.2 (Phase 0 ran on mlx 0.32.3); Phase 8's committed lock + Phase 8b must confirm. Repo `pyproject.toml`/`uv.lock` untouched (`git status` clean).
 - **Scratch speed** (300 s clip, 100 ms chunks, bare thread, no asyncio loop): 8.7 s wall = RTF 0.029 (consistent with retained RTF 0.026-0.038). Not an acceptance number; Phase 8b measures with the real pipeline.
 - **Slot behaviour on the retained 0-300 s clip** (3 real speakers, `low` preset, threshold 0.5): slots activate in first-speech order (slot 0 at 3.5 s = narration, slot 1 at 17.3 s, slot 2 at 26.2 s), only 3 of 8 ever active, so first-activity -> `S1..S3` mapping works. **But slot stability is imperfect:** `guest` frames split between slot 1 (5911) and slot 2 (7292), and slot 2 is also `varun`'s (16948). So ~55% of one speaker's active frames land in another speaker's slot (overlap or a real identity swap; not disambiguated here). A 0-300 s, 3-speaker clip is **not sufficient** to bound this; the 20-60 min multi-speaker run at Phase 8b is required, and the dominant-slot-wins label policy should be expected to mislabel such stretches. Surface in the final docs as a known accuracy limit, not a blocker.
+
+### Conduct notes (workspace; not contract)
+
+- **Phase 3 advisory review (opus)**: (1) fixed — GAP re-anchor must be applied per output row by model-input offset (breakpoints), not to the whole batch, because the `low` preset's ~1 s lookahead emits pre-gap rows after the gap; the plan's literal "anchor + frame_index*160" is only correct with piecewise anchors. Exact for chunks that are multiples of 160 samples (off-multiple chunks round up to the next row boundary: sub-frame skew, untested). (2) fixed — the overrun budget is evaluated per 1 s accumulation window (`BUDGET_WINDOW_SEC`), not per `feed()` call. (3) open/low — the feeder calls the idempotent `timeline.mark_degraded` loop-side (join timeout / start failure), which Req 1's API table reserves for the labeler stall guard; harmless, revisit when the plan is next re-reviewed.
+- **Phase 2**: `HOLD_SEC` set to 1.5 (`low` preset lag 1.04 s + margin) so the 2.0 s `LATENCY_BUDGET_SEC` default stays HOLD_SEC + margin.
 
 ### Review Waivers
 
