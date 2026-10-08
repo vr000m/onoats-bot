@@ -1056,7 +1056,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [x] Phase 4: STT segment-sample stamping
 - [x] Phase 5: Labeler
 - [x] Phase 6: Persistence + render
-- [ ] Phase 7: Wiring
+- [x] Phase 7: Wiring
 - [ ] Phase 8: Dependency + contract
 - [ ] Phase 8b: Real-pipeline validation gate
 - [ ] Phase 9: Integration + smoke
@@ -1090,6 +1090,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 2**: `HOLD_SEC` set to 1.5 (`low` preset lag 1.04 s + margin) so the 2.0 s `LATENCY_BUDGET_SEC` default stays HOLD_SEC + margin.
 - **Phase 4 advisory review (opus)**: fixed — a second `VADUserStartedSpeakingFrame` while a span is open now logs ERROR and keeps the first start (pipecat decodes from the first). **Open, for Phase 8b/9 to measure:** VAD start/stop events fire `start_secs`/`stop_secs` (~0.2 s default) after the speech edges, so the stamp (counter value at the event) misses ~0.2 s of leading speech and includes ~0.2 s of trailing audio; subtracting `frame.start_secs*16000` / `frame.stop_secs*16000` (clamped) would tighten it but changes the Req 3 "stamp == VAD-event position" contract, so it is not applied without a measured accuracy case.
 - **Phase 5 advisory review (opus)**: all fixed with regression tests — the stall streak now resets on the in-line covered release too; it counts distinct `hold_sec` windows (not expired frames), so one hiccup with two parked finals cannot degrade; the release task fails open (one ERROR, degrade, deliver in-flight + pending unlabelled FIFO). The stall WARNING is the timeline's single `mark_degraded` line (the labeler adds none).
+- **Phase 7 (found by the wired-pipeline matrix tests, not by Phase 5's unit tests)**: `DiarizationLabeler` stored its injectable clock as `self._clock`, which pipecat's `FrameProcessor.setup()` overwrites with a `SystemClock`, so every stamped `them` transcript raised `'SystemClock' object is not callable` in a real pipeline. Renamed to `self._now`; swept the other new processors for FrameProcessor-attribute collisions (none). Lesson for Phase 8b/9: unit tests that bypass `setup()` cannot catch framework-attribute shadowing.
 
 ### Review Waivers
 

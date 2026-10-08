@@ -84,7 +84,9 @@ class DiarizationLabeler(FrameProcessor):
         super().__init__(**kwargs)
         self._timeline = timeline
         self._hold_sec = float(hold_sec)
-        self._clock = clock
+        # NOT `_clock`: pipecat's FrameProcessor.setup() overwrites self._clock
+        # with its SystemClock object.
+        self._now = clock
         self._pending: deque[_Pending] = deque()
         self._release_lock: asyncio.Lock | None = None
         self._task: asyncio.Task | None = None
@@ -144,7 +146,7 @@ class DiarizationLabeler(FrameProcessor):
         self._ensure_started()
         hw = self._timeline.coverage_high_water()
         entry = _Pending(
-            frame, direction, int(start), int(end), self._clock() + self._hold_sec, hw
+            frame, direction, int(start), int(end), self._now() + self._hold_sec, hw
         )
         async with self._release_lock:
             if self._timeline.is_degraded:
@@ -218,7 +220,7 @@ class DiarizationLabeler(FrameProcessor):
                 return
             timeout = None
             if self._pending:
-                timeout = max(0.0, self._pending[0].deadline - self._clock())
+                timeout = max(0.0, self._pending[0].deadline - self._now())
             try:
                 await asyncio.wait_for(self._wake_event.wait(), timeout)
             except TimeoutError:
@@ -246,7 +248,7 @@ class DiarizationLabeler(FrameProcessor):
                     await self._push_labelled(head)
                     self._in_flight = None
                     continue
-                now = self._clock()
+                now = self._now()
                 if now < head.deadline:
                     return
                 # Expiry. It counts toward the stall streak only if coverage did
@@ -336,9 +338,9 @@ class DiarizationLabeler(FrameProcessor):
     async def _on_end(self) -> None:
         """Graceful shutdown: wait <= hold_sec for the final flush, then drain."""
         if self._pending and self._progress_event is not None:
-            deadline = self._clock() + self._hold_sec
+            deadline = self._now() + self._hold_sec
             while not (self._timeline.is_flushed or self._timeline.is_degraded):
-                remaining = deadline - self._clock()
+                remaining = deadline - self._now()
                 if remaining <= 0:
                     break
                 self._progress_event.clear()

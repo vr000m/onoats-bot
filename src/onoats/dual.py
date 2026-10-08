@@ -174,6 +174,8 @@ def _build_dual_pipeline(
     *,
     live_terminal: bool = False,
     call_id: str | None = None,
+    diarization: bool = False,
+    diarizer_factory=None,
 ):
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
@@ -251,7 +253,29 @@ def _build_dual_pipeline(
         )
 
     mic_arm.extend([mic_stt, SourceTagger(source="me", source_order=0)])
-    system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
+    if diarization:
+        # Them-arm only. Function-local imports keep `import onoats.dual`
+        # free of mlx_audio (the production factory imports it lazily on the
+        # worker thread). One timeline per session, shared by feeder
+        # (+ its worker) and labeler. The feeder sits IMMEDIATELY before
+        # system_stt so nothing between it and the STT can drop/re-chunk
+        # audio (shared sample-clock premise); the labeler goes after the
+        # SourceTagger.
+        from onoats.processors.diarization_feeder import DiarizationFeeder
+        from onoats.processors.diarization_labeler import DiarizationLabeler
+        from onoats.stt.diarization_timeline import DiarizationTimeline
+
+        timeline = DiarizationTimeline()
+        system_arm.extend(
+            [
+                DiarizationFeeder(timeline, diarizer_factory),
+                system_stt,
+                SourceTagger(source="them", source_order=1),
+                DiarizationLabeler(timeline),
+            ]
+        )
+    else:
+        system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
 
     processors = [
         ParallelPipeline(mic_arm, system_arm),
@@ -567,6 +591,7 @@ async def run_onoats_dual(
         silence_detector,
         live_terminal=live_terminal,
         call_id=call_id,
+        diarization=diarization_on,
     )
 
     task = PipelineTask(
