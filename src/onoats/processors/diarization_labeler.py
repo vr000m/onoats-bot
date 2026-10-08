@@ -1,0 +1,361 @@
+"""Them-channel diarization: downstream labeler (``system_arm``, after ``SourceTagger``).
+
+A stamped ``TranscriptionFrame`` (``onoats_segment_start_sample`` /
+``onoats_segment_end_sample`` set by ``WebSocketSTTService``) is parked in an
+ordered pending deque - ``process_frame`` never awaits on it, so VAD / audio
+frames behind it keep flowing. A **labeler-owned asyncio task** releases the
+deque head-first once ``timeline.coverage_high_water()`` reaches the head's
+segment end, or ``hold_sec`` (``HOLD_SEC``) has elapsed. The task is woken by
+the worker's progress listener (fires on the **worker thread**, hence
+``loop.call_soon_threadsafe``) and by the per-head deadline, so a held frame
+releases even when no further frame ever arrives.
+
+Frame-class rule: only ``TranscriptionFrame``s wait. A frame without a stamped
+range (the fail-loud case) and every other frame pass through immediately.
+``EndFrame`` waits up to ``hold_sec`` for ``timeline.is_flushed`` /
+``is_degraded``, releases every pending frame in FIFO order (labelled with the
+coverage available then), and only then is forwarded. ``CancelFrame`` releases
+immediately without waiting. Once ``timeline.is_degraded`` frames are forwarded
+with no hold and no attributes.
+
+Stall guard: a hung ``feed()`` never trips the worker's own degrade triggers,
+so the labeler counts consecutive ``hold_sec`` **windows** whose expiries saw
+no ``coverage_high_water()`` advance and, after ``STALL_CONSECUTIVE_TIMEOUTS``,
+calls ``timeline.mark_degraded("stalled")``. Several frames expiring within one
+window count once (a no-progress expiry counts only if it lands >= ``hold_sec``
+after the previously counted one), and every coverage-driven release - in-line
+or from the task - resets the streak, so only back-to-back stalled windows
+degrade.
+
+Fail-open: an unexpected exception in the release task logs one ERROR,
+delivers the in-flight frame and every pending frame unlabelled (FIFO, never
+twice), and degrades the timeline so later frames are not held.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from loguru import logger
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    Frame,
+    StartFrame,
+    TranscriptionFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+from onoats._redact import safe_exc_text
+from onoats.stt.diarization_timeline import HOLD_SEC, DiarizationTimeline
+
+#: Consecutive ``HOLD_SEC`` expiries with no ``coverage_high_water()`` progress
+#: after which the labeler declares the diarizer stalled (a Metal hang rather
+#: than an error) and degrades the timeline. A single slow window must not
+#: degrade; two in a row with zero progress means the worker is not producing.
+STALL_CONSECUTIVE_TIMEOUTS = 2
+
+
+@dataclass
+class _Pending:
+    frame: TranscriptionFrame
+    direction: FrameDirection
+    start: int
+    end: int
+    deadline: float
+    hw_at_park: int
+
+
+class DiarizationLabeler(FrameProcessor):
+    """Attach ``onoats_speakers`` (list[str]) / ``onoats_overlap`` (bool)."""
+
+    def __init__(
+        self,
+        timeline: DiarizationTimeline,
+        *,
+        hold_sec: float = HOLD_SEC,
+        clock: Callable[[], float] = time.monotonic,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._timeline = timeline
+        self._hold_sec = float(hold_sec)
+        self._clock = clock
+        self._pending: deque[_Pending] = deque()
+        self._release_lock: asyncio.Lock | None = None
+        self._task: asyncio.Task | None = None
+        self._wake_event: asyncio.Event | None = None
+        self._progress_event: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._listener_registered = False
+        self._closed = False
+        self._stall_streak = 0
+        #: Clock time of the last expiry counted toward ``_stall_streak``.
+        self._last_stall_at: float | None = None
+        #: Frame popped by the release task but not yet successfully pushed.
+        self._in_flight: _Pending | None = None
+
+    # ------------------------------------------------------------- frame entry
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartFrame):
+            self._ensure_started()
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, EndFrame):
+            await self._on_end()
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, CancelFrame):
+            await self._release_all()
+            await self._stop_task()
+            await self.push_frame(frame, direction)
+        elif (
+            isinstance(frame, TranscriptionFrame)
+            and direction == FrameDirection.DOWNSTREAM
+        ):
+            await self._on_transcription(frame, direction)
+        else:
+            await self.push_frame(frame, direction)
+
+    async def cleanup(self) -> None:
+        await super().cleanup()
+        await self._stop_task()
+
+    # ------------------------------------------------------------ transcription
+
+    async def _on_transcription(
+        self, frame: TranscriptionFrame, direction: FrameDirection
+    ) -> None:
+        start = getattr(frame, "onoats_segment_start_sample", None)
+        end = getattr(frame, "onoats_segment_end_sample", None)
+        if start is None or end is None or self._timeline.is_degraded:
+            # Unstamped (fail-loud upstream) or degraded: no hold, no attributes.
+            # Drain anything parked first so FIFO order is preserved.
+            if self._pending:
+                await self._release_all()
+            await self.push_frame(frame, direction)
+            return
+
+        self._ensure_started()
+        hw = self._timeline.coverage_high_water()
+        entry = _Pending(
+            frame, direction, int(start), int(end), self._clock() + self._hold_sec, hw
+        )
+        async with self._release_lock:
+            if self._timeline.is_degraded:
+                # Degraded while we waited for the lock (e.g. release-task
+                # fail-open): never park, forward unlabelled in line.
+                await self.push_frame(frame, direction)
+                return
+            if not self._pending and hw >= entry.end:
+                # Already covered and nothing ahead of it: release in line.
+                # Coverage-driven release => the worker is producing.
+                self._reset_stall()
+                await self._push_labelled(entry)
+                return
+            self._pending.append(entry)
+        self._wake()
+
+    # ------------------------------------------------------------------ task
+
+    def _ensure_started(self) -> None:
+        if self._closed:
+            return
+        if self._release_lock is None:
+            self._release_lock = asyncio.Lock()
+            self._wake_event = asyncio.Event()
+            self._progress_event = asyncio.Event()
+            self._loop = asyncio.get_running_loop()
+        if not self._listener_registered:
+            self._listener_registered = True
+            self._timeline.add_progress_listener(self._on_worker_progress)
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(
+                self._run(), name="diarization_labeler_release"
+            )
+
+    def _on_worker_progress(self) -> None:
+        """Progress listener: runs on the WORKER thread."""
+        loop = self._loop
+        if loop is None or self._closed:
+            return
+        try:
+            loop.call_soon_threadsafe(self._wake)
+        except RuntimeError:  # loop already closed
+            pass
+
+    def _wake(self) -> None:
+        if self._wake_event is not None:
+            self._wake_event.set()
+        if self._progress_event is not None:
+            self._progress_event.set()
+
+    async def _stop_task(self) -> None:
+        self._closed = True
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run(self) -> None:
+        assert self._wake_event is not None
+        while True:
+            self._wake_event.clear()
+            try:
+                await self._drain_ready()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._fail_open(exc)
+                return
+            timeout = None
+            if self._pending:
+                timeout = max(0.0, self._pending[0].deadline - self._clock())
+            try:
+                await asyncio.wait_for(self._wake_event.wait(), timeout)
+            except TimeoutError:
+                pass
+
+    def _reset_stall(self) -> None:
+        self._stall_streak = 0
+        self._last_stall_at = None
+
+    async def _drain_ready(self) -> None:
+        """Release head-first while the head is covered or past its deadline."""
+        assert self._release_lock is not None
+        async with self._release_lock:
+            while self._pending:
+                head = self._pending[0]
+                if self._timeline.is_degraded:
+                    self._in_flight = self._pending.popleft()
+                    await self.push_frame(head.frame, head.direction)
+                    self._in_flight = None
+                    continue
+                hw = self._timeline.coverage_high_water()
+                if hw >= head.end:
+                    self._reset_stall()
+                    self._in_flight = self._pending.popleft()
+                    await self._push_labelled(head)
+                    self._in_flight = None
+                    continue
+                now = self._clock()
+                if now < head.deadline:
+                    return
+                # Expiry. It counts toward the stall streak only if coverage did
+                # not advance at all while this frame was held AND it starts a
+                # new hold window (>= hold_sec after the last counted expiry):
+                # several frames expiring in one slow window count once.
+                self._in_flight = self._pending.popleft()
+                if hw <= head.hw_at_park:
+                    if (
+                        self._last_stall_at is None
+                        or now - self._last_stall_at >= self._hold_sec
+                    ):
+                        self._stall_streak += 1
+                        self._last_stall_at = now
+                else:
+                    self._reset_stall()
+                await self._push_labelled(head)
+                self._in_flight = None
+                if (
+                    self._stall_streak >= STALL_CONSECUTIVE_TIMEOUTS
+                    and not self._timeline.is_degraded
+                ):
+                    # mark_degraded logs the single WARNING; carry the detail in it.
+                    self._timeline.mark_degraded(
+                        reason=(
+                            "stalled: no coverage progress over "
+                            f"{self._stall_streak} consecutive hold windows"
+                        )
+                    )
+
+    async def _fail_open(self, exc: Exception) -> None:
+        """Release task hit an unexpected error: never lose a transcript.
+
+        One ERROR, degrade the timeline (so nothing is held from now on), then
+        deliver the in-flight frame (popped, not yet pushed) and every pending
+        frame unlabelled in FIFO order. Each frame is pushed at most once.
+        """
+        logger.error(
+            "DiarizationLabeler: release task failed "
+            f"({type(exc).__name__}: {safe_exc_text(exc)}); "
+            "releasing pending transcripts unlabelled and disabling labels"
+        )
+        self._timeline.mark_degraded(
+            reason=f"labeler release task failed: {type(exc).__name__}"
+        )
+        assert self._release_lock is not None
+        async with self._release_lock:
+            entries: list[_Pending] = []
+            if self._in_flight is not None:
+                entries.append(self._in_flight)
+                self._in_flight = None
+            entries.extend(self._pending)
+            self._pending.clear()
+            for entry in entries:
+                _strip_labels(entry.frame)
+                try:
+                    await self.push_frame(entry.frame, entry.direction)
+                except Exception as push_exc:
+                    logger.error(
+                        "DiarizationLabeler: dropped a transcript during "
+                        f"fail-open ({type(push_exc).__name__}: "
+                        f"{safe_exc_text(push_exc)})"
+                    )
+
+    # ----------------------------------------------------------------- release
+
+    async def _push_labelled(self, entry: _Pending) -> None:
+        """Label ``entry.frame`` with current coverage and push it. Lock held."""
+        if not self._timeline.is_degraded:
+            try:
+                label = self._timeline.label_for(entry.start, entry.end)
+            except Exception as exc:  # never lose a transcript over a label
+                logger.warning(f"DiarizationLabeler: label_for failed: {exc!r}")
+                label = None
+            if label is not None:
+                entry.frame.onoats_speakers = list(label.speakers)
+                entry.frame.onoats_overlap = bool(label.overlap)
+        await self.push_frame(entry.frame, entry.direction)
+
+    async def _release_all(self) -> None:
+        if self._release_lock is None:
+            return
+        async with self._release_lock:
+            while self._pending:
+                await self._push_labelled(self._pending.popleft())
+
+    async def _on_end(self) -> None:
+        """Graceful shutdown: wait <= hold_sec for the final flush, then drain."""
+        if self._pending and self._progress_event is not None:
+            deadline = self._clock() + self._hold_sec
+            while not (self._timeline.is_flushed or self._timeline.is_degraded):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    break
+                self._progress_event.clear()
+                if self._timeline.is_flushed or self._timeline.is_degraded:
+                    break
+                try:
+                    await asyncio.wait_for(self._progress_event.wait(), remaining)
+                except TimeoutError:
+                    break
+        await self._release_all()
+        await self._stop_task()
+
+
+def _strip_labels(frame: TranscriptionFrame) -> None:
+    """Remove any label attributes so the frame is delivered unlabelled."""
+    for attr in ("onoats_speakers", "onoats_overlap"):
+        try:
+            delattr(frame, attr)
+        except AttributeError:
+            pass

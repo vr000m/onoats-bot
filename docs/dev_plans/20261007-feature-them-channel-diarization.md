@@ -1054,7 +1054,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [x] Phase 2: Leaf module (`diarization_timeline.py`)
 - [x] Phase 3: Feeder + worker
 - [x] Phase 4: STT segment-sample stamping
-- [ ] Phase 5: Labeler
+- [x] Phase 5: Labeler
 - [ ] Phase 6: Persistence + render
 - [ ] Phase 7: Wiring
 - [ ] Phase 8: Dependency + contract
@@ -1089,6 +1089,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 3 advisory review (opus)**: (1) fixed — GAP re-anchor must be applied per output row by model-input offset (breakpoints), not to the whole batch, because the `low` preset's ~1 s lookahead emits pre-gap rows after the gap; the plan's literal "anchor + frame_index*160" is only correct with piecewise anchors. Exact for chunks that are multiples of 160 samples (off-multiple chunks round up to the next row boundary: sub-frame skew, untested). (2) fixed — the overrun budget is evaluated per 1 s accumulation window (`BUDGET_WINDOW_SEC`), not per `feed()` call. (3) open/low — the feeder calls the idempotent `timeline.mark_degraded` loop-side (join timeout / start failure), which Req 1's API table reserves for the labeler stall guard; harmless, revisit when the plan is next re-reviewed.
 - **Phase 2**: `HOLD_SEC` set to 1.5 (`low` preset lag 1.04 s + margin) so the 2.0 s `LATENCY_BUDGET_SEC` default stays HOLD_SEC + margin.
 - **Phase 4 advisory review (opus)**: fixed — a second `VADUserStartedSpeakingFrame` while a span is open now logs ERROR and keeps the first start (pipecat decodes from the first). **Open, for Phase 8b/9 to measure:** VAD start/stop events fire `start_secs`/`stop_secs` (~0.2 s default) after the speech edges, so the stamp (counter value at the event) misses ~0.2 s of leading speech and includes ~0.2 s of trailing audio; subtracting `frame.start_secs*16000` / `frame.stop_secs*16000` (clamped) would tighten it but changes the Req 3 "stamp == VAD-event position" contract, so it is not applied without a measured accuracy case.
+- **Phase 5 advisory review (opus)**: all fixed with regression tests — the stall streak now resets on the in-line covered release too; it counts distinct `hold_sec` windows (not expired frames), so one hiccup with two parked finals cannot degrade; the release task fails open (one ERROR, degrade, deliver in-flight + pending unlabelled FIFO). The stall WARNING is the timeline's single `mark_degraded` line (the labeler adds none).
 
 ### Review Waivers
 
