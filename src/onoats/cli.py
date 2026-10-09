@@ -576,7 +576,8 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # spawn (no TCC prompt / device touch for a doomed start). Import-free and
     # non-downloading; only when the flag is on. A failure raises
     # DiarizationPreflightError (an SttPreflightError → rc=1 in
-    # _run_socket_supervisor). Memoized, so run_onoats_dual's call is a no-op.
+    # _run_socket_supervisor). run_onoats_dual calls it again: the backend check
+    # re-runs, but the extra/weights probes are memoized (see its docstring).
     from onoats.config import load_config as _load_config
     from onoats.runtime import _preflight_diarization
 

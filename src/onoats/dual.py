@@ -447,8 +447,9 @@ async def run_onoats_dual(
     audio_source = cfg.audio_source
 
     # Diarization config-time gate: right after the lock, before PortAudio opens
-    # or the socket transports are built. Only when the flag is on; memoized, so
-    # the socket supervisor's earlier call makes this a no-op.
+    # or the socket transports are built. Only when the flag is on. The backend
+    # check re-runs on every call; the extra/weights probes are memoized, so the
+    # socket supervisor's earlier call spares this one those probes.
     if cfg.diarization:
         from onoats.runtime import _preflight_diarization
 
