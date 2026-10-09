@@ -407,6 +407,98 @@ def test_real_queue_overflow_drop_oldest_realigns():
     assert tl.label_for(0, CHUNK) is None  # dropped range = GAP / uncovered
 
 
+class AccumulatingDiarizer(StubDiarizer):
+    """Streams one row per 160 ACCUMULATED input samples (a chunk's remainder
+    carries into the next call, as the real model buffers it); ``final=True``
+    emits the trailing partial row. Every row is slot 0."""
+
+    def __init__(self):
+        super().__init__([])
+        self.total = 0
+
+    def feed(self, audio, state, *, sample_rate=16000, final=False, **kw):
+        self.total += len(audio)
+        emitted = state.frames_processed
+        avail = (
+            -(-self.total // dt.FRAME_SAMPLES)
+            if final
+            else self.total // dt.FRAME_SAMPLES
+        )
+        k = avail - emitted
+        probs = np.zeros((k, 8), dtype=np.float32)
+        probs[:, 0] = 0.99
+        return _Out(probs), _State(emitted + k)
+
+
+def _resolved_reach(tl):
+    """Walk the segments; fail on any unresolved hole between consecutive ones.
+
+    Returns how far the resolved prefix reaches, and pins it to the timeline's
+    own ``coverage_high_water`` (which must not be stuck behind a hole).
+    """
+    segs = sorted(tl._segments, key=lambda s: s.start)
+    reach = 0
+    for seg in segs:
+        assert seg.start <= reach, f"unresolved hole [{reach}, {seg.start})"
+        reach = max(reach, seg.end)
+    assert tl.coverage_high_water() == reach
+    return reach
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        # Two gaps inside one model row: (0,250) (300,50) (400,160) ...
+        pytest.param(
+            [(0, 250), (300, 50)] + [(400 + i * 160, 160) for i in range(20)],
+            id="250-50-then-aligned",
+        ),
+        # 256-sample chunks, every third dropped.
+        pytest.param(
+            [(i * 256, 256) for i in range(40) if i % 3 != 2],
+            id="256-every-3rd-dropped",
+        ),
+        # A drop, then a non-monotonic (backwards) tag inside the same row.
+        pytest.param(
+            [(0, 250), (300, 50), (340, 160)]
+            + [(500 + i * 160, 160) for i in range(20)],
+            id="drop-then-backwards-tag",
+        ),
+        # Control: 320-sample (frame-aligned) chunks, every third dropped.
+        pytest.param(
+            [(i * 320, 320) for i in range(40) if i % 3 != 2],
+            id="320-aligned-control",
+        ),
+    ],
+)
+def test_unaligned_chunks_with_drops_leave_no_coverage_hole(chunks):
+    """Regression: with chunks that are not 160-sample multiples, the anchor
+    shift makes the mapped row stream end up to a frame before the true
+    ``expected`` position; a GAP started at ``expected`` left the span between
+    them unresolved, freezing ``coverage_high_water`` until ring eviction."""
+    tl = RecordingTimeline()
+    _run_worker(tl, AccumulatingDiarizer(), [(s, pcm(1000, n)) for s, n in chunks])
+    assert tl.is_flushed and not tl.is_degraded
+    newest_end = chunks[-1][0] + chunks[-1][1]
+    reach = _resolved_reach(tl)
+    # The mapped tail is within one frame of the true end (sub-frame skew).
+    assert abs(reach - newest_end) < dt.FRAME_SAMPLES
+    assert tl.label_for(newest_end - 4 * dt.FRAME_SAMPLES, newest_end).speakers == [
+        "S1"
+    ]
+
+
+def test_aligned_chunk_gaps_are_exactly_the_dropped_ranges():
+    """Frame-aligned chunks: the GAPs are exactly the dropped ranges (no
+    widening) and coverage reaches the true end."""
+    kept = [i for i in range(12) if i % 3 != 2]
+    tl = RecordingTimeline()
+    _run_worker(tl, AccumulatingDiarizer(), [(i * 320, pcm(1000, 320)) for i in kept])
+    gaps = sorted((s.start, s.end) for s in tl._segments if s.probs is None)
+    assert gaps == [(i * 320, (i + 1) * 320) for i in range(12) if i % 3 == 2][:-1]
+    assert _resolved_reach(tl) == 12 * 320 - 320
+
+
 def test_contiguous_chunks_record_no_gap():
     tl = RecordingTimeline()
     _run_worker(

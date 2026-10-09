@@ -230,11 +230,26 @@ class DiarizerWorker:
         win_elapsed = 0.0
         win_samples = 0  # int: avoids float drift in the window threshold
 
-        def add_breakpoint() -> None:
-            # Align to the next row boundary; shift the anchor so that row
-            # lands exactly on the true pipeline position of input ``fed``
-            # (exact when chunks are 160-sample multiples, the 10 ms norm).
+        def reanchor(start: int) -> None:
+            # Input ``fed`` now sits at pipeline ``start``. Break at the next
+            # row boundary ``off``, shifting its anchor so that row lands
+            # exactly on ``start`` (exact when chunks are 160-sample
+            # multiples, the 10 ms norm). Rows below ``off`` keep the anchor
+            # they were fed under, so the mapped row stream ends at
+            # ``off + <that anchor>`` - for unaligned chunks up to a frame
+            # BEFORE the true ``expected``. The GAP starts at the lower of the
+            # two, so every position between the last row before the
+            # breakpoint and the first row after it is resolved by
+            # construction (no-op when nothing lies between them).
+            nonlocal anchor
+            expected = anchor + fed
             off = -(-fed // FRAME_SAMPLES) * FRAME_SAMPLES
+            gap_lo = expected
+            if off > 0:
+                k = bisect.bisect_right(bp_offsets, off - 1) - 1
+                gap_lo = min(gap_lo, off + bp_anchors[k])
+            tl.record_gap(gap_lo, start)
+            anchor += start - expected
             a = anchor - (off - fed)
             if bp_offsets[-1] == off:
                 bp_anchors[-1] = a
@@ -272,15 +287,10 @@ class DiarizerWorker:
             if item is None:
                 break
             start, pcm = item
-            expected = anchor + fed
-            if start > expected:
-                tl.record_gap(expected, start)
-                anchor += start - expected
-                add_breakpoint()
-            elif start < expected:
-                # Non-monotonic tag (should not happen): resync without a gap.
-                anchor -= expected - start
-                add_breakpoint()
+            if start != anchor + fed:
+                # A drop (start ahead) or a non-monotonic tag (should not
+                # happen; start behind) - re-anchor and resolve any hole.
+                reanchor(start)
             n = len(pcm) // BYTES_PER_SAMPLE
             if n == 0:
                 continue
