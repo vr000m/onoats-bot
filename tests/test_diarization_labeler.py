@@ -1104,3 +1104,55 @@ def test_error_in_expiry_stall_accounting_fails_open_head_once_fifo(
 
     run(go())
     assert len(errors_seen) == 1 and "stall accounting broke" in errors_seen[0]
+
+
+# ----------------------------------------------------- _stop_task cancellation
+
+
+def test_stop_task_propagates_a_cancellation_of_its_own_caller(monkeypatch):
+    """``_stop_task`` absorbs the RELEASE task's cancellation, never the
+    caller's: a pipeline cancelling ``process_frame`` / ``cleanup`` while it is
+    parked on a slow-to-die release task must still see ``CancelledError``,
+    not have teardown carry on as if nothing had cancelled it."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl)
+
+    async def scenario():
+        await h.start()
+        original = h.labeler._task
+        assert original is not None
+        original.cancel()
+        await asyncio.gather(original, return_exceptions=True)
+
+        gate = asyncio.Event()
+
+        async def slow_to_die():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await gate.wait()  # cleanup that outlives the first cancel
+                raise
+
+        h.labeler._task = asyncio.create_task(slow_to_die())
+        await asyncio.sleep(0)  # let it reach its park point
+        stopper = asyncio.create_task(h.labeler._stop_task())
+        await asyncio.sleep(0.01)  # stopper is now parked on the release task
+        stopper.cancel()
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await stopper
+
+    run(scenario())
+
+
+def test_stop_task_still_absorbs_the_release_tasks_own_cancellation(monkeypatch):
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl)
+
+    async def scenario():
+        await h.start()
+        assert h.labeler._task is not None and not h.labeler._task.done()
+        await h.labeler._stop_task()  # must not raise
+        assert h.labeler._task is None
+
+    run(scenario())

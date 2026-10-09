@@ -235,10 +235,13 @@ class DiarizationLabeler(FrameProcessor):
         task, self._task = self._task, None
         if task is not None and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            # ``gather(..., return_exceptions=True)`` absorbs the RELEASE task's
+            # own cancellation but still lets a cancellation of THIS coroutine
+            # (the pipeline cancelling ``process_frame`` / ``cleanup`` while we
+            # wait) propagate; a bare ``except CancelledError: pass`` around
+            # ``await task`` would swallow both and let teardown carry on as if
+            # it had never been cancelled (same idiom as ``_graceful_close``).
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _run(self) -> None:
         assert self._wake_event is not None
