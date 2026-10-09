@@ -490,7 +490,11 @@ def test_pipecat_hook_shape():
 
 def test_inline_run_stt_within_a_single_process_frame_call(monkeypatch):
     """Behavioural half of the shape guard: one ``process_frame(VADStop)`` call
-    completes ``run_stt`` before returning (no deferral to another task)."""
+    completes ``run_stt`` before returning (no deferral to another task).
+
+    Ordering is recorded inside the call: ``run_stt`` must start AND finish
+    before the VAD-stop ``process_frame`` returns. A pipecat that scheduled
+    ``run_stt`` on a separate task would record the return marker first."""
     svc = _svc()
     seen: list[str] = []
     real = svc.run_stt
@@ -499,13 +503,21 @@ def test_inline_run_stt_within_a_single_process_frame_call(monkeypatch):
         seen.append("run_stt")
         async for f in real(audio):
             yield f
+        seen.append("run_stt done")
 
     monkeypatch.setattr(svc, "run_stt", _spy)
 
-    # Drive via run_test on the service directly and probe ordering through
-    # the frames-after-stop observation.
+    real_process_frame = svc.process_frame
+
+    async def _wrapped(frame, direction):
+        await real_process_frame(frame, direction)
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            seen.append("process_frame(VADStop) returned")
+
+    monkeypatch.setattr(svc, "process_frame", _wrapped)
+
     out = _run(svc, _segment(pre=1, speech=1))
-    assert seen == ["run_stt"]
+    assert seen == ["run_stt", "run_stt done", "process_frame(VADStop) returned"]
     assert len(out) == 1
 
 
