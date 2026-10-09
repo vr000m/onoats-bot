@@ -102,7 +102,12 @@ def make_handler(segments, labels_path, index_html, port):
                 return self._send(200, body, "application/json")
             if url.path == "/api/clip":
                 q = parse_qs(url.query)
-                sid = int(q["id"][0])
+                try:
+                    sid = int(q["id"][0])
+                except (KeyError, IndexError, ValueError):
+                    return self._send(400, b"bad id", "text/plain")
+                if not 0 <= sid < len(segments):  # no negative-index wraparound
+                    return self._send(400, b"bad id", "text/plain")
                 s = segments[sid]
                 return self._send(200, cut_clip(s["start"], s["end"]), "audio/wav")
             self._send(404, b"not found", "text/plain")
