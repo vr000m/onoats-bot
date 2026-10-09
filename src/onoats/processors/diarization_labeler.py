@@ -10,16 +10,19 @@ the worker's progress listener (fires on the **worker thread**, hence
 ``loop.call_soon_threadsafe``) and by the per-head deadline, so a held frame
 releases even when no further frame ever arrives.
 
-Frame-class rule: only ``TranscriptionFrame``s wait. A frame without a stamped
-range (the fail-loud case) and every other frame pass through immediately.
+Frame-class rule: only ``TranscriptionFrame``s wait. Every non-transcription
+frame passes through immediately. A transcription without a stamped range (the
+fail-loud case) is forwarded without a hold, but first drains any frames still
+held, FIFO, under the release lock.
 ``EndFrame`` waits up to ``hold_sec`` for ``timeline.is_flushed`` /
-``is_degraded``, releases every pending frame in FIFO order (labelled with the
-coverage available then), and only then is forwarded. ``CancelFrame`` releases
-immediately without waiting. A teardown with neither (``cleanup()`` after a
+``is_degraded``, releases every pending frame in FIFO order (labelled per
+``_push_labelled`` with the coverage available then), and only then is
+forwarded. ``CancelFrame`` releases immediately without waiting. A teardown with neither (``cleanup()`` after a
 pipeline exception) stops the release task, then releases the in-flight frame
 and every pending frame the same way, FIFO, logging (never raising) a push
 failure. Once ``timeline.is_degraded``, the labeler forwards transcriptions
-immediately with no hold and no attributes.
+with no hold and no attributes, after first draining any still-held frames
+FIFO under the lock.
 
 Stall guard: a hung ``feed()`` never trips the worker's own degrade triggers,
 so the labeler counts consecutive ``hold_sec`` **windows** whose expiries saw
@@ -35,8 +38,10 @@ last counted expiry with no held frame observing it, so only back-to-back
 stalled windows degrade.
 
 Fail-open: an unexpected exception in the release task logs one ERROR,
-delivers the in-flight frame and every pending frame unlabelled (FIFO, never
-twice), and degrades the timeline so later frames are not held.
+delivers the in-flight frame and every pending frame unlabelled (FIFO). Each
+frame is delivered successfully at most once; a push that raised may be
+retried (by the next release or by fail-open) and is then dropped if it fails
+again. The timeline is degraded so later frames are not held.
 """
 
 from __future__ import annotations
@@ -330,9 +335,10 @@ class DiarizationLabeler(FrameProcessor):
 
         One ERROR, degrade the timeline (so nothing is held from now on), then
         deliver the in-flight frame (popped, not yet pushed) and every pending
-        frame unlabelled in FIFO order. Each frame is pushed at most once; one
-        not yet delivered when this is cancelled (``cleanup``) stays held for
-        ``_release_on_cleanup``.
+        frame unlabelled in FIFO order. Each frame is delivered successfully at
+        most once; one whose push raised is retried once here and dropped if it
+        fails again, and one not yet delivered when this is cancelled
+        (``cleanup``) stays held for ``_release_on_cleanup``.
         """
         logger.error(
             "DiarizationLabeler: release task failed "
@@ -392,7 +398,8 @@ class DiarizationLabeler(FrameProcessor):
         self._in_flight = None
 
     async def _drain_all(self) -> None:
-        """Release every held frame, FIFO, labelled. Lock held."""
+        """Release every held frame, FIFO, labelled per ``_push_labelled`` (unlabelled
+        once the timeline is degraded). Lock held."""
         while self._has_held():
             await self._push_next()
 
@@ -423,7 +430,8 @@ class DiarizationLabeler(FrameProcessor):
 
         Runs after the release task and process task are stopped. Delivers the
         in-flight frame (popped, push interrupted) and every pending frame in
-        FIFO order, labelled with the coverage available now. A push failure is
+        FIFO order, labelled per ``_push_labelled`` with the coverage available
+        now (unlabelled once degraded). A push failure is
         logged and never raised out of cleanup. After End/CancelFrame both are
         already empty, so this is a no-op on the normal paths.
         """
