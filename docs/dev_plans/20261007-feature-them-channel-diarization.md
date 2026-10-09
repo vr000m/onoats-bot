@@ -63,8 +63,10 @@ are *not* interview-grilled:
   timeline's full cross-thread API is enumerated (Req 1).
 - **Labeler hold = ordered pending deque**; only `TranscriptionFrame`s wait,
   `EndFrame`/`CancelFrame` drain it, degrade skips the hold (Req 4).
-- **Segment spans = per-instance FIFO** (*superseded in revision 4: pipecat
-  runs `run_stt` inline; see the single pending slot, Req 3*).
+- **Segment spans = per-instance FIFO** (*revision 4 replaced it with a single
+  slot for pipecat 1.3.0-1.8.x, which run `run_stt` inline; revision 5 restores
+  the FIFO so pipecat 1.9+, which queues segments onto one in-order task, works
+  too - see Req 3*).
 - **Preflight is import-free and non-downloading** (`find_spec` + local-cache
   probe), memoized (Req 9).
 - **In-pipeline measurements move out of Phase 0** into a new Phase 8b gate;
@@ -80,11 +82,11 @@ was verified against the installed library: pipecat 1.3.0
 `process_frame(VADUserStoppedSpeakingFrame)` (`stt_service.py:765-780`) — there
 is no segment queue, so revision 3's "out-of-band queue / FIFO" premise was
 wrong. Decisions:
-- **`Decision (grilled)` — single pending span slot, fail loud.** The span is
-  captured into one slot *before* delegating the VAD-stop frame to `super()`,
-  consumed at the head of `run_stt`; a second span while one is pending logs
-  an ERROR and leaves that frame unstamped (Req 3). The FIFO, the queue-size
-  guard and `is_usable` are gone.
+- **`Decision (grilled)` — single pending span slot, fail loud** (*superseded
+  in revision 5, owner-directed: pipecat 1.9+ queues segments, so the slot
+  became an ordered span queue; see Req 3*). The span is captured *before*
+  delegating the VAD-stop frame to `super()` and consumed at the head of
+  `run_stt`.
 - **Shutdown (author question, confirmed against pipecat docs and
   `dual._shutdown_watcher`)**: `EndFrame` is an *in-band* graceful-shutdown
   frame that travels the pipeline **before** it closes (the terminal transcript
@@ -183,6 +185,10 @@ marked *(recollection)*.
   `process_frame(VADUserStoppedSpeakingFrame)` (`pipecat/services/stt_service.py:765-780`),
   and `FrameProcessor` drains its input queue sequentially, so at most **one**
   span is outstanding per STT instance (there is no segment queue).
+  *From pipecat 1.9.0* the handler instead puts the segment on
+  `_segment_queue` and ONE `_segment_task_handler` task awaits `run_stt` for
+  each in turn, so several spans can be outstanding - but still in VAD-stop
+  order (revision 5; Req 3).
   `WebSocketSTTService` (`src/onoats/stt/websocket_stt_service.py`) also
   serializes its own `run_stt` calls behind an onoats-owned `_run_stt_lock`,
   which VAD segments therefore never contend.
@@ -423,29 +429,40 @@ contract is "never a hang"; precedent:
    stamps `onoats_segment_start_sample` / `onoats_segment_end_sample` on the
    `TranscriptionFrame` yielded by `run_stt`. The span **excludes**
    pipecat's pre-roll (a previous speaker's tail must not bias the label).
-   **Correlation structure** (pipecat 1.3.0 runs `run_stt` **inline** inside
-   `process_frame(VADUserStoppedSpeakingFrame)`, so at most one span is
-   outstanding): the override captures `(start_sample, end_sample)` into a
-   **single pending slot *before* delegating the VAD-stop frame to
-   `super()`** (a slot written after `super()` returns would land after
-   `run_stt` has already run and every frame would go unstamped). `run_stt`
-   consumes and clears the slot at its head and stamps the yielded
-   `TranscriptionFrame`. If a second span is captured while one is pending, or
-   `run_stt` finds the slot empty, the service logs an ERROR and that frame is
-   left unstamped (the labeler then passes it through unlabelled) — it never
-   guesses a span. The slot is cleared on `StartFrame` and on the
-   stale-segment discard / reconnect path. There is no segment queue, no
-   `is_usable` guard and no FIFO.
-   Guard: the pipecat coupling is pinned by a test against the installed
-   version that asserts the *shape* the code depends on — the private
-   attributes / method signatures used (`hasattr` / `inspect.signature`), that
-   `_handle_user_stopped_speaking` awaits `run_stt` inline (no segment-queue
-   attribute exists; VAD-stop → `run_stt` is synchronous within one
-   `process_frame` call) against a stub pipeline, and that
-   `SegmentedSTTService.process_audio_frame` has no reconnect-replay branch
-   (so a future pipecat that adds a queue or a replay fails loudly instead of
-   mis-stamping or double-counting). A bare `pipecat.__version__` assertion
-   is avoided (fails on every harmless bump).
+   **Correlation structure** (revision 5): segments reach `run_stt` in the order
+   their VAD-stops were seen - pipecat 1.3.0-1.8.x await `run_stt` **inline**
+   inside `process_frame(VADUserStoppedSpeakingFrame)`; 1.9+ put the segment on
+   `_segment_queue` and ONE task awaits `run_stt` for each in order. The
+   override therefore keeps an ordered **span queue** (`_span_queue`): it
+   appends `(start_sample, end_sample)` **before delegating the VAD-stop frame
+   to `super()`** (an entry appended after `super()` returns would land after an
+   inline `run_stt` has already run and every frame would go unstamped), and
+   `run_stt` pops the head at its start and stamps the yielded
+   `TranscriptionFrame`. A VAD stop with no recorded start appends a `None`
+   placeholder (that segment still reaches `run_stt`, unstamped, and later
+   segments stay aligned); a VAD stop on a service that is not `is_usable`
+   (pipecat 1.9+ drops that segment) appends nothing; `run_stt` finding the
+   queue empty logs an ERROR and leaves that frame unstamped (the labeler then
+   passes it through unlabelled) - it never guesses a span. The queue is
+   cleared on `StartFrame`; a reconnect / stale-segment discard leaves it
+   untouched (each entry belongs to a segment not yet at `run_stt` and is
+   popped exactly once by it, so nothing stale survives). Residual risk: an
+   exception raised by pipecat's stop handler between the append and the
+   segment being queued would strand an entry and misalign later segments;
+   not guarded.
+   Guard: `runtime._preflight_diarization` calls
+   `diarization_timeline.segmented_stt_orders_spans()`, which inspects the
+   installed pipecat's source and accepts only the two ordered shapes (inline
+   `run_stt`; a stop handler that `put`s on `_segment_queue` plus a single
+   `_segment_task_handler` that `get`s and awaits
+   `process_generator(self.run_stt(...))`), failing closed on anything else
+   (unreadable source, a concurrent per-segment task, an unknown design). The
+   coupling is also pinned by a test against the installed version that
+   asserts the private attributes / method signatures used
+   (`hasattr` / `inspect.signature`) and that
+   `SegmentedSTTService.process_audio_frame` has no reconnect-replay branch.
+   A bare `pipecat.__version__` assertion is avoided (fails on every harmless
+   bump).
 4. **`DiarizationLabeler`** (new, `src/onoats/processors/diarization_labeler.py`),
    `system_arm` only, after `SourceTagger`. On each `TranscriptionFrame` with a
    stamped range it **parks the frame in an ordered pending deque** (no
@@ -619,7 +636,8 @@ contract is "never a hang"; precedent:
   (total-distinct, `num_speakers`); their *behaviour at overflow* still
   needs a long-recording check.
 - **Pipecat private-hook coupling** (`SegmentedSTTService` buffering/VAD
-  frame ordering, inline `run_stt`) — guarded by a hook-shape test (Req 3).
+  frame ordering, segment-to-`run_stt` order) — guarded by the preflight probe
+  and a hook-shape test (Req 3).
 - **Above-marker changes from measurement.** Phase 0 / Phase 8b outcomes that
   change the contract (preset fallback, pin policy, `num_speakers`, a
   different cache-probe call) are above-marker edits: update the plan and
@@ -760,12 +778,14 @@ lock), not Phase 0.
   `WebSocketSTTService` tests) and/or a new
   `tests/test_websocket_stt_stamping.py` — stamped start/end == decoded
   segment's VAD span (pre-roll excluded) across a `StartFrame` reset, driven
-  through the real inline VAD-stop → `run_stt` path with a stubbed deferred
-  decode; second span while one is pending → ERROR logged, that frame
-  unstamped; `run_stt` with an empty slot → no stamp (no crash); slot cleared
-  on `StartFrame` / reconnect / stale discard; kwarg False → no attributes;
-  hook-shape pipecat test (attributes/signatures used, inline `run_stt`, no
-  segment-queue attribute, no replay branch in `process_audio_frame`);
+  through the real VAD-stop → `run_stt` path (inline or via pipecat's queue
+  task, whichever is installed) with a stubbed deferred decode; spans stay
+  aligned when several are outstanding before the first `run_stt`; a segment
+  dropped by an unusable service queues no span; `run_stt` with an empty queue
+  → no stamp (no crash); queue cleared on `StartFrame`, untouched by a
+  reconnect / stale discard; kwarg False → no attributes; hook-shape pipecat
+  test (attributes/signatures used, segments reach `run_stt` in order, no
+  replay branch in `process_audio_frame`);
   **clock parity**: the same frame stream through the feeder counter and
   `WebSocketSTTService`'s counter yields equal sample positions
 - `tests/test_stt_config_wiring.py` — kwarg wiring (system arm only;
@@ -1006,9 +1026,10 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
       exactly one WARNING, never a fatal `ErrorFrame`; consecutive-overrun
       threshold; hung `feed()` → labeler stall guard degrades once
 - [x] Unit: `WebSocketSTTService` stamping — VAD span (pre-roll excluded),
-      single pending slot set before `super()` (second span → ERROR, empty
-      slot → no stamp), slot reset paths, kwarg False → nothing, hook-shape
-      pipecat test (inline `run_stt`), feeder↔STT clock parity
+      ordered span queue appended before `super()` (aligned when several spans
+      are outstanding, unusable service → no span, empty queue → no stamp),
+      StartFrame reset / reconnect leaves it alone, kwarg False → nothing,
+      hook-shape pipecat test (ordered segment delivery), feeder↔STT clock parity
 - [x] Unit: labeler — hold/coverage/`HOLD_SEC` timeout, release with no
       further traffic, evicted and N-chunks-behind cases, VAD passthrough
       during hold, FIFO release order, unstamped passthrough, `EndFrame`
@@ -1064,7 +1085,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 5ad69279e1bbac753ad2bc82db6717d8ced3d003 -->
+<!-- reviewed: 2026-10-09 @ 7f59c8cb4d70739a628d2047d786d90298969541 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1116,7 +1137,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 
 - **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amended the Req 4 stall-guard text above the marker (done in the later administrative marker refresh recorded below). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; the preflight and the loader share one repo id (initially pinned by a parity test between two literals; since round 2 both read `diarization_model.REPO_ID`, a single owner, and the alias is gone).
 - **Gauntlet round 5 (2026-10-08)**: `label_for` margin guard now keys on "top slot is not a candidate" (was "no candidates"), per owner decision; the above-marker label policy gained one sentence (administrative marker refresh). Codex's adversarial gate was unavailable (usage limit) in the final confirming pass; owner chose to close on the other gates.
-- **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; `_pending_span` clear in `_detach_client` (plan-specified, fail-safe); contract-test weights skip under `REQUIRE`.
+- **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; contract-test weights skip under `REQUIRE`.
 - **Still open (Phase 8b/9)**: VAD-span edge offset (see Phase 4 note). Facts for the decision: the STT decodes pipecat's `_audio_buffer` (<= 1 s pre-roll + everything to the VAD-stop event), the server returns no timestamps onoats consumes, and `VADUserStartedSpeakingFrame.start_secs` / `VADUserStoppedSpeakingFrame.stop_secs` carry the confirmation delays.
 
 - **Marker refreshed administratively (2026-10-08, owner-approved during the first review-gauntlet round)**: the above-marker text was amended to match shipped, advisory-reviewed behaviour — `Status` now In Progress; the worker's anchor mapping is stated as piecewise (per-row breakpoints, Phase 3 advisory review item 1); the Req 4 stall guard carries the model-load grace and the coverage-advance streak reset. No requirement was added or relaxed; the hash was recomputed per the AGENTS.md recipe rather than via `/review-plan`.
@@ -1124,7 +1145,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 
 - **release_check.sh check 5 guard (gauntlet round 1)**: beyond "working-tree dependent" (Files to Modify, above the marker), the shipped check now *fails* unless `HEAD` equals the resolved commit and the tree is clean, so it can never validate a different checkout than checks 1-4 inspected; checks 1-4 are unchanged.
 
-- **code-review xhigh (2026-10-09)**: (1) fixed — the plan's pipecat premise ("`run_stt` runs inline on VAD-stop") holds for 1.3.0-1.8.x only; 1.9.0 introduced `SegmentedSTTService._segment_queue`/`_segment_task_handler` (verified from the PyPI wheels of 1.4/1.6/1.8 vs 1.9/1.10/1.12) and the declared range `>=1.3.0,<2.0.0` admits them, where the single-slot `_pending_span` can stamp a segment with another segment's span (a wrong label, not a missing one). `tests/test_websocket_stt_stamping.py` pins the shape only on the locked version, so the startup preflight now also calls `diarization_timeline.segmented_stt_runs_inline()` and exits non-zero on a non-inline pipecat. Tightening the `pyproject.toml` cap to `<1.9` was deliberately not done (it would constrain non-diarization users). (2) fixed — `DiarizationLabeler._stop_task` swallowed a cancellation of its own caller; now `gather(..., return_exceptions=True)`. (3) fixed — the worker refuses a model with `output_subsampling_factor != 1` (the weights are not revision-pinned and the contract test skips on a cold cache).
+- **code-review xhigh (2026-10-09)**: (1) fixed — the plan's pipecat premise ("`run_stt` runs inline on VAD-stop") holds for 1.3.0-1.8.x only; 1.9.0 introduced `SegmentedSTTService._segment_queue`/`_segment_task_handler` (verified from the PyPI wheels of 1.4/1.6/1.8 vs 1.9/1.10/1.12) and the declared range `>=1.3.0,<2.0.0` admits them, where the single-slot `_pending_span` can stamp a segment with another segment's span (a wrong label, not a missing one). `tests/test_websocket_stt_stamping.py` pins the shape only on the locked version, so the startup preflight now also calls `diarization_timeline.segmented_stt_runs_inline()` and exits non-zero on a non-inline pipecat. Tightening the `pyproject.toml` cap to `<1.9` was deliberately not done (it would constrain non-diarization users). (2) fixed — `DiarizationLabeler._stop_task` swallowed a cancellation of its own caller; now `gather(..., return_exceptions=True)`. (3) fixed — the worker refuses a model with `output_subsampling_factor != 1` (the weights are not revision-pinned and the contract test skips on a cold cache). **Superseded by revision 5 (owner-directed, 2026-10-09)**: item (1)'s refusal was replaced by support - the STT's single slot became an ordered span queue (Req 3), so pipecat 1.9+ works; the preflight probe is now `segmented_stt_orders_spans()` (accepts inline `run_stt` or one in-order queue task, fails closed otherwise). Verified by running the stamping, timeline, feeder, labeler, preflight, reconnect and dual-source tests under pipecat 1.9.0, 1.11.0 and 1.12.0 (1.3.0 is the locked version). The `_detach_client` span clear (and its Review Checklist entry) was dropped: each queued span is popped once by its own `run_stt`, so a reconnect leaves nothing stale.
 
 ### Review Waivers
 

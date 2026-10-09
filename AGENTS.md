@@ -324,11 +324,13 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
 - **One flag, two consumers.** `dual` derives a single `diarization_on` bool
   and passes it to both `stamp_segment_samples` (STT) and `diarization` (the
   pipeline builder), so stamping and the labeler can't disagree. The STT's
-  `_pending_span` is a single slot written **before** delegating VAD-stop to
-  `super()` (pipecat 1.3.0-1.8.x run `run_stt` inline; **1.9+ queues segments onto
-  a separate task**, which would let a span be matched to the wrong segment, so
-  `runtime._preflight_diarization` refuses it via
-  `diarization_timeline.segmented_stt_runs_inline`); the feeder and the STT
+  `_span_queue` is an ordered queue with one entry per VAD-stop, appended
+  **before** delegating VAD-stop to `super()` and popped at the head of
+  `run_stt` (pipecat 1.3.0-1.8.x run `run_stt` inline; 1.9+ queue segments and
+  ONE task awaits `run_stt` for each in order - either way segments reach
+  `run_stt` in VAD-stop order; `runtime._preflight_diarization` refuses any
+  pipecat for which `diarization_timeline.segmented_stt_orders_spans` cannot
+  see one of those two shapes); the feeder and the STT
   each count samples with `SampleCounter`, and the feeder's `start_sample` is
   the worker's position authority. Pinned by
   `tests/test_websocket_stt_stamping.py`.
@@ -494,11 +496,6 @@ should NOT re-flag go here, one per line:
   keeps its own `frame.timestamp`, and the plan accepts cross-arm arrival-order
   skew; coupling `_rotate_flush` to the labeler is not worth the plumbing.
   (2026-10-08)
-- **[Logic] won't-fix**: `WebSocketSTTService._detach_client` clears
-  `_pending_span` — dead/harmful-looking (a detach between VAD-stop capture and
-  `run_stt`'s first line drops a valid stamp), but the plan's Req 3 specifies the
-  clear on reconnect/discard and the failure mode is fail-safe: one ERROR and an
-  unstamped (unlabelled) line, never a wrong label. (2026-10-08)
 - **[Testing] won't-fix**: `tests/test_diarization_contract.py` skips its
   weights-dependent checks when the model is not in the HF cache, even under
   `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`, so `release_check.sh` can report ok
