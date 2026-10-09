@@ -314,6 +314,11 @@ its scope; this list is a pointer, not the contract itself.
   for `runtime`'s startup preflight, `cached_snapshot_dir()` for the
   feeder's loader), so both check the same files; `huggingface_hub` is
   imported lazily inside the functions.
+- `src/onoats/stt/diarization_timeline.py` — the them-channel diarization
+  correlation clock (`SampleCounter`), the thread-safe coverage ring
+  (`DiarizationTimeline`; the worker is its sole coverage writer) and the
+  label policy (`label_for`), shared by the feeder/worker and the STT
+  service without either importing the other.
 - `src/onoats/_closing.py` — bounded, best-effort teardown of a
   `TranscriptionClient` (timeout + deadline cap + cancellation safety), so
   a hung server's closing handshake can never block a caller forever, plus
@@ -435,3 +440,13 @@ should NOT re-flag go here, one per line:
   are deliberate process-wide dedupe (socket mode preflights twice: supervisor,
   then `run_onoats_dual`; one warning per bad value across several
   `OnoatsConfig` instances). Tests reset them explicitly. (2026-10-08)
+- **[Logic] won't-fix**: `DiarizationLabeler` assumes pipecat's `push_frame`
+  neither suspends nor raises (it only enqueues into the next processor's
+  queue). Reports that a transcript is lost when a push is blocked or raising
+  while a CancelFrame/EndFrame, a pass-through drain or the already-covered
+  fast path is in progress (e.g. the CancelFrame-cancelled process task
+  dropping the frame it is pushing, or a terminal frame skipped because
+  `_drain_all` raised) only reproduce with a test-only blocking/raising push;
+  hardening them would restructure the held-frame bookkeeping for a path the
+  framework does not take. Complements the `_fail_open` re-push entry above.
+  (2026-10-09)
