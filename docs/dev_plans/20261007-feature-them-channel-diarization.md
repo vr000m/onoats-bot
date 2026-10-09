@@ -379,7 +379,9 @@ contract is "never a hang"; precedent:
      recorded, or part GAP) → label if covered fraction ≥
      `MIN_COVERAGE_FRACTION`, else `None`. Averaging is
      **activity-weighted** (frames where no speaker is active contribute
-     nothing).
+     nothing). When the top-scored slot is not the sole
+     `OVERLAP_MIN_FRACTION` candidate (no candidate, or a lower-scored one), it
+     must lead the runner-up by `DOMINANT_MARGIN` or the window is `None`.
    - **Slot → label mapping**: model slot indices map to `S{n}` in the
      order each slot **first crosses `ACTIVITY_THRESHOLD`** in the session
      (a session where slot 3 speaks first labels it `S1`). The number of
@@ -1062,7 +1064,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 02acbc86f2e57aa2d3f5f0d7dbd96160e4cdbc27 -->
+<!-- reviewed: 2026-10-08 @ 3002ada193107688552aae1416c155a55db922d5 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1113,6 +1115,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 8**: `uv.lock` adds exactly `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6` (+ `provides-extras`); **`mlx`/`mlx-metal` unchanged at 0.31.2, so no mlx-whisper re-smoke and no CHANGELOG mlx note is triggered.** The local uv (0.12.23) also tried to rewrite the lock `revision` 3->5 and drop `sys_platform` markers on 10 nvidia edges; that churn was reverted by hand (diff is additions only; `uv lock --check` passes). The contract test ran green against the real installed package with `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` (also confirms mlx-audio 0.5.8 runs on mlx 0.31.2 for load/feed with cached weights). The contract test purges `mlx_audio*` from `sys.modules` on module teardown, because other tests assert it is absent. Full suite with the extra installed: 6737 passed.
 
 - **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amended the Req 4 stall-guard text above the marker (done in the later administrative marker refresh recorded below). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; the preflight and the loader share one repo id (initially pinned by a parity test between two literals; since round 2 both read `diarization_model.REPO_ID`, a single owner, and the alias is gone).
+- **Gauntlet round 5 (2026-10-09)**: `label_for` margin guard now keys on "top slot is not a candidate" (was "no candidates"), per owner decision; the above-marker label policy gained one sentence (administrative marker refresh). Codex's adversarial gate was unavailable (usage limit) in the final confirming pass; owner chose to close on the other gates.
 - **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; `_pending_span` clear in `_detach_client` (plan-specified, fail-safe); contract-test weights skip under `REQUIRE`.
 - **Still open (Phase 8b/9)**: VAD-span edge offset (see Phase 4 note). Facts for the decision: the STT decodes pipecat's `_audio_buffer` (<= 1 s pre-roll + everything to the VAD-stop event), the server returns no timestamps onoats consumes, and `VADUserStartedSpeakingFrame.start_secs` / `VADUserStoppedSpeakingFrame.stop_secs` carry the confirmation delays.
 
