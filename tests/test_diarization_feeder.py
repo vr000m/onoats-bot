@@ -245,6 +245,33 @@ def test_model_rate_mismatch_degrades(monkeypatch, warnings_seen):
     assert m.feed_calls == []
 
 
+def test_model_output_subsampling_mismatch_degrades(monkeypatch, warnings_seen):
+    """One row must be one 10 ms frame; a coarser output hop would shift every
+    label in time with no error, so the worker refuses the model instead."""
+    log = []
+    m = StubDiarizer(log)
+    m.config.output_subsampling_factor = 2
+    tl = RecordingTimeline()
+    feeder = make_feeder(tl, m)
+    out = drive(feeder, [start_frame(), audio_frame(), EndFrame()], monkeypatch)
+    assert tl.is_degraded
+    assert not tl.is_ready  # never published a slot count
+    assert not any(isinstance(f, ErrorFrame) for f in out)
+    assert m.feed_calls == []
+    assert any("output_subsampling_factor" in w for w in warnings_seen)
+
+
+def test_model_output_subsampling_of_one_is_accepted(monkeypatch):
+    log = []
+    m = StubDiarizer(log)
+    m.config.output_subsampling_factor = 1
+    tl = RecordingTimeline()
+    feeder = make_feeder(tl, m)
+    drive(feeder, [start_frame(), audio_frame(), EndFrame()], monkeypatch)
+    assert not tl.is_degraded
+    assert m.feed_calls
+
+
 # --------------------------------------------------------------- observer contract
 
 

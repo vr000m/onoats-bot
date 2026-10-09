@@ -213,6 +213,17 @@ class DiarizerWorker:
             raise RuntimeError(
                 f"diarizer sample rate {model_rate} != pipeline {PIPELINE_SAMPLE_RATE}"
             )
+        # The whole timeline assumes ONE output row per 10 ms (160-sample) input
+        # frame; a model revision with a coarser output hop would put every
+        # label at the wrong time with no error. The weights are not
+        # revision-pinned, so check the live model rather than trust the
+        # release-time contract test (which skips when the cache is cold).
+        subsampling = getattr(model.config, "output_subsampling_factor", 1)
+        if int(subsampling) != 1:
+            raise RuntimeError(
+                f"diarizer output_subsampling_factor {subsampling} != 1: rows are "
+                f"not {FRAME_SAMPLES}-sample frames"
+            )
         tl.set_slot_count(int(model.config.num_speakers))
         init = getattr(model, "init_streaming_state", None)
         state = init() if init is not None else None
