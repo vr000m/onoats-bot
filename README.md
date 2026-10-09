@@ -209,7 +209,7 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   absent by default, in which case self-healing is skipped and today's
   plain-failure behavior is unchanged; must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` — any other value is logged and treated
-  as absent; `diarization` — bool, default off, overridable via the
+  as absent; `diarization` — true/false, default off, overridable via the
   `ONOATS_DIARIZATION` env var, see
   [Speaker diarization](#speaker-diarization-opt-in)), `[speakers]`
   (render-only display labels), `[categories]`, `[tuning]`.
@@ -249,7 +249,11 @@ can be wrong (a speaker may be split across slots, or a quiet or overlapped
 stretch left unlabelled).
 
 - **Enable:** `[stt].diarization = true` in `config.toml`, or
-  `ONOATS_DIARIZATION=1` (the env var wins).
+  `ONOATS_DIARIZATION=1` (the env var wins). Accepted values (case-insensitive):
+  `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; a blank env value falls
+  through to `config.toml`. Any other value logs one warning and disables
+  diarization — a non-empty env value wins even when unrecognised, so
+  `ONOATS_DIARIZATION=maybe` turns off a `config.toml` `diarization = true`.
 - **Websocket STT only** (`STT_SERVICE=websocket`); any other backend exits
   non-zero at startup. `onoats bot-single` ignores the flag with a warning.
 - **Install the extra** (Apple Silicon / macOS): from a checkout
