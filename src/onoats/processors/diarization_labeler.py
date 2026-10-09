@@ -17,10 +17,10 @@ held, FIFO, under the release lock.
 ``EndFrame`` waits up to ``hold_sec`` for ``timeline.is_flushed`` /
 ``is_degraded``, releases every pending frame in FIFO order (labelled per
 ``_push_labelled`` with the coverage available then), and only then is
-forwarded. ``CancelFrame`` releases immediately without waiting. A teardown with neither (``cleanup()`` after a
-pipeline exception) stops the release task, then releases the in-flight frame
-and every pending frame the same way, FIFO, logging (never raising) a push
-failure. Once ``timeline.is_degraded``, the labeler forwards transcriptions
+forwarded. ``CancelFrame`` releases immediately without waiting. A teardown
+with neither (``cleanup()`` after a pipeline exception) stops the release task,
+then releases the in-flight frame and every pending frame the same way, FIFO,
+logging (never raising) a push failure. Once ``timeline.is_degraded``, the labeler forwards transcriptions
 with no hold and no attributes, after first draining any still-held frames
 FIFO under the lock.
 
