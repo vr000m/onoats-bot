@@ -62,7 +62,7 @@ are *not* interview-grilled:
 - **Worker is the sole timeline writer** (GAP records included); the
   timeline's full cross-thread API is enumerated (Req 1).
 - **Labeler hold = ordered pending deque**; only `TranscriptionFrame`s wait,
-  lifecycle frames drain it, degrade skips the hold (Req 4).
+  `EndFrame`/`CancelFrame` drain it, degrade skips the hold (Req 4).
 - **Segment spans = per-instance FIFO** (*superseded in revision 4: pipecat
   runs `run_stt` inline; see the single pending slot, Req 3*).
 - **Preflight is import-free and non-downloading** (`find_spec` + local-cache
@@ -183,7 +183,7 @@ marked *(recollection)*.
   `process_frame(VADUserStoppedSpeakingFrame)` (`pipecat/services/stt_service.py:765-780`),
   and `FrameProcessor` drains its input queue sequentially, so at most **one**
   span is outstanding per STT instance (there is no segment queue).
-  `WebSocketSTTService` (`src/onoats/stt/websocket_stt_service.py:197`) also
+  `WebSocketSTTService` (`src/onoats/stt/websocket_stt_service.py`) also
   serializes its own `run_stt` calls behind an onoats-owned `_run_stt_lock`,
   which VAD segments therefore never contend.
 
@@ -320,9 +320,9 @@ contract is "never a hang"; precedent:
      `tests/test_diarization_timeline.py`):
      | call | thread |
      |---|---|
-     | `record(start_sample, probs)`, `record_gap(start, end)`, `set_slot_count(n)` (once, after model load; `label_for` returns `None` while unset), `mark_flushed()` (after the final flush), `mark_degraded()` | worker |
+     | `record(start_sample, probs)`, `record_gap(start, end)`, `set_slot_count(n)` (once, after model load; `label_for` returns `None` while unset), `mark_flushed()` (after the final flush) | worker |
      | `label_for(start, end)`, `coverage_high_water()`, `is_degraded`, `is_flushed`, `add_progress_listener(cb)` | loop |
-     | `mark_degraded(reason=...)` (idempotent, one WARNING total; the reason is free text, e.g. `stalled: no coverage progress over N consecutive hold windows`) | loop — the labeler's stall guard and fail-open (Req 4) and the feeder's worker-start-failure / join-timeout paths |
+     | `mark_degraded(reason=...)` (idempotent, one WARNING total; the reason is free text, e.g. `stalled: no coverage progress over N consecutive hold windows`) | worker (its own failure paths) or loop — the labeler's stall guard and fail-open (Req 4) and the feeder's worker-start-failure / join-timeout paths |
      Coverage data (records, GAPs, slot count) is written **only** by the
      worker; `mark_degraded` is the one idempotent flag either side may set.
      `add_progress_listener(cb)` registers a callback the worker invokes
@@ -338,11 +338,11 @@ contract is "never a hang"; precedent:
      (`RING_HEADROOM_SEC` = queue/segment-serialisation slack), so a
      maximum-length turn cannot be evicted before its frame arrives.
      `DECODE_TIMEOUT_RATIO` is 1.5, the same factor as
-     `websocket_stt_service.py:376` (`max(_DECODE_TIMEOUT_SECONDS,
+     `websocket_stt_service.py` (`max(_DECODE_TIMEOUT_SECONDS,
      1.5 * audio_seconds)`) — hoisted to one shared constant or pinned by a
      parity test. `MAX_TURN_SEC` is **not** an onoats turn ceiling (the client
      enforces none): it is the STT *server's* `MAX_UNCOMMITTED_SECONDS`
-     (≈ 300 s, cited in the comment at `websocket_stt_service.py:370-371`),
+     (≈ 300 s, cited in a comment in `websocket_stt_service.py`),
      sourced from `stt_server.protocol` if it exports it (a third-party
      import is allowed in a leaf module), else a documented literal. A turn
      longer than that yields an `ErrorFrame` from the server, not a label, so
@@ -449,7 +449,8 @@ contract is "never a hang"; precedent:
    stamped range it **parks the frame in an ordered pending deque** (no
    in-line `await` in `process_frame` — that would stall the whole `them`
    arm, VAD frames included); a frame with **no** stamped range (Req 3's
-   fail-loud case) passes straight through unlabelled. Releases are driven by
+   fail-loud case) is forwarded unlabelled, after draining any frames already
+   held (FIFO). Releases are driven by
    a **labeler-owned asyncio task** (started at `StartFrame`, precedent
    `DualSilenceDetector.start_monitoring`), woken by (a) the worker's
    progress listener via `loop.call_soon_threadsafe` and (b) a per-head
@@ -476,8 +477,9 @@ contract is "never a hang"; precedent:
    re-order by it), so the real effect is a cross-arm arrival-order skew of up
    to `HOLD_SEC` between a `me` line and a `them` line in the JSONL / rendered
    transcript; each entry keeps its own `frame.timestamp`. This skew is
-   accepted. **Degraded**: once `timeline.is_degraded`, the labeler forwards
-   `TranscriptionFrame`s immediately with no hold and no attributes.
+   accepted. **Degraded**: once `timeline.is_degraded`, the labeler drains any held
+   frames (FIFO) and then forwards `TranscriptionFrame`s immediately with no
+   hold and no attributes.
    **Stall guard**: a `feed()` that hangs (Metal hang rather than an error)
    never trips the worker's own degrade triggers, so the labeler counts
    consecutive `HOLD_SEC` expiries during which `coverage_high_water()` did
@@ -498,7 +500,7 @@ contract is "never a hang"; precedent:
    `speakers: list[str] | None` and `overlap: bool` (default false); files
    written before this feature read unchanged.
 7. **Render**: one shared label-composition helper is used by `render.py` (which today
-   emits `**{label}:** text`, `render.py:96`, label from `[speakers]` config)
+   emits `**{label}:** text`, `render.py` (`render_session`), label from `[speakers]` config)
    and `live_terminal.py`. It is **value-based**, defined in `render.py`:
    `compose_speaker_label(display_label: str, speakers: list[str] | None,
    overlap: bool) -> str`, imported by `live_terminal.py` (the two call sites
@@ -549,8 +551,9 @@ contract is "never a hang"; precedent:
      so no backend check applies (pinned by a test asserting
      `_preflight_diarization` is never called).
    - **Runtime failure** after preflight (worker model-load error, `feed()`
-     raises, a batch exceeds the processing budget for
-     `BUDGET_OVERRUN_CONSECUTIVE` consecutive batches — a single slow
+     raises, an accumulation window (>= `BUDGET_WINDOW_SEC` of fed audio)
+     exceeds the processing budget for `BUDGET_OVERRUN_CONSECUTIVE` consecutive
+     windows — a single slow
      first/warm-up call must not degrade, Metal stream error) — degrade:
      the worker stops and calls `timeline.mark_degraded()`, the feeder
      keeps passing frames and stops enqueueing, **one** WARNING is logged,
@@ -558,8 +561,8 @@ contract is "never a hang"; precedent:
      immediately — no hold, no label — for all subsequent frames. A hung
      (non-erroring) `feed()` is caught by the labeler's stall guard (Req 4).
      Never a fatal `ErrorFrame`. The processing
-     budget is a ratio (processing time per batch < `BUDGET_RATIO` ×
-     batch audio duration), named constants.
+     budget is a ratio (processing time per window < `BUDGET_RATIO` ×
+     window audio duration), named constants.
 10. **`me` branch is never touched** — no feeder/labeler, `stamp_segment_samples`
     stays False for `mic_arm`'s STT, no new attributes on `me` frames.
 11. **`onoats flush` (SIGUSR1)**: speaker IDs, the timeline, and the sample
@@ -684,8 +687,8 @@ lock), not Phase 0.
   `tests/test_dual_socket_source.py` — flag=1-without-extra fails loud with
   the `find_spec` / cache-probe hook monkeypatched (identical in CI and on a
   dev Mac); cold-cache and offline give an explicit "weights not downloaded;
-  run <command>" error and perform no download; second call is a memoized
-  no-op; **both entrypoints**: rc=1, capturer spawn / transport builder /
+  run <command>" error and perform no download; second call re-probes nothing (extra/weights
+  probes memoized; the backend check re-runs); **both entrypoints**: rc=1, capturer spawn / transport builder /
   `select_dual_input_devices` never called, and a shared mock call-order list
   asserts `_acquire_instance_lock` then `_preflight_diarization` precede any
   spawn/open call; flag **off** never calls `_preflight_diarization`;
@@ -1017,7 +1020,8 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [ ] Unit: config-time failure (`mlx_audio` missing / cold cache / offline /
       non-websocket STT / preflight) → fail loud, rc=1, transport builder and
       capturer spawn never called, on **both** entrypoints; lock-then-preflight
-      call order; flag off never calls preflight; preflight memoized;
+      call order; flag off never calls preflight; extra/weights probes memoized (backend
+      check re-runs every call);
       single-input mode logs the "ignored" WARNING
 - [ ] Unit: `me` branch structurally and behaviourally unaffected (me/them ×
       flag on/off × portaudio/socket, every cell); wired-arm degrade keeps
@@ -1058,7 +1062,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 7692711d6f8740818b317c8c2f6703a48a6f2e2d -->
+<!-- reviewed: 2026-10-08 @ 02acbc86f2e57aa2d3f5f0d7dbd96160e4cdbc27 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1101,7 +1105,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 
 ### Conduct notes (workspace; not contract)
 
-- **Phase 3 advisory review (opus)**: (1) fixed — GAP re-anchor must be applied per output row by model-input offset (breakpoints), not to the whole batch, because the `low` preset's ~1 s lookahead emits pre-gap rows after the gap; the plan's literal "anchor + frame_index*160" is only correct with piecewise anchors. Exact for chunks that are multiples of 160 samples (off-multiple chunks round up to the next row boundary: sub-frame skew, untested). (2) fixed — the overrun budget is evaluated per 1 s accumulation window (`BUDGET_WINDOW_SEC`), not per `feed()` call. (3) open/low — the feeder calls the idempotent `timeline.mark_degraded` loop-side (join timeout / start failure), which Req 1's API table reserves for the labeler stall guard; harmless, revisit when the plan is next re-reviewed.
+- **Phase 3 advisory review (opus)**: (1) fixed — GAP re-anchor must be applied per output row by model-input offset (breakpoints), not to the whole batch, because the `low` preset's ~1 s lookahead emits pre-gap rows after the gap; the plan's literal "anchor + frame_index*160" is only correct with piecewise anchors. Exact for chunks that are multiples of 160 samples (off-multiple chunks round up to the next row boundary: sub-frame skew, untested). (2) fixed — the overrun budget is evaluated per 1 s accumulation window (`BUDGET_WINDOW_SEC`), not per `feed()` call. (3) resolved (2026-10-09) — Req 1's API table now lists the feeder's loop-side `mark_degraded` calls (join timeout / start failure) alongside the labeler's stall guard and fail-open.
 - **Phase 2**: `HOLD_SEC` set to 1.5 (`low` preset lag 1.04 s + margin) so the 2.0 s `LATENCY_BUDGET_SEC` default stays HOLD_SEC + margin.
 - **Phase 4 advisory review (opus)**: fixed — a second `VADUserStartedSpeakingFrame` while a span is open now logs ERROR and keeps the first start (pipecat decodes from the first). **Open, for Phase 8b/9 to measure:** VAD start/stop events fire `start_secs`/`stop_secs` (~0.2 s default) after the speech edges, so the stamp (counter value at the event) misses ~0.2 s of leading speech and includes ~0.2 s of trailing audio; subtracting `frame.start_secs*16000` / `frame.stop_secs*16000` (clamped) would tighten it but changes the Req 3 "stamp == VAD-event position" contract, so it is not applied without a measured accuracy case.
 - **Phase 5 advisory review (opus)**: all fixed with regression tests — the stall streak now resets on the in-line covered release too; it counts distinct `hold_sec` windows (not expired frames), so one hiccup with two parked finals cannot degrade; the release task fails open (one ERROR, degrade, deliver in-flight + pending unlabelled FIFO). The stall WARNING is the timeline's single `mark_degraded` line (the labeler adds none).

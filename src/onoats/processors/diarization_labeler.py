@@ -27,7 +27,7 @@ FIFO under the lock.
 Stall guard: a hung ``feed()`` never trips the worker's own degrade triggers,
 so the labeler counts consecutive ``hold_sec`` **windows** whose expiries saw
 no ``coverage_high_water()`` advance and, after ``STALL_CONSECUTIVE_TIMEOUTS``,
-calls ``timeline.mark_degraded("stalled")``. Expiries while the worker is still
+calls ``timeline.mark_degraded(reason=...)`` ("stalled: ..."). Expiries while the worker is still
 loading the model (``not timeline.is_ready``, within ``MODEL_LOAD_GRACE_SEC`` of
 the labeler starting) are expected and never count: a cold load is not a hung
 ``feed()``. Several frames expiring within one
