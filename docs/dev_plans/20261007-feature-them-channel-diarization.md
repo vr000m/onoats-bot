@@ -525,7 +525,9 @@ contract is "never a hang"; precedent:
      effect: non-zero exit, ERROR log, install hint. Implemented by
      `runtime._preflight_diarization(cfg)`: **import-free and
      non-downloading** — `importlib.util.find_spec("mlx_audio")` plus a
-     local-cache probe for the model weights (`huggingface_hub` — a baseline
+     local-cache probe for the model weights (owned by the leaf
+     `src/onoats/stt/diarization_model.py`, shared with the feeder's loader;
+     `huggingface_hub` — a baseline
      dependency — `try_to_load_from_cache(repo_id, filename)` for both
      `config.json` and `model.safetensors`, per Phase 0; **not**
      `snapshot_download(local_files_only=True)`, which raises
@@ -665,7 +667,8 @@ lock), not Phase 0.
 - `src/onoats/config/__init__.py` — add the `diarization` property
   (env > toml > default `False`)
 - `src/onoats/runtime.py` — `_preflight_diarization(cfg)` (`find_spec` +
-  non-downloading cache probe; memoized; rejects `stt_service != "websocket"`);
+  non-downloading cache probe via the leaf `src/onoats/stt/diarization_model.py`;
+  the probes are memoized, the `stt_service != "websocket"` rejection is not);
   no model held, no `mlx_audio` import
 - `src/onoats/cli.py` (`_supervise_socket_session`, right after
   `_acquire_instance_lock`, before capturer spawn) and `src/onoats/dual.py`
@@ -840,7 +843,9 @@ lock), not Phase 0.
   `uv run --extra diarization pytest tests/test_diarization_contract.py`
   (today the script is version-check only and runs no tests; this makes the
   release check working-tree dependent for this one step, so the extra must
-  be installable on the release machine)
+  be installable on the release machine; the step fails unless `HEAD` is the
+  commit under check and the tree is clean, so it cannot validate a different
+  checkout than checks 1-4 inspected)
 - `tests/test_release_meta.py` — assert `release_check.sh` references the
   contract test file and the env var; plus a **subprocess test** that runs the
   contract test with `mlx_audio` blocked and the env var set to `1`, asserting
@@ -1024,7 +1029,8 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [ ] Contract (local-only; hard-fails under
       `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`, which `release_check.sh`
       exports): `mlx-audio` API surface pinned at 0.5.8, valid for
-      `>=0.5.8,<0.6`; `test_release_meta.py` asserts the hook is present and
+      `>=0.5.8,<0.6`; `test_release_meta.py` asserts `release_check.sh` references the contract
+      test file and the env var, and
       a subprocess test proves hard-fail-not-skip
 - [ ] Integration (local-only, `-m diarization_integration`): flag on,
       committed/env fixture → label assertions (Phase 9); flag off → no
@@ -1053,7 +1059,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 3dcaea186879db25fe7be1f12ecba01f78b96631 -->
+<!-- reviewed: 2026-10-08 @ 1b5584bfe2104e750c86b745dd447060ab6bf16b -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
