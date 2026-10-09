@@ -278,6 +278,79 @@ feature rather than failing a test you'd notice:
 Regression tests: `tests/test_stt_launchd.py`, `tests/test_runtime_preflight.py`,
 `tests/test_websocket_stt_reconnect.py`.
 
+## Them-channel diarization invariants
+
+`[stt].diarization` / `ONOATS_DIARIZATION` (default **off**) labels `them`
+utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
+`system_stt` -> `WebSocketSTTService` (stamps VAD spans) -> `SourceTagger` ->
+`DiarizationLabeler`, system arm only. Load-bearing invariants:
+
+- **Off means absent.** Flag off: `mlx_audio` is never imported (it is in
+  `_FORBIDDEN` in `tests/test_onoats_imports.py`; the processors import it only
+  on the worker thread via `load_mlx_diarizer`), no feeder/labeler is wired, no
+  attribute reaches a frame, and JSONL/render are unchanged.
+- **The worker thread owns the model and the coverage writes.** One daemon
+  thread (`diar-worker`; bounded join in the feeder's `cleanup()`, never on
+  the frame path) does the load, `set_streaming_config("low")`, every
+  `feed()`, the final flush, and is the **sole coverage writer** to
+  `DiarizationTimeline` (`record`, `record_gap`, `set_slot_count`,
+  `mark_flushed`); the loop only reads. `mark_degraded` is the one idempotent,
+  thread-safe flag either side may set (worker failures; the feeder's start
+  failure / bounded join in `cleanup()`; the labeler's stall guard and
+  fail-open). Don't add a loop-side coverage write or a cross-thread model call.
+- **Fail open: never lose a transcript.** A runtime diarizer failure
+  (loader/`feed()` raising, consecutive over-budget windows, a hung `feed()`)
+  degrades with exactly one WARNING and never a fatal `ErrorFrame`; `them`
+  transcription keeps flowing unlabelled. The labeler parks stamped
+  `TranscriptionFrame`s in an ordered pending deque (released head-first by its
+  own task, never blocking `process_frame`) for at most `HOLD_SEC` each, with a
+  stall guard that degrades after consecutive no-progress windows; a frame stays in the held state
+  until its own push returns, and fail-open / `cleanup()` release every held
+  frame FIFO via `_push_labelled` (labelled if not degraded, else
+  unlabelled). `EndFrame` flush-waits (bounded), `CancelFrame` releases
+  immediately. Accepted gaps are in the Review Checklist below.
+- **`label_for` policy** (`diarization_timeline.py`, pinned by
+  `tests/test_diarization_timeline.py`): unlabelled below
+  `MIN_COVERAGE_FRACTION` recorded coverage (GAP/evicted rows don't count) or
+  if any covered row has activity in an unmappable (beyond-`num_speakers`) slot; 2+ slots active for
+  `>= OVERLAP_MIN_FRACTION` => overlap (top two by score); otherwise the
+  top-scored slot, and **`DOMINANT_MARGIN` over the runner-up is required
+  whenever the top slot is not the sole `OVERLAP_MIN_FRACTION` candidate**
+  (not merely when there is no candidate). A top slot that is the sole
+  candidate is labelled with no margin check.
+- **The `me` branch is structurally untouched.** Nothing is inserted in
+  `mic_arm`; `stamp_segment_samples` is only set on the system STT. Pinned by
+  the me/them x flag x source matrix in `tests/test_dual_socket_source.py`.
+- **One flag, two consumers.** `dual` derives a single `diarization_on` bool
+  and passes it to both `stamp_segment_samples` (STT) and `diarization` (the
+  pipeline builder), so stamping and the labeler can't disagree. The STT's
+  `_pending_span` is a single slot written **before** delegating VAD-stop to
+  `super()` (pipecat >= 1.3.0 runs `run_stt` inline); the feeder and the STT
+  each count samples with `SampleCounter`, and the feeder's `start_sample` is
+  the worker's position authority. Pinned by
+  `tests/test_websocket_stt_stamping.py`.
+- **Persistence is canonical; display is render-time.** `speakers`/`overlap`
+  are stored on the utterance (omitted when empty); the `Them (S1)` string is
+  composed at render/live-terminal time by `render.compose_speaker_label`
+  and never persisted (`tests/test_speaker_labels.py`).
+- **Preflight is hoisted, import-free and non-downloading.**
+  `runtime._preflight_diarization` runs right after `_acquire_instance_lock` in
+  `onoats bot` (supervisor and `run_onoats_dual`), only when the flag is on:
+  `find_spec` for the extra plus a local HF-cache probe
+  (`diarization_model.weights_cached`); failure is a fatal
+  `DiarizationPreflightError` (rc=1) before any capture side effect. Only the
+  extra/weights probes are memoized process-wide (`_diarization_preflight_done`,
+  success only); the `stt_service == "websocket"` check reads `cfg` and runs on
+  every call. `bot-single` has no `them` arm, so it ignores the flag with one
+  WARNING rather than failing.
+
+Regression tests: `tests/test_diarization_timeline.py`,
+`tests/test_diarization_feeder.py`, `tests/test_diarization_labeler.py`,
+`tests/test_diarization_model.py`, `tests/test_diarization_contract.py`
+(local-only; hard-fails under `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`),
+`tests/test_websocket_stt_stamping.py`, `tests/test_speaker_labels.py`,
+`tests/test_runtime_preflight.py`, `tests/test_dual_socket_source.py`.
+
 ## Leaf modules
 
 A recurring pattern in `src/onoats/`: two higher-level modules that must
@@ -449,4 +522,4 @@ should NOT re-flag go here, one per line:
   `_drain_all` raised) only reproduce with a test-only blocking/raising push;
   hardening them would restructure the held-frame bookkeeping for a path the
   framework does not take. Complements the `_fail_open` re-push entry above.
-  (2026-10-09)
+  (2026-10-08)

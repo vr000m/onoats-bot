@@ -130,6 +130,7 @@ onoats status       # recorder pid / running state + data dir; names the capture
 | Local Whisper-MLX (on-device)     | —                           | ✅ `[macos]` extra |
 | Kokoro TTS                        | —                           | ✅ `[macos]` extra |
 | System audio ("them") capture     | loopback driver-dependent   | ✅ native capturer ⁺ |
+| Speaker diarization (opt-in)      | —                           | ✅ `diarization` extra |
 
 ⁺ On **macOS 14.4+** the default system-audio story is the **native capturer**
 (`AUDIO_SOURCE=socket` — Core Audio process tap, no virtual-audio driver; see
@@ -208,8 +209,10 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   absent by default, in which case self-healing is skipped and today's
   plain-failure behavior is unchanged; must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` — any other value is logged and treated
-  as absent), `[speakers]` (render-only display
-  labels), `[categories]`, `[tuning]`.
+  as absent; `diarization` — bool, default off, overridable via the
+  `ONOATS_DIARIZATION` env var, see
+  [Speaker diarization](#speaker-diarization-opt-in)), `[speakers]`
+  (render-only display labels), `[categories]`, `[tuning]`.
 - `[app].launch_at_login` (Onoats.app only — Python never reads this key) —
   bare TOML `true`/`false` (a quoted `"true"`/`"false"` normalizes to the
   same value, since `ConfigStore`'s reader strips surrounding quotes; any
@@ -233,6 +236,36 @@ key) — notably the shutdown timers: on Ctrl+C the recorder drains the pipeline
 (up to `SHUTDOWN_DRAIN_TIMEOUT_SEC`, default `8.0`) so a final in-flight
 transcript lands before the flush, then hard-cancels (capped at
 `SHUTDOWN_CANCEL_TIMEOUT_SEC`, default `2.0`) if the drain stalls.
+
+### Speaker diarization (opt-in)
+
+Off by default. When on, onoats labels who is speaking on the **"them"**
+(system-audio) channel: lines render as `**Them (S1):**`, `**Them (S2):**`, …
+(speakers are numbered in order of first speech in the session), and a window
+with two clearly active speakers renders as `Them (S1 / S2, overlapping)`. The
+suffix is appended to your configured `[speakers]` label for `them`. The `me`
+channel is never labelled. `S1`/`S2` are per-session slots, not identities, and
+can be wrong (a speaker may be split across slots, or a quiet or overlapped
+stretch left unlabelled).
+
+- **Enable:** `[stt].diarization = true` in `config.toml`, or
+  `ONOATS_DIARIZATION=1` (the env var wins).
+- **Websocket STT only** (`STT_SERVICE=websocket`); any other backend exits
+  non-zero at startup. `onoats bot-single` ignores the flag with a warning.
+- **Install the extra** (Apple Silicon / macOS): from a checkout
+  `uv sync --extra diarization`; for a tool install
+  `uv tool install 'onoats[macos,diarization]'` (repeat any extras you already
+  have).
+- **Download the weights yourself** — they are never fetched automatically:
+  `hf download mlx-community/Nemotron-3-Diarization`. If the extra or the
+  weights are missing, `onoats bot` exits non-zero at startup with the exact
+  command to run (before any audio is captured).
+- **Fails open.** If the diarizer fails mid-session, onoats logs one warning and
+  keeps recording; `them` lines continue unlabelled. A label can delay a `them`
+  line by up to about 1.5 s while the diarizer catches up.
+- **Known limitation:** a continuation flush (`Ctrl+T` / `onoats flush` /
+  SIGUSR1) can leave a `them` line that was still waiting for its label to land
+  in the next session file.
 
 ### Audio source
 

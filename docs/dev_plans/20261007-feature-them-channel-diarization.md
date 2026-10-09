@@ -983,55 +983,55 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 
 ## Testing Notes
 
-- [ ] Phase 0 go/no-go recorded in `## Findings`: API/presets/input
+- [x] Phase 0 go/no-go recorded in `## Findings`: API/presets/input
       contract/`num_speakers`/`frames_processed`, non-downloading cache-probe
       call, `uv lock` outcome (advisory, reverted), scratch estimates, 0-300 s
       slot stability
 - [ ] Phase 8b gate recorded in `## Findings`: worker-vs-loop latency, loop
       stall, GPU contention, added commit latency (p95) vs
       `LATENCY_BUDGET_SEC`, long-recording slot stability / overflow
-- [ ] Unit: label policy — dominant, overlap above/below threshold,
+- [x] Unit: label policy — dominant, overlap above/below threshold,
       zero coverage, partial coverage, GAP, ring eviction, ring-capacity
       invariant, `coverage_high_water` semantics, slot first-activity
       mapping, `num_speakers` overflow → `None` + exactly one WARNING (per
       instance), bounded deterministic thread-safety test
-- [ ] Unit: feeder observer contract + sample counting; queue-drop → worker
+- [x] Unit: feeder observer contract + sample counting; queue-drop → worker
       GAP + later windows still aligned; worker thread owns all model calls
       (incl. the factory) in the order load → `set_streaming_config('low')` →
       `set_slot_count` → `feed`; PCM16→float32 conversion; feeder stops
       enqueueing after degrade
-- [ ] Unit: worker lifecycle — `EndFrame` final flush + thread exit,
+- [x] Unit: worker lifecycle — `EndFrame` final flush + thread exit,
       `CancelFrame` abort, blocking `feed()` does not hang shutdown
-- [ ] Unit: runtime failure (incl. loader raising post-preflight) → degrade +
+- [x] Unit: runtime failure (incl. loader raising post-preflight) → degrade +
       exactly one WARNING, never a fatal `ErrorFrame`; consecutive-overrun
       threshold; hung `feed()` → labeler stall guard degrades once
-- [ ] Unit: `WebSocketSTTService` stamping — VAD span (pre-roll excluded),
+- [x] Unit: `WebSocketSTTService` stamping — VAD span (pre-roll excluded),
       single pending slot set before `super()` (second span → ERROR, empty
       slot → no stamp), slot reset paths, kwarg False → nothing, hook-shape
       pipecat test (inline `run_stt`), feeder↔STT clock parity
-- [ ] Unit: labeler — hold/coverage/`HOLD_SEC` timeout, release with no
+- [x] Unit: labeler — hold/coverage/`HOLD_SEC` timeout, release with no
       further traffic, evicted and N-chunks-behind cases, VAD passthrough
       during hold, FIFO release order, unstamped passthrough, `EndFrame`
       flush-wait / `CancelFrame` immediate release, degraded → no hold, flush-
       continuation (Req 11)
-- [ ] Unit: persistence + render — schema (omit-when-None, exact key set, no
+- [x] Unit: persistence + render — schema (omit-when-None, exact key set, no
       display string persisted), writer→reader round-trip, rotation via
       `TranscriptBuffer.flush`, old-file back-compat, canonical `source` enum
       unchanged, render strings with default/configured labels, live-terminal
       suffix parity
-- [ ] Unit: config-time failure (`mlx_audio` missing / cold cache / offline /
+- [x] Unit: config-time failure (`mlx_audio` missing / cold cache / offline /
       non-websocket STT / preflight) → fail loud, rc=1, transport builder and
       capturer spawn never called, on **both** entrypoints; lock-then-preflight
       call order; flag off never calls preflight; extra/weights probes memoized (backend
       check re-runs every call);
       single-input mode logs the "ignored" WARNING
-- [ ] Unit: `me` branch structurally and behaviourally unaffected (me/them ×
+- [x] Unit: `me` branch structurally and behaviourally unaffected (me/them ×
       flag on/off × portaudio/socket, every cell); wired-arm degrade keeps
       `them` transcription flowing
-- [ ] Import hygiene: `mlx_audio` in `_FORBIDDEN` (Phase 1); clean-interpreter
+- [x] Import hygiene: `mlx_audio` in `_FORBIDDEN` (Phase 1); clean-interpreter
       subprocess imports `onoats.dual` and the new modules flag-off;
       `mlx_audio` absent from `sys.modules`
-- [ ] Contract (local-only; hard-fails under
+- [x] Contract (local-only; hard-fails under
       `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`, which `release_check.sh`
       exports): `mlx-audio` API surface pinned at 0.5.8, valid for
       `>=0.5.8,<0.6`; `test_release_meta.py` asserts `release_check.sh` references the contract
@@ -1064,7 +1064,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 3002ada193107688552aae1416c155a55db922d5 -->
+<!-- reviewed: 2026-10-08 @ 5ad69279e1bbac753ad2bc82db6717d8ced3d003 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1107,7 +1107,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 
 ### Conduct notes (workspace; not contract)
 
-- **Phase 3 advisory review (opus)**: (1) fixed — GAP re-anchor must be applied per output row by model-input offset (breakpoints), not to the whole batch, because the `low` preset's ~1 s lookahead emits pre-gap rows after the gap; the plan's literal "anchor + frame_index*160" is only correct with piecewise anchors. Exact for chunks that are multiples of 160 samples (off-multiple chunks round up to the next row boundary: sub-frame skew, untested). (2) fixed — the overrun budget is evaluated per 1 s accumulation window (`BUDGET_WINDOW_SEC`), not per `feed()` call. (3) resolved (2026-10-09) — Req 1's API table now lists the feeder's loop-side `mark_degraded` calls (join timeout / start failure) alongside the labeler's stall guard and fail-open.
+- **Phase 3 advisory review (opus)**: (1) fixed — GAP re-anchor must be applied per output row by model-input offset (breakpoints), not to the whole batch, because the `low` preset's ~1 s lookahead emits pre-gap rows after the gap; the plan's literal "anchor + frame_index*160" is only correct with piecewise anchors. Exact for chunks that are multiples of 160 samples (off-multiple chunks round up to the next row boundary: sub-frame skew, untested). (2) fixed — the overrun budget is evaluated per 1 s accumulation window (`BUDGET_WINDOW_SEC`), not per `feed()` call. (3) resolved (2026-10-08) — Req 1's API table now lists the feeder's loop-side `mark_degraded` calls (join timeout / start failure) alongside the labeler's stall guard and fail-open.
 - **Phase 2**: `HOLD_SEC` set to 1.5 (`low` preset lag 1.04 s + margin) so the 2.0 s `LATENCY_BUDGET_SEC` default stays HOLD_SEC + margin.
 - **Phase 4 advisory review (opus)**: fixed — a second `VADUserStartedSpeakingFrame` while a span is open now logs ERROR and keeps the first start (pipecat decodes from the first). **Open, for Phase 8b/9 to measure:** VAD start/stop events fire `start_secs`/`stop_secs` (~0.2 s default) after the speech edges, so the stamp (counter value at the event) misses ~0.2 s of leading speech and includes ~0.2 s of trailing audio; subtracting `frame.start_secs*16000` / `frame.stop_secs*16000` (clamped) would tighten it but changes the Req 3 "stamp == VAD-event position" contract, so it is not applied without a measured accuracy case.
 - **Phase 5 advisory review (opus)**: all fixed with regression tests — the stall streak now resets on the in-line covered release too; it counts distinct `hold_sec` windows (not expired frames), so one hiccup with two parked finals cannot degrade; the release task fails open (one ERROR, degrade, deliver in-flight + pending unlabelled FIFO). The stall WARNING is the timeline's single `mark_degraded` line (the labeler adds none).
@@ -1115,7 +1115,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 8**: `uv.lock` adds exactly `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6` (+ `provides-extras`); **`mlx`/`mlx-metal` unchanged at 0.31.2, so no mlx-whisper re-smoke and no CHANGELOG mlx note is triggered.** The local uv (0.12.23) also tried to rewrite the lock `revision` 3->5 and drop `sys_platform` markers on 10 nvidia edges; that churn was reverted by hand (diff is additions only; `uv lock --check` passes). The contract test ran green against the real installed package with `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` (also confirms mlx-audio 0.5.8 runs on mlx 0.31.2 for load/feed with cached weights). The contract test purges `mlx_audio*` from `sys.modules` on module teardown, because other tests assert it is absent. Full suite with the extra installed: 6737 passed.
 
 - **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amended the Req 4 stall-guard text above the marker (done in the later administrative marker refresh recorded below). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; the preflight and the loader share one repo id (initially pinned by a parity test between two literals; since round 2 both read `diarization_model.REPO_ID`, a single owner, and the alias is gone).
-- **Gauntlet round 5 (2026-10-09)**: `label_for` margin guard now keys on "top slot is not a candidate" (was "no candidates"), per owner decision; the above-marker label policy gained one sentence (administrative marker refresh). Codex's adversarial gate was unavailable (usage limit) in the final confirming pass; owner chose to close on the other gates.
+- **Gauntlet round 5 (2026-10-08)**: `label_for` margin guard now keys on "top slot is not a candidate" (was "no candidates"), per owner decision; the above-marker label policy gained one sentence (administrative marker refresh). Codex's adversarial gate was unavailable (usage limit) in the final confirming pass; owner chose to close on the other gates.
 - **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; `_pending_span` clear in `_detach_client` (plan-specified, fail-safe); contract-test weights skip under `REQUIRE`.
 - **Still open (Phase 8b/9)**: VAD-span edge offset (see Phase 4 note). Facts for the decision: the STT decodes pipecat's `_audio_buffer` (<= 1 s pre-roll + everything to the VAD-stop event), the server returns no timestamps onoats consumes, and `VADUserStartedSpeakingFrame.start_secs` / `VADUserStoppedSpeakingFrame.stop_secs` carry the confirmation delays.
 

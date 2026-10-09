@@ -15,6 +15,41 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in live speaker diarization on the "them" channel.** New
+  `[stt].diarization` (env `ONOATS_DIARIZATION`, which takes precedence;
+  default off) labels each `them` utterance with a speaker (`S1`, `S2`, … in
+  order of first speech) and flags overlap; the labels persist in the session
+  JSONL (`speakers` / `overlap`) and render as `**Them (S1):**` (or
+  `Them (S1 / S2, overlapping)`). The `me` channel is never labelled. Websocket
+  STT only. Needs the optional extra (`uv sync --extra diarization`, or
+  `uv tool install 'onoats[macos,diarization]'`) and the model weights, which
+  are never auto-downloaded: `hf download mlx-community/Nemotron-3-Diarization`.
+  A startup preflight (right after the single-instance lock, before any capture
+  side effect) exits non-zero with the remedy if the STT backend is not
+  websocket, the extra is missing, or the weights are not cached. After startup
+  it fails open: a runtime diarizer failure logs one WARNING and the session
+  continues with unlabelled `them` lines, never losing a transcript.
+  `onoats bot-single` ignores the flag with one WARNING.
+- **`onoats init` carries `[stt].diarization` over** when re-run over an existing
+  `config.toml`, so re-running init does not silently turn diarization off.
+
+### Changed
+
+- **pipecat floor raised to `>=1.3.0`.** The segment-sample stamping that
+  diarization relies on hooks `SegmentedSTTService` running `run_stt` inline on
+  VAD-stop, verified only from 1.3.0 (pinned by
+  `tests/test_websocket_stt_stamping.py`).
+- **`scripts/release_check.sh` gained a diarization-contract check (check 5).**
+  It runs `tests/test_diarization_contract.py` under
+  `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` via `uv run --extra diarization`,
+  so a missing or drifted `mlx-audio` fails instead of skipping. Unlike checks
+  1-4 it runs against the working tree, so it fails unless `HEAD` equals the
+  commit under check and the tree is clean. The weights-dependent contract
+  tests still skip when the model is not in the local HF cache; pre-cache it on
+  the release machine.
+
 ## [1.3.0] - 2026-09-26
 
 ### Added
