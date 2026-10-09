@@ -4,7 +4,7 @@ in-process at the same time. Run from pipecat-local-stt-server's own venv
 (it owns the `stt_server` package).
 
 Usage:
-    /Users/vr000m/Code/pipecat-ai/pipecat-local-stt-server/.venv/bin/python \
+    <pipecat-local-stt-server>/.venv/bin/python \
         experiments/diarization_scratch/stt_load_client.py --duration 70
 """
 
