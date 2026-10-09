@@ -490,17 +490,15 @@ def test_record_interleaved_into_in_progress_label_for(tl):
     assert after is not None and after.overlap and after.speakers == ["S1", "S2"]
 
 
-# --- segmented_stt_runs_inline: the stamping-soundness probe -------------------
+# --- segmented_stt_orders_spans: the stamping-soundness probe ------------------
 
 
-def test_segmented_stt_runs_inline_true_for_the_locked_pipecat():
+def test_segmented_stt_orders_spans_true_for_the_locked_pipecat():
     """The locked pipecat (1.3.0) awaits ``run_stt`` inline on VAD-stop."""
-    assert dt.segmented_stt_runs_inline() is True
+    assert dt.segmented_stt_orders_spans() is True
 
 
-def test_segmented_stt_runs_inline_false_for_a_queued_segment_shape(monkeypatch):
-    """pipecat >= 1.9 enqueues the segment and a task runs ``run_stt`` later:
-    the single-slot span would then be matched to the wrong segment."""
+def _patch_queued_shape(monkeypatch, task_handler):
     from pipecat.services.stt_service import SegmentedSTTService
 
     async def _handle_user_stopped_speaking(self, frame):
@@ -511,31 +509,56 @@ def test_segmented_stt_runs_inline_false_for_a_queued_segment_shape(monkeypatch)
         "_handle_user_stopped_speaking",
         _handle_user_stopped_speaking,
     )
-    assert dt.segmented_stt_runs_inline() is False
+    monkeypatch.setattr(
+        SegmentedSTTService, "_segment_task_handler", task_handler, raising=False
+    )
 
 
-def test_segmented_stt_runs_inline_false_when_a_segment_task_exists(monkeypatch):
-    """The class-level ``_segment_task_handler`` alone is enough to refuse, even
-    if the stop handler's source still mentions ``self.run_stt(`` inline."""
-    from pipecat.services.stt_service import SegmentedSTTService
+def test_segmented_stt_orders_spans_true_for_pipecat_1_9_queue_shape(monkeypatch):
+    """pipecat >= 1.9 enqueues the segment and ONE task takes segments off the
+    queue and awaits ``run_stt`` for each in turn: still VAD-stop order."""
 
     async def _segment_task_handler(self):  # pragma: no cover - never run
-        return None
+        audio = await self._segment_queue.get()
+        await self.process_generator(self.run_stt(audio))
+
+    _patch_queued_shape(monkeypatch, _segment_task_handler)
+    assert dt.segmented_stt_orders_spans() is True
+
+
+def test_segmented_stt_orders_spans_false_when_segments_run_concurrently(monkeypatch):
+    """A queue drained by tasks spawned per segment can finish out of order, so
+    a span could be popped by another segment's ``run_stt``."""
+
+    async def _segment_task_handler(self):  # pragma: no cover - never run
+        audio = await self._segment_queue.get()
+        self.create_task(self.run_stt(audio))
+
+    _patch_queued_shape(monkeypatch, _segment_task_handler)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+def test_segmented_stt_orders_spans_false_for_an_unrecognised_shape(monkeypatch):
+    """Neither inline nor the queue-and-one-task shape (e.g. a handler that
+    hands the segment to some other mechanism)."""
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    async def _handle_user_stopped_speaking(self, frame):
+        self.schedule_somewhere_else(frame)
 
     monkeypatch.setattr(
         SegmentedSTTService,
-        "_segment_task_handler",
-        _segment_task_handler,
-        raising=False,
+        "_handle_user_stopped_speaking",
+        _handle_user_stopped_speaking,
     )
-    assert dt.segmented_stt_runs_inline() is False
+    assert dt.segmented_stt_orders_spans() is False
 
 
-def test_segmented_stt_runs_inline_fails_closed_without_source(monkeypatch):
+def test_segmented_stt_orders_spans_fails_closed_without_source(monkeypatch):
     import inspect
 
     def _no_source(obj):
         raise OSError("source not available")
 
     monkeypatch.setattr(inspect, "getsource", _no_source)
-    assert dt.segmented_stt_runs_inline() is False
+    assert dt.segmented_stt_orders_spans() is False

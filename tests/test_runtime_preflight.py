@@ -2342,11 +2342,11 @@ def test_diarization_preflight_missing_extra_fails_loud(_diar_cfg, monkeypatch):
     assert "--extra diarization" in str(ei.value)
 
 
-def test_diarization_preflight_refuses_non_inline_segmented_stt(_diar_cfg, monkeypatch):
-    """pipecat >= 1.9 queues segments: refuse before probing the extra/weights
+def test_diarization_preflight_refuses_unordered_segmented_stt(_diar_cfg, monkeypatch):
+    """A pipecat that may reorder segments: refuse before probing the extra/weights
     (no point sending the user to download gigabytes first), and do not memoize."""
     monkeypatch.setattr(
-        "onoats.stt.diarization_timeline.segmented_stt_runs_inline", lambda: False
+        "onoats.stt.diarization_timeline.segmented_stt_orders_spans", lambda: False
     )
     monkeypatch.setattr(
         runtime,
@@ -2356,7 +2356,7 @@ def test_diarization_preflight_refuses_non_inline_segmented_stt(_diar_cfg, monke
     with pytest.raises(runtime.DiarizationPreflightError) as ei:
         runtime._preflight_diarization(_diar_cfg)
     msg = str(ei.value)
-    assert "pipecat" in msg and "1.9" in msg
+    assert "pipecat" in msg and "VAD-stop order" in msg
     assert runtime.DIARIZATION_REPO_ID not in runtime._diarization_preflight_done
 
 

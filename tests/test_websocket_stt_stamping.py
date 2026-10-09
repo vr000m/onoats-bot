@@ -1,12 +1,14 @@
 """Phase 4 - `WebSocketSTTService` segment-sample stamping.
 
 Design intent: each them-arm ``TranscriptionFrame`` is stamped with its VAD span
-(``onoats_segment_start_sample`` / ``onoats_segment_end_sample``) via a single
-pending span slot written *before* delegating the VAD-stop frame to
-``super()``; the me arm (``stamp_segment_samples=False``) is never stamped.
+(``onoats_segment_start_sample`` / ``onoats_segment_end_sample``) via an ordered
+queue of pending spans (one entry per VAD-stop, appended *before* delegating the
+frame to ``super()`` and popped at the head of ``run_stt``); the me arm
+(``stamp_segment_samples=False``) is never stamped.
 
-Tests drive the REAL inline path (``process_frame(VADUserStoppedSpeakingFrame)``
--> ``SegmentedSTTService._handle_user_stopped_speaking`` -> ``run_stt``) through
+Tests drive the REAL path (``process_frame(VADUserStoppedSpeakingFrame)``
+-> ``SegmentedSTTService._handle_user_stopped_speaking`` -> ``run_stt``, inline
+on pipecat <= 1.8 and via its segment-queue task on 1.9+) through
 pipecat's ``run_test`` harness, with a stubbed deferred decode: a fake
 ``TranscriptionClient`` whose ``commit()`` queues a scripted
 ``transcript.completed`` event. Names asserted here come from plan Requirement 3
@@ -17,6 +19,7 @@ pipecat's ``run_test`` harness, with a stubbed deferred decode: a fake
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 
 import pytest
@@ -37,7 +40,11 @@ from onoats.config.audio_devices import PIPELINE_SAMPLE_RATE
 from onoats.processors.diarization_feeder import DiarizationFeeder
 from onoats.stt import launchd
 from onoats.stt import websocket_stt_service as wss_module
-from onoats.stt.diarization_timeline import DiarizationTimeline, SampleCounter
+from onoats.stt.diarization_timeline import (
+    DiarizationTimeline,
+    SampleCounter,
+    segmented_stt_orders_spans,
+)
 from onoats.stt.websocket_stt_service import WebSocketSTTService
 
 START_ATTR = "onoats_segment_start_sample"
@@ -143,9 +150,23 @@ def _segment(pre: int, speech: int) -> list:
     )
 
 
+@functools.cache
+def _warm_pipecat_imports() -> None:
+    """pipecat 1.9+ warms its deferred imports in a worker thread on the first
+    pipeline start, which can outlast ``run_test``'s start timeout (1 s) and
+    stall the event loop for minutes in a fresh venv. Do it once up front, in
+    this thread, so the first test starts like every other."""
+    try:
+        from pipecat.utils.prewarm import warm_deferred_imports
+    except ImportError:  # pipecat < 1.9
+        return
+    warm_deferred_imports()
+
+
 def _run(svc, frames, *, errors: list | None = None):
     """Drive ``frames`` through the real service; returns the downstream
     ``TranscriptionFrame``s in order. ``errors`` collects ERROR log messages."""
+    _warm_pipecat_imports()
     sink = None
     if errors is not None:
         sink = logger.add(
@@ -201,22 +222,25 @@ def test_two_consecutive_segments_each_get_their_own_span():
     )
 
 
-def test_span_restarts_at_zero_across_a_second_startframe():
-    """A ``StartFrame`` resets the sample clock (the feeder resets too)."""
+def test_startframe_resets_the_sample_clock_and_open_state():
+    """A ``StartFrame`` resets the sample clock (the feeder resets too) and any
+    open VAD start / queued span. Driven directly: pipecat 1.9+ handles a
+    ``StartFrame`` out of band, ahead of queued data frames, so it cannot be
+    interleaved mid-stream through a pipeline."""
     svc = _svc()
-    _ScriptedClient.script = ["one", "two"]
-    frames = (
-        _segment(pre=2, speech=2)
-        + [StartFrame(audio_in_sample_rate=PIPELINE_SAMPLE_RATE)]
-        + _segment(pre=1, speech=1)
-    )
-    out = _run(svc, frames)
-    assert [f.text for f in out] == ["one", "two"]
-    assert getattr(out[0], START_ATTR) == 2 * CHUNK
-    assert getattr(out[0], END_ATTR) == 4 * CHUNK
-    # after the reset the clock restarts at 0: pre=1 chunk, speech=1 chunk
-    assert getattr(out[1], START_ATTR) == 1 * CHUNK
-    assert getattr(out[1], END_ATTR) == 2 * CHUNK
+    for f in [_audio(), _audio(), _vad_start(), _audio()]:
+        svc._track_segment_span(f)
+    svc._span_queue.append((1, 2))
+    assert svc._sample_counter.samples == 3 * CHUNK
+
+    svc._track_segment_span(StartFrame(audio_in_sample_rate=PIPELINE_SAMPLE_RATE))
+    assert svc._sample_counter.samples == 0
+    assert svc._vad_start_sample is None
+    assert len(svc._span_queue) == 0
+
+    for f in _segment(pre=1, speech=1):
+        svc._track_segment_span(f)
+    assert list(svc._span_queue) == [(1 * CHUNK, 2 * CHUNK)]
 
 
 def test_kwarg_false_sets_no_attributes():
@@ -241,34 +265,51 @@ def test_default_kwarg_is_false():
 # ----------------------------------------------- fail-loud slot discipline
 
 
-def test_second_span_while_one_pending_logs_error_and_frame_unstamped(monkeypatch):
-    """Segment 1's ``run_stt`` is made to NOT consume the slot (stand-in for a
-    span left outstanding); segment 2 then captures a second span while one is
-    pending -> ERROR logged, and segment 2's frame is unstamped (never a
-    guessed span)."""
+def test_spans_stay_aligned_when_run_stt_is_deferred(monkeypatch):
+    """pipecat 1.9+ queues each segment and a task runs ``run_stt`` later, so
+    several spans are outstanding before the first ``run_stt`` starts. The stop
+    handler is replaced by that queued shape (all three VAD-stops are seen,
+    then the segments are decoded in order): each transcript must still carry
+    its own segment's span."""
     svc = _svc()
-    real_run_stt = svc.run_stt
-    calls = {"n": 0}
+    _ScriptedClient.script = ["one", "two", "three"]
+    deferred: list[bytes] = []
 
-    async def _first_skips_slot(audio):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return  # does not touch _pending_span: slot stays occupied
-            yield  # pragma: no cover  (makes this an async generator)
-        async for f in real_run_stt(audio):
-            yield f
+    async def _queued(frame):
+        svc._user_speaking = False
+        deferred.append(bytes(svc._audio_buffer))
+        svc._audio_buffer.clear()
+        if len(deferred) == 3:
+            for audio in deferred:
+                await svc.process_generator(svc.run_stt(audio))
 
-    monkeypatch.setattr(svc, "run_stt", _first_skips_slot)
-
-    errors: list[str] = []
+    monkeypatch.setattr(svc, "_handle_user_stopped_speaking", _queued)
     out = _run(
-        svc, _segment(pre=1, speech=1) + _segment(pre=1, speech=1), errors=errors
+        svc,
+        _segment(pre=1, speech=1)
+        + _segment(pre=2, speech=2)
+        + _segment(pre=0, speech=3),
     )
-    assert calls["n"] == 2
-    assert len(out) == 1  # first produced nothing; second transcribed
-    assert not hasattr(out[0], START_ATTR)
-    assert not hasattr(out[0], END_ATTR)
-    assert errors, "second span while one pending must log an ERROR"
+    assert [f.text for f in out] == ["one", "two", "three"]
+    # seg1 [1,2); seg2 [2+2, 4+2)=[4,6)... counted in chunks from the clock.
+    assert [(getattr(f, START_ATTR), getattr(f, END_ATTR)) for f in out] == [
+        (1 * CHUNK, 2 * CHUNK),
+        (4 * CHUNK, 6 * CHUNK),
+        (6 * CHUNK, 9 * CHUNK),
+    ]
+
+
+def test_segment_dropped_by_an_unusable_service_leaves_no_span(monkeypatch):
+    """pipecat 1.9+ drops the segment of a service that is not ``is_usable``;
+    no ``run_stt`` will pop for it, so no entry may be queued."""
+    monkeypatch.setattr(
+        WebSocketSTTService, "is_usable", property(lambda self: False), raising=False
+    )
+    svc = _svc()
+    for f in _segment(pre=1, speech=1):
+        svc._track_segment_span(f)
+    assert len(svc._span_queue) == 0
+    assert svc._vad_start_sample is None
 
 
 def test_run_stt_with_empty_slot_is_unstamped_without_crash():
@@ -311,63 +352,39 @@ def test_double_vad_start_keeps_first_start_and_logs_error():
     assert any("already open" in e for e in errors)
 
 
-# ------------------------------------------------------- slot clearing
+# ------------------------------------------------------- queue clearing
 
 
-def _slot_attr(svc) -> str:
-    """The single pending-span slot attribute (name is implementation-chosen)."""
-    cands = [
-        a
-        for a in vars(svc)
-        if "pending" in a and "span" in a and not a.startswith("__")
-    ]
-    assert len(cands) == 1, f"expected one pending span slot attr, found {cands}"
-    return cands[0]
-
-
-def _occupy_slot(svc) -> str:
-    name = _slot_attr(svc)
-    setattr(svc, name, (123, 456))
-    return name
-
-
-def test_slot_cleared_on_startframe():
+def test_queue_cleared_on_startframe():
     svc = _svc()
-    name = _occupy_slot(svc)
+    svc._span_queue.append((123, 456))
     out = _run(svc, [_audio(), _audio()])
     assert out == []
-    assert getattr(svc, name) is None
+    assert len(svc._span_queue) == 0
 
 
-def test_slot_cleared_on_reconnect_stale_discard():
+def test_reconnect_keeps_queued_spans_and_each_run_stt_pops_one():
+    """A reconnect/discard must not touch queued spans (their segments have not
+    reached ``run_stt`` yet); each ``run_stt`` pops exactly its own."""
     svc = _svc()
-    name = _slot_attr(svc)
+    svc._span_queue.extend([(1, 2), (3, 4)])
 
     async def _go():
         await svc._ensure_connected()
-        setattr(svc, name, (1, 2))
         await svc._discard_stale()
-        return getattr(svc, name)
-
-    assert asyncio.run(_go()) is None
-
-
-def test_stale_slot_is_not_attributed_to_a_later_segment():
-    """Slot left over from a discarded decode must not stamp the next frame."""
-    svc = _svc()
-    _occupy_slot(svc)
-
-    async def _go():
-        await svc._ensure_connected()
-        await svc._discard_stale()  # reconnect path clears the slot
+        assert list(svc._span_queue) == [(1, 2), (3, 4)]
         out = []
-        async for f in svc.run_stt(b"\x01\x00" * CHUNK):
-            out.append(f)
+        for _ in range(2):
+            async for f in svc.run_stt(b"\x01\x00" * CHUNK):
+                out.append(f)
         return [f for f in out if isinstance(f, TranscriptionFrame)]
 
     frames = asyncio.run(_go())
-    assert len(frames) == 1
-    assert not hasattr(frames[0], START_ATTR)
+    assert [(getattr(f, START_ATTR), getattr(f, END_ATTR)) for f in frames] == [
+        (1, 2),
+        (3, 4),
+    ]
+    assert len(svc._span_queue) == 0
 
 
 # --------------------------------------------------------- clock parity
@@ -453,8 +470,8 @@ class _NullWorker:
 
 
 def test_pipecat_hook_shape():
-    """Pins the pipecat 1.3.x shape the stamping depends on, so a future
-    pipecat that adds a segment queue or a reconnect-replay fails loudly."""
+    """Pins the pipecat shape the stamping depends on, so a future pipecat that
+    reorders segments or adds a reconnect-replay fails loudly."""
     # private attributes / signatures used
     assert hasattr(SegmentedSTTService, "_handle_user_stopped_speaking")
     assert hasattr(SegmentedSTTService, "_handle_user_started_speaking")
@@ -469,56 +486,15 @@ def test_pipecat_hook_shape():
         inspect.signature(SegmentedSTTService._handle_user_stopped_speaking).parameters
     ) == ["self", "frame"]
 
-    # VAD-stop awaits run_stt inline: no segment-queue attribute exists...
-    src = inspect.getsource(SegmentedSTTService._handle_user_stopped_speaking)
-    assert "self.run_stt(" in src
-    assert "process_generator" in src
-    assert "queue" not in src.lower()
-    svc = _svc(stamp=False)
-    for a in vars(svc):
-        if a.startswith("_pending_span") or a == "_pending":
-            continue
-        assert not ("segment" in a and "queue" in a), a
-    for a in dir(SegmentedSTTService):
-        assert not ("segment" in a.lower() and "queue" in a.lower()), a
+    # Segments reach run_stt in VAD-stop order (inline, or one in-order queue
+    # task): the property the span queue depends on, probed the same way the
+    # startup preflight probes it.
+    assert segmented_stt_orders_spans() is True
 
     # ...and process_audio_frame has no reconnect-replay branch.
     paf = inspect.getsource(SegmentedSTTService.process_audio_frame).lower()
     for word in ("replay", "reconnect", "resend"):
         assert word not in paf
-
-
-def test_inline_run_stt_within_a_single_process_frame_call(monkeypatch):
-    """Behavioural half of the shape guard: one ``process_frame(VADStop)`` call
-    completes ``run_stt`` before returning (no deferral to another task).
-
-    Ordering is recorded inside the call: ``run_stt`` must start AND finish
-    before the VAD-stop ``process_frame`` returns. A pipecat that scheduled
-    ``run_stt`` on a separate task would record the return marker first."""
-    svc = _svc()
-    seen: list[str] = []
-    real = svc.run_stt
-
-    async def _spy(audio):
-        seen.append("run_stt")
-        async for f in real(audio):
-            yield f
-        seen.append("run_stt done")
-
-    monkeypatch.setattr(svc, "run_stt", _spy)
-
-    real_process_frame = svc.process_frame
-
-    async def _wrapped(frame, direction):
-        await real_process_frame(frame, direction)
-        if isinstance(frame, VADUserStoppedSpeakingFrame):
-            seen.append("process_frame(VADStop) returned")
-
-    monkeypatch.setattr(svc, "process_frame", _wrapped)
-
-    out = _run(svc, _segment(pre=1, speech=1))
-    assert seen == ["run_stt", "run_stt done", "process_frame(VADStop) returned"]
-    assert len(out) == 1
 
 
 # --------------------------------------------------- decode-timeout ratio owner

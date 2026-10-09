@@ -89,33 +89,43 @@ RING_CAPACITY_SEC: float = (
 Listener = Callable[[], None]
 
 
-def segmented_stt_runs_inline() -> bool:
-    """True when pipecat's ``SegmentedSTTService`` awaits ``run_stt`` inline.
+def segmented_stt_orders_spans() -> bool:
+    """True when ``SegmentedSTTService`` hands segments to ``run_stt`` in VAD-stop order.
 
-    The STT's single-slot ``_pending_span`` stamping is only sound when the
-    VAD-stop ``process_frame`` call runs ``run_stt`` to completion before the
-    next frame is handled (pipecat 1.3.0-1.8.x). From 1.9.0 the service queues
-    each segment and a separate task runs ``run_stt`` later, so a second
-    VAD-stop can overwrite or steal the slot and stamp a segment with another
-    segment's span - a wrong label rather than a missing one. The dependency
-    range admits those releases, so the startup preflight checks this and
-    refuses to enable diarization rather than mislabel.
+    The STT's span queue (one entry per VAD-stop, popped at the head of
+    ``run_stt``) is only sound if segments reach ``run_stt`` in the order their
+    VAD-stops were seen. Two shapes guarantee that: pipecat 1.3.0-1.8.x await
+    ``run_stt`` inline in the stop handler; from 1.9.0 the handler puts the
+    segment on ``_segment_queue`` and ONE ``_segment_task_handler`` task takes
+    them off one at a time. Anything else (a concurrent or re-ordering design)
+    could pair a span with another segment - a wrong label rather than a
+    missing one - so the startup preflight refuses it.
 
     Fails closed: an unreadable source or an unrecognised shape is "not
-    inline". Third-party import only (lazy), so this stays a leaf helper.
+    ordered". Third-party import only (lazy), so this stays a leaf helper.
     """
     import inspect
+    import re
 
     from pipecat.services.stt_service import SegmentedSTTService
 
     handler = getattr(SegmentedSTTService, "_handle_user_stopped_speaking", None)
-    if handler is None or hasattr(SegmentedSTTService, "_segment_task_handler"):
+    if handler is None:
         return False
     try:
         src = inspect.getsource(handler)
+        task = getattr(SegmentedSTTService, "_segment_task_handler", None)
+        task_src = inspect.getsource(task) if task is not None else ""
     except (OSError, TypeError):
         return False
-    return "self.run_stt(" in src and "queue" not in src.lower()
+    if task is None:
+        return "self.run_stt(" in src and "queue" not in src.lower()
+    return (
+        "self._segment_queue.put(" in src
+        and "self._segment_queue.get()" in task_src
+        and re.search(r"await\s+self\.process_generator\(\s*self\.run_stt\(", task_src)
+        is not None
+    )
 
 
 class SampleCounter:

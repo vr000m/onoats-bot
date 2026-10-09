@@ -1924,19 +1924,19 @@ def _preflight_diarization(cfg) -> None:
         )
     if DIARIZATION_REPO_ID in _diarization_preflight_done:
         return
-    # First, so a user on an unsupported pipecat is not sent off to install the
+    # First, so a user on an unrecognised pipecat is not sent off to install the
     # extra and download the weights only to hit this wall. Lazy import: the
     # leaf pulls pipecat in only when the flag is on.
-    from onoats.stt.diarization_timeline import segmented_stt_runs_inline
+    from onoats.stt.diarization_timeline import segmented_stt_orders_spans
 
-    if not segmented_stt_runs_inline():
+    if not segmented_stt_orders_spans():
         _fail(
-            "diarization is enabled but the installed pipecat-ai does not run "
-            "SegmentedSTTService segments inline (pipecat >= 1.9 queues them "
-            "onto a separate task), so a VAD span cannot be matched to its "
-            "segment and speaker labels could land on the wrong utterance. "
-            "Use a pipecat-ai release below 1.9 (a checkout's uv.lock pins "
-            "1.3.0) or disable ONOATS_DIARIZATION / [stt].diarization."
+            "diarization is enabled but the installed pipecat-ai does not "
+            "hand SegmentedSTTService segments to run_stt in VAD-stop order "
+            "(neither inline nor through one in-order queue task), so a VAD "
+            "span cannot be matched to its segment and speaker labels could "
+            "land on the wrong utterance. Upgrade onoats, or disable "
+            "ONOATS_DIARIZATION / [stt].diarization."
         )
     if not _diarization_extra_installed():
         _fail(
