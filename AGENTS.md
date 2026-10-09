@@ -325,7 +325,10 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   and passes it to both `stamp_segment_samples` (STT) and `diarization` (the
   pipeline builder), so stamping and the labeler can't disagree. The STT's
   `_pending_span` is a single slot written **before** delegating VAD-stop to
-  `super()` (pipecat >= 1.3.0 runs `run_stt` inline); the feeder and the STT
+  `super()` (pipecat 1.3.0-1.8.x run `run_stt` inline; **1.9+ queues segments onto
+  a separate task**, which would let a span be matched to the wrong segment, so
+  `runtime._preflight_diarization` refuses it via
+  `diarization_timeline.segmented_stt_runs_inline`); the feeder and the STT
   each count samples with `SampleCounter`, and the feeder's `start_sample` is
   the worker's position authority. Pinned by
   `tests/test_websocket_stt_stamping.py`.

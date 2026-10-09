@@ -2342,6 +2342,24 @@ def test_diarization_preflight_missing_extra_fails_loud(_diar_cfg, monkeypatch):
     assert "--extra diarization" in str(ei.value)
 
 
+def test_diarization_preflight_refuses_non_inline_segmented_stt(_diar_cfg, monkeypatch):
+    """pipecat >= 1.9 queues segments: refuse before probing the extra/weights
+    (no point sending the user to download gigabytes first), and do not memoize."""
+    monkeypatch.setattr(
+        "onoats.stt.diarization_timeline.segmented_stt_runs_inline", lambda: False
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_diarization_extra_installed",
+        lambda: pytest.fail("extra probed despite unsupported pipecat"),
+    )
+    with pytest.raises(runtime.DiarizationPreflightError) as ei:
+        runtime._preflight_diarization(_diar_cfg)
+    msg = str(ei.value)
+    assert "pipecat" in msg and "1.9" in msg
+    assert runtime.DIARIZATION_REPO_ID not in runtime._diarization_preflight_done
+
+
 def test_diarization_preflight_cold_cache_names_download_and_never_downloads(
     _diar_cfg, monkeypatch
 ):

@@ -29,7 +29,10 @@ classifiers = [
 dependencies = [
     # >=1.3.0: the diarization stamping hooks SegmentedSTTService running
     # run_stt inline on VAD-stop, a private behaviour verified only from 1.3.0
-    # (pinned by tests/test_websocket_stt_stamping.py).
+    # (pinned by tests/test_websocket_stt_stamping.py). pipecat >= 1.9 queues
+    # segments onto a separate task, which the range still admits: the
+    # diarization preflight (`diarization_timeline.segmented_stt_runs_inline`)
+    # refuses to enable the feature there instead of mislabelling.
     "pipecat-ai[deepgram,google,local,runner,silero,soundfile,webrtc,whisper]>=1.3.0,<2.0.0",
     # Kept in lockstep with the running server generation. 0.3.3 added UDS
     # trust-boundary hardening (0700 socket-dir enforcement + peer-cred 403);

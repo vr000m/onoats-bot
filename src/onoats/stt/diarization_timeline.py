@@ -89,6 +89,35 @@ RING_CAPACITY_SEC: float = (
 Listener = Callable[[], None]
 
 
+def segmented_stt_runs_inline() -> bool:
+    """True when pipecat's ``SegmentedSTTService`` awaits ``run_stt`` inline.
+
+    The STT's single-slot ``_pending_span`` stamping is only sound when the
+    VAD-stop ``process_frame`` call runs ``run_stt`` to completion before the
+    next frame is handled (pipecat 1.3.0-1.8.x). From 1.9.0 the service queues
+    each segment and a separate task runs ``run_stt`` later, so a second
+    VAD-stop can overwrite or steal the slot and stamp a segment with another
+    segment's span - a wrong label rather than a missing one. The dependency
+    range admits those releases, so the startup preflight checks this and
+    refuses to enable diarization rather than mislabel.
+
+    Fails closed: an unreadable source or an unrecognised shape is "not
+    inline". Third-party import only (lazy), so this stays a leaf helper.
+    """
+    import inspect
+
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    handler = getattr(SegmentedSTTService, "_handle_user_stopped_speaking", None)
+    if handler is None or hasattr(SegmentedSTTService, "_segment_task_handler"):
+        return False
+    try:
+        src = inspect.getsource(handler)
+    except (OSError, TypeError):
+        return False
+    return "self.run_stt(" in src and "queue" not in src.lower()
+
+
 class SampleCounter:
     """The one counter used by the feeder and the STT service.
 

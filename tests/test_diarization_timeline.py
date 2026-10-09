@@ -488,3 +488,54 @@ def test_record_interleaved_into_in_progress_label_for(tl):
     # ...and the write really does change this window once it lands.
     after = tl.label_for(*window)
     assert after is not None and after.overlap and after.speakers == ["S1", "S2"]
+
+
+# --- segmented_stt_runs_inline: the stamping-soundness probe -------------------
+
+
+def test_segmented_stt_runs_inline_true_for_the_locked_pipecat():
+    """The locked pipecat (1.3.0) awaits ``run_stt`` inline on VAD-stop."""
+    assert dt.segmented_stt_runs_inline() is True
+
+
+def test_segmented_stt_runs_inline_false_for_a_queued_segment_shape(monkeypatch):
+    """pipecat >= 1.9 enqueues the segment and a task runs ``run_stt`` later:
+    the single-slot span would then be matched to the wrong segment."""
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    async def _handle_user_stopped_speaking(self, frame):
+        await self._segment_queue.put(b"audio")
+
+    monkeypatch.setattr(
+        SegmentedSTTService,
+        "_handle_user_stopped_speaking",
+        _handle_user_stopped_speaking,
+    )
+    assert dt.segmented_stt_runs_inline() is False
+
+
+def test_segmented_stt_runs_inline_false_when_a_segment_task_exists(monkeypatch):
+    """The class-level ``_segment_task_handler`` alone is enough to refuse, even
+    if the stop handler's source still mentions ``self.run_stt(`` inline."""
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    async def _segment_task_handler(self):  # pragma: no cover - never run
+        return None
+
+    monkeypatch.setattr(
+        SegmentedSTTService,
+        "_segment_task_handler",
+        _segment_task_handler,
+        raising=False,
+    )
+    assert dt.segmented_stt_runs_inline() is False
+
+
+def test_segmented_stt_runs_inline_fails_closed_without_source(monkeypatch):
+    import inspect
+
+    def _no_source(obj):
+        raise OSError("source not available")
+
+    monkeypatch.setattr(inspect, "getsource", _no_source)
+    assert dt.segmented_stt_runs_inline() is False

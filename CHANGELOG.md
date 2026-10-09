@@ -40,7 +40,10 @@ Annotated tags exist from `v0.9.0` forward.
 - **pipecat floor raised to `>=1.3.0`.** The segment-sample stamping that
   diarization relies on hooks `SegmentedSTTService` running `run_stt` inline on
   VAD-stop, verified only from 1.3.0 (pinned by
-  `tests/test_websocket_stt_stamping.py`).
+  `tests/test_websocket_stt_stamping.py`). pipecat 1.9+ queues segments onto a
+  separate task, which the dependency range still admits, so the diarization
+  startup preflight exits non-zero there rather than risk a label landing on
+  the wrong utterance; a checkout's `uv.lock` pins 1.3.0.
 - **`scripts/release_check.sh` gained a diarization-contract check (check 5).**
   It runs `tests/test_diarization_contract.py` under
   `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` via `uv run --extra diarization`,
