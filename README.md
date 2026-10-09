@@ -341,12 +341,19 @@ a consumer drains.
 | Line type      | Shape                                                              |
 |----------------|--------------------------------------------------------------------|
 | `session_meta` | `{"type":"session_meta","category":"<cat>"}` — optional FIRST line |
-| `utterance`    | `{"type":"utterance","time":...,"text":...,"source":"me"\|"them"}` |
+| `utterance`    | `{"type":"utterance","time":...,"text":...,"source":"me"\|"them"}` plus optional `speakers` / `overlap` (below) |
 | `silence_gap`  | `{"type":"silence_gap","time":...,"duration_seconds":N}`           |
 
 - The `source` field is the **canonical `me`/`them` enum** — the frozen wire
   contract. Configurable speaker display labels (`[speakers]`) are applied
   **only at render time**, never written into the queue.
+- With [speaker diarization](#speaker-diarization-opt-in) on, a labelled
+  `them` utterance also carries two optional keys: `speakers` (a non-empty
+  list of canonical labels such as `["S1"]`, or `["S1","S2"]` for overlap) and
+  `overlap` (a bool). Both are **omitted** when diarization is off or the
+  utterance was left unlabelled, and `me` utterances never carry them. Treat
+  absence as unlabelled. Display strings like `Them (S1)` are composed at
+  render time and are not stored.
 - The chosen `--category` rides on the `session_meta` first line (not the
   filename); the `{session_id}` stem stays load-bearing for a consumer's
   back-fill keying.
