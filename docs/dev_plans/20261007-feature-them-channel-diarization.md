@@ -322,7 +322,7 @@ contract is "never a hang"; precedent:
      |---|---|
      | `record(start_sample, probs)`, `record_gap(start, end)`, `set_slot_count(n)` (once, after model load; `label_for` returns `None` while unset), `mark_flushed()` (after the final flush), `mark_degraded()` | worker |
      | `label_for(start, end)`, `coverage_high_water()`, `is_degraded`, `is_flushed`, `add_progress_listener(cb)` | loop |
-     | `mark_degraded(reason="stalled")` (idempotent, one WARNING total) | loop — **only** from the labeler's stall guard (Req 4) |
+     | `mark_degraded(reason=...)` (idempotent, one WARNING total; the reason is free text, e.g. `stalled: no coverage progress over N consecutive hold windows`) | loop — the labeler's stall guard and fail-open (Req 4) and the feeder's worker-start-failure / join-timeout paths |
      Coverage data (records, GAPs, slot count) is written **only** by the
      worker; `mark_degraded` is the one idempotent flag either side may set.
      `add_progress_listener(cb)` registers a callback the worker invokes
@@ -482,7 +482,7 @@ contract is "never a hang"; precedent:
    never trips the worker's own degrade triggers, so the labeler counts
    consecutive `HOLD_SEC` expiries during which `coverage_high_water()` did
    not advance; after `STALL_CONSECUTIVE_TIMEOUTS` it calls
-   `timeline.mark_degraded(reason="stalled")` (one WARNING) and stops holding.
+   `timeline.mark_degraded(reason="stalled: ...")` (one WARNING; the reason names the no-progress condition) and stops holding.
    Two refinements keep the guard from false-tripping: expiries do not count
    while the model is still loading (`not timeline.is_ready`, within
    `MODEL_LOAD_GRACE_SEC` = 60 s of the labeler starting — a cold load
@@ -534,9 +534,10 @@ contract is "never a hang"; precedent:
      `IncompleteSnapshotError` on a fully cached repo; no `mlx_audio` import), so no MLX state is ever created
      on the main thread and a cold cache / offline machine fails loud with an
      explicit "weights not downloaded; run <command>" hint rather than
-     stalling startup on a network fetch. It is memoized (mirror
-     `_preflight_cache` in `runtime.py`) so the socket-mode double call is a
-     no-op. The worker does the real load. Called **right after
+     stalling startup on a network fetch. The config-independent probes (extra installed, weights cached) are
+     memoized (mirror `_preflight_cache` in `runtime.py`) so the socket-mode
+     double call re-probes nothing; the `stt_service` backend check is cheap
+     and runs on every call. The worker does the real load. Called **right after
      `_acquire_instance_lock`** in both `_supervise_socket_session`
      (before the capturer is spawned; it names its own `load_config()` call)
      and `run_onoats_dual` (before PortAudio opens; `src/onoats/dual.py`), and
@@ -544,11 +545,9 @@ contract is "never a hang"; precedent:
      `onoats bot-single` / `python -m onoats` (`__main__.run_onoats`), has no
      `them` arm: with the flag on it logs one WARNING that the flag is ignored
      in single-input mode (a Non-Goal, not a fail-loud, because nothing
-     capture-side is mis-configured). It also fails loud when the flag is on and
-     `stt_service != "websocket"` (the other STT backends cannot stamp
-     segment samples, so the flag would silently do nothing). Pinned by a
-     test asserting the transport builder / capturer spawn is never called
-     and rc=1.
+     capture-side is mis-configured). The flag is ignored there entirely,
+     so no backend check applies (pinned by a test asserting
+     `_preflight_diarization` is never called).
    - **Runtime failure** after preflight (worker model-load error, `feed()`
      raises, a batch exceeds the processing budget for
      `BUDGET_OVERRUN_CONSECUTIVE` consecutive batches — a single slow
@@ -1059,7 +1058,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-08 @ 1b5584bfe2104e750c86b745dd447060ab6bf16b -->
+<!-- reviewed: 2026-10-08 @ 7692711d6f8740818b317c8c2f6703a48a6f2e2d -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1109,7 +1108,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Phase 7 (found by the wired-pipeline matrix tests, not by Phase 5's unit tests)**: `DiarizationLabeler` stored its injectable clock as `self._clock`, which pipecat's `FrameProcessor.setup()` overwrites with a `SystemClock`, so every stamped `them` transcript raised `'SystemClock' object is not callable` in a real pipeline. Renamed to `self._now`; swept the other new processors for FrameProcessor-attribute collisions (none). Lesson for Phase 8b/9: unit tests that bypass `setup()` cannot catch framework-attribute shadowing.
 - **Phase 8**: `uv.lock` adds exactly `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6` (+ `provides-extras`); **`mlx`/`mlx-metal` unchanged at 0.31.2, so no mlx-whisper re-smoke and no CHANGELOG mlx note is triggered.** The local uv (0.12.23) also tried to rewrite the lock `revision` 3->5 and drop `sys_platform` markers on 10 nvidia edges; that churn was reverted by hand (diff is additions only; `uv lock --check` passes). The contract test ran green against the real installed package with `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` (also confirms mlx-audio 0.5.8 runs on mlx 0.31.2 for load/feed with cached weights). The contract test purges `mlx_audio*` from `sys.modules` on module teardown, because other tests assert it is absent. Full suite with the extra installed: 6737 passed.
 
-- **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amended the Req 4 stall-guard text above the marker (done in the later administrative marker refresh recorded below). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; `DIARIZATION_REPO_ID` == `DIARIZATION_MODEL_ID` pinned by a test.
+- **Post-/code-review fixes (2026-10-08)**: (1) labeler stall guard now ignores expiries while the model loads (`DiarizationTimeline.is_ready`, `MODEL_LOAD_GRACE_SEC`=60): a cold load otherwise tripped `mark_degraded("stalled")` for the whole session. This amended the Req 4 stall-guard text above the marker (done in the later administrative marker refresh recorded below). (2) Labeler pass-through (unstamped/degraded) now takes `_release_lock`, so it cannot overtake the head frame the release task is mid-push. (3) Feeder: `EndFrame`/`CancelFrame` post the finish/abort sentinel and are forwarded **immediately**; the bounded join moved to `cleanup()` (which aborts first if no terminal frame arrived). Matches the plan's "sentinel before forwarding" + "cleanup() backstop"; the labeler's `HOLD_SEC` wait on `is_flushed` is unchanged. (4) `OnoatsConfig.diarization` warns once per process per bad value. (5) Preflight install hint covers `uv tool install`; the preflight and the loader share one repo id (initially pinned by a parity test between two literals; since round 2 both read `diarization_model.REPO_ID`, a single owner, and the alias is gone).
 - **Accepted, recorded in AGENTS.md Review Checklist**: continuation-flush spill of labeler-held frames; `_pending_span` clear in `_detach_client` (plan-specified, fail-safe); contract-test weights skip under `REQUIRE`.
 - **Still open (Phase 8b/9)**: VAD-span edge offset (see Phase 4 note). Facts for the decision: the STT decodes pipecat's `_audio_buffer` (<= 1 s pre-roll + everything to the VAD-stop event), the server returns no timestamps onoats consumes, and `VADUserStartedSpeakingFrame.start_secs` / `VADUserStoppedSpeakingFrame.stop_secs` carry the confirmation delays.
 
