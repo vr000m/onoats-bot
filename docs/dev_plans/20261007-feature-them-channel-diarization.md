@@ -1124,6 +1124,8 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 
 - **release_check.sh check 5 guard (gauntlet round 1)**: beyond "working-tree dependent" (Files to Modify, above the marker), the shipped check now *fails* unless `HEAD` equals the resolved commit and the tree is clean, so it can never validate a different checkout than checks 1-4 inspected; checks 1-4 are unchanged.
 
+- **code-review xhigh (2026-10-09)**: (1) fixed — the plan's pipecat premise ("`run_stt` runs inline on VAD-stop") holds for 1.3.0-1.8.x only; 1.9.0 introduced `SegmentedSTTService._segment_queue`/`_segment_task_handler` (verified from the PyPI wheels of 1.4/1.6/1.8 vs 1.9/1.10/1.12) and the declared range `>=1.3.0,<2.0.0` admits them, where the single-slot `_pending_span` can stamp a segment with another segment's span (a wrong label, not a missing one). `tests/test_websocket_stt_stamping.py` pins the shape only on the locked version, so the startup preflight now also calls `diarization_timeline.segmented_stt_runs_inline()` and exits non-zero on a non-inline pipecat. Tightening the `pyproject.toml` cap to `<1.9` was deliberately not done (it would constrain non-diarization users). (2) fixed — `DiarizationLabeler._stop_task` swallowed a cancellation of its own caller; now `gather(..., return_exceptions=True)`. (3) fixed — the worker refuses a model with `output_subsampling_factor != 1` (the weights are not revision-pinned and the contract test skips on a cold cache).
+
 ### Review Waivers
 
 (none)
