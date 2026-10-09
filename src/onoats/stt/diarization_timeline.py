@@ -50,9 +50,10 @@ FRAME_SAMPLES = 160
 
 #: Per-frame probability at/above which a slot counts as active.
 ACTIVITY_THRESHOLD = 0.5
-#: When no slot is active for >= OVERLAP_MIN_FRACTION of the window (sparse,
-#: scattered activity), the top slot must lead the runner-up's activity-weighted
-#: score by at least this much or the window is left unlabelled.
+#: When the top-scored slot is not the sole OVERLAP_MIN_FRACTION candidate (no
+#: candidate at all - sparse, scattered activity - or a lower-scored candidate),
+#: it must lead the runner-up's activity-weighted score by at least this much
+#: or the window is left unlabelled.
 DOMINANT_MARGIN = 0.15
 #: Two+ slots each active for >= this fraction of the covered window => overlap.
 OVERLAP_MIN_FRACTION = 0.2
@@ -237,6 +238,16 @@ class DiarizationTimeline:
             return self._high_water
 
     def label_for(self, start_sample: int, end_sample: int) -> Label | None:
+        """Label ``[start_sample, end_sample)``, or ``None`` if unlabelable.
+
+        A *candidate* is a mapped slot active for ``>= OVERLAP_MIN_FRACTION``
+        of the covered rows. Two+ candidates => overlap (top two by
+        activity-weighted score). Otherwise the top-scored mapped slot is
+        labelled; when it is **not** the sole candidate (no candidate, or the
+        candidate scored lower) it must lead the runner-up by
+        ``>= DOMINANT_MARGIN`` or the window is left unlabelled. A top slot that
+        IS the sole candidate is labelled without a margin check.
+        """
         end_sample = int(end_sample)
         start_sample = int(start_sample)
         window = end_sample - start_sample
@@ -298,7 +309,11 @@ class DiarizationTimeline:
             return None
         ranked = sorted(mapped, key=key)
         top = ranked[0]
-        if not candidates and len(ranked) > 1:
+        # The margin guard keys on "top is not a candidate", not on "no
+        # candidates": a top-scored slot that is not the sole candidate must
+        # still clear DOMINANT_MARGIN, or the sole candidate's presence would
+        # be overruled with no check at all.
+        if top not in candidates and len(ranked) > 1:
             if float(scores[top]) - float(scores[ranked[1]]) < DOMINANT_MARGIN:
                 return None
         return Label([f"S{slot_map[top]}"], False)

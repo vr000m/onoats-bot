@@ -176,6 +176,50 @@ def test_overlap_below_threshold_is_dominant_only(tl):
     assert label.overlap is False
 
 
+def _sole_candidate_window(a_on, a_on_b, b_on, b_on_a):
+    """150-row window: slot 0 (A) active 40 rows (fraction 0.27 -> the sole
+    candidate), then slot 1 (B) active 25 rows (fraction 0.17), then silence.
+    ``a_on_b`` is A's probability on B's rows, ``b_on_a`` B's on A's rows."""
+    n_a, n_b, n = 40, 25, 150
+    arr = probs(n)
+    arr[:n_a, 0] = a_on
+    arr[:n_a, 1] = b_on_a
+    arr[n_a : n_a + n_b, 1] = b_on
+    arr[n_a : n_a + n_b, 0] = a_on_b
+    assert n_a / n >= dt.OVERLAP_MIN_FRACTION > n_b / n
+    return arr, n * HOP
+
+
+def test_top_not_sole_candidate_requires_margin(tl):
+    # A barely active (sole candidate, score ~0.31), B louder but brief
+    # (score ~0.38): B tops the ranking but leads by < DOMINANT_MARGIN.
+    arr, end = _sole_candidate_window(0.51, 0.0, 1.0, 0.0)
+    tl.record(0, arr)
+    assert tl.label_for(0, end) is None
+
+
+def test_top_not_sole_candidate_with_margin_is_labelled(tl):
+    # Same shape, but B sits just below threshold under A (score ~0.66 vs
+    # ~0.31): B leads by >= DOMINANT_MARGIN, so it is labelled.
+    arr, end = _sole_candidate_window(0.51, 0.0, 1.0, 0.45)
+    tl.record(0, arr)
+    label = tl.label_for(0, end)
+    assert label is not None
+    assert label.speakers == ["S2"]
+    assert label.overlap is False
+
+
+def test_sole_candidate_on_top_needs_no_margin(tl):
+    # A is the sole candidate AND top-scored (~0.48 vs ~0.35, lead below
+    # DOMINANT_MARGIN): labelled A with no margin check.
+    arr, end = _sole_candidate_window(0.6, 0.3, 0.9, 0.0)
+    tl.record(0, arr)
+    label = tl.label_for(0, end)
+    assert label is not None
+    assert label.speakers == ["S1"]
+    assert label.overlap is False
+
+
 def test_slot_mapping_by_first_activity(tl):
     # Slot 3 speaks first -> S1; slot 0 later -> S2.
     tl.record(0, probs(frames(2), s3=ON))
