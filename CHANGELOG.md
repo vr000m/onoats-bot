@@ -40,10 +40,12 @@ Annotated tags exist from `v0.9.0` forward.
 - **pipecat floor raised to `>=1.3.0`.** The segment-sample stamping that
   diarization relies on needs `SegmentedSTTService` to hand segments to
   `run_stt` in VAD-stop order: inline on 1.3.0-1.8.x, through one in-order
-  queue task from 1.9 (the STT keeps an ordered span queue, so both work; pinned
-  by `tests/test_websocket_stt_stamping.py`, exercised on 1.9.0, 1.11.0 and
-  1.12.0). The diarization startup preflight exits non-zero on a pipecat that
-  does neither; a checkout's `uv.lock` pins 1.3.0.
+  queue task from 1.9 (the STT keeps an ordered span queue, so both work). CI
+  runs against the locked pipecat 1.3.0 and covers the 1.9+ queue shape with
+  fixtures in `tests/test_websocket_stt_stamping.py`; the diarization tests
+  were additionally run by hand in isolated pipecat 1.9.0, 1.11.0 and 1.12.0
+  environments (not in CI). The diarization startup preflight exits non-zero
+  on a pipecat that does neither; a checkout's `uv.lock` pins 1.3.0.
 - **`scripts/release_check.sh` gained a diarization-contract check (check 5).**
   It runs `tests/test_diarization_contract.py` under
   `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` via `uv run --extra diarization`,

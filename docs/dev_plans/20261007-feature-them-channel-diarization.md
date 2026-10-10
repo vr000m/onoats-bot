@@ -235,11 +235,11 @@ attribute. Two preflight/config touch points sit outside the pipeline.
     - process_frame override counts samples      |   bounded, thread-safe;
       from StartFrame; records the position at   |   no frame carries this)
       VADUserStartedSpeakingFrame / Stopped;     |
-      sets ONE pending (start, end) slot at      |
-      VAD-stop, BEFORE delegating to super()     |
+      appends (start, end) to an ordered span    |
+      queue at VAD-stop, BEFORE super()          |
     - stamps onoats_segment_start_sample /       |
       onoats_segment_end_sample (pre-roll        |
-      EXCLUDED), consumed from the slot at the   |
+      EXCLUDED), popped from the queue at the    |
       head of run_stt, on each TranscriptionFrame|
         |                                        |
         v                                        |
@@ -765,8 +765,9 @@ lock), not Phase 0.
 
 **Phase 4 — STT segment-sample stamping**
 - `src/onoats/stt/websocket_stt_service.py` — `stamp_segment_samples`,
-  `process_frame` counting, single pending span slot (set before delegating
-  VAD-stop to `super()`), stamping
+  `process_frame` counting, ordered span queue `_span_queue` (appended before
+  delegating VAD-stop to `super()`, popped at the head of `run_stt`; revision
+  5), stamping
 - `src/onoats/runtime.py` — `_create_stt_service(..., stamp_segment_samples:
   bool = False)` threads the kwarg through (never derives it from config)
 - `src/onoats/dual.py` — `run_onoats_dual` resolves `cfg.diarization` once and
@@ -913,7 +914,7 @@ lock), not Phase 0.
   worker thread owns the model and the coverage writes, no cross-thread model
   use, daemon worker with bounded join, hoisted import-free preflight vs
   runtime-degrade split, feeder `start_sample` is the position authority,
-  single pending span slot set before `super()`, labeler pending-deque hold
+  ordered span queue appended before `super()`, labeler pending-deque hold
   with stall guard and EndFrame flush-wait, canonical persistence)
 - `README.md`, `CHANGELOG.md` (include the `mlx` bump note if Phase 8's
   `uv.lock` showed one)
@@ -958,7 +959,7 @@ Spec: the "Phase 3" block under `## Files to Modify` and the Requirements it cit
 
 ### Phase 4: STT segment-sample stamping
 
-**Goal:** Stamp each them-arm TranscriptionFrame with its VAD span via a single pending span slot set before delegating VAD-stop to super(); me arm never stamped.
+**Goal:** Stamp each them-arm TranscriptionFrame with its VAD span via an ordered span queue appended before delegating VAD-stop to super() and popped at the head of run_stt (revision 5); me arm never stamped.
 **Impl files:** src/onoats/stt/websocket_stt_service.py, src/onoats/runtime.py, src/onoats/dual.py
 **Test files:** tests/test_websocket_stt_reconnect.py, tests/test_websocket_stt_stamping.py, tests/test_stt_config_wiring.py
 **Test command:** `uv run ruff format --check src tests && uv run ruff check src tests && uv run pytest tests/test_websocket_stt_reconnect.py tests/test_websocket_stt_stamping.py tests/test_stt_config_wiring.py -q`
@@ -1085,7 +1086,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-09 @ 7f59c8cb4d70739a628d2047d786d90298969541 -->
+<!-- reviewed: 2026-10-09 @ 2ca990ddb99038a54fdc656363c9f46aa1da09a8 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1146,6 +1147,8 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **release_check.sh check 5 guard (gauntlet round 1)**: beyond "working-tree dependent" (Files to Modify, above the marker), the shipped check now *fails* unless `HEAD` equals the resolved commit and the tree is clean, so it can never validate a different checkout than checks 1-4 inspected; checks 1-4 are unchanged.
 
 - **code-review xhigh (2026-10-09)**: (1) fixed — the plan's pipecat premise ("`run_stt` runs inline on VAD-stop") holds for 1.3.0-1.8.x only; 1.9.0 introduced `SegmentedSTTService._segment_queue`/`_segment_task_handler` (verified from the PyPI wheels of 1.4/1.6/1.8 vs 1.9/1.10/1.12) and the declared range `>=1.3.0,<2.0.0` admits them, where the single-slot `_pending_span` can stamp a segment with another segment's span (a wrong label, not a missing one). `tests/test_websocket_stt_stamping.py` pins the shape only on the locked version, so the startup preflight now also calls `diarization_timeline.segmented_stt_runs_inline()` and exits non-zero on a non-inline pipecat. Tightening the `pyproject.toml` cap to `<1.9` was deliberately not done (it would constrain non-diarization users). (2) fixed — `DiarizationLabeler._stop_task` swallowed a cancellation of its own caller; now `gather(..., return_exceptions=True)`. (3) fixed — the worker refuses a model with `output_subsampling_factor != 1` (the weights are not revision-pinned and the contract test skips on a cold cache). **Superseded by revision 5 (owner-directed, 2026-10-09)**: item (1)'s refusal was replaced by support - the STT's single slot became an ordered span queue (Req 3), so pipecat 1.9+ works; the preflight probe is now `segmented_stt_orders_spans()` (accepts inline `run_stt` or one in-order queue task, fails closed otherwise). Verified by running the stamping, timeline, feeder, labeler, preflight, reconnect and dual-source tests under pipecat 1.9.0, 1.11.0 and 1.12.0 (1.3.0 is the locked version). The `_detach_client` span clear (and its Review Checklist entry) was dropped: each queued span is popped once by its own `run_stt`, so a reconnect leaves nothing stale.
+
+- **review-gauntlet round (2026-10-09)**: (1) fixed — a model row whose input straddles an *unaligned* queue drop (pre-gap tail + post-gap head) was recorded at the pre-gap anchor, overlapping the GAP so dropped audio counted toward `MIN_COVERAGE_FRACTION`; the worker now skips that row and starts the GAP where it would have begun (no probability row ever overlaps a GAP; still no coverage hole). (2) fixed — the `output_subsampling_factor` guard read a missing field as 1 and `int()`-truncated non-integral values; it now fails closed unless the value is exactly the `int` 1 (mlx-audio 0.5.x's `ModelConfig` always carries it, default 1; the cached config has 1). (3) fixed — Phase 4 / Files-to-Modify text and the data-flow diagram still described the pre-revision-5 single span slot; reworded to the ordered span queue (marker refreshed). (4) fixed — CHANGELOG now says the 1.9.0/1.11.0/1.12.0 runs were by hand in isolated environments; CI runs the locked 1.3.0 with queue-shape fixtures.
 
 ### Review Waivers
 
