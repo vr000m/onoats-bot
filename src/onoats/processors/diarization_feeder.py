@@ -237,6 +237,10 @@ class DiarizerWorker:
         # was fed: monotonic breakpoints (frame-aligned model offset, anchor).
         bp_offsets: list[int] = [0]
         bp_anchors: list[int] = [0]
+        # Model offsets of rows whose input straddles a drop (ascending; popped
+        # as ``record`` passes them). Such a row mixes pre- and post-gap audio
+        # and has no single pipeline position, so it is never recorded.
+        skip_rows: deque[int] = deque()
         overruns = 0  # consecutive over-budget WINDOWS
         win_elapsed = 0.0
         win_samples = 0  # int: avoids float drift in the window threshold
@@ -246,17 +250,27 @@ class DiarizerWorker:
             # row boundary ``off``, shifting its anchor so that row lands
             # exactly on ``start`` (exact when chunks are 160-sample
             # multiples, the 10 ms norm). Rows below ``off`` keep the anchor
-            # they were fed under, so the mapped row stream ends at
-            # ``off + <that anchor>`` - for unaligned chunks up to a frame
-            # BEFORE the true ``expected``. The GAP starts at the lower of the
-            # two, so every position between the last row before the
-            # breakpoint and the first row after it is resolved by
-            # construction (no-op when nothing lies between them).
+            # they were fed under. Aligned (``off == fed``): the mapped row
+            # stream ends at ``off + <that anchor>`` - up to a frame BEFORE
+            # the true ``expected`` after an earlier unaligned re-anchor - and
+            # the GAP starts at the lower of the two. Unaligned: the row
+            # ``[off - 160, off)`` straddles the drop, so it is skipped and
+            # the GAP starts where that row would have started; recording it
+            # at the pre-gap anchor would lay it over dropped audio and count
+            # that audio as speaker coverage. Either way every position
+            # between the last recorded row before the breakpoint and the
+            # first row after it is resolved by construction, by a GAP only.
             nonlocal anchor
             expected = anchor + fed
             off = -(-fed // FRAME_SAMPLES) * FRAME_SAMPLES
             gap_lo = expected
-            if off > 0:
+            if off > fed:
+                row = off - FRAME_SAMPLES
+                k = bisect.bisect_right(bp_offsets, row) - 1
+                gap_lo = min(gap_lo, row + bp_anchors[k])
+                if not skip_rows or skip_rows[-1] != row:
+                    skip_rows.append(row)
+            elif off > 0:
                 k = bisect.bisect_right(bp_offsets, off - 1) - 1
                 gap_lo = min(gap_lo, off + bp_anchors[k])
             tl.record_gap(gap_lo, start)
@@ -283,12 +297,20 @@ class DiarizerWorker:
             i = 0
             while i < n_rows:
                 off = (idx + i) * FRAME_SAMPLES
+                while skip_rows and skip_rows[0] < off:
+                    skip_rows.popleft()
+                if skip_rows and skip_rows[0] == off:
+                    skip_rows.popleft()  # straddles a drop: its GAP covers it
+                    i += 1
+                    continue
                 k = bisect.bisect_right(bp_offsets, off) - 1
                 if k + 1 < len(bp_offsets):
                     # Breakpoints are frame-aligned, so this split is exact.
                     run_end = min(n_rows, bp_offsets[k + 1] // FRAME_SAMPLES - idx)
                 else:
                     run_end = n_rows
+                if skip_rows:
+                    run_end = min(run_end, skip_rows[0] // FRAME_SAMPLES - idx)
                 tl.record(off + bp_anchors[k], arr[i:run_end])
                 i = run_end
             return n_rows

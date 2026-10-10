@@ -510,9 +510,52 @@ def test_unaligned_chunks_with_drops_leave_no_coverage_hole(chunks):
     reach = _resolved_reach(tl)
     # The mapped tail is within one frame of the true end (sub-frame skew).
     assert abs(reach - newest_end) < dt.FRAME_SAMPLES
-    assert tl.label_for(newest_end - 4 * dt.FRAME_SAMPLES, newest_end).speakers == [
-        "S1"
+    # The last kept chunk (no drop inside it) labels; a window reaching back
+    # over a drop may not, since dropped audio never counts as coverage.
+    assert tl.label_for(chunks[-1][0], newest_end).speakers == ["S1"]
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        pytest.param([(0, 100)] + [(200 + i * 160, 160) for i in range(10)], id="100"),
+        pytest.param(
+            [(0, 250), (300, 50)] + [(400 + i * 160, 160) for i in range(20)],
+            id="250-50-then-aligned",
+        ),
+        pytest.param(
+            [(i * 256, 256) for i in range(40) if i % 3 != 2],
+            id="256-every-3rd-dropped",
+        ),
+        pytest.param(
+            [(i * 100, 100) for i in range(60) if i % 2 == 0],
+            id="100-every-other-dropped",
+        ),
+    ],
+)
+def test_unaligned_drop_ranges_never_count_as_speaker_coverage(chunks):
+    """Regression: a model row whose input straddles an unaligned drop (pre-gap
+    tail + post-gap head) was recorded at the pre-gap anchor, so it overlapped
+    the GAP and dropped audio counted as speaker coverage (``label_for`` over a
+    wholly dropped range returned a speaker). Dropped audio must stay
+    resolved-but-unlabelled: no probability row may overlap a GAP."""
+    tl = RecordingTimeline()
+    _run_worker(tl, AccumulatingDiarizer(), [(s, pcm(1000, n)) for s, n in chunks])
+    assert tl.is_flushed and not tl.is_degraded
+    _resolved_reach(tl)  # still no coverage hole
+    gaps = [(s.start, s.end) for s in tl._segments if s.probs is None]
+    rows = [(s.start, s.end) for s in tl._segments if s.probs is not None]
+    for g0, g1 in gaps:
+        for r0, r1 in rows:
+            assert r1 <= g0 or r0 >= g1, f"row [{r0},{r1}) overlaps GAP [{g0},{g1})"
+    dropped = [
+        (a[0] + a[1], b[0])
+        for a, b in zip(chunks, chunks[1:], strict=False)
+        if b[0] > a[0] + a[1]
     ]
+    assert dropped
+    for d0, d1 in dropped:
+        assert tl.label_for(d0, d1) is None, (d0, d1)
 
 
 def test_aligned_chunk_gaps_are_exactly_the_dropped_ranges():
