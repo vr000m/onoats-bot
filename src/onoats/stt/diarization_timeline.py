@@ -97,9 +97,13 @@ def segmented_stt_orders_spans() -> bool:
     VAD-stops were seen. Two shapes guarantee that: pipecat 1.3.0-1.8.x await
     ``run_stt`` inline in the stop handler; from 1.9.0 the handler puts the
     segment on ``_segment_queue`` and ONE ``_segment_task_handler`` task takes
-    them off one at a time. Anything else (a concurrent or re-ordering design)
-    could pair a span with another segment - a wrong label rather than a
-    missing one - so the startup preflight refuses it.
+    them off one at a time. The queue shape is only in order if the whole
+    class agrees (:func:`_segment_queue_is_one_fifo_consumer`): the queue is
+    built once as a plain ``asyncio.Queue()`` (not LIFO / priority) and
+    ``start`` creates exactly one handler task, the queue's only reader.
+    Anything else (a concurrent or re-ordering design) could pair a span with
+    another segment - a wrong label rather than a missing one - so the
+    startup preflight refuses it.
 
     Fails closed: an unreadable source or an unrecognised shape is "not
     ordered". Third-party import only (lazy), so this stays a leaf helper.
@@ -125,7 +129,120 @@ def segmented_stt_orders_spans() -> bool:
         and "self._segment_queue.get()" in task_src
         and re.search(r"await\s+self\.process_generator\(\s*self\.run_stt\(", task_src)
         is not None
+        and _segment_queue_is_one_fifo_consumer(SegmentedSTTService)
     )
+
+
+def _is_self_attr(node: object, attr: str) -> bool:
+    import ast
+
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
+    """True iff ``cls`` builds ``_segment_queue`` as ONE FIFO with ONE reader task.
+
+    Parses every method defined on ``cls`` (the class that owns the queue) and
+    requires, exactly as pipecat 1.9-1.12 write it:
+
+    - the queue is assigned once, in ``__init__``, as ``asyncio.Queue()`` with
+      no arguments (a ``LifoQueue`` / ``PriorityQueue`` / factory call / a
+      second assignment is not order-preserving or not recognisable);
+    - ``self._segment_task_handler`` is referenced once in the class, as the
+      top-level ``start`` statement
+      ``self._segment_task = self.create_task(self._segment_task_handler())``
+      (not in a loop, not twice, not elsewhere);
+    - ``self._segment_queue.get``/``get_nowait`` is called once, inside
+      ``_segment_task_handler`` (no second reader).
+
+    Fails closed on an unreadable/unparseable method or a ``"_segment_queue"``
+    string (a ``setattr`` the walk cannot follow).
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    methods: dict[str, ast.AST] = {}
+    for name, attr in vars(cls).items():
+        fn = attr.fget if isinstance(attr, property) else attr
+        fn = getattr(fn, "__func__", fn)  # staticmethod / classmethod
+        if not inspect.isfunction(fn):
+            continue
+        try:
+            methods[name] = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        except (OSError, TypeError, SyntaxError):
+            return False
+
+    queue_assigns: list[tuple[str, ast.expr | None]] = []
+    handler_refs: list[str] = []
+    readers: list[str] = []
+    for name, tree in methods.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and node.value == "_segment_queue":
+                return False
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) or isinstance(
+                node, ast.NamedExpr
+            ):
+                targets, value = [node.target], node.value
+            else:
+                targets, value = [], None
+            for target in targets:
+                if any(_is_self_attr(t, "_segment_queue") for t in ast.walk(target)):
+                    queue_assigns.append((name, value))
+            if _is_self_attr(node, "_segment_task_handler"):
+                handler_refs.append(name)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "get_nowait")
+                and _is_self_attr(node.func.value, "_segment_queue")
+            ):
+                readers.append(name)
+
+    if len(queue_assigns) != 1:
+        return False
+    where, value = queue_assigns[0]
+    if not (
+        where == "__init__"
+        and isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "Queue"
+        and isinstance(value.func.value, ast.Name)
+        and value.func.value.id == "asyncio"
+        and not value.args
+        and not value.keywords
+    ):
+        return False
+    if readers != ["_segment_task_handler"] or handler_refs != ["start"]:
+        return False
+
+    def _is_the_one_task(stmt: ast.stmt) -> bool:
+        call = stmt.value if isinstance(stmt, ast.Assign) else None
+        return (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and _is_self_attr(stmt.targets[0], "_segment_task")
+            and isinstance(call, ast.Call)
+            and _is_self_attr(call.func, "create_task")
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Call)
+            and _is_self_attr(call.args[0].func, "_segment_task_handler")
+            and not call.args[0].args
+            and not call.args[0].keywords
+        )
+
+    start = methods["start"].body[0]
+    if not isinstance(start, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    return sum(_is_the_one_task(stmt) for stmt in start.body) == 1
 
 
 class SampleCounter:

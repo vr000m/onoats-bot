@@ -15,6 +15,7 @@ mismatch here is an interface finding, not necessarily an impl bug):
 from __future__ import annotations
 
 import ast
+import asyncio
 import threading
 from pathlib import Path
 
@@ -498,7 +499,24 @@ def test_segmented_stt_orders_spans_true_for_the_locked_pipecat():
     assert dt.segmented_stt_orders_spans() is True
 
 
-def _patch_queued_shape(monkeypatch, task_handler):
+# The pipecat 1.9-1.12 shape, verbatim in the parts the probe inspects.
+def _init_fifo(self, **kwargs):  # pragma: no cover - never run
+    self._segment_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    self._segment_task: asyncio.Task | None = None
+
+
+async def _start_one_task(self, frame):  # pragma: no cover - never run
+    self._segment_task = self.create_task(self._segment_task_handler())
+
+
+async def _ordered_task_handler(self):  # pragma: no cover - never run
+    audio = await self._segment_queue.get()
+    await self.process_generator(self.run_stt(audio))
+
+
+def _patch_queued_shape(
+    monkeypatch, task_handler=_ordered_task_handler, *, init=_init_fifo, start=None
+):
     from pipecat.services.stt_service import SegmentedSTTService
 
     async def _handle_user_stopped_speaking(self, frame):
@@ -512,18 +530,93 @@ def _patch_queued_shape(monkeypatch, task_handler):
     monkeypatch.setattr(
         SegmentedSTTService, "_segment_task_handler", task_handler, raising=False
     )
+    monkeypatch.setattr(SegmentedSTTService, "__init__", init)
+    monkeypatch.setattr(SegmentedSTTService, "start", start or _start_one_task)
 
 
 def test_segmented_stt_orders_spans_true_for_pipecat_1_9_queue_shape(monkeypatch):
     """pipecat >= 1.9 enqueues the segment and ONE task takes segments off the
     queue and awaits ``run_stt`` for each in turn: still VAD-stop order."""
-
-    async def _segment_task_handler(self):  # pragma: no cover - never run
-        audio = await self._segment_queue.get()
-        await self.process_generator(self.run_stt(audio))
-
-    _patch_queued_shape(monkeypatch, _segment_task_handler)
+    _patch_queued_shape(monkeypatch)
     assert dt.segmented_stt_orders_spans() is True
+
+
+def _init_lifo(self, **kwargs):  # pragma: no cover - never run
+    self._segment_queue = asyncio.LifoQueue()
+
+
+def _init_priority(self, **kwargs):  # pragma: no cover - never run
+    self._segment_queue = asyncio.PriorityQueue()
+
+
+def _init_unrecognised(self, **kwargs):  # pragma: no cover - never run
+    self._segment_queue = self._make_segment_queue()
+
+
+def _init_bounded(self, **kwargs):  # pragma: no cover - never run
+    self._segment_queue = asyncio.Queue(maxsize=4)
+
+
+def _init_twice(self, **kwargs):  # pragma: no cover - never run
+    self._segment_queue = asyncio.Queue()
+    self._segment_queue = asyncio.LifoQueue()
+
+
+@pytest.mark.parametrize(
+    "init",
+    [_init_lifo, _init_priority, _init_unrecognised, _init_bounded, _init_twice],
+    ids=["lifo", "priority", "unrecognised", "bounded-kwargs", "reassigned"],
+)
+def test_segmented_stt_orders_spans_false_unless_the_queue_is_a_plain_fifo(
+    monkeypatch, init
+):
+    """Regression: the probe read only the put/get/run_stt method bodies, so a
+    LIFO / priority queue behind the same ``put``/``get`` calls passed and a
+    span could be popped by another segment's ``run_stt``. Anything but one
+    plain ``asyncio.Queue()`` construction is unrecognised and fails closed."""
+    _patch_queued_shape(monkeypatch, init=init)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _start_two_tasks(self, frame):  # pragma: no cover - never run
+    self._segment_task = self.create_task(self._segment_task_handler())
+    self._extra_task = self.create_task(self._segment_task_handler())
+
+
+async def _start_in_a_loop(self, frame):  # pragma: no cover - never run
+    for _ in range(2):
+        self._segment_task = self.create_task(self._segment_task_handler())
+
+
+async def _start_without_the_task(self, frame):  # pragma: no cover - never run
+    pass
+
+
+@pytest.mark.parametrize(
+    "start",
+    [_start_two_tasks, _start_in_a_loop, _start_without_the_task],
+    ids=["two-tasks", "loop", "no-task"],
+)
+def test_segmented_stt_orders_spans_false_unless_start_creates_one_consumer(
+    monkeypatch, start
+):
+    """Regression: two consumers draining one FIFO can still finish out of
+    order; the probe never looked at how many handler tasks ``start`` makes."""
+    _patch_queued_shape(monkeypatch, start=start)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+def test_segmented_stt_orders_spans_false_with_a_second_queue_consumer(monkeypatch):
+    """Another method also taking segments off the queue is a second consumer."""
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    _patch_queued_shape(monkeypatch)
+
+    async def _steal(self):  # pragma: no cover - never run
+        await self._segment_queue.get()
+
+    monkeypatch.setattr(SegmentedSTTService, "_steal", _steal, raising=False)
+    assert dt.segmented_stt_orders_spans() is False
 
 
 def test_segmented_stt_orders_spans_false_when_segments_run_concurrently(monkeypatch):
