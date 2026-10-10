@@ -51,7 +51,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from pipecat.frames.frames import TranscriptionFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
@@ -716,7 +715,7 @@ def test_single_input_logs_ignored_warning_once(monkeypatch, tmp_path):
             return orig()
 
         monkeypatch.setattr(cfgmod, "load_config", _load)
-        import pipecat.audio.vad.silero as silero
+        from pipecat.audio.vad import silero
 
         monkeypatch.setattr(
             silero,
@@ -744,9 +743,9 @@ class _Stop(Exception):
 
 
 def _dual_spies(monkeypatch, tmp_path, *, preflight_raises: bool):
-    import onoats.config.audio_devices as audio_devices
     import onoats.dual as dual_mod
     from onoats import runtime
+    from onoats.config import audio_devices
     from onoats.runtime import SttPreflightError
 
     calls: list[str] = []
@@ -912,7 +911,7 @@ class _StubModel:
     def __init__(self, raise_in_feed: bool = False):
         import types
 
-        self.config = types.SimpleNamespace(num_speakers=8)
+        self.config = types.SimpleNamespace(num_speakers=8, output_subsampling_factor=1)
         self._raise = raise_in_feed
         self._total = 0
         self._emitted = 0
@@ -1022,7 +1021,7 @@ def test_feeder_adjacent_to_stt_after_audio_dump(
     two_paths, captured_arms, monkeypatch, tmp_path
 ):
     """With ONOATS_AUDIO_DUMP on, the dump processor precedes the feeder."""
-    import onoats.processors.audio_dump as audio_dump
+    from onoats.processors import audio_dump
     from onoats.processors.audio_dump import RawAudioDumpProcessor
     from onoats.processors.diarization_feeder import DiarizationFeeder
 

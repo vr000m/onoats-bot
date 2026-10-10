@@ -54,6 +54,7 @@ class _Out:
 
 class _Cfg:
     num_speakers = 8
+    output_subsampling_factor = 1  # always present on mlx-audio's ModelConfig
 
 
 class StubDiarizer:
@@ -256,6 +257,36 @@ def test_model_output_subsampling_mismatch_degrades(monkeypatch, warnings_seen):
     out = drive(feeder, [start_frame(), audio_frame(), EndFrame()], monkeypatch)
     assert tl.is_degraded
     assert not tl.is_ready  # never published a slot count
+    assert not any(isinstance(f, ErrorFrame) for f in out)
+    assert m.feed_calls == []
+    assert any("output_subsampling_factor" in w for w in warnings_seen)
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "factor",
+    [_MISSING, None, 1.5, 1.0, "1", True],
+    ids=["missing", "none", "1.5", "float-1.0", "str-1", "bool-true"],
+)
+def test_model_output_subsampling_unverifiable_fails_closed(
+    monkeypatch, warnings_seen, factor
+):
+    """Regression: ``getattr(..., 1)`` read a missing field as a verified 1 and
+    ``int()`` truncated 1.5 to 1. mlx-audio's ``ModelConfig`` always carries an
+    ``int`` ``output_subsampling_factor`` (default 1), so anything that is not
+    exactly the int 1 is an unsupported model and must degrade, not run."""
+    log = []
+    m = StubDiarizer(log)
+    m.config = type("Cfg", (), {"num_speakers": 8})()
+    if factor is not _MISSING:
+        m.config.output_subsampling_factor = factor
+    tl = RecordingTimeline()
+    feeder = make_feeder(tl, m)
+    out = drive(feeder, [start_frame(), audio_frame(), EndFrame()], monkeypatch)
+    assert tl.is_degraded
+    assert not tl.is_ready
     assert not any(isinstance(f, ErrorFrame) for f in out)
     assert m.feed_calls == []
     assert any("output_subsampling_factor" in w for w in warnings_seen)
