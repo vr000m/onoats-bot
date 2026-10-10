@@ -232,18 +232,92 @@ def test_config_slots_and_one_to_one_frame_rate(model):
     assert model.sample_rate == 16000
 
 
-def test_speaker_probs_rows_equal_frames_processed(model):
+#: Whole 160-sample frames fed by the row-rate check (4 s, well past the
+#: ``low`` preset's lookahead, so most rows arrive before the final flush).
+_ROW_CHECK_FRAMES = 400
+
+
+def _assert_one_row_per_frame_fed(model, chunk_samples: int) -> None:
+    """Feed whole frames exactly as the worker does and count the rows.
+
+    Mirrors ``diarization_feeder._Worker._run_inner``: ``feed(chunk, state,
+    sample_rate=16000)`` per chunk, each chunk's rows mapped from the
+    ``frames_processed`` read BEFORE the call, then one
+    ``feed(<empty>, state, final=True)`` to drain the lookahead. The worker
+    maps row ``r`` to input samples ``[r*160, r*160+160)``, so ``N`` whole
+    frames must yield exactly ``N`` rows - counted from the emitted
+    ``speaker_probs``, NOT from ``frames_processed`` (the model owns both, so
+    comparing them alone cannot catch a model that emits rows at another
+    rate) - and every call's rows must start where the previous ones ended.
+    """
     import numpy as np
 
+    frame = diarization_model.ROW_HOP_SAMPLES
     model.set_streaming_config("low")
     state = model.init_streaming_state()
     rng = np.random.default_rng(0)
-    audio = (rng.standard_normal(16000 * 4) * 0.01).astype(np.float32)
+    audio = (rng.standard_normal(_ROW_CHECK_FRAMES * frame) * 0.01).astype(np.float32)
     rows = 0
-    for i in range(0, len(audio), 1600):
-        out, state = model.feed(audio[i : i + 1600], state, sample_rate=16000)
+    chunks = [audio[i : i + chunk_samples] for i in range(0, len(audio), chunk_samples)]
+    for chunk, final in [(c, False) for c in chunks] + [
+        (np.zeros(0, dtype=np.float32), True)
+    ]:
+        idx = int(state.frames_processed)  # the worker's frame_index()
+        out, state = model.feed(chunk, state, sample_rate=16000, final=final)
+        assert idx == rows, "a feed's rows do not start where the last ones ended"
         rows += int(out.speaker_probs.shape[0])
-    assert state.frames_processed > 0
-    # Output rows are 1:1 with native 10 ms frames: total rows == frames_processed,
-    # which is what the worker's anchor + row_offset mapping relies on.
-    assert rows == state.frames_processed
+    assert rows == _ROW_CHECK_FRAMES, (
+        f"{rows} rows for {_ROW_CHECK_FRAMES} whole {frame}-sample frames"
+    )
+    assert int(state.frames_processed) == rows
+
+
+@pytest.mark.parametrize("chunk_samples", [160, 1600], ids=["10ms", "100ms"])
+def test_one_speaker_probs_row_per_160_samples_fed(model, chunk_samples):
+    """The worker's whole timeline assumes one row per 10 ms of audio fed."""
+    _assert_one_row_per_frame_fed(model, chunk_samples)
+
+
+class _StubStreamingModel:
+    """Weights-free stand-in: ``rows_per_frame`` rows per 160 samples, with a
+    lookahead released on ``final`` and ``frames_processed`` bumped per row
+    (so total rows == frames_processed whatever the rate)."""
+
+    def __init__(self, rows_per_frame: int, lookahead_frames: int = 40) -> None:
+        self.rows_per_frame = rows_per_frame
+        self.lookahead = lookahead_frames
+
+    def set_streaming_config(self, preset):
+        assert preset == "low"
+
+    def init_streaming_state(self):
+        return types.SimpleNamespace(frames_processed=0, fed=0)
+
+    def feed(self, audio, state, sample_rate=16000, *, final=False):
+        import numpy as np
+
+        state.fed += len(audio)
+        frames = (
+            state.fed // 160 if final else max(0, state.fed // 160 - self.lookahead)
+        )
+        due = frames * self.rows_per_frame - state.frames_processed
+        state.frames_processed += due
+        return types.SimpleNamespace(speaker_probs=np.zeros((due, 8))), state
+
+
+def test_row_rate_check_rejects_a_model_emitting_rows_at_another_rate():
+    """Regression: the check compared emitted rows only with the model's own
+    ``frames_processed``, so a model emitting two rows per 160 samples (and
+    counting both) passed while the worker laid every label at the wrong time.
+    Weights-free, so it runs in CI: the stub passes the old equality yet fails
+    the samples-fed count."""
+    import numpy as np
+
+    _assert_one_row_per_frame_fed(_StubStreamingModel(1), 160)
+    doubled = _StubStreamingModel(2)
+    # The old check (total rows == frames_processed) is blind to the rate.
+    state = doubled.init_streaming_state()
+    out, state = doubled.feed(np.zeros(16000, np.float32), state, final=True)
+    assert out.speaker_probs.shape[0] == state.frames_processed == 200
+    with pytest.raises(AssertionError, match="rows for 400 whole"):
+        _assert_one_row_per_frame_fed(doubled, 160)
