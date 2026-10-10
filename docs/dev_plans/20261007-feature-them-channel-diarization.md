@@ -452,11 +452,19 @@ contract is "never a hang"; precedent:
    not guarded.
    Guard: `runtime._preflight_diarization` calls
    `diarization_timeline.segmented_stt_orders_spans()`, which inspects the
-   installed pipecat's source and accepts only the two ordered shapes (inline
-   `run_stt`; a stop handler that `put`s on `_segment_queue` plus a single
-   `_segment_task_handler` that `get`s and awaits
-   `process_generator(self.run_stt(...))`), failing closed on anything else
-   (unreadable source, a concurrent per-segment task, an unknown design). The
+   installed pipecat's source and accepts only the two ordered shapes (inline:
+   a stop handler with exactly one `run_stt` call; queue: a plain
+   `asyncio.Queue()` built once in `__init__`, one
+   `self._segment_task = self.create_task(self._segment_task_handler())` in
+   `start`, a stop handler whose one top-level `put` on `_segment_queue` is
+   reached on every stop except the `not self.is_usable` drop the STT mirrors,
+   no other `put` but the `None` finish sentinel, and `_segment_task_handler`
+   as the queue's sole reader - one sentinel-ended `while` loop, with no
+   `return`/`break`/`raise`, that `get`s each item and awaits its ONE
+   `process_generator(self.run_stt(<item>))` under at most `if <item>:` and a
+   `try` body), failing closed on anything else (unreadable source, a
+   concurrent per-segment task, a one-shot or skipping reader, an unknown
+   design). The
    coupling is also pinned by a test against the installed version that
    asserts the private attributes / method signatures used
    (`hasattr` / `inspect.signature`) and that
@@ -860,7 +868,7 @@ lock), not Phase 0.
   trigger)
 - `tests/test_diarization_contract.py` (new) — pins the exact
   `mlx_audio` symbols/kwargs used, the preset names, the input contract
-  the Phase 0-recorded `model.config.num_speakers` (8), and `speaker_probs`/`frames_processed` row-parity (rows == `frames_processed`); skip-unless `mlx_audio`
+  the Phase 0-recorded `model.config.num_speakers` (8), and `speaker_probs` row rate (feeding N whole 160-sample frames the way the worker does, then its `final=True` flush, yields exactly N emitted rows - counted from `speaker_probs`, not from the model's own `frames_processed` - each feed's rows starting at the `frames_processed` read before it); skip-unless `mlx_audio`
   importable, **but hard-fails instead of skipping when
   `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`**; local-only, not a CI gate
 - `scripts/release_check.sh` — new step that exports
@@ -1086,7 +1094,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-09 @ 2ca990ddb99038a54fdc656363c9f46aa1da09a8 -->
+<!-- reviewed: 2026-10-10 @ 8be9afa9728cff58ce53ba671fb5b4e3565d2958 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1151,6 +1159,7 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **review-gauntlet round (2026-10-09)**: (1) fixed — a model row whose input straddles an *unaligned* queue drop (pre-gap tail + post-gap head) was recorded at the pre-gap anchor, overlapping the GAP so dropped audio counted toward `MIN_COVERAGE_FRACTION`; the worker now skips that row and starts the GAP where it would have begun (no probability row ever overlaps a GAP; still no coverage hole). (2) fixed — the `output_subsampling_factor` guard read a missing field as 1 and `int()`-truncated non-integral values; it now fails closed unless the value is exactly the `int` 1 (mlx-audio 0.5.x's `ModelConfig` always carries it, default 1; the cached config has 1). (3) fixed — Phase 4 / Files-to-Modify text and the data-flow diagram still described the pre-revision-5 single span slot; reworded to the ordered span queue (marker refreshed). (4) fixed — CHANGELOG now says the 1.9.0/1.11.0/1.12.0 runs were by hand in isolated environments; CI runs the locked 1.3.0 with queue-shape fixtures.
 - **Shutdown close ordering (2026-10-09, e1e34df)**: fixed — on pipecat 1.9+ `SegmentedSTTService.stop()` drains its queued segments through `run_stt`, but `WebSocketSTTService.stop()` closed the websocket first, so a segment still decoding at shutdown lost its transcript and the shutdown drain timed out. `stop()` now awaits `super().stop()` and closes the session in a `finally` (graceful even when the parent raises); a cancelled drain takes the hard-close path and re-raises; `cancel()` still hard-closes first. No change on 1.3.0-1.8.x. Pinned by `tests/test_websocket_stt_reconnect.py::test_stop_drains_the_parent_before_closing_the_websocket`, `::test_stop_still_closes_gracefully_when_the_parent_stop_raises`, `::test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled`; recorded in AGENTS.md and the CHANGELOG `Fixed` entry.
 - **review-gauntlet round (2026-10-09, row-hop + span-order probe)**: (1) fixed — `diarization_model.one_row_per_frame()` checked only `output_subsampling_factor`, but a row spans `hop_length * output_subsampling_factor` input samples and the weights are not revision-pinned, so a `hop_length=320` revision passed the worker guard and every label landed at half its real time; the predicate now also requires `config.processor_config.hop_length` (the public `ModelConfig` field; the model's `_processor_config` is the same object, pinned by the contract test) to be exactly the `int` 160, and the worker degrades with one WARNING otherwise. (2) fixed — `segmented_stt_orders_spans()` read only the put/get/`run_stt` method bodies, so a LIFO/priority `_segment_queue` or several handler tasks would have passed; the queue branch now also parses every `SegmentedSTTService` method and requires one `asyncio.Queue()` assignment in `__init__`, one top-level `self._segment_task = self.create_task(self._segment_task_handler())` in `start`, and the handler as the queue's only reader (fails closed otherwise). Re-verified True on pipecat 1.3.0 (locked), 1.9.0, 1.11.0 and 1.12.0, with the timeline, stamping, preflight, feeder, model, reconnect and dual-source tests passing under 1.9.0 and 1.12.0.
+- **review-gauntlet round (2026-10-10, reader loop + row rate)**: (1) fixed — `segmented_stt_orders_spans()` required one `get` and one awaited `run_stt` but no loop and no one-put-per-stop, so a reader that transcribes one segment and returns (its own accepted fixture had that shape), a `run_stt` outside the loop, a second or skippable `run_stt`, or a conditional/duplicate `put` passed and could strand a span or pair it with another segment. The queue branch now requires the pipecat 1.9-1.12 reader verbatim in structure (one top-level sentinel-ended `while`, no `return`/`break`/`raise` in it, one `get` assignment, the handler's single `run_stt` awaited via `process_generator` under only `if <item>:`/`try`), one unconditional top-level segment `put` in the stop handler (only the `not self.is_usable` guard may exit early - the STT mirrors it), and only `None` sentinels elsewhere; the inline branch requires exactly one `run_stt` call. The `if <item>:` skip of an empty segment is unreachable for `WebSocketSTTService` (pipecat's default `wants_wav_segments` = True: every segment is a non-empty WAV). `SegmentedSTTService`'s queue methods are byte-identical across 1.9.0-1.12.0; the probe is True on 1.3.0 (locked), 1.9.0, 1.10.0, 1.11.0 and 1.12.0, with the timeline, stamping and preflight tests passing under 1.9.0 and 1.12.0. (2) fixed (contract test) — the row-rate contract compared emitted rows only with the model's own `frames_processed`; it now feeds N whole 160-sample frames the worker's way (10 ms and 100 ms chunks, then `final=True`) and requires exactly N emitted rows (verified on the cached weights, mlx-audio 0.5.8: 400 frames -> 400 rows, 360 before the flush), with a weights-free stub test pinning that a doubled-rate model fails. Runtime half quarantined: an exact rows-vs-samples equality only exists after the final flush, after every label is already released, and a mid-stream bound would rely on undocumented lookahead/padding behaviour that could reject a valid revision; the worker keeps the `one_row_per_frame()` config guard and the release-time contract test is the guard for rate drift.
 
 ### Review Waivers
 

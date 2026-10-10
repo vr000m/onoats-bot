@@ -47,7 +47,16 @@ Annotated tags exist from `v0.9.0` forward.
   `tests/test_diarization_timeline.py`; the diarization tests
   were additionally run by hand in isolated pipecat 1.9.0, 1.11.0 and 1.12.0
   environments (not in CI). The diarization startup preflight exits non-zero
-  on a pipecat that does neither; a checkout's `uv.lock` pins 1.3.0.
+  on a pipecat that does neither; a checkout's `uv.lock` pins 1.3.0. For the
+  queue shape the probe also requires one segment `put` per VAD stop and a
+  single reader loop that awaits `run_stt` once per segment until the finish
+  sentinel; a reader that transcribes one segment and returns, or skips or
+  repeats `run_stt`, is refused.
+- **Diarization needs a 160-sample model row hop.** The worker's load-time
+  check now also requires the model's `processor_config.hop_length` to be
+  exactly the integer 160, not only `output_subsampling_factor == 1`. A model
+  revision with `hop_length=320`, which passed before, now logs one WARNING and
+  the session carries on with unlabelled `them` lines.
 - **`scripts/release_check.sh` gained a diarization-contract check (check 5).**
   It runs `tests/test_diarization_contract.py` under
   `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` via `uv run --extra diarization`,
@@ -55,7 +64,9 @@ Annotated tags exist from `v0.9.0` forward.
   1-4 it runs against the working tree, so it fails unless `HEAD` equals the
   commit under check and the tree is clean. The weights-dependent contract
   tests still skip when the model is not in the local HF cache; pre-cache it on
-  the release machine.
+  the release machine. The contract checks the model's row rate against the
+  audio fed: N whole 160-sample frames plus the final flush must yield exactly N
+  rows.
 
 ### Fixed
 

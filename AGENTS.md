@@ -332,7 +332,11 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   pipecat for which `diarization_timeline.segmented_stt_orders_spans` cannot
   see one of those two shapes - for the queue shape that means one plain
   `asyncio.Queue()` built in `__init__`, one handler task created by `start`,
-  and that handler as the queue's only reader); the feeder and the STT
+  that handler as the queue's only reader, one unconditional segment `put`
+  per VAD stop (only the `not self.is_usable` drop, which the STT mirrors,
+  may exit early; any other `put` is the `None` sentinel), and the reader one
+  sentinel-ended loop awaiting its single `run_stt` once per segment); the
+  feeder and the STT
   each count samples with `SampleCounter`, and the feeder's `start_sample` is
   the worker's position authority. Pinned by
   `tests/test_websocket_stt_stamping.py` (span queue) and
