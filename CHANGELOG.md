@@ -42,7 +42,9 @@ Annotated tags exist from `v0.9.0` forward.
   `run_stt` in VAD-stop order: inline on 1.3.0-1.8.x, through one in-order
   queue task from 1.9 (the STT keeps an ordered span queue, so both work). CI
   runs against the locked pipecat 1.3.0 and covers the 1.9+ queue shape with
-  fixtures in `tests/test_websocket_stt_stamping.py`; the diarization tests
+  fixtures in `tests/test_websocket_stt_stamping.py` and (for the
+  `segmented_stt_orders_spans` preflight probe and its fail-closed cases)
+  `tests/test_diarization_timeline.py`; the diarization tests
   were additionally run by hand in isolated pipecat 1.9.0, 1.11.0 and 1.12.0
   environments (not in CI). The diarization startup preflight exits non-zero
   on a pipecat that does neither; a checkout's `uv.lock` pins 1.3.0.

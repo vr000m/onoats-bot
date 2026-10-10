@@ -140,9 +140,12 @@ def _env_float(
 # Graceful two-phase shutdown (see _shutdown_watcher in __main__/dual):
 #
 #   1. DRAIN — queue an EndFrame (``task.stop_when_done()``). An EndFrame, unlike
-#      a CancelFrame, lets an in-flight segment finish: SegmentedSTTService
-#      awaits ``run_stt`` inline in ``process_frame``, so the EndFrame queues
-#      behind it, the final ``TranscriptionFrame`` is delivered to
+#      a CancelFrame, lets an in-flight segment finish. On pipecat 1.3.0-1.8.x
+#      SegmentedSTTService awaits ``run_stt`` inline in ``process_frame``, so
+#      the EndFrame queues behind it; on 1.9+ segments go onto one in-order
+#      queue task, and the EndFrame's graceful ``stop()`` lets that task
+#      transcribe what is queued before it ends (only ``cancel()`` drops queued
+#      segments). Either way the final ``TranscriptionFrame`` is delivered to
 #      TranscriptBuffer, and only then does the pipeline end. This is what makes
 #      the terminal flush capture the last spoken segment. The drain ends as
 #      soon as the pipeline finishes, so the common (nothing-pending) case exits

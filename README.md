@@ -263,7 +263,9 @@ stretch left unlabelled).
 - **Download the weights yourself** — they are never fetched automatically:
   `hf download mlx-community/Nemotron-3-Diarization`. If the extra or the
   weights are missing, `onoats bot` exits non-zero at startup with the exact
-  command to run (before any audio is captured).
+  command to run (before any audio is captured). It also exits non-zero at
+  startup on a pipecat version whose STT segment ordering it cannot verify
+  (diarization labels depend on segments reaching the STT in order).
 - **Fails open.** If the diarizer fails mid-session, onoats logs one warning and
   keeps recording; `them` lines continue unlabelled. A label can delay a `them`
   line by up to about 1.5 s while the diarizer catches up.
