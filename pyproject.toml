@@ -83,3 +83,6 @@ dev = ["pytest>=8", "ruff>=0.15,<0.16"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "diarization_integration: local-only end-to-end diarization on a real clip and the real model (needs the diarization extra, cached weights and ONOATS_DIARIZATION_FIXTURE)",
+]
