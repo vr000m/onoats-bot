@@ -371,6 +371,9 @@ Regression tests: `tests/test_diarization_timeline.py`,
 `tests/test_diarization_feeder.py`, `tests/test_diarization_labeler.py`,
 `tests/test_diarization_model.py`, `tests/test_diarization_contract.py`
 (local-only; hard-fails under `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`),
+`tests/test_diarization_integration.py` (local-only, `-m diarization_integration`;
+real model + real pipeline on a WAV named by `ONOATS_DIARIZATION_FIXTURE`, skips
+when unset),
 `tests/test_websocket_stt_stamping.py`, `tests/test_speaker_labels.py`,
 `tests/test_runtime_preflight.py`, `tests/test_dual_socket_source.py`.
 
