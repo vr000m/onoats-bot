@@ -330,12 +330,24 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   ONE task awaits `run_stt` for each in order - either way segments reach
   `run_stt` in VAD-stop order; `runtime._preflight_diarization` refuses any
   pipecat for which `diarization_timeline.segmented_stt_orders_spans` cannot
-  see one of those two shapes); the feeder and the STT
+  see one of those two shapes - for the queue shape that means one plain
+  `asyncio.Queue()` built in `__init__`, one handler task created by `start`,
+  and that handler as the queue's only reader); the feeder and the STT
   each count samples with `SampleCounter`, and the feeder's `start_sample` is
   the worker's position authority. Pinned by
   `tests/test_websocket_stt_stamping.py` (span queue) and
   `tests/test_diarization_timeline.py` (the `segmented_stt_orders_spans`
   probe and its fail-closed cases).
+- **Shutdown closes the websocket only after the parent drain.**
+  `WebSocketSTTService.stop()` awaits `super().stop()` first (on pipecat 1.9+
+  that drains still-queued segments through `run_stt` over the still-open
+  socket) and closes the session in a `finally`; a cancelled drain takes the
+  hard-close path and re-raises. `cancel()` hard-closes first. Reordering the
+  close ahead of the parent stop silently drops final transcripts on 1.9+.
+  Pinned by `tests/test_websocket_stt_reconnect.py`
+  (`test_stop_drains_the_parent_before_closing_the_websocket`,
+  `test_stop_still_closes_gracefully_when_the_parent_stop_raises`,
+  `test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled`).
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
   composed at render/live-terminal time by `render.compose_speaker_label`
@@ -394,8 +406,10 @@ its scope; this list is a pointer, not the contract itself.
   for `runtime`'s startup preflight, `cached_snapshot_dir()` for the
   feeder's loader), so both check the same files; `huggingface_hub` is
   imported lazily inside the functions. Also `one_row_per_frame()`, the one
-  exact-`int`-1 `output_subsampling_factor` predicate shared by the worker's
-  load-time guard and the release-time contract test.
+  frame-rate predicate (`output_subsampling_factor` exactly `int` 1 AND
+  `processor_config.hop_length` exactly `int` 160 = `ROW_HOP_SAMPLES`, pinned
+  equal to the timeline's `FRAME_SAMPLES`) shared by the worker's load-time
+  guard and the release-time contract test.
 - `src/onoats/stt/diarization_timeline.py` — the them-channel diarization
   correlation clock (`SampleCounter`), the thread-safe coverage ring
   (`DiarizationTimeline`; the worker is its sole coverage writer) and the
