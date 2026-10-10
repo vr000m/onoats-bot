@@ -333,7 +333,9 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   see one of those two shapes); the feeder and the STT
   each count samples with `SampleCounter`, and the feeder's `start_sample` is
   the worker's position authority. Pinned by
-  `tests/test_websocket_stt_stamping.py`.
+  `tests/test_websocket_stt_stamping.py` (span queue) and
+  `tests/test_diarization_timeline.py` (the `segmented_stt_orders_spans`
+  probe and its fail-closed cases).
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
   composed at render/live-terminal time by `render.compose_speaker_label`
