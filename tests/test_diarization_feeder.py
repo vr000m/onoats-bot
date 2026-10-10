@@ -13,6 +13,7 @@ and `.thread`, `feeder.counter` (a `SampleCounter`), and the model contract
 from __future__ import annotations
 
 import asyncio
+import random
 import subprocess
 import sys
 import threading
@@ -587,6 +588,65 @@ def test_unaligned_drop_ranges_never_count_as_speaker_coverage(chunks):
     assert dropped
     for d0, d1 in dropped:
         assert tl.label_for(d0, d1) is None, (d0, d1)
+
+
+def _assert_no_row_overlaps_a_gap(tl):
+    gaps = [(s.start, s.end) for s in tl._segments if s.probs is None]
+    rows = [(s.start, s.end) for s in tl._segments if s.probs is not None]
+    for g0, g1 in gaps:
+        for r0, r1 in rows:
+            assert r1 <= g0 or r0 >= g1, f"row [{r0},{r1}) overlaps GAP [{g0},{g1})"
+
+
+def test_aligned_reanchor_after_unaligned_drop_leaves_no_coverage_hole():
+    """Regression: the second chunk ends exactly on the row boundary (480) at
+    which the earlier unaligned re-anchor put a breakpoint mapping row 480 to
+    465. The next (aligned) re-anchor started its GAP at row 480's pre-
+    breakpoint position (480) instead of where the stream actually continues
+    (465), leaving ``[465, 480)`` unresolved and ``coverage_high_water``
+    stuck at 465 for the rest of the session."""
+    chunks = [(0, 385), (465, 95), (841, 203)]
+    tl = RecordingTimeline()
+    _run_worker(tl, AccumulatingDiarizer(), [(s, pcm(1000, n)) for s, n in chunks])
+    assert tl.is_flushed and not tl.is_degraded
+    gaps = sorted((s.start, s.end) for s in tl._segments if s.probs is None)
+    assert gaps == [(320, 465), (465, 841)]
+    assert _resolved_reach(tl) == 1161  # 841 + two rows (one final partial)
+    _assert_no_row_overlaps_a_gap(tl)
+    assert tl.label_for(841, 1001).speakers == ["S1"]
+
+
+def _mixed_drop_chunks(seed):
+    """Forward-only chunk tags mixing aligned/unaligned lengths and drops."""
+    rng = random.Random(seed)
+    chunks, pos, fed = [], 0, 0
+    for _ in range(rng.randint(5, 30)):
+        to_row = -fed % dt.FRAME_SAMPLES  # completes the model's partial row
+        n = rng.choice(
+            [160, 320, rng.randint(1, 159), rng.randint(161, 480), to_row, to_row]
+        )
+        n = max(1, n)
+        chunks.append((pos, n))
+        pos += n
+        fed += n
+        roll = rng.random()
+        if roll < 0.3:
+            pos += rng.randint(1, 400)  # unaligned drop
+        elif roll < 0.5:
+            pos += 160 * rng.randint(1, 3)  # aligned drop
+    return chunks
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_mixed_aligned_unaligned_drops_leave_no_hole_or_overlap(seed):
+    chunks = _mixed_drop_chunks(seed)
+    tl = RecordingTimeline()
+    _run_worker(tl, AccumulatingDiarizer(), [(s, pcm(1000, n)) for s, n in chunks])
+    assert tl.is_flushed and not tl.is_degraded
+    reach = _resolved_reach(tl)
+    newest_end = chunks[-1][0] + chunks[-1][1]
+    assert abs(reach - newest_end) < dt.FRAME_SAMPLES
+    _assert_no_row_overlaps_a_gap(tl)
 
 
 def test_aligned_chunk_gaps_are_exactly_the_dropped_ranges():

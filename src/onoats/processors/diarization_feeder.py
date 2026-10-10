@@ -253,29 +253,28 @@ class DiarizerWorker:
             # row boundary ``off``, shifting its anchor so that row lands
             # exactly on ``start`` (exact when chunks are 160-sample
             # multiples, the 10 ms norm). Rows below ``off`` keep the anchor
-            # they were fed under. Aligned (``off == fed``): the mapped row
-            # stream ends at ``off + <that anchor>`` - up to a frame BEFORE
-            # the true ``expected`` after an earlier unaligned re-anchor - and
-            # the GAP starts at the lower of the two. Unaligned: the row
-            # ``[off - 160, off)`` straddles the drop, so it is skipped and
-            # the GAP starts where that row would have started; recording it
-            # at the pre-gap anchor would lay it over dropped audio and count
-            # that audio as speaker coverage. Either way every position
-            # between the last recorded row before the breakpoint and the
-            # first row after it is resolved by construction, by a GAP only.
+            # they were fed under. The GAP starts exactly where the mapped row
+            # stream continues: at row ``r = floor(fed)`` (the first row not
+            # wholly fed) under the anchor ``record`` would map it with - the
+            # same ``bisect_right(bp_offsets, r)`` lookup. Aligned (``r ==
+            # off``): that is up to a frame BEFORE the true ``expected`` after
+            # an earlier unaligned re-anchor, and when that re-anchor's
+            # breakpoint already sits at ``off`` (fed then grew exactly onto
+            # it) it is THAT breakpoint's anchor, not the pre-breakpoint one.
+            # Unaligned (``r == off - 160``): row ``r`` straddles the drop, so
+            # it is skipped; recording it at the pre-gap anchor would lay it
+            # over dropped audio and count that audio as speaker coverage.
+            # Either way every position between the last recorded row before
+            # the breakpoint and the first row after it is resolved by
+            # construction, by a GAP only.
             nonlocal anchor
             expected = anchor + fed
             off = -(-fed // FRAME_SAMPLES) * FRAME_SAMPLES
-            gap_lo = expected
-            if off > fed:
-                row = off - FRAME_SAMPLES
-                k = bisect.bisect_right(bp_offsets, row) - 1
-                gap_lo = min(gap_lo, row + bp_anchors[k])
-                if not skip_rows or skip_rows[-1] != row:
-                    skip_rows.append(row)
-            elif off > 0:
-                k = bisect.bisect_right(bp_offsets, off - 1) - 1
-                gap_lo = min(gap_lo, off + bp_anchors[k])
+            r = fed // FRAME_SAMPLES * FRAME_SAMPLES
+            k = bisect.bisect_right(bp_offsets, r) - 1
+            gap_lo = min(expected, r + bp_anchors[k])
+            if off > fed and (not skip_rows or skip_rows[-1] != r):
+                skip_rows.append(r)
             tl.record_gap(gap_lo, start)
             anchor += start - expected
             a = anchor - (off - fed)
