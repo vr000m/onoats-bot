@@ -99,17 +99,18 @@ def segmented_stt_orders_spans() -> bool:
     segment on ``_segment_queue`` and ONE ``_segment_task_handler`` task takes
     them off one at a time. The queue shape is only in order if the whole
     class agrees (:func:`_segment_queue_is_one_fifo_consumer`): the queue is
-    built once as a plain ``asyncio.Queue()`` (not LIFO / priority) and
-    ``start`` creates exactly one handler task, the queue's only reader.
-    Anything else (a concurrent or re-ordering design) could pair a span with
-    another segment - a wrong label rather than a missing one - so the
-    startup preflight refuses it.
+    built once as a plain ``asyncio.Queue()`` (not LIFO / priority),
+    ``start`` creates exactly one handler task, the queue's only reader, each
+    VAD-stop puts exactly one segment, and that reader is one loop that
+    awaits ``run_stt`` once per segment until the ``None`` sentinel. Anything
+    else (a concurrent, re-ordering, one-shot or skipping design) could
+    strand a span or pair it with another segment - a wrong label rather
+    than a missing one - so the startup preflight refuses it.
 
     Fails closed: an unreadable source or an unrecognised shape is "not
     ordered". Third-party import only (lazy), so this stays a leaf helper.
     """
     import inspect
-    import re
 
     from pipecat.services.stt_service import SegmentedSTTService
 
@@ -118,19 +119,11 @@ def segmented_stt_orders_spans() -> bool:
         return False
     try:
         src = inspect.getsource(handler)
-        task = getattr(SegmentedSTTService, "_segment_task_handler", None)
-        task_src = inspect.getsource(task) if task is not None else ""
     except (OSError, TypeError):
         return False
-    if task is None:
-        return "self.run_stt(" in src and "queue" not in src.lower()
-    return (
-        "self._segment_queue.put(" in src
-        and "self._segment_queue.get()" in task_src
-        and re.search(r"await\s+self\.process_generator\(\s*self\.run_stt\(", task_src)
-        is not None
-        and _segment_queue_is_one_fifo_consumer(SegmentedSTTService)
-    )
+    if getattr(SegmentedSTTService, "_segment_task_handler", None) is None:
+        return src.count("self.run_stt(") == 1 and "queue" not in src.lower()
+    return _segment_queue_is_one_fifo_consumer(SegmentedSTTService)
 
 
 def _is_self_attr(node: object, attr: str) -> bool:
@@ -158,7 +151,12 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
       ``self._segment_task = self.create_task(self._segment_task_handler())``
       (not in a loop, not twice, not elsewhere);
     - ``self._segment_queue.get``/``get_nowait`` is called once, inside
-      ``_segment_task_handler`` (no second reader).
+      ``_segment_task_handler`` (no second reader);
+    - ``self._segment_queue.put``/``put_nowait`` carries a segment only in
+      ``_handle_user_stopped_speaking``, exactly once
+      (:func:`_stop_handler_puts_one_segment`); every other put is the
+      ``None`` finish sentinel (``stop``);
+    - the reader drains one-for-one (:func:`_reader_drains_one_for_one`).
 
     Fails closed on an unreadable/unparseable method or a ``"_segment_queue"``
     string (a ``setattr`` the walk cannot follow).
@@ -181,6 +179,7 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
     queue_assigns: list[tuple[str, ast.expr | None]] = []
     handler_refs: list[str] = []
     readers: list[str] = []
+    segment_puts: list[str] = []
     for name, tree in methods.items():
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value == "_segment_queue":
@@ -205,6 +204,22 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
                 and _is_self_attr(node.func.value, "_segment_queue")
             ):
                 readers.append(name)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("put", "put_nowait")
+                and _is_self_attr(node.func.value, "_segment_queue")
+            ):
+                sentinel = (
+                    len(node.args) == 1
+                    and not node.keywords
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value is None
+                )
+                if name == "_handle_user_stopped_speaking" and not sentinel:
+                    segment_puts.append(name)
+                elif not sentinel:
+                    return False  # a segment producer other than the VAD stop
 
     if len(queue_assigns) != 1:
         return False
@@ -221,6 +236,12 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
     ):
         return False
     if readers != ["_segment_task_handler"] or handler_refs != ["start"]:
+        return False
+    if segment_puts != ["_handle_user_stopped_speaking"]:
+        return False
+    if not _stop_handler_puts_one_segment(methods["_handle_user_stopped_speaking"]):
+        return False
+    if not _reader_drains_one_for_one(methods["_segment_task_handler"]):
         return False
 
     def _is_the_one_task(stmt: ast.stmt) -> bool:
@@ -243,6 +264,215 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
     if not isinstance(start, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return False
     return sum(_is_the_one_task(stmt) for stmt in start.body) == 1
+
+
+def _function_def(tree: object) -> object | None:
+    import ast
+
+    body = getattr(tree, "body", None)
+    if not body or not isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    return body[0]
+
+
+def _is_queue_call(node: object, method: str) -> bool:
+    import ast
+
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == method
+        and _is_self_attr(node.func.value, "_segment_queue")
+    )
+
+
+def _stop_handler_puts_one_segment(tree: object) -> bool:
+    """True iff the VAD-stop handler puts its segment on EVERY stop it does not drop.
+
+    The STT appends one span per VAD-stop and skips only when ``is_usable`` is
+    false (mirroring pipecat 1.9-1.12, which drops that segment). So the put
+    must be one top-level ``await self._segment_queue.put(<segment>)``
+    statement (not under a branch or loop), and every ``return`` / ``raise``
+    in the handler must sit in an ``if not self.is_usable:`` block - any
+    other early exit would leave the STT's span without a segment.
+    """
+    import ast
+
+    fn = _function_def(tree)
+    if fn is None:
+        return False
+
+    def _is_put_stmt(stmt: ast.stmt) -> bool:
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Await)
+            and _is_queue_call(stmt.value.value, "put")
+            and len(stmt.value.value.args) == 1
+            and not stmt.value.value.keywords
+        )
+
+    def _is_usable_guard(stmt: ast.stmt) -> bool:
+        return (
+            isinstance(stmt, ast.If)
+            and isinstance(stmt.test, ast.UnaryOp)
+            and isinstance(stmt.test.op, ast.Not)
+            and _is_self_attr(stmt.test.operand, "is_usable")
+            and not stmt.orelse
+        )
+
+    if sum(_is_put_stmt(stmt) for stmt in fn.body) != 1:
+        return False
+    for stmt in fn.body:
+        if _is_usable_guard(stmt):
+            continue
+        if any(isinstance(n, (ast.Return, ast.Raise)) for n in ast.walk(stmt)):
+            return False
+    return True
+
+
+def _reader_drains_one_for_one(tree: object) -> bool:
+    """True iff ``_segment_task_handler`` awaits ``run_stt`` once per queued segment.
+
+    Requires pipecat 1.9-1.12's exact reader shape::
+
+        running = True
+        while running:
+            audio = await self._segment_queue.get()
+            running = audio is not None
+            if audio:
+                try:
+                    await self.process_generator(self.run_stt(audio))
+                except Exception as e: ...
+
+    i.e. one top-level ``while <flag>:`` loop (no ``else``) ended ONLY by the
+    ``None`` sentinel (``<flag>`` is otherwise only ever ``True``), with no
+    ``return`` / ``break`` / ``raise`` inside it, whose body gets one item and
+    awaits the handler's ONE ``run_stt`` call on it - reached through nothing
+    but ``if <item>:`` and a ``try`` body. A one-shot reader, a ``run_stt``
+    outside the loop, a second or skippable ``run_stt`` would strand a span
+    or pair it with another segment.
+
+    ``if <item>:`` skips an empty segment without calling ``run_stt``. That
+    is unreachable for ``WebSocketSTTService``: it keeps pipecat's default
+    ``wants_wav_segments`` (True), so every segment is a non-empty WAV.
+    """
+    import ast
+
+    fn = _function_def(tree)
+    if fn is None:
+        return False
+    loops = [n for n in ast.walk(fn) if isinstance(n, ast.While)]
+    if len(loops) != 1 or loops[0] not in fn.body:
+        return False
+    loop = loops[0]
+    if loop.orelse or not isinstance(loop.test, ast.Name):
+        return False
+    flag = loop.test.id
+    if any(isinstance(n, (ast.Return, ast.Break, ast.Raise)) for n in ast.walk(loop)):
+        return False
+
+    # ``<item> = await self._segment_queue.get()``, directly in the loop body.
+    gets = [
+        stmt
+        for stmt in loop.body
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(stmt.value, ast.Await)
+        and _is_queue_call(stmt.value.value, "get")
+        and not stmt.value.value.args
+        and not stmt.value.value.keywords
+    ]
+    if len(gets) != 1:
+        return False
+    item = gets[0].targets[0].id
+
+    def _is_sentinel_test(value: ast.expr) -> bool:
+        return (
+            isinstance(value, ast.Compare)
+            and isinstance(value.left, ast.Name)
+            and value.left.id == item
+            and len(value.ops) == 1
+            and isinstance(value.ops[0], ast.IsNot)
+            and isinstance(value.comparators[0], ast.Constant)
+            and value.comparators[0].value is None
+        )
+
+    # Every write of the loop flag is ``True`` outside the loop or the one
+    # ``<flag> = <item> is not None`` directly in its body.
+    sentinel_writes = 0
+    for node in ast.walk(fn):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            targets = [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith)):
+            targets = [getattr(node, "target", None)] + [
+                item_.optional_vars for item_ in getattr(node, "items", [])
+            ]
+        for target in targets:
+            if target is None:
+                continue
+            if not any(
+                isinstance(t, ast.Name) and t.id == flag for t in ast.walk(target)
+            ):
+                continue
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                return False
+            if node in loop.body and _is_sentinel_test(node.value):
+                sentinel_writes += 1
+            elif not (
+                node in fn.body
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is True
+            ):
+                return False
+    if sentinel_writes != 1:
+        return False
+
+    # The handler's one ``run_stt`` call: ``await self.process_generator(
+    # self.run_stt(<item>))``, inside the loop under only ``if <item>:``/``try``.
+    calls = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and _is_self_attr(n.func, "run_stt")
+    ]
+    if len(calls) != 1:
+        return False
+    run_stt = calls[0]
+    if not (
+        len(run_stt.args) == 1
+        and not run_stt.keywords
+        and isinstance(run_stt.args[0], ast.Name)
+        and run_stt.args[0].id == item
+    ):
+        return False
+
+    def _reaches(stmts: list[ast.stmt]) -> bool:
+        for stmt in stmts:
+            if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Await)
+                and isinstance(stmt.value.value, ast.Call)
+                and _is_self_attr(stmt.value.value.func, "process_generator")
+                and stmt.value.value.args == [run_stt]
+                and not stmt.value.value.keywords
+            ):
+                return True
+            if (
+                isinstance(stmt, ast.If)
+                and isinstance(stmt.test, ast.Name)
+                and stmt.test.id == item
+                and not stmt.orelse
+                and _reaches(stmt.body)
+            ):
+                return True
+            if isinstance(stmt, ast.Try) and not stmt.orelse and _reaches(stmt.body):
+                return True
+        return False
+
+    return _reaches(loop.body)
 
 
 class SampleCounter:

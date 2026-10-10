@@ -510,22 +510,39 @@ async def _start_one_task(self, frame):  # pragma: no cover - never run
 
 
 async def _ordered_task_handler(self):  # pragma: no cover - never run
-    audio = await self._segment_queue.get()
-    await self.process_generator(self.run_stt(audio))
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio:
+            try:
+                await self.process_generator(self.run_stt(audio))
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _stop_puts_one_segment(self, frame):  # pragma: no cover - never run
+    self._user_speaking = False
+    if not self.is_usable:
+        self._audio_buffer.clear()
+        return
+    audio = bytes(self._audio_buffer)
+    self._audio_buffer.clear()
+    await self._segment_queue.put(audio)
 
 
 def _patch_queued_shape(
-    monkeypatch, task_handler=_ordered_task_handler, *, init=_init_fifo, start=None
+    monkeypatch,
+    task_handler=_ordered_task_handler,
+    *,
+    init=_init_fifo,
+    start=None,
+    stop_handler=_stop_puts_one_segment,
 ):
     from pipecat.services.stt_service import SegmentedSTTService
 
-    async def _handle_user_stopped_speaking(self, frame):
-        await self._segment_queue.put(b"audio")
-
     monkeypatch.setattr(
-        SegmentedSTTService,
-        "_handle_user_stopped_speaking",
-        _handle_user_stopped_speaking,
+        SegmentedSTTService, "_handle_user_stopped_speaking", stop_handler
     )
     monkeypatch.setattr(
         SegmentedSTTService, "_segment_task_handler", task_handler, raising=False
@@ -628,6 +645,193 @@ def test_segmented_stt_orders_spans_false_when_segments_run_concurrently(monkeyp
         self.create_task(self.run_stt(audio))
 
     _patch_queued_shape(monkeypatch, _segment_task_handler)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _handler_one_shot(self):  # pragma: no cover - never run
+    audio = await self._segment_queue.get()
+    await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_run_stt_outside_loop(self):  # pragma: no cover - never run
+    running = True
+    audio = None
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+    await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_two_run_stt_sites(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio:
+            await self.process_generator(self.run_stt(audio))
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_returns_inside_loop(self):  # pragma: no cover - never run
+    while True:
+        audio = await self._segment_queue.get()
+        await self.process_generator(self.run_stt(audio))
+        return
+
+
+async def _handler_breaks_inside_loop(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio:
+            await self.process_generator(self.run_stt(audio))
+        break
+
+
+async def _handler_stops_on_a_non_sentinel(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = len(self._segment_queue._queue) > 0
+        if audio:
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_other_condition(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio and self._muted is False:
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio:
+            self.process_generator(self.run_stt(audio))
+
+
+@pytest.mark.parametrize(
+    "task_handler",
+    [
+        _handler_one_shot,
+        _handler_run_stt_outside_loop,
+        _handler_two_run_stt_sites,
+        _handler_returns_inside_loop,
+        _handler_breaks_inside_loop,
+        _handler_stops_on_a_non_sentinel,
+        _handler_other_condition,
+        _handler_run_stt_not_awaited,
+    ],
+    ids=[
+        "one-shot",
+        "run_stt-outside-loop",
+        "two-run_stt-sites",
+        "return-in-loop",
+        "break-in-loop",
+        "loop-ends-without-sentinel",
+        "extra-run_stt-condition",
+        "run_stt-not-awaited",
+    ],
+)
+def test_segmented_stt_orders_spans_false_unless_the_reader_drains_one_for_one(
+    monkeypatch, task_handler
+):
+    """Regression: the probe checked for one ``get`` and one awaited
+    ``run_stt`` but never for a loop, so a handler that transcribes ONE segment
+    and returns (or skips/duplicates ``run_stt``) passed - later segments and
+    their spans then stay queued or pop the wrong span. The reader must be one
+    loop, ended only by the ``None`` sentinel, awaiting exactly one ``run_stt``
+    per real segment."""
+    _patch_queued_shape(monkeypatch, task_handler)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _stop_puts_twice(self, frame):  # pragma: no cover - never run
+    await self._segment_queue.put(b"a")
+    await self._segment_queue.put(b"b")
+
+
+async def _stop_puts_conditionally(self, frame):  # pragma: no cover - never run
+    if self._audio_buffer:
+        await self._segment_queue.put(bytes(self._audio_buffer))
+
+
+async def _stop_drops_on_another_condition(self, frame):  # pragma: no cover
+    if len(self._audio_buffer) < 320:
+        return
+    await self._segment_queue.put(bytes(self._audio_buffer))
+
+
+async def _stop_puts_none(self, frame):  # pragma: no cover - never run
+    await self._segment_queue.put(None)
+
+
+@pytest.mark.parametrize(
+    "stop_handler",
+    [
+        _stop_puts_twice,
+        _stop_puts_conditionally,
+        _stop_drops_on_another_condition,
+        _stop_puts_none,
+    ],
+    ids=["two-puts", "conditional-put", "unmirrored-drop", "puts-sentinel"],
+)
+def test_segmented_stt_orders_spans_false_unless_each_stop_puts_one_segment(
+    monkeypatch, stop_handler
+):
+    """Regression: the STT appends one span per VAD-stop (skipping only when
+    ``is_usable`` is false, mirroring pipecat), so the stop handler must put
+    exactly one segment, unconditionally once past that guard; anything else
+    strands a span or pairs it with another segment."""
+    _patch_queued_shape(monkeypatch, stop_handler=stop_handler)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+def test_segmented_stt_orders_spans_false_with_a_second_segment_producer(
+    monkeypatch,
+):
+    """Only the VAD-stop handler may put a segment; any other put must be the
+    ``None`` finish sentinel (pipecat's ``stop``)."""
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    _patch_queued_shape(monkeypatch)
+
+    async def _finish(self):  # pragma: no cover - never run
+        await self._segment_queue.put(None)
+
+    async def _flush_early(self):  # pragma: no cover - never run
+        await self._segment_queue.put(bytes(self._audio_buffer))
+
+    monkeypatch.setattr(SegmentedSTTService, "_finish", _finish, raising=False)
+    assert dt.segmented_stt_orders_spans() is True
+    monkeypatch.setattr(
+        SegmentedSTTService, "_flush_early", _flush_early, raising=False
+    )
+    assert dt.segmented_stt_orders_spans() is False
+
+
+def test_segmented_stt_orders_spans_false_with_two_inline_run_stt_sites(monkeypatch):
+    """The inline (<= 1.8) shape must also await ``run_stt`` once per stop."""
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    if "_segment_task_handler" in vars(SegmentedSTTService):
+        pytest.skip("locked pipecat is not the inline shape")
+
+    async def _handle_user_stopped_speaking(self, frame):  # pragma: no cover
+        await self.process_generator(self.run_stt(b"a"))
+        await self.process_generator(self.run_stt(b"b"))
+
+    monkeypatch.setattr(
+        SegmentedSTTService,
+        "_handle_user_stopped_speaking",
+        _handle_user_stopped_speaking,
+    )
     assert dt.segmented_stt_orders_spans() is False
 
 
