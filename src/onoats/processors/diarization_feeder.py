@@ -87,6 +87,12 @@ def load_mlx_diarizer() -> Any:
     return load_diarization(snapshot, strict=True)
 
 
+def _int_repr(value: object) -> str:
+    """A model-config value for the guard's WARNING: the repr of an exact
+    ``int``, else only its type name (never an arbitrary object's repr)."""
+    return repr(value) if type(value) is int else f"<{type(value).__name__}>"
+
+
 class DiarizerWorker:
     """Owns the diarizer model, its thread, and all timeline writes."""
 
@@ -214,17 +220,20 @@ class DiarizerWorker:
                 f"diarizer sample rate {model_rate} != pipeline {PIPELINE_SAMPLE_RATE}"
             )
         # The whole timeline assumes ONE output row per 10 ms (160-sample) input
-        # frame; a model revision with a coarser output hop would put every
-        # label at the wrong time with no error. The weights are not
-        # revision-pinned, so check the live model rather than trust the
-        # release-time contract test (which skips when the cache is cold).
-        # Fails closed on anything but the exact int 1; the release-time
-        # contract test checks the same predicate, so the two cannot disagree.
+        # frame; a model revision with a coarser output hop (a subsampling
+        # factor != 1 OR a processor hop != 160) would put every label at the
+        # wrong time with no error. The weights are not revision-pinned, so
+        # check the live model rather than trust the release-time contract
+        # test (which skips when the cache is cold). Fails closed on anything
+        # but the exact ints 1 and 160; the release-time contract test checks
+        # the same predicate, so the two cannot disagree.
         if not diarization_model.one_row_per_frame(model.config):
             subsampling = getattr(model.config, "output_subsampling_factor", None)
+            hop = diarization_model.row_hop_length(model.config)
             raise RuntimeError(
-                f"diarizer output_subsampling_factor {subsampling!r} != 1: rows "
-                f"are not {FRAME_SAMPLES}-sample frames"
+                f"diarizer output_subsampling_factor {_int_repr(subsampling)} "
+                f"(need 1), hop_length {_int_repr(hop)} (need {FRAME_SAMPLES}): "
+                f"rows are not {FRAME_SAMPLES}-sample frames"
             )
         tl.set_slot_count(int(model.config.num_speakers))
         init = getattr(model, "init_streaming_state", None)

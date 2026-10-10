@@ -17,6 +17,7 @@ import random
 import subprocess
 import sys
 import threading
+import types
 
 import numpy as np
 import pytest
@@ -56,6 +57,10 @@ class _Out:
 class _Cfg:
     num_speakers = 8
     output_subsampling_factor = 1  # always present on mlx-audio's ModelConfig
+
+    def __init__(self):
+        # mlx-audio's ModelConfig.processor_config (a MelConfig); hop 160.
+        self.processor_config = types.SimpleNamespace(hop_length=160)
 
 
 class StubDiarizer:
@@ -281,6 +286,7 @@ def test_model_output_subsampling_unverifiable_fails_closed(
     log = []
     m = StubDiarizer(log)
     m.config = type("Cfg", (), {"num_speakers": 8})()
+    m.config.processor_config = types.SimpleNamespace(hop_length=160)
     if factor is not _MISSING:
         m.config.output_subsampling_factor = factor
     tl = RecordingTimeline()
@@ -291,6 +297,32 @@ def test_model_output_subsampling_unverifiable_fails_closed(
     assert not any(isinstance(f, ErrorFrame) for f in out)
     assert m.feed_calls == []
     assert any("output_subsampling_factor" in w for w in warnings_seen)
+
+
+@pytest.mark.parametrize(
+    "hop",
+    [320, _MISSING, 160.0, "160"],
+    ids=["320", "missing", "float-160.0", "str-160"],
+)
+def test_model_hop_length_not_one_frame_degrades(monkeypatch, warnings_seen, hop):
+    """Regression: the guard checked only ``output_subsampling_factor``, so a
+    model whose processor hop is 320 samples (factor 1) ran, and the timeline
+    recorded each row as 160 samples - every label at half its real time. The
+    weights are not revision-pinned, so the worker must refuse it and degrade."""
+    log = []
+    m = StubDiarizer(log)
+    m.config = _Cfg()
+    m.config.processor_config = types.SimpleNamespace()
+    if hop is not _MISSING:
+        m.config.processor_config.hop_length = hop
+    tl = RecordingTimeline()
+    feeder = make_feeder(tl, m)
+    out = drive(feeder, [start_frame(), audio_frame(), EndFrame()], monkeypatch)
+    assert tl.is_degraded
+    assert not tl.is_ready
+    assert not any(isinstance(f, ErrorFrame) for f in out)
+    assert m.feed_calls == []
+    assert any("hop_length" in w for w in warnings_seen)
 
 
 def test_model_output_subsampling_of_one_is_accepted(monkeypatch):

@@ -223,10 +223,12 @@ def test_feed_rejects_bad_rate_and_2d_input(model):
 def test_config_slots_and_one_to_one_frame_rate(model):
     # model.config (NOT the per-call output.num_speakers).
     assert model.config.num_speakers == 8
-    # The worker's own load-time guard (exact int 1, not 1.0 / True).
+    # The worker's own load-time guard (exact ints: subsampling 1, hop 160 @
+    # 16 kHz == 10 ms per output row; not 1.0 / True / 160.0).
     assert diarization_model.one_row_per_frame(model.config)
-    # hop 160 @ 16 kHz == 10 ms per output row.
-    assert model._processor_config.hop_length == 160
+    # The guard reads the public config field; pin that the model's feed()
+    # really uses that same processor config (a private alias today).
+    assert model._processor_config is model.config.processor_config
     assert model.sample_rate == 16000
 
 

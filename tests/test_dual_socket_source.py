@@ -911,7 +911,11 @@ class _StubModel:
     def __init__(self, raise_in_feed: bool = False):
         import types
 
-        self.config = types.SimpleNamespace(num_speakers=8, output_subsampling_factor=1)
+        self.config = types.SimpleNamespace(
+            num_speakers=8,
+            output_subsampling_factor=1,
+            processor_config=types.SimpleNamespace(hop_length=160),
+        )
         self._raise = raise_in_feed
         self._total = 0
         self._emitted = 0
