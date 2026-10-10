@@ -391,7 +391,9 @@ its scope; this list is a pointer, not the contract itself.
   weight-file tuple and non-downloading HF-cache probes (`weights_cached()`
   for `runtime`'s startup preflight, `cached_snapshot_dir()` for the
   feeder's loader), so both check the same files; `huggingface_hub` is
-  imported lazily inside the functions.
+  imported lazily inside the functions. Also `one_row_per_frame()`, the one
+  exact-`int`-1 `output_subsampling_factor` predicate shared by the worker's
+  load-time guard and the release-time contract test.
 - `src/onoats/stt/diarization_timeline.py` — the them-channel diarization
   correlation clock (`SampleCounter`), the thread-safe coverage ring
   (`DiarizationTimeline`; the worker is its sole coverage writer) and the

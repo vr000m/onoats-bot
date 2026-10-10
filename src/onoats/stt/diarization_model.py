@@ -4,7 +4,9 @@ Leaf module: no ``onoats`` imports, and ``huggingface_hub`` is imported lazily
 inside the functions, so importing this pulls in nothing heavy. Shared by the
 startup preflight (``runtime._preflight_diarization``) and the worker's loader
 (``diarization_feeder.load_mlx_diarizer``) so the two cannot disagree on which
-repo is the model or which files make its cache complete.
+repo is the model or which files make its cache complete. Also owns
+:func:`one_row_per_frame`, the frame-rate predicate shared by the worker's
+load-time guard and the release-time contract test.
 
 Neither function touches the network: ``try_to_load_from_cache`` returns a path
 str when a file is cached and ``None`` (or a sentinel for a known-missing file)
@@ -18,6 +20,19 @@ REPO_ID = "mlx-community/Nemotron-3-Diarization"
 #: The files ``mlx_audio``'s loader reads (Phase 0); all must be cached.
 WEIGHT_FILES = ("config.json", "model.safetensors")
 DOWNLOAD_HINT = f"hf download {REPO_ID}"
+
+
+def one_row_per_frame(config: object) -> bool:
+    """True only if the model emits ONE output row per 10 ms input frame.
+
+    The single predicate for both the worker's load-time guard and the
+    release-time contract test. Fails closed: mlx-audio's ``ModelConfig``
+    always carries ``output_subsampling_factor`` as an ``int`` (default 1),
+    so a missing field, a float (``1.0``), a bool (``True == 1``) or a str is
+    an unsupported model, never a verified 1.
+    """
+    factor = getattr(config, "output_subsampling_factor", None)
+    return type(factor) is int and factor == 1
 
 
 def _cached_paths(repo_id: str) -> list[str] | None:

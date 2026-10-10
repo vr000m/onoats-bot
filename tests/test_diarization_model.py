@@ -94,3 +94,47 @@ def test_full_cache_probes_every_file_and_returns_unresolved_snapshot_dir(
     assert dm.cached_snapshot_dir() == str(snap)
     assert [f for _, f in probed] == list(dm.WEIGHT_FILES) * 2
     assert {r for r, _ in probed} == {dm.REPO_ID}
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("factor", "ok"),
+    [
+        (1, True),
+        (_MISSING, False),
+        (None, False),
+        (1.0, False),
+        (1.5, False),
+        ("1", False),
+        (True, False),
+        (2, False),
+    ],
+    ids=["int-1", "missing", "none", "float-1.0", "1.5", "str-1", "bool-true", "2"],
+)
+def test_one_row_per_frame_is_exactly_int_one(factor, ok):
+    cfg = type("Cfg", (), {})()
+    if factor is not _MISSING:
+        cfg.output_subsampling_factor = factor
+    assert dm.one_row_per_frame(cfg) is ok
+
+
+def _calls(path: Path, name: str) -> int:
+    return sum(
+        1
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == name
+    )
+
+
+def test_worker_and_release_contract_share_one_frame_rate_predicate():
+    """Regression: the worker's guard was type-strict while the release-time
+    contract test used ``== 1`` (accepting 1.0 / True), so a weights revision
+    storing 1.0 would pass ``release_check.sh`` and then degrade every live
+    session. Both must route through the leaf module's one predicate."""
+    contract = Path(__file__).with_name("test_diarization_contract.py")
+    assert _calls(Path(diarization_feeder.__file__), "one_row_per_frame") == 1
+    assert _calls(contract, "one_row_per_frame") == 1
+    assert "output_subsampling_factor == 1" not in contract.read_text()

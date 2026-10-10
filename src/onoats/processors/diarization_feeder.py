@@ -218,14 +218,13 @@ class DiarizerWorker:
         # label at the wrong time with no error. The weights are not
         # revision-pinned, so check the live model rather than trust the
         # release-time contract test (which skips when the cache is cold).
-        # Fail closed: mlx-audio's ``ModelConfig`` always carries this as an
-        # ``int`` (default 1), so a missing or non-int value is an unsupported
-        # model, never a verified 1 (``int(1.5)`` would truncate to 1).
-        subsampling = getattr(model.config, "output_subsampling_factor", None)
-        if type(subsampling) is not int or subsampling != 1:
+        # Fails closed on anything but the exact int 1; the release-time
+        # contract test checks the same predicate, so the two cannot disagree.
+        if not diarization_model.one_row_per_frame(model.config):
+            subsampling = getattr(model.config, "output_subsampling_factor", None)
             raise RuntimeError(
-                f"diarizer output_subsampling_factor {subsampling} != 1: rows are "
-                f"not {FRAME_SAMPLES}-sample frames"
+                f"diarizer output_subsampling_factor {subsampling!r} != 1: rows "
+                f"are not {FRAME_SAMPLES}-sample frames"
             )
         tl.set_slot_count(int(model.config.num_speakers))
         init = getattr(model, "init_streaming_state", None)
