@@ -12,7 +12,9 @@ Lifecycle wire mapping:
   ``turn_detection=null``, await ``session.updated``
 - ``run_stt(audio)``       -> ``send_audio`` + ``commit``, wait for
   ``conversation.item.input_audio_transcription.completed``
-- ``stop(EndFrame)``       -> graceful ``session.close`` + socket close
+- ``stop(EndFrame)``       -> parent stop first (on pipecat 1.9+ it drains
+  queued segments over the still-open socket), then graceful
+  ``session.close`` + socket close
 - ``cancel(CancelFrame)``  -> best-effort ``session.cancel``, then close;
   also resolves any in-flight ``_pending`` so ``run_stt`` unwinds promptly
 - ``cleanup()``            -> fallback teardown; takes the cancel path if
@@ -327,10 +329,36 @@ class WebSocketSTTService(SegmentedSTTService):
     async def stop(self, frame: EndFrame) -> None:
         # Pipecat invokes this via the pipeline AND ``bot/dual.py`` calls it
         # directly during shutdown, bypassing the pipeline. Either way we
-        # must close the websocket session cleanly here — waiting until
-        # cleanup() leaves the socket open for the whole drain window.
-        await self._graceful_close()
-        await super().stop(frame)
+        # close the websocket session here rather than leaving it open until
+        # cleanup() — but only AFTER the parent's stop has returned:
+        #
+        # * pipecat 1.3.0-1.8.x: ``run_stt`` runs inline in the VAD-stop
+        #   handler, so nothing is queued by now and ``super().stop()`` never
+        #   touches the socket; the order is immaterial.
+        # * pipecat 1.9+: ``SegmentedSTTService.stop()`` awaits its segment
+        #   task, which transcribes every still-queued segment through
+        #   ``run_stt`` over THIS websocket. Closing first would detach the
+        #   client mid-drain: a late ``transcript.completed`` is ignored and
+        #   ``run_stt`` waits out its decode timeout, so the shutdown drain
+        #   hard-cancels and loses the final transcript.
+        #
+        # The close runs in ``finally`` so a raising parent stop cannot leak
+        # the session. A *cancelled* drain is the pipeline aborting, so it
+        # takes the hard-cancel path (as cleanup() does under
+        # ``_cancelling``) instead of waiting out a ``session.closed`` ack;
+        # the cancellation itself still propagates. Both closers are
+        # idempotent, so the later cleanup() / direct dual.py call no-ops.
+        drain_cancelled = False
+        try:
+            await super().stop(frame)
+        except asyncio.CancelledError:
+            drain_cancelled = True
+            raise
+        finally:
+            if drain_cancelled:
+                await self._cancel_and_close()
+            else:
+                await self._graceful_close()
 
     async def cancel(self, frame: CancelFrame) -> None:
         # Direct cancel() during an in-flight run_stt would otherwise leave

@@ -57,6 +57,15 @@ Annotated tags exist from `v0.9.0` forward.
   tests still skip when the model is not in the local HF cache; pre-cache it on
   the release machine.
 
+### Fixed
+
+- **Final transcript lost at shutdown on pipecat 1.9+ (websocket STT).** The
+  websocket STT's graceful `stop()` closed the session before pipecat's own
+  `stop()` drained its queued segments, so a segment still decoding at shutdown
+  never got its transcript and the shutdown drain timed out. The session now
+  closes only after pipecat's drain returns (a cancelled drain still takes the
+  hard-cancel path). No change on pipecat 1.3.0-1.8.x, which queue nothing.
+
 ## [1.3.0] - 2026-09-26
 
 ### Added
