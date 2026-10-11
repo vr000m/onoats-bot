@@ -96,6 +96,20 @@ def test_full_cache_probes_every_file_and_returns_unresolved_snapshot_dir(
     assert {r for r, _ in probed} == {dm.REPO_ID}
 
 
+def test_provenance_is_model_and_snapshot_revision_from_the_local_cache(
+    monkeypatch, tmp_path
+):
+    snap = tmp_path / "snapshots" / "0123abcd"
+    snap.mkdir(parents=True)
+    _cache(monkeypatch, {f: str(snap / f) for f in dm.WEIGHT_FILES})
+    assert dm.provenance() == {"model": dm.REPO_ID, "version": "0123abcd"}
+
+
+def test_provenance_omits_version_when_the_cache_misses(monkeypatch):
+    _cache(monkeypatch, {})
+    assert dm.provenance() == {"model": dm.REPO_ID}
+
+
 _MISSING = object()
 
 

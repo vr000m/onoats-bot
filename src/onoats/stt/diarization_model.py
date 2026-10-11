@@ -96,3 +96,21 @@ def cached_snapshot_dir(repo_id: str = REPO_ID) -> str:
     # abspath, not resolve(): the files inside a snapshot are symlinks into
     # ``blobs/``, and resolving would walk out of the snapshot directory.
     return os.path.dirname(os.path.abspath(paths[0]))
+
+
+def provenance(repo_id: str = REPO_ID) -> dict[str, str]:
+    """Header provenance for the locally cached model: ``{"model", "version"}``.
+
+    ``version`` is the Hugging Face snapshot revision (the cached snapshot
+    directory's name), read from the local cache only - no network and no
+    ``mlx_audio`` import. If the cache cannot be resolved the key is omitted
+    rather than invented; the startup preflight normally guarantees it exists.
+    """
+    import os
+
+    info = {"model": repo_id}
+    try:
+        info["version"] = os.path.basename(cached_snapshot_dir(repo_id))
+    except RuntimeError:
+        pass
+    return info

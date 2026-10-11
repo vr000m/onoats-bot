@@ -61,12 +61,27 @@ def validate_category(
     return cat
 
 
-def session_meta_line(category: str | None) -> str:
+def session_meta_line(
+    category: str | None = None,
+    *,
+    run_id: str | None = None,
+    diarization: dict[str, str] | None = None,
+) -> str:
     """Return the JSONL ``session_meta`` first line for a session.
 
-    ``category`` defaults to ``uncategorized`` when ``None`` so the consumer
-    always sees an explicit value. The returned string has NO trailing newline
+    ``category`` is written ONLY when a lock exists: a consumer treats any
+    non-blank ``category`` as a hard lock that skips classification, so a
+    default such as ``uncategorized`` would pin every transcript. ``run_id`` is
+    an opaque per-recorder-run token; ``diarization`` is provenance
+    (``{"model", "version"}``) recording that diarization was configured on,
+    not that a line was labelled. The returned string has NO trailing newline
     — the writer appends it.
     """
-    meta = {"type": "session_meta", "category": category or DEFAULT_CATEGORY}
+    meta: dict[str, object] = {"type": "session_meta"}
+    if category:
+        meta["category"] = category
+    if run_id:
+        meta["run_id"] = run_id
+    if diarization:
+        meta["diarization"] = dict(diarization)
     return json.dumps(meta, ensure_ascii=False)

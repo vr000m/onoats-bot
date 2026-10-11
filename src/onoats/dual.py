@@ -72,6 +72,7 @@ from onoats.runtime import (  # noqa: E402
     stt_banner,
     wait_or_force,
 )
+from onoats.stt import diarization_model  # noqa: E402
 
 
 def _finalize_shutdown_status(
@@ -494,6 +495,10 @@ async def run_onoats_dual(
         track_vad_gaps=True,
         use_frame_source=True,
         locked_category=locked_category,
+        # Provenance for the session_meta header: what the run was configured
+        # with. A runtime degrade does not change it; per-utterance `speakers`
+        # is the truth about whether a line was labelled.
+        diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
     )
     flush_lock = asyncio.Lock()
 
