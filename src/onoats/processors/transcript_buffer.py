@@ -173,6 +173,10 @@ class TranscriptBuffer(FrameProcessor):
         # Provenance of the diarizer the run was *configured* with (known at
         # file creation); None when diarization is off.
         self._diarization_meta = dict(diarization_meta) if diarization_meta else None
+        # Session file whose header has been settled (written, or found to need
+        # no header). Keeps ``_write_entry`` from re-reading the file's first
+        # line on the event loop for every utterance.
+        self._meta_settled_path: Optional[Path] = None
 
         # In-memory buffer of JSONL entry dicts
         self._buffer: list[dict] = []
@@ -461,22 +465,22 @@ class TranscriptBuffer(FrameProcessor):
     def _maybe_write_session_meta(self, path: Path) -> None:
         """Write the typed ``session_meta`` FIRST line for a fresh session file.
 
-        Fires for every fresh file (empty, or a pre-minted continuation file)
-        that has no session_meta yet. The line carries the run id, the
-        ``--category`` lock when one exists, and diarization provenance when
-        configured. Idempotent: a file that already starts with a session_meta
-        line is left untouched.
+        Fires for every fresh (empty or absent) file, including a pre-minted
+        continuation file. The line carries the run id, the ``--category`` lock
+        when one exists, and diarization provenance when configured. A
+        non-empty file is never touched: its first line already exists, so a
+        header appended now would sit mid-file, not on line 1 - and, because
+        the check runs on every write, would be repeated before every later
+        entry. Settled once per file (``_meta_settled_path``); a failed header
+        write leaves the file unsettled so the next write retries while the file
+        is still empty.
         """
+        if path == self._meta_settled_path:
+            return
         try:
             if path.exists() and path.stat().st_size > 0:
-                with path.open("r", encoding="utf-8") as fh:
-                    first = fh.readline()
-                if first.strip():
-                    try:
-                        if json.loads(first).get("type") == "session_meta":
-                            return
-                    except json.JSONDecodeError:
-                        pass
+                self._meta_settled_path = path
+                return
             from onoats.categories import session_meta_line
 
             _append_line(
@@ -487,6 +491,7 @@ class TranscriptBuffer(FrameProcessor):
                     diarization=self._diarization_meta,
                 ),
             )
+            self._meta_settled_path = path
         except OSError as exc:
             logger.warning(
                 f"TranscriptBuffer: could not write session_meta line: {exc}"

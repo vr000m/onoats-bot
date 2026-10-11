@@ -187,3 +187,68 @@ def test_session_meta_carries_diarization_provenance_only_when_given(tmp_path):
     (off_head,) = _first_lines(tmp_path / "off")
     assert on_head["diarization"] == {"model": "m/x", "version": "r"}
     assert "diarization" not in off_head
+
+
+def test_failed_header_write_never_repeats_the_header_mid_file(tmp_path, monkeypatch):
+    """A header that never landed on line 1 is not re-appended before every entry.
+
+    Both header attempts for the first entry (file creation, then the pre-write
+    guard) fail; the entry lands first. Later writes must leave the file alone:
+    the old first-line sniff saw a non-header first line each time and appended
+    another ``session_meta`` ahead of every subsequent entry.
+    """
+    import asyncio
+
+    from onoats.processors import transcript_buffer as tb
+
+    real_append = tb._append_line
+    calls = {"n": 0}
+
+    def flaky_append(path, line):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise OSError(5, "transient I/O error")
+        return real_append(path, line)
+
+    monkeypatch.setattr(tb, "_append_line", flaky_append)
+
+    async def _run() -> None:
+        buf = tb.TranscriptBuffer(data_dir=tmp_path)
+        for i in range(4):
+            await buf._write_entry(
+                {"time": "2026-01-01T00:00:00+00:00", "type": "utterance", "text": i}
+            )
+
+    asyncio.run(_run())
+    (session_file,) = (tmp_path / ".active").glob("*.jsonl")
+    types = [json.loads(line)["type"] for line in session_file.read_text().splitlines()]
+    assert types == ["utterance"] * 4
+
+
+def test_session_header_is_settled_once_per_file(tmp_path, monkeypatch):
+    """The header guard stats the file on the first write only, not on every entry."""
+    import asyncio
+    from pathlib import Path
+
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    stats = {"n": 0}
+    real_exists = Path.exists
+
+    def counting_exists(self):
+        if self.suffix == ".jsonl":
+            stats["n"] += 1
+        return real_exists(self)
+
+    async def _run() -> None:
+        buf = TranscriptBuffer(data_dir=tmp_path)
+        entry = {"time": "2026-01-01T00:00:00+00:00", "type": "utterance", "text": "x"}
+        await buf._write_entry(entry)
+        monkeypatch.setattr(Path, "exists", counting_exists)
+        for _ in range(5):
+            await buf._write_entry(entry)
+
+    asyncio.run(_run())
+    assert stats["n"] == 0
+    (first,) = _first_lines(tmp_path)
+    assert first["type"] == "session_meta"
