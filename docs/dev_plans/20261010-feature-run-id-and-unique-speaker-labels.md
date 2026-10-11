@@ -4,15 +4,15 @@
 **Component**: recorder, stt
 **Assigned to**: Claude
 **Priority**: Medium
-**Branch**: feature/run-id-and-unique-speaker-labels
+**Branch**: feature/them-channel-diarization (folded into PR #29)
 **Created**: 2026-10-10
 **Review Gates**: none
 
 ## Objective
 
 Two additive changes that let the koda consumer attribute speaker labels
-correctly, as a follow-up to the them-channel diarization PR (#29, which this
-branch is stacked on):
+correctly. Built as a follow-up to the them-channel diarization work and folded
+into the same PR (#29) so the labels and the header can be tested together:
 
 1. **Run id header.** Every session file starts with a `session_meta` line that
    carries a per-recorder-run id, so a consumer can tell "same run" from
@@ -74,7 +74,7 @@ that and never rewrites `speakers` with display names. S-labels stay canonical.
 - [x] Header: `session_meta_line` + `TranscriptBuffer` + provenance + tests
 - [x] Labels: generations and re-mint in `DiarizationTimeline` + tests
 - [x] Docs: AGENTS, README, CHANGELOG, sibling plan pointer
-- [ ] Pre-push checks and PR
+- [x] Pre-push checks; folded into PR #29
 
 ## Findings
 
