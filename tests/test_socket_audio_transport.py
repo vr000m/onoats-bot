@@ -186,8 +186,8 @@ class _SocketWriterServer:
 class _CapturingSink(FrameProcessor):
     """Records every frame that flows downstream into it."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.frames: list = []
 
     async def process_frame(self, frame, direction):
@@ -229,7 +229,11 @@ class _ManualHarness:
         # pushes UPSTREAM (that is what the pipeline worker watches to cancel on
         # a fatal error). Capture the transport's upstream neighbour so tests can
         # assert the fatal ErrorFrame, not just the downstream audio flow.
-        self.upstream = _CapturingSink()
+        # Direct mode: pipecat 1.12 only drains a processor's queue after it
+        # has seen a StartFrame, and nothing starts this upstream neighbour (the
+        # StartFrame enters at the transport), so queued frames would never be
+        # processed. Direct mode handles each frame as it arrives.
+        self.upstream = _CapturingSink(enable_direct_mode=True)
         self._tm: TaskManager | None = None
 
     async def setup(self) -> None:
