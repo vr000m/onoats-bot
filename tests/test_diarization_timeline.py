@@ -571,7 +571,8 @@ def test_record_interleaved_into_in_progress_label_for(tl):
 
 
 def test_segmented_stt_orders_spans_true_for_the_locked_pipecat():
-    """The locked pipecat (1.3.0) awaits ``run_stt`` inline on VAD-stop."""
+    """The locked pipecat hands segments to ``run_stt`` in VAD-stop order
+    (inline up to 1.8, one in-order queue task from 1.9)."""
     assert dt.segmented_stt_orders_spans() is True
 
 
@@ -934,4 +935,86 @@ def test_segmented_stt_orders_spans_fails_closed_without_source(monkeypatch):
         raise OSError("source not available")
 
     monkeypatch.setattr(inspect, "getsource", _no_source)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+# --- the inline (pipecat <= 1.8) shape must run run_stt on EVERY stop ---------
+#
+# These force the inline branch (no ``_segment_task_handler``) so they hold
+# whichever pipecat the checkout locks; the real 1.3.0 handler is mirrored by
+# ``_inline_sound``.
+
+
+async def _inline_sound(self, frame):  # pragma: no cover - source is parsed
+    self._user_speaking = False
+    content = bytes(self._audio_buffer)
+    self._audio_buffer.clear()
+    await self.process_generator(self.run_stt(content))
+
+
+async def _inline_with_usable_guard(self, frame):  # pragma: no cover
+    if not self.is_usable:
+        return
+    await self.process_generator(self.run_stt(b"x"))
+
+
+async def _inline_early_return(self, frame):  # pragma: no cover
+    if not self._audio_buffer:
+        return
+    await self.process_generator(self.run_stt(bytes(self._audio_buffer)))
+
+
+async def _inline_conditional(self, frame):  # pragma: no cover
+    if self._user_speaking:
+        await self.process_generator(self.run_stt(b"x"))
+
+
+async def _inline_swallowing_try(self, frame):  # pragma: no cover
+    try:
+        await self.process_generator(self.run_stt(b"x"))
+    except Exception:
+        return
+
+
+async def _inline_in_loop(self, frame):  # pragma: no cover
+    for chunk in (b"a",):
+        await self.process_generator(self.run_stt(chunk))
+
+
+async def _inline_raising(self, frame):  # pragma: no cover
+    if not self._audio_buffer:
+        raise RuntimeError("no audio")
+    await self.process_generator(self.run_stt(b"x"))
+
+
+def _force_inline_shape(monkeypatch, handler):
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    monkeypatch.setattr(
+        SegmentedSTTService, "_segment_task_handler", None, raising=False
+    )
+    monkeypatch.setattr(SegmentedSTTService, "_handle_user_stopped_speaking", handler)
+
+
+@pytest.mark.parametrize("handler", [_inline_sound, _inline_with_usable_guard])
+def test_inline_shape_accepted_when_run_stt_is_unconditional(monkeypatch, handler):
+    _force_inline_shape(monkeypatch, handler)
+    assert dt.segmented_stt_orders_spans() is True
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        _inline_early_return,
+        _inline_conditional,
+        _inline_swallowing_try,
+        _inline_in_loop,
+        _inline_raising,
+    ],
+)
+def test_inline_shape_refused_when_run_stt_can_be_skipped(monkeypatch, handler):
+    """A handler that may skip ``run_stt`` strands the STT's span for that stop and
+    shifts every later segment onto the wrong span - the exact failure the
+    probe exists to refuse (the queue shape already enforces this)."""
+    _force_inline_shape(monkeypatch, handler)
     assert dt.segmented_stt_orders_spans() is False

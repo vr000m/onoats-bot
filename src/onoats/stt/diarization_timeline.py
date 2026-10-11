@@ -105,7 +105,8 @@ def segmented_stt_orders_spans() -> bool:
     The STT's span queue (one entry per VAD-stop, popped at the head of
     ``run_stt``) is only sound if segments reach ``run_stt`` in the order their
     VAD-stops were seen. Two shapes guarantee that: pipecat 1.3.0-1.8.x await
-    ``run_stt`` inline in the stop handler; from 1.9.0 the handler puts the
+    ``run_stt`` inline in the stop handler, once and unconditionally
+    (:func:`_inline_handler_runs_stt_once`); from 1.9.0 the handler puts the
     segment on ``_segment_queue`` and ONE ``_segment_task_handler`` task takes
     them off one at a time. The queue shape is only in order if the whole
     class agrees (:func:`_segment_queue_is_one_fifo_consumer`): the queue is
@@ -132,7 +133,16 @@ def segmented_stt_orders_spans() -> bool:
     except (OSError, TypeError):
         return False
     if getattr(SegmentedSTTService, "_segment_task_handler", None) is None:
-        return src.count("self.run_stt(") == 1 and "queue" not in src.lower()
+        if src.count("self.run_stt(") != 1 or "queue" in src.lower():
+            return False
+        import ast
+        import textwrap
+
+        try:
+            tree = ast.parse(textwrap.dedent(src))
+        except SyntaxError:
+            return False
+        return _inline_handler_runs_stt_once(tree)
     return _segment_queue_is_one_fifo_consumer(SegmentedSTTService)
 
 
@@ -296,6 +306,70 @@ def _is_queue_call(node: object, method: str) -> bool:
     )
 
 
+def _is_usable_guard(stmt: object) -> bool:
+    """``if not self.is_usable:`` with no ``else`` (the one early exit pipecat 1.9+ has)."""
+    import ast
+
+    return (
+        isinstance(stmt, ast.If)
+        and isinstance(stmt.test, ast.UnaryOp)
+        and isinstance(stmt.test.op, ast.Not)
+        and _is_self_attr(stmt.test.operand, "is_usable")
+        and not stmt.orelse
+    )
+
+
+def _inline_handler_runs_stt_once(tree: object) -> bool:
+    """True iff the VAD-stop handler awaits ``run_stt`` once, on every stop.
+
+    The pipecat 1.3-1.8 shape: one top-level
+    ``await self.process_generator(self.run_stt(<audio>))`` statement (not under
+    a branch, loop or ``try``) and no ``return`` / ``raise`` anywhere else (an
+    ``if not self.is_usable:`` guard excepted, as in the queue shape). The STT
+    appends one span per VAD stop, so a handler that can leave without calling
+    ``run_stt``, or calls it conditionally, would strand a span and pair every
+    later span with the wrong segment - a wrong label rather than a missing one.
+    The exact-one-call count alone cannot tell those from the sound shape.
+    """
+    import ast
+
+    fn = _function_def(tree)
+    if fn is None:
+        return False
+
+    def _is_run_stmt(stmt: ast.stmt) -> bool:
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Await)
+            and isinstance(stmt.value.value, ast.Call)
+        ):
+            return False
+        call = stmt.value.value
+        return (
+            _is_self_attr(call.func, "process_generator")
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Call)
+            and _is_self_attr(call.args[0].func, "run_stt")
+        )
+
+    if sum(_is_run_stmt(stmt) for stmt in fn.body) != 1:
+        return False
+    run_calls = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and _is_self_attr(n.func, "run_stt")
+    ]
+    if len(run_calls) != 1:
+        return False
+    for stmt in fn.body:
+        if _is_usable_guard(stmt):
+            continue
+        if any(isinstance(n, (ast.Return, ast.Raise)) for n in ast.walk(stmt)):
+            return False
+    return True
+
+
 def _stop_handler_puts_one_segment(tree: object) -> bool:
     """True iff the VAD-stop handler puts its segment on EVERY stop it does not drop.
 
@@ -319,15 +393,6 @@ def _stop_handler_puts_one_segment(tree: object) -> bool:
             and _is_queue_call(stmt.value.value, "put")
             and len(stmt.value.value.args) == 1
             and not stmt.value.value.keywords
-        )
-
-    def _is_usable_guard(stmt: ast.stmt) -> bool:
-        return (
-            isinstance(stmt, ast.If)
-            and isinstance(stmt.test, ast.UnaryOp)
-            and isinstance(stmt.test.op, ast.Not)
-            and _is_self_attr(stmt.test.operand, "is_usable")
-            and not stmt.orelse
         )
 
     if sum(_is_put_stmt(stmt) for stmt in fn.body) != 1:

@@ -52,17 +52,21 @@ Annotated tags exist from `v0.9.0` forward.
   diarization relies on needs `SegmentedSTTService` to hand segments to
   `run_stt` in VAD-stop order: inline on 1.3.0-1.8.x, through one in-order
   queue task from 1.9 (the STT keeps an ordered span queue, so both work). CI
-  runs against the locked pipecat 1.3.0 and covers the 1.9+ queue shape with
-  fixtures in `tests/test_websocket_stt_stamping.py` and (for the
-  `segmented_stt_orders_spans` preflight probe and its fail-closed cases)
-  `tests/test_diarization_timeline.py`; the diarization tests
+  runs the real-pipecat stamping tests (`tests/test_websocket_stt_stamping.py`)
+  and the `segmented_stt_orders_spans` preflight probe tests
+  (`tests/test_diarization_timeline.py`) against the locked pipecat 1.12.0, the
+  queue shape; the inline shape (1.3.0-1.8.x) is covered in CI only by that
+  probe's source fixtures, not by a real pipecat run. The diarization tests
   were additionally run by hand in isolated pipecat 1.9.0, 1.11.0 and 1.12.0
   environments (not in CI). The diarization startup preflight exits non-zero
-  on a pipecat that does neither; a checkout's `uv.lock` pins 1.3.0. For the
+  on a pipecat that does neither; a checkout's `uv.lock` pins 1.12.0. For the
   queue shape the probe also requires one segment `put` per VAD stop and a
   single reader loop that awaits `run_stt` once per segment until the finish
   sentinel; a reader that transcribes one segment and returns, or skips or
-  repeats `run_stt`, is refused.
+  repeats `run_stt`, is refused. For the inline shape it likewise requires one
+  unconditional `await self.process_generator(self.run_stt(...))` per stop: a
+  handler that returns early, or calls `run_stt` under a branch, loop or `try`,
+  is refused.
 - **Diarization needs a 160-sample model row hop.** The worker's load-time
   check now also requires the model's `processor_config.hop_length` to be
   exactly the integer 160, not only `output_subsampling_factor == 1`. A model

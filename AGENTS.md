@@ -566,3 +566,18 @@ should NOT re-flag go here, one per line:
   hardening them would restructure the held-frame bookkeeping for a path the
   framework does not take. Complements the `_fail_open` re-push entry above.
   (2026-10-08)
+- **[Logic] won't-fix**: `segmented_stt_orders_spans()` inspects the stop handler
+  and the queue methods but not `SegmentedSTTService.process_frame`, so a future
+  pipecat that gates the stop-handler dispatch (e.g. on `_user_speaking`) would
+  pass the probe and strand a span. Speculative: 1.3.0 and 1.12.0 dispatch
+  unconditionally, and the probe fails closed on the shapes it can see.
+  (2026-10-11)
+- **[Architecture] won't-fix**: the `pipecat-ai>=1.3.0` floor applies to every
+  user, although only diarization needs it. Deliberate and stated in the
+  CHANGELOG; the preflight alone cannot protect a user who never enables the
+  flag but runs a pipecat that predates the stamping hooks. (2026-10-11)
+- **[Security] won't-fix**: `jsonl.read_session_file` does not enforce the
+  `^S[0-9]+$` grammar on `speakers`, so a hand-edited session file could inject
+  markdown into a rendered label. onoats reads only files it wrote itself into
+  its 0700 data dir; an attacker who can edit them can already edit the
+  transcript text. (2026-10-11)
