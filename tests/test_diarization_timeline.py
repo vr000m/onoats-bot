@@ -229,6 +229,82 @@ def test_slot_mapping_by_first_activity(tl):
     assert tl.label_for(seconds(2), seconds(4)).speakers == ["S2"]
 
 
+def _long_tl():
+    t = DiarizationTimeline(capacity_sec=100_000)
+    t.set_slot_count(8)
+    return t
+
+
+def test_idle_slot_gets_a_fresh_label_never_a_reused_one():
+    t = _long_tl()
+    idle = dt.SLOT_IDLE_REMINT_SEC
+    t.record(0, probs(frames(2), s3=ON))
+    t.record(seconds(10), probs(frames(2), s0=ON))
+    t.record(seconds(idle + 100), probs(frames(2), s3=ON))  # slot 3 again, much later
+    assert t.label_for(0, seconds(2)).speakers == ["S1"]
+    assert t.label_for(seconds(10), seconds(12)).speakers == ["S2"]
+    # S3 - not S1: slot 3 may have been recycled for a different person.
+    again = t.label_for(seconds(idle + 100), seconds(idle + 102))
+    assert again.speakers == ["S3"]
+
+
+def test_slot_active_again_within_the_idle_threshold_keeps_its_label():
+    t = _long_tl()
+    t.record(0, probs(frames(2), s3=ON))
+    t.record(seconds(dt.SLOT_IDLE_REMINT_SEC - 10), probs(frames(2), s3=ON))
+    assert t.label_for(0, seconds(2)).speakers == ["S1"]
+    later = seconds(dt.SLOT_IDLE_REMINT_SEC - 10)
+    assert t.label_for(later, later + seconds(2)).speakers == ["S1"]
+
+
+def test_idle_is_measured_from_the_slots_last_active_frame_not_the_gap_start():
+    t = _long_tl()
+    step = dt.SLOT_IDLE_REMINT_SEC * 0.6  # each gap alone is under the threshold
+    for i in range(4):
+        t.record(seconds(i * step), probs(frames(2), s3=ON))
+    last = seconds(3 * step)
+    assert t.label_for(last, last + seconds(2)).speakers == ["S1"]
+
+
+def test_remint_numbers_are_unbounded_past_the_slot_count():
+    t = _long_tl()
+    gap = dt.SLOT_IDLE_REMINT_SEC + 60
+    for i in range(10):  # one slot, ten incarnations: S1..S10 with only 8 slots
+        t.record(seconds(i * gap), probs(frames(2), s0=ON))
+    last = seconds(9 * gap)
+    assert t.label_for(last, last + seconds(2)).speakers == ["S10"]
+
+
+def test_remint_applies_per_slot_and_overlap_uses_each_slots_generation():
+    t = _long_tl()
+    gap = dt.SLOT_IDLE_REMINT_SEC + 60
+    t.record(0, probs(frames(2), s0=ON, s1=ON))  # S1 and S2
+    start = seconds(gap)
+    t.record(start, probs(frames(2), s0=ON, s1=ON))  # both idle too long: S3, S4
+    label = t.label_for(start, start + seconds(2))
+    assert label.overlap is True
+    assert sorted(label.speakers) == ["S3", "S4"]
+
+
+def test_out_of_order_recording_does_not_remint():
+    t = _long_tl()
+    t.record(seconds(500), probs(frames(2), s0=ON))
+    t.record(0, probs(frames(2), s0=ON))  # earlier audio recorded later
+    assert t.label_for(seconds(500), seconds(502)).speakers == ["S1"]
+    assert t.label_for(0, seconds(2)).speakers == ["S1"]
+
+
+def test_generations_are_pruned_with_ring_eviction(monkeypatch):
+    monkeypatch.setattr(dt, "IDLE_REMINT_SAMPLES", seconds(5))
+    t = DiarizationTimeline(capacity_sec=20)
+    t.set_slot_count(8)
+    for i in range(60):  # a new generation every 10 s, far beyond the ring
+        t.record(seconds(i * 10), probs(frames(1), s0=ON))
+    assert len(t._gens[0]) < 10
+    last = seconds(59 * 10)
+    assert t.label_for(last, last + seconds(1)).speakers == ["S60"]
+
+
 def test_activity_weighted_average_ignores_silent_frames(tl):
     arr = np.concatenate([probs(frames(3)), probs(frames(1), s2=ON)])
     tl.record(0, arr)

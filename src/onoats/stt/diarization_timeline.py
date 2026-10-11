@@ -27,7 +27,11 @@ It is the **single owner** of:
 
 Slot -> ``S{n}`` mapping happens in ``record`` (worker thread), in the order
 each model slot first crosses ``ACTIVITY_THRESHOLD`` in the session, so the
-loop-side ``label_for`` never mutates mapping state.
+loop-side ``label_for`` never mutates mapping state. Numbers come from one
+monotonic counter and are never reused: a slot idle for more than
+``SLOT_IDLE_REMINT_SEC`` is given a fresh number on its next active frame, so a
+label does not silently move to a different speaker if the model recycles the
+slot. A slot therefore has a list of generations ``(start_sample, n)``.
 """
 
 from __future__ import annotations
@@ -63,6 +67,12 @@ MIN_COVERAGE_FRACTION = 0.5
 #: `low` preset lag (~1.04 s) + margin. The dev plan's ``LATENCY_BUDGET_SEC``
 #: (2.0 s) is this + margin - a plan acceptance threshold, not a code constant.
 HOLD_SEC = 1.5
+#: A model slot idle (no active frame) for longer than this is given a fresh
+#: label on its next active frame. This errs toward splitting one person in two
+#: (safe) rather than letting a recycled slot carry an old speaker's label; it
+#: cannot catch a swap while both speakers are active.
+SLOT_IDLE_REMINT_SEC = 300.0
+IDLE_REMINT_SAMPLES = int(SLOT_IDLE_REMINT_SEC * SAMPLE_RATE_HZ)
 #: Queue / segment-serialisation slack added to the ring capacity.
 RING_HEADROOM_SEC = 10.0
 #: How long after the labeler starts the worker may still be loading the model
@@ -532,7 +542,12 @@ class DiarizationTimeline:
         self._high_water = 0
         self._newest_end = 0
         self._slot_count: int | None = None
-        self._slot_map: dict[int, int] = {}  # model slot -> 1-based S{n}
+        # model slot -> [(first active sample, S{n} number)], sorted by start. A
+        # new entry is appended when the slot first speaks and after every idle
+        # gap longer than SLOT_IDLE_REMINT_SEC; numbers are never reused.
+        self._gens: dict[int, list[tuple[int, int]]] = {}
+        self._last_active: dict[int, int] = {}  # slot -> end of its last active frame
+        self._next_label = 1
         self._overflow_warned = False
         self._degraded = False
         self._flushed = False
@@ -556,15 +571,15 @@ class DiarizationTimeline:
             slot_count = self._slot_count
             bad = np.zeros(n, dtype=bool)
             active = arr >= ACTIVITY_THRESHOLD
-            # Map slots in order of first activity (earliest frame first).
+            # Label slots in order of first activity (earliest frame first).
             for row in np.flatnonzero(active.any(axis=1)):
+                pos = int(start_sample) + int(row) * FRAME_SAMPLES
                 for slot in np.flatnonzero(active[row]):
                     slot = int(slot)
                     if slot_count is not None and slot >= slot_count:
                         bad[row] = True
                         continue
-                    if slot not in self._slot_map:
-                        self._slot_map[slot] = len(self._slot_map) + 1
+                    self._touch_slot(slot, pos)
             if bad.any() and not self._overflow_warned:
                 self._overflow_warned = True
                 warn = True
@@ -575,6 +590,22 @@ class DiarizationTimeline:
                 f"({slot_count}); affected windows are left unlabelled"
             )
         self._notify()
+
+    def _touch_slot(self, slot: int, pos: int) -> None:
+        """Caller holds ``_lock``. Note activity of ``slot`` at sample ``pos``."""
+        gens = self._gens.get(slot)
+        if gens is None:
+            self._gens[slot] = [(pos, self._take_label())]
+        elif pos - self._last_active[slot] > IDLE_REMINT_SAMPLES:
+            gens.append((pos, self._take_label()))
+        self._last_active[slot] = max(
+            self._last_active.get(slot, 0), pos + FRAME_SAMPLES
+        )
+
+    def _take_label(self) -> int:
+        n = self._next_label
+        self._next_label += 1
+        return n
 
     def record_gap(self, start: int, end: int) -> None:
         """Worker: mark ``[start, end)`` resolved-but-unlabelled (dropped audio)."""
@@ -643,8 +674,8 @@ class DiarizationTimeline:
         with self._lock:
             if self._slot_count is None:
                 return None
-            slot_map = dict(self._slot_map)
-            parts: list[tuple[np.ndarray, np.ndarray]] = []
+            gens = {s: list(g) for s, g in self._gens.items()}
+            parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
             covered = 0
             for seg in self._segments:
                 if seg.end <= start_sample:
@@ -660,12 +691,14 @@ class DiarizationTimeline:
                 i1 = min(
                     seg.probs.shape[0], -(-(hi - seg.start) // FRAME_SAMPLES)
                 )  # ceil
-                parts.append((seg.probs[i0:i1], seg.bad[i0:i1]))
+                pos = seg.start + (i0 + np.arange(i1 - i0)) * FRAME_SAMPLES
+                parts.append((seg.probs[i0:i1], seg.bad[i0:i1], pos))
         if covered <= 0 or covered / window < MIN_COVERAGE_FRACTION:
             return None
-        if any(bad.any() for _, bad in parts):
+        if any(bad.any() for _, bad, _ in parts):
             return None
-        rows = np.concatenate([p for p, _ in parts], axis=0)
+        rows = np.concatenate([p for p, _, _ in parts], axis=0)
+        positions = np.concatenate([pos for _, _, pos in parts])
         if rows.shape[0] == 0:
             return None
         active = rows >= ACTIVITY_THRESHOLD  # (n, slots)
@@ -679,18 +712,26 @@ class DiarizationTimeline:
         candidates = [
             s
             for s in range(rows.shape[1])
-            if fractions[s] >= OVERLAP_MIN_FRACTION and s in slot_map
+            if fractions[s] >= OVERLAP_MIN_FRACTION and s in gens
         ]
 
+        def label_number(s: int) -> int:
+            # The generation in force at the slot's last active frame in the window.
+            last = int(positions[np.flatnonzero(active[:, s])[-1]])
+            number = gens[s][0][1]
+            for start, n in gens[s]:
+                if start > last:
+                    break
+                number = n
+            return number
+
         def key(s: int) -> tuple[float, int]:
-            return (-float(scores[s]), slot_map[s])
+            return (-float(scores[s]), label_number(s))
 
         if len(candidates) >= 2:
             top2 = sorted(candidates, key=key)[:2]
-            return Label([f"S{slot_map[s]}" for s in top2], True)
-        mapped = [
-            s for s in range(rows.shape[1]) if s in slot_map and active[:, s].any()
-        ]
+            return Label([f"S{label_number(s)}" for s in top2], True)
+        mapped = [s for s in range(rows.shape[1]) if s in gens and active[:, s].any()]
         if not mapped:
             return None
         ranked = sorted(mapped, key=key)
@@ -702,7 +743,7 @@ class DiarizationTimeline:
         if top not in candidates and len(ranked) > 1:
             if float(scores[top]) - float(scores[ranked[1]]) < DOMINANT_MARGIN:
                 return None
-        return Label([f"S{slot_map[top]}"], False)
+        return Label([f"S{label_number(top)}"], False)
 
     # ---------------------------------------------------------------- internal
 
@@ -740,8 +781,19 @@ class DiarizationTimeline:
                     )
             keep.append(seg)
         self._segments = keep
+        self._prune_generations(cutoff)
         # Evicted positions are no longer resolvable; never regress, never stall.
         self._high_water = max(self._high_water, cutoff)
+
+    def _prune_generations(self, cutoff: int) -> None:
+        """Caller holds ``_lock``. Drop generations wholly before ``cutoff``."""
+        for gens in self._gens.values():
+            keep_from = 0
+            for i, (start, _) in enumerate(gens):
+                if start <= cutoff:
+                    keep_from = i
+            if keep_from:
+                del gens[:keep_from]
 
     def _advance(self) -> None:
         moved = True

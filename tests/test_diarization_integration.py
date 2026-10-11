@@ -195,14 +195,15 @@ def test_them_utterances_get_distinct_speaker_labels_on_a_real_clip():
     labelled = [f for f in sink.transcripts if getattr(f, "onoats_speakers", None)]
     assert labelled, "no utterance was labelled"
 
-    slots = timeline._slot_count  # model num_speakers: upper bound for S<n>
-    assert slots, "worker never published the model's slot count"
+    assert timeline._slot_count, "worker never published the model's slot count"
     seen: set[str] = set()
     for f in labelled:
         assert isinstance(f.onoats_overlap, bool)
         for label in f.onoats_speakers:
             m = LABEL.match(label)
             assert m, f"{label!r} is not S<n>"
-            assert 1 <= int(m.group(1)) <= slots, f"{label} beyond {slots} slots"
+            # Numbers are a never-reused counter, so they can exceed the slot
+            # count after an idle re-mint; a short clip never reaches one.
+            assert int(m.group(1)) >= 1, label
             seen.add(label)
     assert len(seen) >= 2, f"only {sorted(seen)} across {len(labelled)} utterances"
