@@ -241,12 +241,16 @@ transcript lands before the flush, then hard-cancels (capped at
 
 Off by default. When on, onoats labels who is speaking on the **"them"**
 (system-audio) channel: lines render as `**Them (S1):**`, `**Them (S2):**`, …
-(speakers are numbered in order of first speech in the session), and a window
+(speakers are numbered in order of first speech in the recorder run), and a window
 with two clearly active speakers renders as `Them (S1 / S2, overlapping)`. The
 suffix is appended to your configured `[speakers]` label for `them`. The `me`
-channel is never labelled. `S1`/`S2` are per-session slots, not identities, and
+channel is never labelled. `S1`/`S2` are per-run slots, not identities, and
 can be wrong (a speaker may be split across slots, or a quiet or overlapped
-stretch left unlabelled).
+stretch left unlabelled). A number is never reused within a run: a model slot
+that has been silent for more than 5 minutes gets a fresh number (`S9`, `S10`,
+… are possible) when it next speaks, so a label cannot silently move to a
+different person, at the cost of splitting someone who was quiet that long. Names
+are not assigned by onoats; a consumer maps labels to names.
 
 - **Enable:** `[stt].diarization = true` in `config.toml`, or
   `ONOATS_DIARIZATION=1` (the env var wins). Accepted values (case-insensitive):
@@ -346,7 +350,7 @@ a consumer drains.
 
 | Line type      | Shape                                                              |
 |----------------|--------------------------------------------------------------------|
-| `session_meta` | `{"type":"session_meta","category":"<cat>"}` — optional FIRST line |
+| `session_meta` | `{"type":"session_meta","run_id":"<hex>"}` plus optional `category` / `diarization` — FIRST line of every file |
 | `utterance`    | `{"type":"utterance","time":...,"text":...,"source":"me"\|"them"}` plus optional `speakers` / `overlap` (below) |
 | `silence_gap`  | `{"type":"silence_gap","time":...,"duration_seconds":N}`           |
 
@@ -362,7 +366,17 @@ a consumer drains.
   render time and are not stored.
 - The chosen `--category` rides on the `session_meta` first line (not the
   filename); the `{session_id}` stem stays load-bearing for a consumer's
-  back-fill keying.
+  back-fill keying. `category` is written **only when `--category` locks one**:
+  a consumer reads any non-blank category as a hard lock, so it is never
+  defaulted. `run_id` is an opaque random token minted once per `onoats bot`
+  process, identical in every file that run rotates through (silence timeout,
+  Ctrl+T, menu bar) and new on each start; missing means unknown. With
+  diarization configured on, `diarization` is `{"model","version"}` (model repo
+  id and cached snapshot revision) - provenance of what the run was configured
+  with, not proof a line was labelled; per-utterance `speakers` is the truth.
+  The header never lists speakers: they are not known at file creation. Labels
+  are unique within a run, so `(run_id, label)` identifies a speaker across the
+  files of one run.
 - `active → pending` is an atomic `rename(2)`; a partial file is never visible
   in `pending/`.
 

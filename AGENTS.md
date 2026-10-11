@@ -288,7 +288,9 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
 - **Off means absent.** Flag off: `mlx_audio` is never imported (it is in
   `_FORBIDDEN` in `tests/test_onoats_imports.py`; the processors import it only
   on the worker thread via `load_mlx_diarizer`), no feeder/labeler is wired, no
-  attribute reaches a frame, and JSONL/render are unchanged.
+  attribute reaches a frame, and utterance JSONL/render are unchanged (the
+  always-written `session_meta` header then carries `run_id` only, no
+  `diarization` key).
 - **The worker thread owns the model and the coverage writes.** One daemon
   thread (`diar-worker`; bounded join in the feeder's `cleanup()`, never on
   the frame path) does the load, `set_streaming_config("low")`, every
@@ -352,6 +354,22 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   (`test_stop_drains_the_parent_before_closing_the_websocket`,
   `test_stop_still_closes_gracefully_when_the_parent_stop_raises`,
   `test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled`).
+- **Labels are never reused within a run.** `DiarizationTimeline` keeps, per
+  model slot, a list of generations `(first active sample, number)` from one
+  monotonic counter (`record`, worker thread; `label_for` only reads). A slot
+  idle for more than `SLOT_IDLE_REMINT_SEC` (300 s) gets a new number on its
+  next active frame, and a window's label uses the generation in force at the
+  slot's last active frame in it, so numbers pass `S8` and the grammar is
+  `^S[0-9]+$`. This errs toward splitting a speaker and cannot catch a swap while
+  both speakers are active. Pinned by `tests/test_diarization_timeline.py`.
+- **`session_meta` is line 1 of every file, `category` only on a lock.**
+  `TranscriptBuffer` writes `{"type":"session_meta","run_id", "category"?,
+  "diarization"?}` through `categories.session_meta_line`; never default
+  `category` (the consumer reads any non-blank value as a hard classification
+  lock). `run_id` is minted once per buffer (so stable across continuation
+  files), `diarization` is `diarization_model.provenance()` and is configuration
+  provenance only (a runtime degrade leaves it stale by design). Never put a
+  speaker list in it. Pinned by `tests/test_categories.py`.
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
   composed at render/live-terminal time by `render.compose_speaker_label`

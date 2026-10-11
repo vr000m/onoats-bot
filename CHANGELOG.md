@@ -32,6 +32,17 @@ Annotated tags exist from `v0.9.0` forward.
   it fails open: a runtime diarizer failure logs one WARNING and the session
   continues with unlabelled `them` lines, never losing a transcript.
   `onoats bot-single` ignores the flag with one WARNING.
+- **`session_meta` header on every session file.** The first line now always
+  carries a per-run `run_id` (opaque random token, stable across the files one
+  recorder run rotates through), `category` only when `--category` locks one
+  (never defaulted), and `diarization: {model, version}` when diarization is
+  configured on. A consumer can treat equal `run_id`s as "same run" and a
+  missing one as unknown.
+- **Speaker labels are never reused within a run.** A model slot idle for more
+  than 5 minutes (`SLOT_IDLE_REMINT_SEC`) is given a fresh label on its next
+  speech, so `S1` cannot silently move to a different person; numbers continue
+  past `S8`. Errs toward splitting one person in two; a swap while both speakers
+  are active is not detected.
 - **`onoats init` carries `[stt].diarization` over** when re-run over an existing
   `config.toml`, so re-running init does not silently turn diarization off.
 
