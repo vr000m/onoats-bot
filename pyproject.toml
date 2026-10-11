@@ -79,6 +79,11 @@ onoats = "onoats.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/onoats"]
 
+[tool.hatch.build.targets.sdist]
+# Scratch experiments (and any local clips/logs under them) stay in the repo
+# for future work but never ship in the source distribution.
+exclude = ["/experiments"]
+
 [dependency-groups]
 # ruff is pinned to a minor range so CI's `ruff format --check` matches the
 # formatter version contributors run locally (formatter output can shift

@@ -84,6 +84,14 @@ def test_build_backend_pins_hatchling_with_pep639_support():
     )
 
 
+def test_experiments_are_excluded_from_the_distributions():
+    """Scratch experiments stay in the repo but never ship (sdist) or install (wheel)."""
+    build = _load_pyproject()["tool"]["hatch"]["build"]["targets"]
+    assert "/experiments" in build["sdist"]["exclude"]
+    # The wheel is an allowlist of one package, so nothing else can ride along.
+    assert build["wheel"]["packages"] == ["src/onoats"]
+
+
 def test_changelog_has_keep_a_changelog_structure():
     text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert text.startswith("# Changelog")

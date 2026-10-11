@@ -242,7 +242,8 @@ transcript lands before the flush, then hard-cancels (capped at
 Off by default. When on, onoats labels who is speaking on the **"them"**
 (system-audio) channel: lines render as `**Them (S1):**`, `**Them (S2):**`, …
 (speakers are numbered in order of first speech in the recorder run), and a window
-with two clearly active speakers renders as `Them (S1 / S2, overlapping)`. The
+with two clearly active speakers renders as `Them (S1 / S2, overlapping)`, the
+more active speaker in that utterance first (so the order can differ between lines). The
 suffix is appended to your configured `[speakers]` label for `them`. The `me`
 channel is never labelled. `S1`/`S2` are per-run slots, not identities, and
 can be wrong (a speaker may be split across slots, or a quiet or overlapped
@@ -359,7 +360,8 @@ a consumer drains.
   **only at render time**, never written into the queue.
 - With [speaker diarization](#speaker-diarization-opt-in) on, a labelled
   `them` utterance also carries two optional keys: `speakers` (a non-empty
-  list of canonical labels such as `["S1"]`, or `["S1","S2"]` for overlap) and
+  list of canonical labels such as `["S1"]`, or `["S1","S2"]` for overlap, the more
+  active speaker first) and
   `overlap` (a bool). Both are **omitted** when diarization is off or the
   utterance was left unlabelled, and `me` utterances never carry them. Treat
   absence as unlabelled. Display strings like `Them (S1)` are composed at
