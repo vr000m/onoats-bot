@@ -160,8 +160,11 @@ class DiarizationLabeler(FrameProcessor):
     ) -> None:
         start = getattr(frame, "onoats_segment_start_sample", None)
         end = getattr(frame, "onoats_segment_end_sample", None)
-        if start is None or end is None or self._timeline.is_degraded:
-            # Unstamped (fail-loud upstream) or degraded: no hold, no attributes.
+        if start is None or end is None or self._timeline.is_degraded or self._closed:
+            # Unstamped (fail-loud upstream), degraded, or already closed (End /
+            # Cancel / cleanup stopped the release task, and ``_ensure_started``
+            # will not restart it, so a parked frame would be stranded): no hold,
+            # no attributes.
             # Serialise behind the release task (it pops the head and pushes it
             # while holding the lock, so ``_pending`` can be empty mid-push) and
             # drain everything still held first, so FIFO order is preserved.

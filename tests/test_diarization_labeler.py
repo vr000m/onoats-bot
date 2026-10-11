@@ -19,13 +19,6 @@ import time
 import numpy as np
 import pytest
 from loguru import logger
-from onoats.config.audio_devices import PIPELINE_SAMPLE_RATE
-from onoats.processors import diarization_labeler as dl
-from onoats.stt.diarization_timeline import (
-    FRAME_SAMPLES,
-    MODEL_LOAD_GRACE_SEC,
-    DiarizationTimeline,
-)
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -34,6 +27,14 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+
+from onoats.config.audio_devices import PIPELINE_SAMPLE_RATE
+from onoats.processors import diarization_labeler as dl
+from onoats.stt.diarization_timeline import (
+    FRAME_SAMPLES,
+    MODEL_LOAD_GRACE_SEC,
+    DiarizationTimeline,
+)
 
 SLOTS = 2
 HOLD = 0.05  # real-time hold used with the fake clock
@@ -1031,6 +1032,25 @@ def test_cleanup_after_endframe_does_not_repush(monkeypatch):
         await h.send(EndFrame())
         await h.close()
         assert h.texts() == ["a", "EndFrame"]
+
+    run(go())
+
+
+def test_stamped_frame_after_endframe_is_forwarded_not_stranded(monkeypatch):
+    """Once End closed the release task nothing would ever release a parked
+    frame (``_ensure_started`` does not restart it), so a stamped, uncovered
+    transcription arriving afterwards must be forwarded in line, once."""
+    tl = make_timeline()
+    h, _ = make(monkeypatch, tl, hold_sec=0.01)
+    late = tframe("late", 0, 10**9)
+
+    async def go():
+        await h.start()
+        await h.send(EndFrame())
+        await h.send(late)
+        assert h.texts() == ["EndFrame", "late"]
+        await h.close()
+        assert h.texts() == ["EndFrame", "late"]  # cleanup does not push it again
 
     run(go())
 
