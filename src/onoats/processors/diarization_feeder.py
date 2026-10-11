@@ -126,10 +126,6 @@ class DiarizerWorker:
     def thread(self) -> threading.Thread | None:
         return self._thread
 
-    @property
-    def stopped(self) -> bool:
-        return self._dead
-
     def start(self) -> None:
         if self._thread is not None:
             return

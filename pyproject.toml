@@ -39,6 +39,10 @@ dependencies = [
     # <0.4 until the next minor is smoke-tested live against the recorder.
     "pipecat-local-stt-server>=0.3.3,<0.4",
     "websockets>=13.0",
+    # Imported directly by stt/diarization_timeline.py (and the feeder). It is
+    # already a hard pipecat-ai requirement; same bounds so this adds no
+    # constraint of its own.
+    "numpy>=1.26.4,<3",
     "python-dotenv>=1.2.1",
     "loguru>=0.7.0",
 ]

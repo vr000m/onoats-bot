@@ -7,9 +7,12 @@ default set is ``{"uncategorized"}``; users extend it via
 
 The validated ``--category`` is NOT written into the filename — the
 ``{session_id}`` stem stays load-bearing for a consumer's back-fill keying.
-Instead it rides in the queue contract as a typed ``session_meta`` FIRST line::
+Instead it rides in the queue contract as the ``category`` key of the typed
+``session_meta`` FIRST line (written on every session file; ``category`` only
+when a lock exists, alongside ``run_id`` and optional ``diarization``
+provenance)::
 
-    {"type": "session_meta", "category": "<cat>"}
+    {"type": "session_meta", "run_id": "<hex>", "category": "<cat>"}
 
 so a downstream consumer (a queue worker, or the converter) can honor it.
 """
