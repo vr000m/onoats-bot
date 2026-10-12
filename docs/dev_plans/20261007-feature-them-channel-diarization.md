@@ -1109,9 +1109,9 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [x] Phase 6: Persistence + render
 - [x] Phase 7: Wiring
 - [x] Phase 8: Dependency + contract
-- [ ] Phase 8b: Real-pipeline validation gate
-- [ ] Phase 9: Integration + smoke
-- [ ] Phase 10: Docs
+- [ ] Phase 8b: Real-pipeline validation gate (latency, drops and slot stability recorded from the 2026-10-12 call; ratio/stall/contention numbers still open)
+- [x] Phase 9: Integration + smoke (live call 2026-10-12; see Findings)
+- [x] Phase 10: Docs
 
 ## Findings
 
@@ -1134,6 +1134,18 @@ All checked against the **installed** package, load+feed on a non-main daemon th
 - **Advisory `uv lock`** (throwaway copy, extra `diarization = ["mlx-audio==0.5.8"]`): adds `mlx-audio 0.5.8`, `transformers 5.17.0`, `safetensors 0.8.0`, `miniaudio 1.71`, `sounddevice 0.5.6`. **`mlx` stays 0.31.2** (no bump). Not yet verified: that mlx-audio 0.5.8 runs against mlx 0.31.2 (Phase 0 ran on mlx 0.32.3); Phase 8's committed lock + Phase 8b must confirm. Repo `pyproject.toml`/`uv.lock` untouched (`git status` clean).
 - **Scratch speed** (300 s clip, 100 ms chunks, bare thread, no asyncio loop): 8.7 s wall = RTF 0.029 (consistent with retained RTF 0.026-0.038). Not an acceptance number; Phase 8b measures with the real pipeline.
 - **Slot behaviour on the retained 0-300 s clip** (3 real speakers, `low` preset, threshold 0.5): slots activate in first-speech order (slot 0 at 3.5 s = narration, slot 1 at 17.3 s, slot 2 at 26.2 s), only 3 of 8 ever active, so first-activity -> `S1..S3` mapping works. **But slot stability is imperfect:** `guest` frames split between slot 1 (5911) and slot 2 (7292), and slot 2 is also `varun`'s (16948). So ~55% of one speaker's active frames land in another speaker's slot (overlap or a real identity swap; not disambiguated here). A 0-300 s, 3-speaker clip is **not sufficient** to bound this; the 20-60 min multi-speaker run at Phase 8b is required, and the dominant-slot-wins label policy should be expected to mislabel such stretches. Surface in the final docs as a known accuracy limit, not a blocker.
+
+### Phase 9 live call (2026-10-12, menu-bar app, socket capture, flag on, no `--category`)
+
+One real multi-speaker call: 47 min recorded (07:33-08:20 local; the owner recalls the call itself at 50-55 min, so the recorder started a few minutes in), 4 people on the `them` side plus the user on `me`, `onoats-bot.log` and the session file kept. Recorder code was the 300 s idle re-mint build (before the 1200 s change).
+
+- **Output:** 969 utterances (159 `me`, 810 `them`). 794 of 810 `them` lines (98.0%) carry `speakers`; 16 are unlabelled; 11 are `overlap`. No `me` line carries `speakers`. Header: one `run_id`, `diarization` provenance, no `category`.
+- **No degrade:** no diarization WARNING/ERROR, no stall, no "degraded" for the whole 47 min. A sustained over-budget worker or a hung `feed()` would have degraded labels, so the worker kept pace with the real pipeline (this is evidence of "kept pace", not a measured processing ratio).
+- **`them` commit latency (VAD stop -> utterance recorded, log timestamps; only stops directly followed by their own record, 444 of 810):** median 0.62 s, p90 0.95 s, p99 1.06 s, max 1.08 s. The `me` channel, with no diarization, over the same call: median 0.13 s, p99 0.20 s (157 samples). The channels differ (longer `them` utterances, labeler hold), so this is not a flag-on minus flag-off figure; it is an absolute upper bound on the added latency and sits inside `LATENCY_BUDGET_SEC` (2.0 s).
+- **Staging drops:** no recorder-side staging-drop WARNING. The capturer logged `send queue full (256)` once per branch at startup (total dropped 100 per branch, i.e. at most ~150 frames) while the recorder was still connecting, then nothing for 47 min. Not diarization related (it happens before the pipeline is ready); both arms drop the same frames before the recorder counts them, so the sample clock stays consistent.
+- **Slot stability:** 12 labels for 4 people (S1 is one stray line). Per the owner's listening, every label belonged to a single person (no label mixed two people), but each person was split: A = S2, S6, S12; B = S4, S7, S8, S11; C = S5, S9; D = S3, S10. All seven splits followed a silence of 336-946 s, i.e. an idle re-mint at the 300 s threshold. It is not known whether those speakers kept one model slot (a longer threshold merges them) or the model gave them new slots (it would not). Default raised to 1200 s and made configurable in `d794b91`/`15fca9d`; each first activity and re-mint now logs the model slot. Needs one more call (or a short run) to see the slot ids.
+- **Shutdown:** the capturer exited first (rc=0) when the app was stopped, so the supervisor logged `capturer exited mid-session (rc=0)` as an ERROR and rotated 969 entries into `pending/`; no data lost.
+- **Not measured here:** worker processing ratio, event-loop stall and GPU contention as numbers (Phase 8b), and a flag-off latency on the same channel. 8b stays open for those.
 
 ### Conduct notes (workspace; not contract)
 
