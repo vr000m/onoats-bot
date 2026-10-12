@@ -25,7 +25,8 @@ Annotated tags exist from `v0.9.0` forward.
   `Them (S1 / S2, overlapping)`). The `me` channel is never labelled. Websocket
   STT only. Needs the optional extra (`uv sync --extra diarization`, or
   `uv tool install 'onoats[macos,diarization]'`) and the model weights, which
-  are never auto-downloaded: `hf download mlx-community/Nemotron-3-Diarization`.
+  are never auto-downloaded: `uvx --from huggingface_hub hf download mlx-community/Nemotron-3-Diarization`
+  (a `uv tool install` links only `onoats` onto PATH, so a bare `hf` may not exist).
   A startup preflight (right after the single-instance lock, before any capture
   side effect) exits non-zero with the remedy if the STT backend is not
   websocket, the extra is missing, or the weights are not cached. After startup

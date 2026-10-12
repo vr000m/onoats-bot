@@ -20,7 +20,9 @@ from __future__ import annotations
 REPO_ID = "mlx-community/Nemotron-3-Diarization"
 #: The files ``mlx_audio``'s loader reads (Phase 0); all must be cached.
 WEIGHT_FILES = ("config.json", "model.safetensors")
-DOWNLOAD_HINT = f"hf download {REPO_ID}"
+# ``uvx`` rather than a bare ``hf``: ``uv tool install onoats[...]`` links only
+# ``onoats`` onto PATH, so the ``hf`` inside the tool venv is not reachable.
+DOWNLOAD_HINT = f"uvx --from huggingface_hub hf download {REPO_ID}"
 #: Input samples per output row the timeline assumes (10 ms at 16 kHz). A copy
 #: of ``diarization_timeline.FRAME_SAMPLES`` (this leaf cannot import it),
 #: pinned equal by ``tests/test_diarization_model.py``.
@@ -91,7 +93,7 @@ def cached_snapshot_dir(repo_id: str = REPO_ID) -> str:
     if paths is None:
         raise RuntimeError(
             f"diarization weights ({repo_id}) are not in the local "
-            "Hugging Face cache; run: hf download " + repo_id
+            "Hugging Face cache; run: uvx --from huggingface_hub hf download " + repo_id
         )
     # abspath, not resolve(): the files inside a snapshot are symlinks into
     # ``blobs/``, and resolving would walk out of the snapshot directory.

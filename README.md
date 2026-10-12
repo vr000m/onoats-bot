@@ -266,7 +266,8 @@ are not assigned by onoats; a consumer maps labels to names.
   `uv tool install 'onoats[macos,diarization]'` (repeat any extras you already
   have).
 - **Download the weights yourself** — they are never fetched automatically:
-  `hf download mlx-community/Nemotron-3-Diarization`. If the extra or the
+  `uvx --from huggingface_hub hf download mlx-community/Nemotron-3-Diarization`
+  (or plain `hf download ...` if you already have `hf` on PATH). If the extra or the
   weights are missing, `onoats bot` exits non-zero at startup with the exact
   command to run (before any audio is captured). It also exits non-zero at
   startup on a pipecat version whose STT segment ordering it cannot verify
