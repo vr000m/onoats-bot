@@ -43,6 +43,7 @@ from onoats.config import (
     load_config,
     normalize_launchd_label,
     parse_diarization_value,
+    parse_idle_remint_sec,
     secrets_env_path,
 )
 
@@ -447,6 +448,10 @@ def _render_config_toml(
         lines.append(f'launchd_label = "{_toml_escape(stt["launchd_label"])}"')
     if isinstance(stt.get("diarization"), bool):
         lines.append(f"diarization = {'true' if stt['diarization'] else 'false'}")
+    if isinstance(stt.get("diarization_idle_remint_sec"), float):
+        lines.append(
+            f"diarization_idle_remint_sec = {stt['diarization_idle_remint_sec']!r}"
+        )
     lines.append("")
     # `[app]` is Swift-only (the Python config reader never reads it), but it
     # still has to survive a regeneration — see the carry-over in `main()`,
@@ -778,7 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     # actively re-renders several of its keys every run (`service`, `model`,
     # `ws_socket`, `language`) from this run's prompts/flags, so a
     # whole-section raw copy would silently discard those answers. Only
-    # `launchd_label` and `diarization` — the `[stt]` keys `onoats init` never
+    # `launchd_label`, `diarization` and `diarization_idle_remint_sec` — the `[stt]` keys `onoats init` never
     # prompts for — need a carry-over, and they have to merge into the
     # freshly-built `stt` dict below rather than overwrite the section, which
     # the generic raw-block mechanism has no per-key granularity to do. So the
@@ -836,6 +841,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if parsed_diar is not None:
                 stt["diarization"] = parsed_diar
+    # `diarization_idle_remint_sec`: same shape, validated by the runtime
+    # reader's own helper (`parse_idle_remint_sec`); a malformed value is
+    # already ignored at runtime, so it is dropped with a note.
+    carried_remint = existing_stt.get("diarization_idle_remint_sec")
+    try:
+        parsed_remint = parse_idle_remint_sec(carried_remint)
+    except ValueError:
+        print(
+            f"  note: ignoring invalid [stt].diarization_idle_remint_sec "
+            f"{carried_remint!r} — it already falls back to the default at "
+            "runtime and is not carried into the regenerated config.toml."
+        )
+    else:
+        if parsed_remint is not None:
+            stt["diarization_idle_remint_sec"] = parsed_remint
     # Verbatim, not re-rendered from `existing.raw["app"]` — see
     # `_extract_raw_section`'s docstring, `_render_config_toml`'s `[app]`
     # handling, and the comment above for why this section uses a different

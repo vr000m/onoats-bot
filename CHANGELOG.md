@@ -44,9 +44,12 @@ Annotated tags exist from `v0.9.0` forward.
   `[stt].diarization_idle_remint_sec` or `ONOATS_DIARIZATION_IDLE_REMINT_SEC`) is given a fresh label on its next
   speech, so `S1` cannot silently move to a different person; numbers continue
   past `S8`. Errs toward splitting one person in two; a swap while both speakers
-  are active is not detected.
-- **`onoats init` carries `[stt].diarization` over** when re-run over an existing
-  `config.toml`, so re-running init does not silently turn diarization off.
+  are active is not detected. First activity and each re-mint of a model slot log
+  at INFO with the slot number and label.
+- **`onoats init` carries `[stt].diarization` and
+  `[stt].diarization_idle_remint_sec` over** when re-run over an existing
+  `config.toml`, so re-running init does not silently turn diarization off or
+  drop a tuned re-mint threshold.
 
 ### Changed
 

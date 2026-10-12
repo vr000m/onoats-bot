@@ -75,6 +75,7 @@ that and never rewrites `speakers` with display names. S-labels stay canonical.
 - [x] Labels: generations and re-mint in `DiarizationTimeline` + tests
 - [x] Docs: AGENTS, README, CHANGELOG, sibling plan pointer
 - [x] Pre-push checks; folded into PR #29
+- [x] Idle re-mint raised to 1200 s, configurable (`[stt].diarization_idle_remint_sec` / `ONOATS_DIARIZATION_IDLE_REMINT_SEC`), slot INFO logs, `onoats init` carry-over
 
 ## Findings
 

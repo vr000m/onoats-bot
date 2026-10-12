@@ -908,3 +908,41 @@ def test_rerun_without_diarization_does_not_add_it(_isolate_env, monkeypatch):
     from onoats.config import config_toml_path
 
     assert "diarization" not in _load_toml(config_toml_path())["stt"]
+
+
+def test_rerun_preserves_diarization_idle_remint_sec(_isolate_env, monkeypatch):
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import OnoatsConfig, config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace(
+            "[stt]\n", "[stt]\ndiarization_idle_remint_sec = 1800\n"
+        )
+    )
+    _force_tty(monkeypatch, value=False)
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    cfg = _load_toml(config_toml_path())
+    assert cfg["stt"]["diarization_idle_remint_sec"] == 1800.0
+    assert OnoatsConfig(raw=cfg).diarization_idle_remint_sec == 1800.0
+
+
+def test_rerun_drops_an_invalid_idle_remint_sec_with_note(
+    _isolate_env, monkeypatch, capsys
+):
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace("[stt]\n", "[stt]\ndiarization_idle_remint_sec = -5\n")
+    )
+    _force_tty(monkeypatch, value=False)
+    capsys.readouterr()
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    assert "diarization_idle_remint_sec" not in _load_toml(config_toml_path())["stt"]
+    assert "[stt].diarization_idle_remint_sec" in capsys.readouterr().out

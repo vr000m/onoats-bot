@@ -119,6 +119,27 @@ def normalize_launchd_label(value: str | None) -> str | None:
     return validate_launchd_label(stripped) if stripped else None
 
 
+def parse_idle_remint_sec(value: Any) -> float | None:
+    """Map a raw ``diarization_idle_remint_sec`` value to seconds; ``None`` if absent.
+
+    Absent is ``None`` or a blank string. A positive, finite number (or numeric
+    string) is returned as a float; anything else (including a TOML bool, zero,
+    a negative, ``inf``/``nan`` or text) raises ``ValueError``. Shared by the
+    runtime reader and ``onoats init``'s carry-over so they cannot disagree.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"invalid diarization_idle_remint_sec {value!r}")
+    try:
+        sec = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid diarization_idle_remint_sec {value!r}") from None
+    if not 0 < sec < float("inf"):
+        raise ValueError(f"invalid diarization_idle_remint_sec {value!r}")
+    return sec
+
+
 def parse_diarization_value(value: Any) -> bool | None:
     """Map a raw ``diarization`` value to a bool; ``None`` if absent.
 
@@ -449,14 +470,10 @@ class OnoatsConfig:
             "ONOATS_DIARIZATION_IDLE_REMINT_SEC",
             self.raw.get("stt", {}).get("diarization_idle_remint_sec"),
         )
-        if val is None:
-            return None
         try:
-            sec = float("nan") if isinstance(val, bool) else float(val)
-        except (TypeError, ValueError):
-            sec = float("nan")
-        if sec > 0 and sec != float("inf"):
-            return sec
+            return parse_idle_remint_sec(val)
+        except ValueError:
+            pass
         text = f"idle_remint:{val}"
         if text not in _warned_diarization_values:
             _warned_diarization_values.add(text)
