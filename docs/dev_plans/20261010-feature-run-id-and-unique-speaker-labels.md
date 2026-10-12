@@ -1,10 +1,10 @@
 # Task: Run id header and never-reused speaker labels
 
-**Status**: In Progress
+**Status**: Complete (merged in PR #29; ships in v1.4.0)
 **Component**: recorder, stt
 **Assigned to**: Claude
 **Priority**: Medium
-**Branch**: feature/them-channel-diarization (folded into PR #29)
+**Branch**: feature/them-channel-diarization (merged via PR #29)
 **Created**: 2026-10-10
 **Review Gates**: none
 

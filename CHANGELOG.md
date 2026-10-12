@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-12
+
 ### Added
 
 - **Opt-in live speaker diarization on the "them" channel.** New
