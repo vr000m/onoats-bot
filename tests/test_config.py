@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import textwrap
 
+import pytest
+
 from onoats.config import OnoatsConfig, load_config, normalize_launchd_label
 
 _CONFIG = textwrap.dedent(
@@ -128,3 +130,147 @@ def test_blank_stt_launchd_label_env_var_disables_kickstart(tmp_path, monkeypatc
     # A real env value still wins over config.toml, unchanged.
     monkeypatch.setenv("STT_LAUNCHD_LABEL", "pipecat.stt-server.nemotron")
     assert cfg.stt_launchd_label == "pipecat.stt-server.nemotron"
+
+
+def test_diarization_flag_resolution(monkeypatch):
+    """env ONOATS_DIARIZATION > [stt].diarization > default False."""
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    assert OnoatsConfig(raw={}).diarization is False
+    assert OnoatsConfig(raw={"stt": {"diarization": True}}).diarization is True
+    assert OnoatsConfig(raw={"stt": {"diarization": False}}).diarization is False
+    assert OnoatsConfig(raw={"stt": {"diarization": "on"}}).diarization is True
+
+    for truthy in ("1", "true", "TRUE", "yes", "On"):
+        monkeypatch.setenv("ONOATS_DIARIZATION", truthy)
+        assert OnoatsConfig(raw={}).diarization is True, truthy
+    # env wins over the file in both directions
+    monkeypatch.setenv("ONOATS_DIARIZATION", "0")
+    assert OnoatsConfig(raw={"stt": {"diarization": True}}).diarization is False
+    monkeypatch.setenv("ONOATS_DIARIZATION", "true")
+    assert OnoatsConfig(raw={"stt": {"diarization": False}}).diarization is True
+    # blank env falls through to the file
+    monkeypatch.setenv("ONOATS_DIARIZATION", "  ")
+    assert OnoatsConfig(raw={"stt": {"diarization": True}}).diarization is True
+
+
+def test_diarization_flag_garbage_is_false_with_warning(monkeypatch):
+    from loguru import logger
+
+    import onoats.config as cfgmod
+
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    monkeypatch.setattr(cfgmod, "_warned_diarization_values", set())
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
+    try:
+        assert OnoatsConfig(raw={"stt": {"diarization": "maybe"}}).diarization is False
+    finally:
+        logger.remove(sink)
+    assert len(records) == 1 and "diarization" in records[0]
+
+
+def test_diarization_flag_garbage_warns_once_across_reads_and_configs(monkeypatch):
+    """The flag is read at several startup sites (each often on its own config
+    object): one WARNING per process per bad value, not one per read."""
+    from loguru import logger
+
+    import onoats.config as cfgmod
+
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    monkeypatch.setattr(cfgmod, "_warned_diarization_values", set())
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
+    try:
+        for _ in range(3):
+            cfg = OnoatsConfig(raw={"stt": {"diarization": "ture"}})
+            assert cfg.diarization is False
+            assert cfg.diarization is False
+        OnoatsConfig(raw={"stt": {"diarization": "tuer"}}).diarization  # new value
+    finally:
+        logger.remove(sink)
+    assert len(records) == 2
+
+
+# --- diarization flag: env ONOATS_DIARIZATION > [stt] diarization > False ---
+
+
+def test_diarization_defaults_off(monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    assert OnoatsConfig(raw={}).diarization is False
+    assert OnoatsConfig(raw={"stt": {"service": "websocket"}}).diarization is False
+
+
+def test_diarization_from_toml(monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    assert OnoatsConfig(raw={"stt": {"diarization": True}}).diarization is True
+    assert OnoatsConfig(raw={"stt": {"diarization": False}}).diarization is False
+
+
+def test_diarization_env_on_beats_toml_off(monkeypatch):
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    assert OnoatsConfig(raw={"stt": {"diarization": False}}).diarization is True
+
+
+def test_diarization_env_off_beats_toml_on(monkeypatch):
+    monkeypatch.setenv("ONOATS_DIARIZATION", "0")
+    assert OnoatsConfig(raw={"stt": {"diarization": True}}).diarization is False
+
+
+def test_diarization_env_only_no_toml(monkeypatch):
+    monkeypatch.setenv("ONOATS_DIARIZATION", "true")
+    assert OnoatsConfig(raw={}).diarization is True
+
+
+def test_diarization_blank_env_falls_through_to_toml(monkeypatch):
+    monkeypatch.setenv("ONOATS_DIARIZATION", "   ")
+    assert OnoatsConfig(raw={"stt": {"diarization": True}}).diarization is True
+
+
+def test_diarization_resolves_from_config_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            [stt]
+            service = "websocket"
+            diarization = true
+            """
+        )
+    )
+    cfg = load_config(config_path=cfg_path, secrets_path=tmp_path / "secrets.env")
+    assert cfg.diarization is True
+
+
+def test_diarization_idle_remint_sec_resolution(monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    assert OnoatsConfig(raw={}).diarization_idle_remint_sec is None
+    toml = {"stt": {"diarization_idle_remint_sec": 900}}
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 900.0
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", "1800")
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 1800.0
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", "  ")
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 900.0
+
+
+@pytest.mark.parametrize("bad", ["soon", "0", "-5", "inf", "nan", True])
+def test_diarization_idle_remint_sec_invalid_falls_back_to_default(monkeypatch, bad):
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    cfg = OnoatsConfig(raw={"stt": {"diarization_idle_remint_sec": bad}})
+    assert cfg.diarization_idle_remint_sec is None
+
+
+def test_parse_diarization_value_distinguishes_absent_off_and_garbage():
+    """One owner of the absent-vs-off rule for both the runtime reader and
+    `onoats init`: absent (None / blank) is None, off is False, garbage raises."""
+    from onoats.config import parse_diarization_value
+
+    for absent in (None, "", "   "):
+        assert parse_diarization_value(absent) is None, absent
+    for off in (False, 0, "0", "false", " OFF ", "no"):
+        assert parse_diarization_value(off) is False, off
+    for on in (True, 1, "1", "true", " Yes ", "on"):
+        assert parse_diarization_value(on) is True, on
+    for garbage in ("maybe", "ture", 2, 1.0):
+        with pytest.raises(ValueError):
+            parse_diarization_value(garbage)

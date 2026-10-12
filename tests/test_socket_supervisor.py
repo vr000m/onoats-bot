@@ -518,6 +518,9 @@ def sup_env(short_root, fake_capturer, monkeypatch):
     monkeypatch.setenv("AUDIO_SOURCE", "socket")
     monkeypatch.setenv("ONOATS_CAPTURER_BIN", str(fake_capturer))
     monkeypatch.delenv("KODA_DATA_DIR", raising=False)
+    # Hermetic config: never read the developer's real config.toml (a local
+    # `[stt] diarization = true` made the flag-off preflight test fail).
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(short_root / "xdg"))
     # Don't leak socket paths in from a prior test/process.
     monkeypatch.delenv("ONOATS_MIC_SOCKET", raising=False)
     monkeypatch.delenv("ONOATS_SYSTEM_SOCKET", raising=False)
@@ -2241,3 +2244,151 @@ def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
     assert end_rec.audio_source == "socket", (
         "stop must preserve start-of-session detail"
     )
+
+
+def test_diarization_preflight_fails_loud_before_capturer_spawn(sup_env, monkeypatch):
+    """Flag on + preflight failure: rc=1, capturer never spawned, and the shared
+    call-order list proves lock -> preflight precede any spawn."""
+    import asyncio as _asyncio
+
+    from onoats import runtime
+
+    order: list[str] = []
+    real_lock = runtime._acquire_instance_lock
+
+    def _lock(active_dir):
+        order.append("lock")
+        return real_lock(active_dir)
+
+    def _preflight(cfg):
+        order.append("preflight")
+        raise runtime.DiarizationPreflightError("diarization: extra missing")
+
+    async def _spawn(*a, **k):
+        order.append("spawn")
+        raise AssertionError("capturer must not be spawned")
+
+    monkeypatch.setattr(runtime, "_acquire_instance_lock", _lock)
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+
+    assert _run_supervisor_bounded([]) == 1
+    assert order == ["lock", "preflight"]
+
+
+def test_diarization_flag_off_never_calls_preflight_in_supervisor(sup_env, monkeypatch):
+    import asyncio as _asyncio
+
+    from onoats import runtime
+
+    def _preflight(cfg):
+        raise AssertionError("preflight must not run with the flag off")
+
+    async def _spawn(*a, **k):
+        raise RuntimeError("stop here: past the preflight point")
+
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "0")
+    try:
+        _run_supervisor_bounded([])
+    except RuntimeError as exc:
+        assert "past the preflight point" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (them-channel diarization): hoisted `_preflight_diarization`.
+# Lock -> preflight -> (only then) capturer spawn; flag off never preflights.
+# ---------------------------------------------------------------------------
+
+
+def _install_clean_recorder(monkeypatch):
+    """A recorder that reads a few frames and returns voluntarily (rc=0 path)."""
+
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)
+            for _ in range(3):
+                if not await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT):
+                    break
+        finally:
+            writer.close()
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
+
+
+def _order_spies(monkeypatch, *, preflight_raises: bool):
+    """Record lock / preflight / spawn call order across the supervisor."""
+    import asyncio as _asyncio
+
+    from onoats import runtime
+    from onoats.runtime import SttPreflightError
+
+    calls: list[str] = []
+
+    def _lock(*_a, **_k):
+        calls.append("lock")
+
+    def _preflight(*_a, **_k):
+        calls.append("preflight")
+        if preflight_raises:
+            raise SttPreflightError("diarization: mlx_audio not installed")
+
+    real_exec = _asyncio.create_subprocess_exec
+
+    async def _spawn(*a, **k):
+        calls.append("spawn")
+        return await real_exec(*a, **k)
+
+    monkeypatch.setattr(runtime, "_acquire_instance_lock", _lock)
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spawn)
+    return calls
+
+
+def test_diarization_preflight_failure_blocks_capturer_spawn(sup_env, monkeypatch):
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    calls = _order_spies(monkeypatch, preflight_raises=True)
+
+    rc = _run_supervisor_bounded([])
+
+    assert rc == 1, "a failed diarization preflight must exit rc=1"
+    assert calls == ["lock", "preflight"], (
+        "lock then preflight must precede (and here, prevent) any capturer spawn"
+    )
+    assert "spawn" not in calls
+
+
+def test_diarization_preflight_runs_after_lock_before_spawn(
+    sup_env, set_capturer_behaviour, monkeypatch
+):
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    set_capturer_behaviour("stream")
+    _install_clean_recorder(monkeypatch)
+    calls = _order_spies(monkeypatch, preflight_raises=False)
+
+    _run_supervisor_bounded([])
+
+    assert calls[:2] == ["lock", "preflight"]
+    assert "spawn" in calls
+    assert calls.index("lock") < calls.index("preflight") < calls.index("spawn")
+    assert calls.count("preflight") == 1
+
+
+def test_diarization_flag_off_never_preflights(
+    sup_env, set_capturer_behaviour, monkeypatch
+):
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    set_capturer_behaviour("stream")
+    _install_clean_recorder(monkeypatch)
+    calls = _order_spies(monkeypatch, preflight_raises=True)
+
+    _run_supervisor_bounded([])
+
+    assert "preflight" not in calls
+    assert "spawn" in calls

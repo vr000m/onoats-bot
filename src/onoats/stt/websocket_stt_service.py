@@ -12,7 +12,9 @@ Lifecycle wire mapping:
   ``turn_detection=null``, await ``session.updated``
 - ``run_stt(audio)``       -> ``send_audio`` + ``commit``, wait for
   ``conversation.item.input_audio_transcription.completed``
-- ``stop(EndFrame)``       -> graceful ``session.close`` + socket close
+- ``stop(EndFrame)``       -> parent stop first (on pipecat 1.9+ it drains
+  queued segments over the still-open socket), then graceful
+  ``session.close`` + socket close
 - ``cancel(CancelFrame)``  -> best-effort ``session.cancel``, then close;
   also resolves any in-flight ``_pending`` so ``run_stt`` unwinds promptly
 - ``cleanup()``            -> fallback teardown; takes the cancel path if
@@ -50,17 +52,22 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import AsyncGenerator, Callable
 
 from loguru import logger
 from pipecat.frames.frames import (
+    AudioRawFrame,
     CancelFrame,
     EndFrame,
     ErrorFrame,
     Frame,
     StartFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
@@ -86,6 +93,7 @@ from stt_server import protocol as P
 from onoats import _closing
 from onoats._redact import display_uri, safe_exc_text
 from onoats.stt import launchd
+from onoats.stt.diarization_timeline import DECODE_TIMEOUT_RATIO, SampleCounter
 
 # Wait at most this long for a decode round trip before surfacing an
 # error frame and giving up on the segment. Covers the 16 kHz / 60 s
@@ -155,6 +163,7 @@ class WebSocketSTTService(SegmentedSTTService):
         instance_name: str | None = None,
         on_recovery: Callable[[str | None], None] | None = None,
         on_preflight_confirmed: Callable[[], None] | None = None,
+        stamp_segment_samples: bool = False,
         **kwargs,
     ) -> None:
         # Pin the parent's sample_rate to the server's fixed wire format
@@ -265,6 +274,22 @@ class WebSocketSTTService(SegmentedSTTService):
         # instance-scoped ``stt-mic``/``stt-system`` branch.
         self._on_preflight_confirmed = on_preflight_confirmed
         self._preflight_confirm_pending = on_preflight_confirmed is not None
+        # Segment-sample stamping (them-channel diarization; system arm only).
+        # ``_sample_counter`` is the same helper the upstream feeder uses, so
+        # both count the 16 kHz sample clock identically. ``_span_queue`` holds
+        # one entry per segment pipecat will hand to ``run_stt``, in VAD-stop
+        # order: pipecat 1.3.0-1.8.x run ``run_stt`` INLINE inside
+        # ``process_frame(VADUserStoppedSpeakingFrame)`` (so the queue never
+        # holds more than one), 1.9+ queue the segment and ONE task drains the
+        # queue in order. Either way segments reach ``run_stt`` in the order
+        # their VAD-stops were seen, so the entry is appended BEFORE delegating
+        # the frame to ``super()`` and popped at the head of ``run_stt``. An
+        # entry is ``None`` when the segment must go unstamped; it is kept so
+        # later segments stay aligned.
+        self._stamp_segment_samples = stamp_segment_samples
+        self._sample_counter = SampleCounter()
+        self._vad_start_sample: int | None = None
+        self._span_queue: deque[tuple[int, int] | None] = deque()
 
     # ------------------------------------------------------------------
     # Backend identity (populated on connect from server.hello)
@@ -304,10 +329,36 @@ class WebSocketSTTService(SegmentedSTTService):
     async def stop(self, frame: EndFrame) -> None:
         # Pipecat invokes this via the pipeline AND ``bot/dual.py`` calls it
         # directly during shutdown, bypassing the pipeline. Either way we
-        # must close the websocket session cleanly here — waiting until
-        # cleanup() leaves the socket open for the whole drain window.
-        await self._graceful_close()
-        await super().stop(frame)
+        # close the websocket session here rather than leaving it open until
+        # cleanup() — but only AFTER the parent's stop has returned:
+        #
+        # * pipecat 1.3.0-1.8.x: ``run_stt`` runs inline in the VAD-stop
+        #   handler, so nothing is queued by now and ``super().stop()`` never
+        #   touches the socket; the order is immaterial.
+        # * pipecat 1.9+: ``SegmentedSTTService.stop()`` awaits its segment
+        #   task, which transcribes every still-queued segment through
+        #   ``run_stt`` over THIS websocket. Closing first would detach the
+        #   client mid-drain: a late ``transcript.completed`` is ignored and
+        #   ``run_stt`` waits out its decode timeout, so the shutdown drain
+        #   hard-cancels and loses the final transcript.
+        #
+        # The close runs in ``finally`` so a raising parent stop cannot leak
+        # the session. A *cancelled* drain is the pipeline aborting, so it
+        # takes the hard-cancel path (as cleanup() does under
+        # ``_cancelling``) instead of waiting out a ``session.closed`` ack;
+        # the cancellation itself still propagates. Both closers are
+        # idempotent, so the later cleanup() / direct dual.py call no-ops.
+        drain_cancelled = False
+        try:
+            await super().stop(frame)
+        except asyncio.CancelledError:
+            drain_cancelled = True
+            raise
+        finally:
+            if drain_cancelled:
+                await self._cancel_and_close()
+            else:
+                await self._graceful_close()
 
     async def cancel(self, frame: CancelFrame) -> None:
         # Direct cancel() during an in-flight run_stt would otherwise leave
@@ -336,10 +387,72 @@ class WebSocketSTTService(SegmentedSTTService):
             await super().cleanup()
 
     # ------------------------------------------------------------------
+    # Segment-sample stamping
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if self._stamp_segment_samples:
+            self._track_segment_span(frame)
+        await super().process_frame(frame, direction)
+
+    def _track_segment_span(self, frame: Frame) -> None:
+        """Count samples and queue the VAD span BEFORE ``super()`` runs.
+
+        The entry must be appended here, ahead of ``super().process_frame``:
+        on pipecat <= 1.8 that call runs ``run_stt`` inline for a VAD-stop
+        frame, so an entry appended afterwards would be missing when
+        ``run_stt`` pops it.
+        """
+        counter = self._sample_counter
+        if isinstance(frame, StartFrame):
+            counter.reset()
+            self._vad_start_sample = None
+            self._span_queue.clear()
+        elif isinstance(frame, AudioRawFrame):
+            counter.add_pcm16_bytes(len(frame.audio))
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            if self._vad_start_sample is not None:
+                # pipecat keeps decoding from the FIRST start while the user is
+                # still "speaking"; keep that start so the stamp is not narrower
+                # than the decoded audio.
+                logger.error(
+                    f"{self.name}: VAD start while a span is already open; "
+                    "keeping the first start"
+                )
+            else:
+                self._vad_start_sample = counter.samples
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            start, self._vad_start_sample = self._vad_start_sample, None
+            end = counter.samples
+            if not getattr(self, "is_usable", True):
+                # pipecat 1.9+ drops the segment of a service that can no
+                # longer work: no run_stt call will pop an entry.
+                return
+            if start is None:
+                logger.error(
+                    f"{self.name}: VAD stop without a recorded VAD start; "
+                    "leaving this segment unstamped"
+                )
+                self._span_queue.append(None)
+            else:
+                self._span_queue.append((start, end))
+
+    # ------------------------------------------------------------------
     # STTService contract
     # ------------------------------------------------------------------
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        # Pop this segment's span first, before any early return, so a stale
+        # span can never be attributed to a later segment.
+        span: tuple[int, int] | None = None
+        if self._stamp_segment_samples:
+            if self._span_queue:
+                span = self._span_queue.popleft()
+            else:
+                logger.error(
+                    f"{self.name}: run_stt found no pending VAD span; "
+                    "transcription will be unstamped"
+                )
         if not audio:
             return
 
@@ -373,7 +486,9 @@ class WebSocketSTTService(SegmentedSTTService):
             audio_seconds = len(audio) / (
                 P.AUDIO_SAMPLE_RATE_HZ * P.AUDIO_SAMPLE_WIDTH_BYTES
             )
-            decode_timeout = max(_DECODE_TIMEOUT_SECONDS, 1.5 * audio_seconds)
+            decode_timeout = max(
+                _DECODE_TIMEOUT_SECONDS, DECODE_TIMEOUT_RATIO * audio_seconds
+            )
             try:
                 await self.start_processing_metrics()
                 # Chunk under MAX_APPEND_BYTES (1 MiB) so long VAD turns
@@ -408,12 +523,16 @@ class WebSocketSTTService(SegmentedSTTService):
 
         text = (text or "").strip()
         if text:
-            yield TranscriptionFrame(
+            out = TranscriptionFrame(
                 text,
                 self._user_id,
                 time_now_iso8601(),
                 self._language,
             )
+            if span is not None:
+                out.onoats_segment_start_sample = span[0]
+                out.onoats_segment_end_sample = span[1]
+            yield out
 
     # ------------------------------------------------------------------
     # Internals
@@ -708,6 +827,9 @@ class WebSocketSTTService(SegmentedSTTService):
         client = self._client
         reader = self._reader_task
         self._client = None
+        # Spans are not touched here: each queued span belongs to a segment
+        # that has not reached run_stt yet and is popped exactly once by it, so
+        # a reconnect leaves nothing stale behind.
         if draining:
             # Only ever *set* here, never cleared: a non-draining detach
             # running while another path's drain window is open must not

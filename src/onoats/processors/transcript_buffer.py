@@ -10,6 +10,7 @@ All frames are passed downstream unchanged (transparent processor).
 import asyncio
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,7 +24,11 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from onoats.frames import resolve_frame_source
+from onoats.frames import (
+    resolve_frame_overlap,
+    resolve_frame_source,
+    resolve_frame_speakers,
+)
 
 # Reserved source key used in dual mode when a VAD frame arrives without
 # a branch tag. Treating it as a distinct source keeps it inside the
@@ -68,6 +73,8 @@ def _utterance_entry(
     source_order: int | None = None,
     branch_sequence: int | None = None,
     timestamp: str | None = None,
+    speakers: list[str] | None = None,
+    overlap: bool | None = None,
 ) -> dict:
     # Prefer the STT-supplied timestamp (ISO8601) when available; branches
     # can finalize at different speeds, so wall-clock arrival time would
@@ -84,6 +91,12 @@ def _utterance_entry(
         entry["source_order"] = source_order
     if isinstance(branch_sequence, int):
         entry["branch_sequence"] = branch_sequence
+    # Canonical diarization label (never a display string); keys are omitted
+    # entirely when the labeler did not stamp the frame.
+    if speakers:
+        entry["speakers"] = list(speakers)
+    if isinstance(overlap, bool):
+        entry["overlap"] = overlap
     return entry
 
 
@@ -133,6 +146,8 @@ class TranscriptBuffer(FrameProcessor):
         track_vad_gaps: bool = True,
         use_frame_source: bool = False,
         locked_category: Optional[str] = None,
+        run_id: Optional[str] = None,
+        diarization_meta: Optional[dict[str, str]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -145,11 +160,23 @@ class TranscriptBuffer(FrameProcessor):
         self._data_dir = Path(data_dir) if data_dir is not None else _data_dir()
         self._track_vad_gaps = track_vad_gaps
         self._use_frame_source = use_frame_source
-        # The user's --category lock. Written as the typed ``session_meta``
+        # The user's --category lock. Written in the typed ``session_meta``
         # FIRST line of every session file (the queue contract carries it so
-        # a consumer can honor the lock without a DB row). ``None`` writes no
-        # session_meta line; the consumer defaults to ``uncategorized``.
+        # a consumer can honor the lock without a DB row). ``None`` omits the
+        # ``category`` key entirely: a consumer reads any non-blank category as
+        # a hard lock, so it is never defaulted here.
         self._locked_category = locked_category
+        # Opaque per-recorder-run token, minted once per buffer so every file a
+        # run rotates through (silence timeout, Ctrl+T, menu bar) carries the
+        # same id and a new process start gets a new one. Merge hint only.
+        self._run_id = run_id or uuid.uuid4().hex
+        # Provenance of the diarizer the run was *configured* with (known at
+        # file creation); None when diarization is off.
+        self._diarization_meta = dict(diarization_meta) if diarization_meta else None
+        # Session file whose header has been settled (written, or found to need
+        # no header). Keeps ``_write_entry`` from re-reading the file's first
+        # line on the event loop for every utterance.
+        self._meta_settled_path: Optional[Path] = None
 
         # In-memory buffer of JSONL entry dicts
         self._buffer: list[dict] = []
@@ -179,6 +206,11 @@ class TranscriptBuffer(FrameProcessor):
             f"TranscriptBuffer initialized "
             f"(threshold={self._threshold}s, data_dir={self._data_dir})"
         )
+
+    @property
+    def run_id(self) -> str:
+        """Opaque per-recorder-run token written in every file's session_meta."""
+        return self._run_id
 
     # ------------------------------------------------------------------
     # FrameProcessor interface
@@ -321,6 +353,9 @@ class TranscriptBuffer(FrameProcessor):
             if isinstance(raw_branch_sequence, int):
                 branch_sequence = raw_branch_sequence
 
+        speakers = resolve_frame_speakers(frame)
+        overlap = resolve_frame_overlap(frame)
+
         frame_timestamp = getattr(frame, "timestamp", None)
         frame_timestamp = str(frame_timestamp) if frame_timestamp else None
 
@@ -331,6 +366,8 @@ class TranscriptBuffer(FrameProcessor):
                 source_order=source_order,
                 branch_sequence=branch_sequence,
                 timestamp=frame_timestamp,
+                speakers=speakers,
+                overlap=overlap,
             )
             self._buffer.append(entry)
             idx = len(self._buffer) - 1
@@ -400,8 +437,6 @@ class TranscriptBuffer(FrameProcessor):
         if self._session_file is not None:
             return self._session_file
 
-        import uuid
-
         active_dir = self._data_dir / ".active"
 
         # Reject symlinks in data_dir or .active before creating/writing
@@ -430,27 +465,33 @@ class TranscriptBuffer(FrameProcessor):
     def _maybe_write_session_meta(self, path: Path) -> None:
         """Write the typed ``session_meta`` FIRST line for a fresh session file.
 
-        Only fires when a category lock is set AND the file has no
-        session_meta yet (empty file, or a pre-minted continuation file). The
-        line carries the ``--category`` lock in the queue contract so a
-        consumer can honor it without a DB row. Idempotent: a file that
-        already starts with a session_meta line is left untouched.
+        Fires for every fresh (empty or absent) file, including a pre-minted
+        continuation file. The line carries the run id, the ``--category`` lock
+        when one exists, and diarization provenance when configured. A
+        non-empty file is never touched: its first line already exists, so a
+        header appended now would sit mid-file, not on line 1 - and, because
+        the check runs on every write, would be repeated before every later
+        entry. Settled once per file (``_meta_settled_path``); a failed header
+        write leaves the file unsettled so the next write retries while the file
+        is still empty.
         """
-        if not self._locked_category:
+        if path == self._meta_settled_path:
             return
         try:
             if path.exists() and path.stat().st_size > 0:
-                with path.open("r", encoding="utf-8") as fh:
-                    first = fh.readline()
-                if first.strip():
-                    try:
-                        if json.loads(first).get("type") == "session_meta":
-                            return
-                    except json.JSONDecodeError:
-                        pass
+                self._meta_settled_path = path
+                return
             from onoats.categories import session_meta_line
 
-            _append_line(path, session_meta_line(self._locked_category))
+            _append_line(
+                path,
+                session_meta_line(
+                    self._locked_category,
+                    run_id=self._run_id,
+                    diarization=self._diarization_meta,
+                ),
+            )
+            self._meta_settled_path = path
         except OSError as exc:
             logger.warning(
                 f"TranscriptBuffer: could not write session_meta line: {exc}"

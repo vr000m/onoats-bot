@@ -72,6 +72,7 @@ from onoats.runtime import (  # noqa: E402
     stt_banner,
     wait_or_force,
 )
+from onoats.stt import diarization_model  # noqa: E402
 
 
 def _finalize_shutdown_status(
@@ -174,6 +175,9 @@ def _build_dual_pipeline(
     *,
     live_terminal: bool = False,
     call_id: str | None = None,
+    diarization: bool = False,
+    diarizer_factory=None,
+    idle_remint_sec: float | None = None,
 ):
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
@@ -251,7 +255,29 @@ def _build_dual_pipeline(
         )
 
     mic_arm.extend([mic_stt, SourceTagger(source="me", source_order=0)])
-    system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
+    if diarization:
+        # Them-arm only. Function-local imports keep `import onoats.dual`
+        # free of mlx_audio (the production factory imports it lazily on the
+        # worker thread). One timeline per session, shared by feeder
+        # (+ its worker) and labeler. The feeder sits IMMEDIATELY before
+        # system_stt so nothing between it and the STT can drop/re-chunk
+        # audio (shared sample-clock premise); the labeler goes after the
+        # SourceTagger.
+        from onoats.processors.diarization_feeder import DiarizationFeeder
+        from onoats.processors.diarization_labeler import DiarizationLabeler
+        from onoats.stt.diarization_timeline import DiarizationTimeline
+
+        timeline = DiarizationTimeline(idle_remint_sec=idle_remint_sec)
+        system_arm.extend(
+            [
+                DiarizationFeeder(timeline, diarizer_factory),
+                system_stt,
+                SourceTagger(source="them", source_order=1),
+                DiarizationLabeler(timeline),
+            ]
+        )
+    else:
+        system_arm.extend([system_stt, SourceTagger(source="them", source_order=1)])
 
     processors = [
         ParallelPipeline(mic_arm, system_arm),
@@ -422,6 +448,15 @@ async def run_onoats_dual(
     cfg = load_config()
     audio_source = cfg.audio_source
 
+    # Diarization config-time gate: right after the lock, before PortAudio opens
+    # or the socket transports are built. Only when the flag is on. The backend
+    # check re-runs on every call; the extra/weights probes are memoized, so the
+    # socket supervisor's earlier call spares this one those probes.
+    if cfg.diarization:
+        from onoats.runtime import _preflight_diarization
+
+        _preflight_diarization(cfg)
+
     # Build the two capture-branch transports. The branch is the AUDIO_SOURCE
     # swap seam: `portaudio` keeps today's LocalAudioTransport path verbatim;
     # `socket` reads framed PCM16 from per-branch unix sockets. The socket
@@ -461,6 +496,10 @@ async def run_onoats_dual(
         track_vad_gaps=True,
         use_frame_source=True,
         locked_category=locked_category,
+        # Provenance for the session_meta header: what the run was configured
+        # with. A runtime degrade does not change it; per-utterance `speakers`
+        # is the truth about whether a line was labelled.
+        diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
     )
     flush_lock = asyncio.Lock()
 
@@ -526,9 +565,13 @@ async def run_onoats_dual(
     # (no mic transcript ever) still clears the shared warning.
     mic_result = await _create_stt_service(data_dir=data_dir, branch_instance="mic")
     mic_stt = mic_result.service
+    # Resolved once; Phase 7 reuses this bool for `_build_dual_pipeline`. Only
+    # the system ("them") arm stamps VAD spans; the mic arm never does.
+    diarization_on = bool(cfg.diarization)
     system_result = await _create_stt_service(
         data_dir=data_dir,
         branch_instance="system",
+        stamp_segment_samples=diarization_on,
     )
     system_stt = system_result.service
     preflight_recovery_warning = (
@@ -555,6 +598,8 @@ async def run_onoats_dual(
         silence_detector,
         live_terminal=live_terminal,
         call_id=call_id,
+        diarization=diarization_on,
+        idle_remint_sec=cfg.diarization_idle_remint_sec,
     )
 
     task = PipelineTask(

@@ -15,6 +15,88 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in live speaker diarization on the "them" channel.** New
+  `[stt].diarization` (env `ONOATS_DIARIZATION`, which takes precedence;
+  default off) labels each `them` utterance with a speaker (`S1`, `S2`, … in
+  order of first speech) and flags overlap; the labels persist in the session
+  JSONL (`speakers` / `overlap`) and render as `**Them (S1):**` (or
+  `Them (S1 / S2, overlapping)`). The `me` channel is never labelled. Websocket
+  STT only. Needs the optional extra (`uv sync --extra diarization`, or
+  `uv tool install 'onoats[macos,diarization]'`) and the model weights, which
+  are never auto-downloaded: `uvx --from huggingface_hub hf download mlx-community/Nemotron-3-Diarization`
+  (a `uv tool install` links only `onoats` onto PATH, so a bare `hf` may not exist).
+  A startup preflight (right after the single-instance lock, before any capture
+  side effect) exits non-zero with the remedy if the STT backend is not
+  websocket, the extra is missing, or the weights are not cached. After startup
+  it fails open: a runtime diarizer failure logs one WARNING and the session
+  continues with unlabelled `them` lines, never losing a transcript.
+  `onoats bot-single` ignores the flag with one WARNING.
+- **`session_meta` header on every session file.** The first line now always
+  carries a per-run `run_id` (opaque random token, stable across the files one
+  recorder run rotates through), `category` only when `--category` locks one
+  (never defaulted), and `diarization: {model, version}` when diarization is
+  configured on. A consumer can treat equal `run_id`s as "same run" and a
+  missing one as unknown.
+- **Speaker labels are never reused within a run.** A model slot idle for more
+  than 20 minutes (`SLOT_IDLE_REMINT_SEC`, 1200 s; override with
+  `[stt].diarization_idle_remint_sec` or `ONOATS_DIARIZATION_IDLE_REMINT_SEC`) is given a fresh label on its next
+  speech, so `S1` cannot silently move to a different person; numbers continue
+  past `S8`. Errs toward splitting one person in two; a swap while both speakers
+  are active is not detected. First activity and each re-mint of a model slot log
+  at INFO with the slot number and label.
+- **`onoats init` carries `[stt].diarization` and
+  `[stt].diarization_idle_remint_sec` over** when re-run over an existing
+  `config.toml`, so re-running init does not silently turn diarization off or
+  drop a tuned re-mint threshold.
+
+### Changed
+
+- **pipecat floor raised to `>=1.3.0`.** The segment-sample stamping that
+  diarization relies on needs `SegmentedSTTService` to hand segments to
+  `run_stt` in VAD-stop order: inline on 1.3.0-1.8.x, through one in-order
+  queue task from 1.9 (the STT keeps an ordered span queue, so both work). CI
+  runs the real-pipecat stamping tests (`tests/test_websocket_stt_stamping.py`)
+  and the `segmented_stt_orders_spans` preflight probe tests
+  (`tests/test_diarization_timeline.py`) against the locked pipecat 1.12.0, the
+  queue shape; the inline shape (1.3.0-1.8.x) is covered in CI only by that
+  probe's source fixtures, not by a real pipecat run. The diarization tests
+  were additionally run by hand in isolated pipecat 1.9.0, 1.11.0 and 1.12.0
+  environments (not in CI). The diarization startup preflight exits non-zero
+  on a pipecat that does neither; a checkout's `uv.lock` pins 1.12.0. For the
+  queue shape the probe also requires one segment `put` per VAD stop and a
+  single reader loop that awaits `run_stt` once per segment until the finish
+  sentinel; a reader that transcribes one segment and returns, or skips or
+  repeats `run_stt`, is refused. For the inline shape it likewise requires one
+  unconditional `await self.process_generator(self.run_stt(...))` per stop: a
+  handler that returns early, or calls `run_stt` under a branch, loop or `try`,
+  is refused.
+- **Diarization needs a 160-sample model row hop.** The worker's load-time
+  check now also requires the model's `processor_config.hop_length` to be
+  exactly the integer 160, not only `output_subsampling_factor == 1`. A model
+  revision with `hop_length=320`, which passed before, now logs one WARNING and
+  the session carries on with unlabelled `them` lines.
+- **`scripts/release_check.sh` gained a diarization-contract check (check 5).**
+  It runs `tests/test_diarization_contract.py` under
+  `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1` via `uv run --extra diarization`,
+  so a missing or drifted `mlx-audio` fails instead of skipping. Unlike checks
+  1-4 it runs against the working tree, so it fails unless `HEAD` equals the
+  commit under check and the tree is clean. The weights-dependent contract
+  tests still skip when the model is not in the local HF cache; pre-cache it on
+  the release machine. The contract checks the model's row rate against the
+  audio fed: N whole 160-sample frames plus the final flush must yield exactly N
+  rows.
+
+### Fixed
+
+- **Final transcript lost at shutdown on pipecat 1.9+ (websocket STT).** The
+  websocket STT's graceful `stop()` closed the session before pipecat's own
+  `stop()` drained its queued segments, so a segment still decoding at shutdown
+  never got its transcript and the shutdown drain timed out. The session now
+  closes only after pipecat's drain returns (a cancelled drain still takes the
+  hard-cancel path). No change on pipecat 1.3.0-1.8.x, which queue nothing.
+
 ## [1.3.0] - 2026-09-26
 
 ### Added

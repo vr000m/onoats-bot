@@ -1462,3 +1462,116 @@ def test_graceful_close_deliberately_does_not_use_the_shared_reader_join():
         assert "asyncio.gather(reader" not in body, (
             f"{method.__name__} re-hand-rolled the reader join"
         )
+
+
+# ---------------------------------------------------------------------------
+# Graceful stop ordering: the parent's drain runs BEFORE the websocket closes.
+# ---------------------------------------------------------------------------
+
+
+def _parent_stop_owner() -> type:
+    """The class whose `stop` `WebSocketSTTService.stop`'s `super().stop()`
+    resolves to, so a patch there stands in for the parent drain on any
+    pipecat version (the lock pins 1.3.0, where nothing is queued at stop)."""
+    mro = WebSocketSTTService.__mro__
+    return next(c for c in mro[1:] if "stop" in vars(c))
+
+
+def _patch_parent_stop(monkeypatch, fn) -> None:
+    monkeypatch.setattr(_parent_stop_owner(), "stop", fn)
+
+
+def test_stop_drains_the_parent_before_closing_the_websocket(monkeypatch):
+    """pipecat 1.9+ `SegmentedSTTService.stop()` awaits its segment task,
+    which transcribes every queued segment through `run_stt` -- over THIS
+    websocket. `stop()` used to `_graceful_close()` first, so that drain ran
+    against a detached client: a late `transcript.completed` was ignored and
+    `run_stt` waited out its 90s decode timeout (the recorder's 8s shutdown
+    drain then hard-cancelled and lost the final transcript). Modelled here
+    with a patched parent `stop` that asserts the session is still live while
+    it "drains", and that the graceful close runs only once it returns."""
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    # The fake never acks session.close; don't burn the real join window.
+    monkeypatch.setattr(wss_module, "_READER_JOIN_TIMEOUT_SEC", 0.05)
+    svc = _make_service()
+    order: list[str] = []
+
+    async def _draining_parent_stop(self, frame):
+        client = self._client
+        assert client is not None, "websocket detached before the parent drain"
+        assert self._connected is True
+        assert client.session_closed is False and client.closed is False
+        assert self._draining_client is None
+        await asyncio.sleep(0)
+        order.append("parent-drain")
+
+    _patch_parent_stop(monkeypatch, _draining_parent_stop)
+
+    async def _run():
+        await svc._ensure_connected()
+        client = svc._client
+        await svc.stop(wss_module.EndFrame())
+        order.append("closed" if client.closed else "open")
+        return client
+
+    client = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    assert order == ["parent-drain", "closed"]
+    assert client.session_closed is True, "graceful close must send session.close"
+    assert svc._client is None and svc._connected is False
+
+
+def test_stop_still_closes_gracefully_when_the_parent_stop_raises(monkeypatch):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    monkeypatch.setattr(wss_module, "_READER_JOIN_TIMEOUT_SEC", 0.05)
+    svc = _make_service()
+
+    async def _raising_parent_stop(self, frame):
+        raise RuntimeError("parent stop failed")
+
+    _patch_parent_stop(monkeypatch, _raising_parent_stop)
+
+    async def _run():
+        await svc._ensure_connected()
+        client = svc._client
+        with pytest.raises(RuntimeError, match="parent stop failed"):
+            await svc.stop(wss_module.EndFrame())
+        return client
+
+    client = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    assert client.session_closed is True and client.closed is True
+    assert svc._client is None and svc._connected is False
+
+
+def test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled(
+    monkeypatch,
+):
+    """A cancelled drain is the pipeline aborting (shutdown-drain timeout /
+    second Ctrl+C): take the hard-cancel path, as `cleanup()` does under
+    `_cancelling`, rather than wait out a `session.closed` ack -- and never
+    swallow the cancellation."""
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    svc = _make_service()
+    cancels: list[object] = []
+
+    async def _cancelled_parent_stop(self, frame):
+        raise asyncio.CancelledError()
+
+    _patch_parent_stop(monkeypatch, _cancelled_parent_stop)
+
+    async def _run():
+        await svc._ensure_connected()
+        client = svc._client
+
+        async def _cancel():
+            cancels.append(client)
+
+        client.cancel = _cancel
+        with pytest.raises(asyncio.CancelledError):
+            await svc.stop(wss_module.EndFrame())
+        return client
+
+    client = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+    assert cancels == [client], "the hard-cancel path must run"
+    assert client.session_closed is False, "no graceful session.close"
+    assert client.closed is True
+    assert svc._client is None and svc._connected is False

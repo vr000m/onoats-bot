@@ -1,0 +1,4 @@
+.vendor/
+audio/
+out/
+out-*.log

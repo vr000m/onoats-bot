@@ -27,13 +27,22 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
 ]
 dependencies = [
-    "pipecat-ai[deepgram,google,local,runner,silero,soundfile,webrtc,whisper]>=1.0.0,<2.0.0",
+    # >=1.3.0: the diarization stamping relies on SegmentedSTTService handing
+    # segments to run_stt in VAD-stop order - inline on 1.3.0-1.8.x, via one
+    # in-order queue task from 1.9 (pinned by tests/test_websocket_stt_stamping.py;
+    # the preflight probe `diarization_timeline.segmented_stt_orders_spans`
+    # refuses any pipecat that does neither).
+    "pipecat-ai[deepgram,google,local,runner,silero,soundfile,webrtc,whisper]>=1.3.0,<2.0.0",
     # Kept in lockstep with the running server generation. 0.3.3 added UDS
     # trust-boundary hardening (0700 socket-dir enforcement + peer-cred 403);
     # wire protocol stays "0.1", so the recorder's client code is unchanged.
     # <0.4 until the next minor is smoke-tested live against the recorder.
     "pipecat-local-stt-server>=0.3.3,<0.4",
     "websockets>=13.0",
+    # Imported directly by stt/diarization_timeline.py (and the feeder). It is
+    # already a hard pipecat-ai requirement; same bounds so this adds no
+    # constraint of its own.
+    "numpy>=1.26.4,<3",
     "python-dotenv>=1.2.1",
     "loguru>=0.7.0",
 ]
@@ -54,12 +63,26 @@ macos = [
     "mlx-whisper>=0.4.0",
     "kokoro-onnx>=0.4.0",
 ]
+# Optional them-channel speaker diarization (mlx-audio). macOS / Apple-Silicon
+# by convention only: there is no platform marker. NOT in the baseline.
+# Install with `uv sync --extra diarization` (checkout) or
+# `uv tool install 'onoats[macos,diarization]'` (tool install; extras are not
+# merged, so repeat any you already have). Keep in sync with
+# `runtime._DIARIZATION_INSTALL_HINT`.
+diarization = [
+    "mlx-audio>=0.5.8,<0.6",
+]
 
 [project.scripts]
 onoats = "onoats.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/onoats"]
+
+[tool.hatch.build.targets.sdist]
+# Scratch experiments (and any local clips/logs under them) stay in the repo
+# for future work but never ship in the source distribution.
+exclude = ["/experiments"]
 
 [dependency-groups]
 # ruff is pinned to a minor range so CI's `ruff format --check` matches the
@@ -69,3 +92,6 @@ dev = ["pytest>=8", "ruff>=0.15,<0.16"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "diarization_integration: local-only end-to-end diarization on a real clip and the real model (needs the diarization extra, cached weights and ONOATS_DIARIZATION_FIXTURE)",
+]

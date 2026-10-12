@@ -2,9 +2,14 @@
 
 A session file is a type-discriminated JSONL stream:
 
-    {"type": "session_meta", "category": "<cat>"}        # optional FIRST line
-    {"type": "utterance", "time": "...", "text": "...", "source": "me"|"them"}
+    {"type": "session_meta", "run_id": "<hex>", "category"?: "<cat>",
+     "diarization"?: {"model": "...", "version": "..."}}   # FIRST line
+    {"type": "utterance", "time": "...", "text": "...", "source": "me"|"them",
+     "speakers"?: ["S1", ...], "overlap"?: bool}
     {"type": "silence_gap", "time": "...", "duration_seconds": N}
+
+``category`` is present only when ``--category`` locks one; ``speakers`` /
+``overlap`` only on a diarization-labelled ``them`` utterance.
 
 This is onoats' own minimal reader — no upstream classifier/segmenter/renderer
 imports. It tolerates a missing ``session_meta`` line (the category then
@@ -27,6 +32,8 @@ class Utterance:
     time: str
     text: str
     source: str | None = None
+    speakers: list[str] | None = None
+    overlap: bool = False
 
 
 @dataclass
@@ -72,10 +79,20 @@ def read_session_file(path: str | Path) -> Session:
                 if isinstance(category, str) and category.strip():
                     session.category = category.strip()
             elif etype == "utterance":
+                raw_speakers = entry.get("speakers")
+                speakers = (
+                    list(raw_speakers)
+                    if isinstance(raw_speakers, list)
+                    and raw_speakers
+                    and all(isinstance(s, str) for s in raw_speakers)
+                    else None
+                )
                 utt = Utterance(
                     time=str(entry.get("time", "")),
                     text=str(entry.get("text", "")),
                     source=entry.get("source"),
+                    speakers=speakers,
+                    overlap=entry.get("overlap") is True,
                 )
                 session.utterances.append(utt)
                 session.entries.append(utt)

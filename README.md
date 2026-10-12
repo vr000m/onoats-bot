@@ -130,6 +130,7 @@ onoats status       # recorder pid / running state + data dir; names the capture
 | Local Whisper-MLX (on-device)     | —                           | ✅ `[macos]` extra |
 | Kokoro TTS                        | —                           | ✅ `[macos]` extra |
 | System audio ("them") capture     | loopback driver-dependent   | ✅ native capturer ⁺ |
+| Speaker diarization (opt-in)      | —                           | ✅ `diarization` extra |
 
 ⁺ On **macOS 14.4+** the default system-audio story is the **native capturer**
 (`AUDIO_SOURCE=socket` — Core Audio process tap, no virtual-audio driver; see
@@ -208,8 +209,10 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   absent by default, in which case self-healing is skipped and today's
   plain-failure behavior is unchanged; must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` — any other value is logged and treated
-  as absent), `[speakers]` (render-only display
-  labels), `[categories]`, `[tuning]`.
+  as absent; `diarization` — true/false, default off, overridable via the
+  `ONOATS_DIARIZATION` env var, see
+  [Speaker diarization](#speaker-diarization-opt-in)), `[speakers]`
+  (render-only display labels), `[categories]`, `[tuning]`.
 - `[app].launch_at_login` (Onoats.app only — Python never reads this key) —
   bare TOML `true`/`false` (a quoted `"true"`/`"false"` normalizes to the
   same value, since `ConfigStore`'s reader strips surrounding quotes; any
@@ -233,6 +236,51 @@ key) — notably the shutdown timers: on Ctrl+C the recorder drains the pipeline
 (up to `SHUTDOWN_DRAIN_TIMEOUT_SEC`, default `8.0`) so a final in-flight
 transcript lands before the flush, then hard-cancels (capped at
 `SHUTDOWN_CANCEL_TIMEOUT_SEC`, default `2.0`) if the drain stalls.
+
+### Speaker diarization (opt-in)
+
+Off by default. When on, onoats labels who is speaking on the **"them"**
+(system-audio) channel: lines render as `**Them (S1):**`, `**Them (S2):**`, …
+(speakers are numbered in order of first speech in the recorder run), and a window
+with two clearly active speakers renders as `Them (S1 / S2, overlapping)`, the
+more active speaker in that utterance first (so the order can differ between lines). The
+suffix is appended to your configured `[speakers]` label for `them`. The `me`
+channel is never labelled. `S1`/`S2` are per-run slots, not identities, and
+can be wrong (a speaker may be split across slots, or a quiet or overlapped
+stretch left unlabelled). A number is never reused within a run: a model slot
+that has been silent for more than 20 minutes gets a fresh number (`S9`, `S10`,
+… are possible) when it next speaks, so a label cannot silently move to a
+different person, at the cost of splitting someone who was quiet that long
+(tune it with `[stt].diarization_idle_remint_sec` or
+`ONOATS_DIARIZATION_IDLE_REMINT_SEC`, in seconds; a bad value falls back to the
+default with a warning). Names
+are not assigned by onoats; a consumer maps labels to names.
+
+- **Enable:** `[stt].diarization = true` in `config.toml`, or
+  `ONOATS_DIARIZATION=1` (the env var wins). Accepted values (case-insensitive):
+  `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; a blank env value falls
+  through to `config.toml`. Any other value logs one warning and disables
+  diarization — a non-empty env value wins even when unrecognised, so
+  `ONOATS_DIARIZATION=maybe` turns off a `config.toml` `diarization = true`.
+- **Websocket STT only** (`STT_SERVICE=websocket`); any other backend exits
+  non-zero at startup. `onoats bot-single` ignores the flag with a warning.
+- **Install the extra** (Apple Silicon / macOS): from a checkout
+  `uv sync --extra diarization`; for a tool install
+  `uv tool install 'onoats[macos,diarization]'` (repeat any extras you already
+  have).
+- **Download the weights yourself** — they are never fetched automatically:
+  `uvx --from huggingface_hub hf download mlx-community/Nemotron-3-Diarization`
+  (or plain `hf download ...` if you already have `hf` on PATH). If the extra or the
+  weights are missing, `onoats bot` exits non-zero at startup with the exact
+  command to run (before any audio is captured). It also exits non-zero at
+  startup on a pipecat version whose STT segment ordering it cannot verify
+  (diarization labels depend on segments reaching the STT in order).
+- **Fails open.** If the diarizer fails mid-session, onoats logs one warning and
+  keeps recording; `them` lines continue unlabelled. A label can delay a `them`
+  line by up to about 1.5 s while the diarizer catches up.
+- **Known limitation:** a continuation flush (`Ctrl+T` / `onoats flush` /
+  SIGUSR1) can leave a `them` line that was still waiting for its label to land
+  in the next session file.
 
 ### Audio source
 
@@ -307,16 +355,34 @@ a consumer drains.
 
 | Line type      | Shape                                                              |
 |----------------|--------------------------------------------------------------------|
-| `session_meta` | `{"type":"session_meta","category":"<cat>"}` — optional FIRST line |
-| `utterance`    | `{"type":"utterance","time":...,"text":...,"source":"me"\|"them"}` |
+| `session_meta` | `{"type":"session_meta","run_id":"<hex>"}` plus optional `category` / `diarization` — FIRST line of every file |
+| `utterance`    | `{"type":"utterance","time":...,"text":...,"source":"me"\|"them"}` plus optional `speakers` / `overlap` (below) |
 | `silence_gap`  | `{"type":"silence_gap","time":...,"duration_seconds":N}`           |
 
 - The `source` field is the **canonical `me`/`them` enum** — the frozen wire
   contract. Configurable speaker display labels (`[speakers]`) are applied
   **only at render time**, never written into the queue.
+- With [speaker diarization](#speaker-diarization-opt-in) on, a labelled
+  `them` utterance also carries two optional keys: `speakers` (a non-empty
+  list of canonical labels such as `["S1"]`, or `["S1","S2"]` for overlap, the more
+  active speaker first) and
+  `overlap` (a bool). Both are **omitted** when diarization is off or the
+  utterance was left unlabelled, and `me` utterances never carry them. Treat
+  absence as unlabelled. Display strings like `Them (S1)` are composed at
+  render time and are not stored.
 - The chosen `--category` rides on the `session_meta` first line (not the
   filename); the `{session_id}` stem stays load-bearing for a consumer's
-  back-fill keying.
+  back-fill keying. `category` is written **only when `--category` locks one**:
+  a consumer reads any non-blank category as a hard lock, so it is never
+  defaulted. `run_id` is an opaque random token minted once per `onoats bot`
+  process, identical in every file that run rotates through (silence timeout,
+  Ctrl+T, menu bar) and new on each start; missing means unknown. With
+  diarization configured on, `diarization` is `{"model","version"}` (model repo
+  id and cached snapshot revision) - provenance of what the run was configured
+  with, not proof a line was labelled; per-utterance `speakers` is the truth.
+  The header never lists speakers: they are not known at file creation. Labels
+  are unique within a run, so `(run_id, label)` identifies a speaker across the
+  files of one run.
 - `active → pending` is an atomic `rename(2)`; a partial file is never visible
   in `pending/`.
 

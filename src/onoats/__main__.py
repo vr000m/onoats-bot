@@ -145,6 +145,17 @@ async def run_onoats(
     data_dir = onoats_data_dir()
     _acquire_instance_lock(data_dir / ".active")
 
+    # Single-input mode has no "them" arm, so the diarization flag cannot do
+    # anything here. A warning, not a fail-loud: nothing capture-side is
+    # mis-configured.
+    from onoats.config import load_config as _load_config
+
+    if _load_config().diarization:
+        logger.warning(
+            "diarization is enabled but ignored in single-input mode "
+            "(`onoats bot-single`): there is no 'them' arm to diarize."
+        )
+
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask

@@ -119,6 +119,52 @@ def normalize_launchd_label(value: str | None) -> str | None:
     return validate_launchd_label(stripped) if stripped else None
 
 
+def parse_idle_remint_sec(value: Any) -> float | None:
+    """Map a raw ``diarization_idle_remint_sec`` value to seconds; ``None`` if absent.
+
+    Absent is ``None`` or a blank string. A positive, finite number (or numeric
+    string) is returned as a float; anything else (including a TOML bool, zero,
+    a negative, ``inf``/``nan`` or text) raises ``ValueError``. Shared by the
+    runtime reader and ``onoats init``'s carry-over so they cannot disagree.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"invalid diarization_idle_remint_sec {value!r}")
+    try:
+        sec = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid diarization_idle_remint_sec {value!r}") from None
+    if not 0 < sec < float("inf"):
+        raise ValueError(f"invalid diarization_idle_remint_sec {value!r}")
+    return sec
+
+
+def parse_diarization_value(value: Any) -> bool | None:
+    """Map a raw ``diarization`` value to a bool; ``None`` if absent.
+
+    Absent is ``None`` or a blank/whitespace-only string; each caller decides
+    what absent means (the runtime reader: off; ``onoats init``: nothing to
+    carry). Accepts a TOML bool, or a string/int in the truthy/falsy
+    vocabulary (``1/true/yes/on`` / ``0/false/no/off``, case-insensitive);
+    anything else raises ``ValueError``. Shared by the runtime reader
+    (``OnoatsConfig.diarization``) and ``onoats init``'s carry-over so the two
+    cannot drift on which values count as absent, on, off, or garbage.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"unrecognised diarization value {value!r}")
+
+
 def _config_home() -> Path:
     raw = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(raw).expanduser() if raw else Path.home() / ".config"
@@ -175,6 +221,10 @@ def _env_or(env_name: str, file_value: Any) -> Any:
 def _source_of(env_name: str, file_value: Any) -> str:
     """Provenance label for the value :func:`_env_or` would return."""
     return _env_or_with_source(env_name, file_value)[1]
+
+
+#: Unrecognised ``diarization`` values already warned about (warn-once dedupe).
+_warned_diarization_values: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -378,6 +428,60 @@ class OnoatsConfig:
         # is delimiter-sensitive. A non-conforming value normalizes to None
         # (self-healing off) — see `normalize_launchd_label`/`validate_launchd_label`.
         return normalize_launchd_label(val)
+
+    @property
+    def diarization(self) -> bool:
+        """Live "them"-channel speaker diarization flag (default off).
+
+        env ``ONOATS_DIARIZATION`` > config.toml ``[stt].diarization`` >
+        ``False``. Accepts a TOML bool, or a string/int in the usual
+        truthy/falsy vocabulary (``1/true/yes/on`` / ``0/false/no/off``,
+        case-insensitive). An unrecognised value logs a WARNING and resolves
+        to ``False`` (the flag gates a heavyweight optional feature; guessing
+        "on" from garbage would fail loud at startup for a typo).
+        """
+        val = _env_or("ONOATS_DIARIZATION", self.raw.get("stt", {}).get("diarization"))
+        try:
+            return bool(parse_diarization_value(val))  # absent (None) is off
+        except ValueError:
+            pass
+        text = str(val).strip().lower()
+        # The property is read at several startup sites, each often on its own
+        # OnoatsConfig; warn once per process per value, not once per read.
+        if text not in _warned_diarization_values:
+            _warned_diarization_values.add(text)
+            logger.warning(
+                f"STT: ignoring unrecognised diarization value {val!r} "
+                "(expected true/false); diarization disabled"
+            )
+        return False
+
+    @property
+    def diarization_idle_remint_sec(self) -> float | None:
+        """Seconds a diarizer slot may sit idle before it is given a new label.
+
+        env ``ONOATS_DIARIZATION_IDLE_REMINT_SEC`` > config.toml
+        ``[stt].diarization_idle_remint_sec`` > ``None`` (the timeline's own
+        default). A non-positive, non-finite or non-numeric value logs one
+        WARNING and falls back to the default, so a typo can never disable
+        re-minting or make every utterance a new speaker.
+        """
+        val = _env_or(
+            "ONOATS_DIARIZATION_IDLE_REMINT_SEC",
+            self.raw.get("stt", {}).get("diarization_idle_remint_sec"),
+        )
+        try:
+            return parse_idle_remint_sec(val)
+        except ValueError:
+            pass
+        text = f"idle_remint:{val}"
+        if text not in _warned_diarization_values:
+            _warned_diarization_values.add(text)
+            logger.warning(
+                f"STT: ignoring invalid diarization_idle_remint_sec {val!r} "
+                "(expected a positive number of seconds); using the default"
+            )
+        return None
 
     # ---- speakers (render-only display labels) ----
     @property

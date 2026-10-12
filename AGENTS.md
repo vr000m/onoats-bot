@@ -278,6 +278,124 @@ feature rather than failing a test you'd notice:
 Regression tests: `tests/test_stt_launchd.py`, `tests/test_runtime_preflight.py`,
 `tests/test_websocket_stt_reconnect.py`.
 
+## Them-channel diarization invariants
+
+`[stt].diarization` / `ONOATS_DIARIZATION` (default **off**) labels `them`
+utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
+`system_stt` -> `WebSocketSTTService` (stamps VAD spans) -> `SourceTagger` ->
+`DiarizationLabeler`, system arm only. Load-bearing invariants:
+
+- **Off means absent.** Flag off: `mlx_audio` is never imported (it is in
+  `_FORBIDDEN` in `tests/test_onoats_imports.py`; the processors import it only
+  on the worker thread via `load_mlx_diarizer`), no feeder/labeler is wired, no
+  attribute reaches a frame, and utterance JSONL/render are unchanged (the
+  always-written `session_meta` header then carries `run_id` only, no
+  `diarization` key).
+- **The worker thread owns the model and the coverage writes.** One daemon
+  thread (`diar-worker`; bounded join in the feeder's `cleanup()`, never on
+  the frame path) does the load, `set_streaming_config("low")`, every
+  `feed()`, the final flush, and is the **sole coverage writer** to
+  `DiarizationTimeline` (`record`, `record_gap`, `set_slot_count`,
+  `mark_flushed`); the loop only reads. `mark_degraded` is the one idempotent,
+  thread-safe flag either side may set (worker failures; the feeder's start
+  failure / bounded join in `cleanup()`; the labeler's stall guard and
+  fail-open). Don't add a loop-side coverage write or a cross-thread model call.
+- **Fail open: never lose a transcript.** A runtime diarizer failure
+  (loader/`feed()` raising, consecutive over-budget windows, a hung `feed()`)
+  degrades with exactly one WARNING and never a fatal `ErrorFrame`; `them`
+  transcription keeps flowing unlabelled. The labeler parks stamped
+  `TranscriptionFrame`s in an ordered pending deque (released head-first by its
+  own task, never blocking `process_frame`) for at most `HOLD_SEC` each, with a
+  stall guard that degrades after consecutive no-progress windows; a frame stays in the held state
+  until its own push returns, and fail-open / `cleanup()` release every held
+  frame FIFO via `_push_labelled` (labelled if not degraded, else
+  unlabelled). `EndFrame` flush-waits (bounded), `CancelFrame` releases
+  immediately. Accepted gaps are in the Review Checklist below.
+- **`label_for` policy** (`diarization_timeline.py`, pinned by
+  `tests/test_diarization_timeline.py`): unlabelled below
+  `MIN_COVERAGE_FRACTION` recorded coverage (GAP/evicted rows don't count) or
+  if any covered row has activity in an unmappable (beyond-`num_speakers`) slot; 2+ slots active for
+  `>= OVERLAP_MIN_FRACTION` => overlap (top two by score); otherwise the
+  top-scored slot, and **`DOMINANT_MARGIN` over the runner-up is required
+  whenever the top slot is not the sole `OVERLAP_MIN_FRACTION` candidate**
+  (not merely when there is no candidate). A top slot that is the sole
+  candidate is labelled with no margin check.
+- **The `me` branch is structurally untouched.** Nothing is inserted in
+  `mic_arm`; `stamp_segment_samples` is only set on the system STT. Pinned by
+  the me/them x flag x source matrix in `tests/test_dual_socket_source.py`.
+- **One flag, two consumers.** `dual` derives a single `diarization_on` bool
+  and passes it to both `stamp_segment_samples` (STT) and `diarization` (the
+  pipeline builder), so stamping and the labeler can't disagree. The STT's
+  `_span_queue` is an ordered queue with one entry per VAD-stop, appended
+  **before** delegating VAD-stop to `super()` and popped at the head of
+  `run_stt` (pipecat 1.3.0-1.8.x run `run_stt` inline; 1.9+ queue segments and
+  ONE task awaits `run_stt` for each in order - either way segments reach
+  `run_stt` in VAD-stop order; `runtime._preflight_diarization` refuses any
+  pipecat for which `diarization_timeline.segmented_stt_orders_spans` cannot
+  see one of those two shapes - for the queue shape that means one plain
+  `asyncio.Queue()` built in `__init__`, one handler task created by `start`,
+  that handler as the queue's only reader, one unconditional segment `put`
+  per VAD stop (only the `not self.is_usable` drop, which the STT mirrors,
+  may exit early; any other `put` is the `None` sentinel), and the reader one
+  sentinel-ended loop awaiting its single `run_stt` once per segment); the
+  feeder and the STT
+  each count samples with `SampleCounter`, and the feeder's `start_sample` is
+  the worker's position authority. Pinned by
+  `tests/test_websocket_stt_stamping.py` (span queue) and
+  `tests/test_diarization_timeline.py` (the `segmented_stt_orders_spans`
+  probe and its fail-closed cases).
+- **Shutdown closes the websocket only after the parent drain.**
+  `WebSocketSTTService.stop()` awaits `super().stop()` first (on pipecat 1.9+
+  that drains still-queued segments through `run_stt` over the still-open
+  socket) and closes the session in a `finally`; a cancelled drain takes the
+  hard-close path and re-raises. `cancel()` hard-closes first. Reordering the
+  close ahead of the parent stop silently drops final transcripts on 1.9+.
+  Pinned by `tests/test_websocket_stt_reconnect.py`
+  (`test_stop_drains_the_parent_before_closing_the_websocket`,
+  `test_stop_still_closes_gracefully_when_the_parent_stop_raises`,
+  `test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled`).
+- **Labels are never reused within a run.** `DiarizationTimeline` keeps, per
+  model slot, a list of generations `(first active sample, number)` from one
+  monotonic counter (`record`, worker thread; `label_for` only reads). A slot
+  idle for more than `SLOT_IDLE_REMINT_SEC` (1200 s; override with
+  `[stt].diarization_idle_remint_sec` or `ONOATS_DIARIZATION_IDLE_REMINT_SEC`)
+  gets a new number on its next active frame, and a window's label uses the generation in force at the
+  slot's last active frame in it, so numbers pass `S8` and the grammar is
+  `^S[0-9]+$`. This errs toward splitting a speaker and cannot catch a swap while
+  both speakers are active. Pinned by `tests/test_diarization_timeline.py`.
+- **`session_meta` is line 1 of every file, `category` only on a lock.**
+  `TranscriptBuffer` writes `{"type":"session_meta","run_id", "category"?,
+  "diarization"?}` through `categories.session_meta_line`; never default
+  `category` (the consumer reads any non-blank value as a hard classification
+  lock). `run_id` is minted once per buffer (so stable across continuation
+  files), `diarization` is `diarization_model.provenance()` and is configuration
+  provenance only (a runtime degrade leaves it stale by design). Never put a
+  speaker list in it. Pinned by `tests/test_categories.py`.
+- **Persistence is canonical; display is render-time.** `speakers`/`overlap`
+  are stored on the utterance (omitted when empty); the `Them (S1)` string is
+  composed at render/live-terminal time by `render.compose_speaker_label`
+  and never persisted (`tests/test_speaker_labels.py`).
+- **Preflight is hoisted, import-free and non-downloading.**
+  `runtime._preflight_diarization` runs right after `_acquire_instance_lock` in
+  `onoats bot` (supervisor and `run_onoats_dual`), only when the flag is on:
+  `find_spec` for the extra plus a local HF-cache probe
+  (`diarization_model.weights_cached`); failure is a fatal
+  `DiarizationPreflightError` (rc=1) before any capture side effect. Only the
+  extra/weights probes are memoized process-wide (`_diarization_preflight_done`,
+  success only); the `stt_service == "websocket"` check reads `cfg` and runs on
+  every call. `bot-single` has no `them` arm, so it ignores the flag with one
+  WARNING rather than failing.
+
+Regression tests: `tests/test_diarization_timeline.py`,
+`tests/test_diarization_feeder.py`, `tests/test_diarization_labeler.py`,
+`tests/test_diarization_model.py`, `tests/test_diarization_contract.py`
+(local-only; hard-fails under `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`),
+`tests/test_diarization_integration.py` (local-only, `-m diarization_integration`;
+real model + real pipeline on a WAV named by `ONOATS_DIARIZATION_FIXTURE`, skips
+when unset),
+`tests/test_websocket_stt_stamping.py`, `tests/test_speaker_labels.py`,
+`tests/test_runtime_preflight.py`, `tests/test_dual_socket_source.py`.
+
 ## Leaf modules
 
 A recurring pattern in `src/onoats/`: two higher-level modules that must
@@ -309,6 +427,20 @@ its scope; this list is a pointer, not the contract itself.
   *leak*, and a destructive *over-redaction* that removes the credential
   correctly but fabricates a hostname out of text later in the string. The
   sweep pins both.
+- `src/onoats/stt/diarization_model.py` — the diarization model's repo id,
+  weight-file tuple and non-downloading HF-cache probes (`weights_cached()`
+  for `runtime`'s startup preflight, `cached_snapshot_dir()` for the
+  feeder's loader), so both check the same files; `huggingface_hub` is
+  imported lazily inside the functions. Also `one_row_per_frame()`, the one
+  frame-rate predicate (`output_subsampling_factor` exactly `int` 1 AND
+  `processor_config.hop_length` exactly `int` 160 = `ROW_HOP_SAMPLES`, pinned
+  equal to the timeline's `FRAME_SAMPLES`) shared by the worker's load-time
+  guard and the release-time contract test.
+- `src/onoats/stt/diarization_timeline.py` — the them-channel diarization
+  correlation clock (`SampleCounter`), the thread-safe coverage ring
+  (`DiarizationTimeline`; the worker is its sole coverage writer) and the
+  label policy (`label_for`), shared by the feeder/worker and the STT
+  service without either importing the other.
 - `src/onoats/_closing.py` — bounded, best-effort teardown of a
   `TranscriptionClient` (timeout + deadline cap + cancellation safety), so
   a hung server's closing handshake can never block a caller forever, plus
@@ -401,3 +533,67 @@ should NOT re-flag go here, one per line:
   which is the supported edit path, and `ConfigStore` round-trips arbitrary
   keys without code changes. A GUI picker would be a separate feature.
   (2026-06-12)
+- **[Logic] won't-fix**: a continuation flush (SIGUSR1 / Ctrl+T) does not drain
+  `DiarizationLabeler`'s held frames (<= `HOLD_SEC`), so a parked `them` line can
+  land in the next session file. In-flight STT transcripts already cross a
+  continuation flush the same way (decode latency exceeds the hold), each entry
+  keeps its own `frame.timestamp`, and the plan accepts cross-arm arrival-order
+  skew; coupling `_rotate_flush` to the labeler is not worth the plumbing.
+  (2026-10-08)
+- **[Testing] won't-fix**: `tests/test_diarization_contract.py` skips its
+  weights-dependent checks when the model is not in the HF cache, even under
+  `ONOATS_REQUIRE_DIARIZATION_CONTRACT=1`, so `release_check.sh` can report ok
+  without them. Deliberate (owner decision): the cache is never a hard-fail and
+  nothing in the test downloads; cache the weights on the release machine
+  (`hf download mlx-community/Nemotron-3-Diarization`). (2026-10-08)
+- **[Logic] won't-fix**: `DiarizationLabeler._fail_open` re-pushing the
+  in-flight frame after a raising `push_frame` could in theory duplicate a
+  transcript. pipecat's `push_frame` only enqueues into the next processor's
+  queue (`__internal_push_frame` -> `self._next.queue_frame`), so downstream side
+  effects cannot raise back into the pusher; plan Req 4 deliberately prefers
+  at-least-once over losing a transcript. (2026-10-08)
+- **[Architecture] won't-fix**: module-level memos
+  `runtime._diarization_preflight_done` and `config._warned_diarization_values`
+  are deliberate process-wide dedupe (socket mode preflights twice: supervisor,
+  then `run_onoats_dual`; one warning per bad value across several
+  `OnoatsConfig` instances). Tests reset them explicitly. (2026-10-08)
+- **[Logic] won't-fix**: `DiarizationLabeler` assumes pipecat's `push_frame`
+  neither suspends nor raises (it only enqueues into the next processor's
+  queue). Reports that a transcript is lost when a push is blocked or raising
+  while a CancelFrame/EndFrame, a pass-through drain or the already-covered
+  fast path is in progress (e.g. the CancelFrame-cancelled process task
+  dropping the frame it is pushing, or a terminal frame skipped because
+  `_drain_all` raised) only reproduce with a test-only blocking/raising push;
+  hardening them would restructure the held-frame bookkeeping for a path the
+  framework does not take. Complements the `_fail_open` re-push entry above.
+  (2026-10-08)
+- **[Logic] won't-fix**: `segmented_stt_orders_spans()` inspects the stop handler
+  and the queue methods but not `SegmentedSTTService.process_frame`, so a future
+  pipecat that gates the stop-handler dispatch (e.g. on `_user_speaking`) would
+  pass the probe and strand a span. Speculative: 1.3.0 and 1.12.0 dispatch
+  unconditionally, and the probe fails closed on the shapes it can see.
+  (2026-10-11)
+- **[Architecture] won't-fix**: the `pipecat-ai>=1.3.0` floor applies to every
+  user, although only diarization needs it. Deliberate and stated in the
+  CHANGELOG; the preflight alone cannot protect a user who never enables the
+  flag but runs a pipecat that predates the stamping hooks. (2026-10-11)
+- **[Security] won't-fix**: `jsonl.read_session_file` does not enforce the
+  `^S[0-9]+$` grammar on `speakers`, so a hand-edited session file could inject
+  markdown into a rendered label. onoats reads only files it wrote itself into
+  its 0700 data dir; an attacker who can edit them can already edit the
+  transcript text. (2026-10-11)
+- **[Logic] won't-fix**: `DiarizationLabeler`'s stall guard reads "coverage did
+  not advance" as "the diarizer is hung", but coverage also stalls when no audio
+  reaches the feeder (capture hiccup, device re-bind). More than ~3 s of silence
+  while two stamped frames are held degrades labels for the rest of the session
+  although the diarizer is healthy. Accepted: the socket capturer's silence
+  pacer keeps audio flowing, so it is unlikely, and fixing it means a design
+  change to the fail-open contract (only count a stall when the feeder has audio
+  queued or its counter has advanced). Transcription is never lost, only
+  unlabelled. (2026-10-11)
+- **[Logic] won't-fix**: stopping `onoats bot` while the diarizer model is still
+  loading leaves the daemon worker thread behind after the feeder's bounded join
+  (5 s). Tried to reproduce on 2026-10-11: five start-then-stop cycles with the
+  stop sent 0.1-0.6 s after the pipeline was ready (inside the load window), all
+  exit 0 in 3-4 s with no degraded WARNING, no traceback and no macOS crash
+  report. Not reproducible, so left as is. (2026-10-11)

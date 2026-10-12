@@ -5,11 +5,21 @@
 #
 #   scripts/release_check.sh v0.9.0 [commit-ish]   # default commit: HEAD
 #
-# Checks, all against <commit-ish> (not the working tree):
+# Checks 1-4 read <commit-ish> (not the working tree):
 #   1. pyproject.toml  [project] version == X.Y.Z
 #   2. uv.lock         onoats package entry version == X.Y.Z
 #   3. Info.plist      CFBundleShortVersionString == X.Y.Z (menu-bar app)
 #   4. CHANGELOG.md    has a "## [X.Y.Z] - YYYY-MM-DD" entry
+#   5. mlx_audio diarization contract (working tree, `--extra diarization`):
+#      tests/test_diarization_contract.py, hard-fail (not skip) if the
+#      optional dep is missing or drifted (ONOATS_REQUIRE_DIARIZATION_CONTRACT=1).
+#      Because it runs the working tree, it FAILS unless HEAD is <commit-ish>
+#      and the tree is clean: run the script from a clean checkout of it.
+#      The weights-dependent contract tests still SKIP when the model is not
+#      in the local HF cache, even under ONOATS_REQUIRE_DIARIZATION_CONTRACT=1
+#      (deliberate waiver: nothing downloads in a test; see AGENTS.md Review
+#      Checklist), so pre-cache the weights on the release machine:
+#        hf download mlx-community/Nemotron-3-Diarization
 set -euo pipefail
 
 tag="${1:?usage: release_check.sh vX.Y.Z [commit-ish]}"
@@ -68,6 +78,23 @@ if grep -Eq "^## \[$(printf '%s' "$version" | sed 's/\./\\./g')\] - [0-9]{4}-[0-
     check "CHANGELOG.md entry for $version" 1 ""
 else
     check "CHANGELOG.md entry for $version" 0 "no '## [$version] - YYYY-MM-DD' heading"
+fi
+
+# Unlike checks 1-4 this runs against the working tree (it imports the
+# installed mlx-audio), so it only vouches for <commit-ish> from a clean
+# checkout of exactly that commit; anything else fails rather than passing
+# on code that is not the one being tagged.
+target_sha=$(git rev-parse --verify "${commit}^{commit}")
+head_sha=$(git rev-parse --verify HEAD)
+if [ "$head_sha" != "$target_sha" ]; then
+    check "mlx_audio diarization contract" 0 "working tree HEAD ($head_sha) is not ${commit} ($target_sha); run release_check.sh from a clean checkout of ${commit}"
+elif [ -n "$(git status --porcelain)" ]; then
+    check "mlx_audio diarization contract" 0 "working tree is dirty; run release_check.sh from a clean checkout of ${commit}"
+elif ONOATS_REQUIRE_DIARIZATION_CONTRACT=1 \
+    uv run --extra diarization pytest tests/test_diarization_contract.py -q; then
+    check "mlx_audio diarization contract" 1 ""
+else
+    check "mlx_audio diarization contract" 0 "tests/test_diarization_contract.py failed under ONOATS_REQUIRE_DIARIZATION_CONTRACT=1"
 fi
 
 if [ "$fail" -ne 0 ]; then

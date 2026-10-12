@@ -51,7 +51,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from pipecat.frames.frames import TranscriptionFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
@@ -637,3 +636,651 @@ def test_dual_main_invalid_category_short_circuits_before_run(
     rc = dual_mod.main(["--category", "definitely-not-a-category"])
     assert rc == 1
     assert "Error:" in capsys.readouterr().err
+
+
+# --- Diarization preflight at the run_onoats_dual entrypoint -----------------
+
+
+def _diar_dual_env(monkeypatch, tmp_path, *, flag):
+    from onoats import dual as dual_mod
+    from onoats import runtime
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ONOATS_DIARIZATION", flag)
+    monkeypatch.setenv("AUDIO_SOURCE", "portaudio")
+    order: list[str] = []
+    monkeypatch.setattr(
+        dual_mod, "_acquire_instance_lock", lambda d: order.append("lock")
+    )
+
+    def _boom(name):
+        def _f(*a, **k):
+            order.append(name)
+            raise RuntimeError(f"{name} reached")
+
+        return _f
+
+    monkeypatch.setattr(dual_mod, "_build_portaudio_transports", _boom("portaudio"))
+    monkeypatch.setattr(dual_mod, "_build_socket_transports", _boom("socket"))
+    return dual_mod, runtime, order
+
+
+def test_run_onoats_dual_diarization_preflight_failure_is_rc1_before_capture(
+    monkeypatch, tmp_path
+):
+    dual_mod, runtime, order = _diar_dual_env(monkeypatch, tmp_path, flag="1")
+
+    def _preflight(cfg):
+        order.append("preflight")
+        raise runtime.DiarizationPreflightError("diarization: extra missing")
+
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    rc = dual_mod.main([])
+    assert rc == 1
+    assert order == ["lock", "preflight"]  # no transport builder / PortAudio call
+
+
+def test_run_onoats_dual_flag_off_never_calls_preflight(monkeypatch, tmp_path):
+    dual_mod, runtime, order = _diar_dual_env(monkeypatch, tmp_path, flag="0")
+    monkeypatch.setattr(
+        runtime,
+        "_preflight_diarization",
+        lambda cfg: pytest.fail("preflight must not run with the flag off"),
+    )
+    with pytest.raises(RuntimeError, match="portaudio reached"):
+        dual_mod.main([])
+    assert order == ["lock", "portaudio"]
+
+
+def test_single_input_logs_ignored_warning_once(monkeypatch, tmp_path):
+    from loguru import logger
+
+    from onoats import __main__ as main_mod
+
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    monkeypatch.setattr(main_mod, "_acquire_instance_lock", lambda d: None)
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
+    try:
+        # Stop right after the flag check: the next import-heavy step is the
+        # native deps; force a controlled failure there.
+        import onoats.config as cfgmod
+
+        orig = cfgmod.load_config
+        calls = {"n": 0}
+
+        def _load():
+            calls["n"] += 1
+            return orig()
+
+        monkeypatch.setattr(cfgmod, "load_config", _load)
+        from pipecat.audio.vad import silero
+
+        monkeypatch.setattr(
+            silero,
+            "SileroVADAnalyzer",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")),
+            raising=False,
+        )
+        with pytest.raises(Exception):
+            asyncio.run(main_mod.run_onoats())
+    finally:
+        logger.remove(sink)
+    ignored = [r for r in records if "ignored in single-input" in r]
+    assert len(ignored) == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (them-channel diarization): hoisted `_preflight_diarization` in
+# `run_onoats_dual` — after `_acquire_instance_lock`, before PortAudio opens /
+# socket transports are built; never called when the flag is off.
+# ---------------------------------------------------------------------------
+
+
+class _Stop(Exception):
+    """Sentinel raised by the builder spies to cut run_onoats_dual short."""
+
+
+def _dual_spies(monkeypatch, tmp_path, *, preflight_raises: bool):
+    import onoats.dual as dual_mod
+    from onoats import runtime
+    from onoats.config import audio_devices
+    from onoats.runtime import SttPreflightError
+
+    calls: list[str] = []
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("STT_SERVICE", "websocket")
+
+    def _lock(*_a, **_k):
+        calls.append("lock")
+
+    def _preflight(*_a, **_k):
+        calls.append("preflight")
+        if preflight_raises:
+            raise SttPreflightError("diarization: weights not downloaded")
+
+    def _builder(name):
+        def _b(*_a, **_k):
+            calls.append(name)
+            raise _Stop
+
+        return _b
+
+    monkeypatch.setattr(dual_mod, "_acquire_instance_lock", _lock)
+    monkeypatch.setattr(runtime, "_preflight_diarization", _preflight)
+    monkeypatch.setattr(dual_mod, "_build_socket_transports", _builder("socket"))
+    monkeypatch.setattr(dual_mod, "_build_portaudio_transports", _builder("portaudio"))
+    monkeypatch.setattr(
+        audio_devices, "select_dual_input_devices", _builder("select_devices")
+    )
+    return dual_mod, calls
+
+
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
+def test_dual_diarization_preflight_failure_blocks_capture(
+    source, tmp_path, monkeypatch
+):
+    from onoats.runtime import SttPreflightError
+
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    dual_mod, calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=True)
+
+    with pytest.raises(SttPreflightError):  # mapped to rc=1 by dual.main
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    assert calls == ["lock", "preflight"], (
+        "no transport builder / select_dual_input_devices may run once "
+        f"preflight fails; saw {calls}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "builder"), [("portaudio", "portaudio"), ("socket", "socket")]
+)
+def test_dual_diarization_lock_then_preflight_precede_capture(
+    source, builder, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+    dual_mod, calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=False)
+
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    assert calls[:3] == ["lock", "preflight", builder], calls
+
+
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
+def test_dual_diarization_flag_off_never_preflights(source, tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
+    dual_mod, calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=True)
+
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    assert "preflight" not in calls
+    assert calls[0] == "lock"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 (them-channel diarization): feeder/labeler wiring in the system arm
+# ---------------------------------------------------------------------------
+#
+# ``_build_dual_pipeline(..., diarization=<bool>, diarizer_factory=<stub>)``
+# inserts ``DiarizationFeeder`` IMMEDIATELY BEFORE ``system_stt`` and
+# ``DiarizationLabeler`` after the system ``SourceTagger`` — system arm only.
+# The mic arm is identical flag on/off. No test here ever imports ``mlx_audio``;
+# the model is always a stub injected via ``diarizer_factory`` (invoked on the
+# worker thread).
+
+
+class _FakeInput(FrameProcessor):
+    """Stand-in for ``transport.input()`` (structure-only builds)."""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+
+
+class _FakeTransport:
+    def __init__(self):
+        self._input = _FakeInput()
+
+    def input(self):
+        return self._input
+
+
+@pytest.fixture
+def captured_arms(monkeypatch):
+    """Capture the ``(mic_arm, system_arm)`` lists handed to ``ParallelPipeline``."""
+    import pipecat.pipeline.parallel_pipeline as pp_mod
+
+    captured: dict[str, list] = {}
+    real = pp_mod.ParallelPipeline
+
+    def spy(*arms, **kw):
+        captured["mic"], captured["system"] = list(arms[0]), list(arms[1])
+        return real(*arms, **kw)
+
+    monkeypatch.setattr(pp_mod, "ParallelPipeline", spy)
+    return captured
+
+
+def _build_structure(builder, captured, *, diarization, two_paths=None, **extra):
+    """Build the dual pipeline (structure only) and return ``(mic_arm, system_arm, sys_stt)``."""
+    from onoats.dual import _build_dual_pipeline, _build_socket_transports
+
+    if builder == "socket":
+        _b, mic_path, system_path = two_paths
+        mic_t, system_t, _ml, _sl = _build_socket_transports(
+            _cfg(mic_path, system_path)
+        )
+    else:  # "portaudio": the default-path shape, without opening PortAudio
+        mic_t, system_t = _FakeTransport(), _FakeTransport()
+    system_stt = _MarkerSTT("system")
+    _build_dual_pipeline(
+        mic_t,
+        system_t,
+        _PassThroughVAD(),
+        _PassThroughVAD(),
+        _MarkerSTT("mic"),
+        system_stt,
+        _NoopSilenceDetector(),
+        _NoopSilenceDetector(),
+        call_id="test-diar-struct",
+        diarization=diarization,
+        diarizer_factory=_stub_factory if diarization else None,
+        **extra,
+    )
+    return captured["mic"], captured["system"], system_stt
+
+
+# ---- stub diarizer model (matches the surface DiarizerWorker uses) ----------
+
+
+class _StubModel:
+    """Quacks like the mlx_audio diarizer: 160-sample rows, slot 0 always active."""
+
+    sample_rate = 16000
+
+    def __init__(self, raise_in_feed: bool = False):
+        import types
+
+        self.config = types.SimpleNamespace(
+            num_speakers=8,
+            output_subsampling_factor=1,
+            processor_config=types.SimpleNamespace(hop_length=160),
+        )
+        self._raise = raise_in_feed
+        self._total = 0
+        self._emitted = 0
+
+    def set_streaming_config(self, preset):
+        self.preset = preset
+
+    def init_streaming_state(self):
+        import types
+
+        return types.SimpleNamespace(frames_processed=0)
+
+    def feed(self, audio, state, sample_rate=16000, final=False):
+        import types
+
+        import numpy as np
+
+        if self._raise:
+            raise RuntimeError("stub feed() boom")
+        self._total += len(audio)
+        rows = self._total // 160 - self._emitted
+        if final:
+            rows += 1 if self._total % 160 else 0
+        rows = max(rows, 0)
+        self._emitted += rows
+        probs = np.zeros((rows, 8), dtype=np.float32)
+        if rows:
+            probs[:, 0] = 0.99
+        state.frames_processed = self._emitted
+        return types.SimpleNamespace(speaker_probs=probs), state
+
+
+def _stub_factory():
+    return _StubModel()
+
+
+def _raising_factory():
+    raise RuntimeError("stub factory boom")
+
+
+def _raising_feed_factory():
+    return _StubModel(raise_in_feed=True)
+
+
+# ---- structure: mic arm unchanged, feeder adjacent, system arm only ----------
+
+
+@pytest.mark.parametrize("builder", ["portaudio", "socket"])
+def test_mic_arm_processor_types_identical_flag_on_off(
+    builder, two_paths, captured_arms
+):
+    mic_off, _s_off, _ = _build_structure(
+        builder, captured_arms, diarization=False, two_paths=two_paths
+    )
+    types_off = [type(p) for p in mic_off]
+    mic_on, _s_on, _ = _build_structure(
+        builder, captured_arms, diarization=True, two_paths=two_paths
+    )
+    types_on = [type(p) for p in mic_on]
+    assert types_off == types_on
+    from onoats.processors.diarization_feeder import DiarizationFeeder
+    from onoats.processors.diarization_labeler import DiarizationLabeler
+
+    assert not any(
+        isinstance(p, (DiarizationFeeder, DiarizationLabeler)) for p in mic_on
+    )
+
+
+@pytest.mark.parametrize("builder", ["portaudio", "socket"])
+def test_flag_off_system_arm_has_no_diarization_processors(
+    builder, two_paths, captured_arms
+):
+    from onoats.processors.diarization_feeder import DiarizationFeeder
+    from onoats.processors.diarization_labeler import DiarizationLabeler
+
+    _m, system, _ = _build_structure(
+        builder, captured_arms, diarization=False, two_paths=two_paths
+    )
+    assert not any(
+        isinstance(p, (DiarizationFeeder, DiarizationLabeler)) for p in system
+    )
+
+
+@pytest.mark.parametrize("builder", ["portaudio", "socket"])
+def test_flag_on_feeder_immediately_before_system_stt(
+    builder, two_paths, captured_arms
+):
+    from onoats.processors.diarization_feeder import DiarizationFeeder
+    from onoats.processors.diarization_labeler import DiarizationLabeler
+    from onoats.processors.source_tagger import SourceTagger
+
+    _m, system, system_stt = _build_structure(
+        builder, captured_arms, diarization=True, two_paths=two_paths
+    )
+    i = system.index(system_stt)
+    assert isinstance(system[i - 1], DiarizationFeeder)
+    assert sum(isinstance(p, DiarizationFeeder) for p in system) == 1
+    assert sum(isinstance(p, DiarizationLabeler) for p in system) == 1
+    # Labeler is downstream of the system SourceTagger (which follows the STT).
+    assert isinstance(system[i + 1], SourceTagger)
+    assert isinstance(system[i + 2], DiarizationLabeler)
+    # Feeder + labeler share one session timeline.
+    assert system[i - 1]._timeline is system[i + 2]._timeline
+
+
+def test_feeder_adjacent_to_stt_after_audio_dump(
+    two_paths, captured_arms, monkeypatch, tmp_path
+):
+    """With ONOATS_AUDIO_DUMP on, the dump processor precedes the feeder."""
+    from onoats.processors import audio_dump
+    from onoats.processors.audio_dump import RawAudioDumpProcessor
+    from onoats.processors.diarization_feeder import DiarizationFeeder
+
+    monkeypatch.setenv("ONOATS_AUDIO_DUMP", "1")
+    monkeypatch.setattr(audio_dump, "resolve_dump_dir", lambda: tmp_path)
+    _m, system, system_stt = _build_structure(
+        "portaudio", captured_arms, diarization=True
+    )
+    i = system.index(system_stt)
+    assert isinstance(system[i - 1], DiarizationFeeder)
+    assert isinstance(system[i - 2], RawAudioDumpProcessor)
+
+
+def test_diarizer_factory_not_invoked_at_build_time(two_paths, captured_arms):
+    """The factory runs on the worker thread (after StartFrame), never at build."""
+    from onoats.dual import _build_dual_pipeline
+
+    calls: list[str] = []
+
+    def factory():
+        calls.append("called")
+        return _StubModel()
+
+    _build_dual_pipeline(
+        _FakeTransport(),
+        _FakeTransport(),
+        _PassThroughVAD(),
+        _PassThroughVAD(),
+        _MarkerSTT("mic"),
+        _MarkerSTT("system"),
+        _NoopSilenceDetector(),
+        _NoopSilenceDetector(),
+        diarization=True,
+        diarizer_factory=factory,
+    )
+    assert calls == []
+
+
+# ---- behaviour: me/them x flag on/off matrix, through the built arms --------
+
+_ATTRS = ("onoats_speakers", "onoats_overlap")
+_SEG_ATTRS = ("onoats_segment_start_sample", "onoats_segment_end_sample")
+_FRAME_SAMPLES = 160
+
+
+class _StampingSTT(FrameProcessor):
+    """Marker STT that mirrors production stamping: only ``stamp=True`` (them arm,
+    flag on in production) sets ``onoats_segment_*``. It never sets
+    ``onoats_speakers`` / ``onoats_overlap`` — only the labeler may.
+    """
+
+    def __init__(self, *, stamp: bool):
+        super().__init__()
+        self._stamp = stamp
+        self._samples = 0
+
+    async def process_frame(self, frame, direction):
+        from pipecat.frames.frames import InputAudioRawFrame, StartFrame
+
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            self._samples = 0
+        if isinstance(frame, InputAudioRawFrame):
+            start = self._samples
+            self._samples += len(frame.audio) // 2
+            out = TranscriptionFrame(
+                text=f"t:{start}", user_id="", timestamp="2026-01-01T00:00:00Z"
+            )
+            if self._stamp:
+                out.onoats_segment_start_sample = start
+                out.onoats_segment_end_sample = self._samples
+            await self.push_frame(out, direction)
+            return
+        await self.push_frame(frame, direction)
+
+
+class _Recorder(FrameProcessor):
+    """Pass-through that records TranscriptionFrames (the ``TranscriptBuffer`` slot)."""
+
+    def __init__(self):
+        super().__init__()
+        self.transcripts: list = []
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            self.transcripts.append(frame)
+        await self.push_frame(frame, direction)
+
+
+async def _feed_blocks(marker: int, n_frames: int = 4):
+    pcm = pcm_from_samples([marker] + [0] * (_FRAME_SAMPLES - 1))
+
+    async def feed(writer: asyncio.StreamWriter):
+        writer.write(make_header())
+        for seq in range(n_frames):
+            writer.write(make_frame(seq, pcm))
+        await writer.drain()
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    return feed
+
+
+async def _run_socket_dual(two_paths, *, diarization, factory, buffer=None):
+    """Drive the real ``_build_dual_pipeline`` over two sockets; return (down, up)."""
+    from onoats.dual import _build_dual_pipeline, _build_socket_transports
+
+    _base, mic_path, system_path = two_paths
+    mic_t, system_t, _ml, _sl = _build_socket_transports(_cfg(mic_path, system_path))
+    pipeline = _build_dual_pipeline(
+        mic_t,
+        system_t,
+        _PassThroughVAD(),
+        _PassThroughVAD(),
+        _StampingSTT(stamp=False),  # mic: stamp kwarg is False in production
+        _StampingSTT(stamp=diarization),  # system: stamped only with flag on
+        buffer if buffer is not None else _Recorder(),
+        _NoopSilenceDetector(),
+        call_id="test-diar-matrix",
+        diarization=diarization,
+        diarizer_factory=factory if diarization else None,
+    )
+    mic_server = _SocketWriterServer(mic_path, await _feed_blocks(MIC_MARKER))
+    system_server = _SocketWriterServer(system_path, await _feed_blocks(SYSTEM_MARKER))
+    await mic_server.start()
+    await system_server.start()
+    try:
+        return await asyncio.wait_for(
+            run_test(pipeline, frames_to_send=[SleepFrame(0.5)]),
+            timeout=WAIT_TIMEOUT * 2,
+        )
+    finally:
+        await mic_server.aclose()
+        await system_server.aclose()
+
+
+def _split(down):
+    ts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    return (
+        [f for f in ts if f.user_id == "me"],
+        [f for f in ts if f.user_id == "them"],
+    )
+
+
+def _has_any(frame, names):
+    return [n for n in names if hasattr(frame, n)]
+
+
+@pytest.mark.anyio
+async def test_matrix_me_flag_off_never_carries_diarization_attrs(two_paths):
+    down, _up = await _run_socket_dual(two_paths, diarization=False, factory=None)
+    me, them = _split(down)
+    assert me and them
+    for f in me:
+        assert _has_any(f, _ATTRS + _SEG_ATTRS) == []
+
+
+@pytest.mark.anyio
+async def test_matrix_me_flag_on_never_carries_diarization_attrs(two_paths):
+    down, _up = await _run_socket_dual(
+        two_paths, diarization=True, factory=_stub_factory
+    )
+    me, them = _split(down)
+    assert me and them
+    for f in me:
+        assert _has_any(f, _ATTRS + _SEG_ATTRS) == []
+
+
+@pytest.mark.anyio
+async def test_matrix_them_flag_off_never_carries_any_attr(two_paths):
+    """Req 8: flag off => ``them`` frames carry none of speakers/overlap/segment_*."""
+    down, _up = await _run_socket_dual(two_paths, diarization=False, factory=None)
+    _me, them = _split(down)
+    assert them
+    for f in them:
+        assert _has_any(f, _ATTRS + _SEG_ATTRS) == []
+
+
+@pytest.mark.anyio
+async def test_matrix_them_flag_on_carries_attrs_only_via_labeler(
+    two_paths, monkeypatch
+):
+    """Flag on => ``them`` frames are labelled; the labeler is the only writer.
+
+    A spy on the system ``SourceTagger``'s successor proves the STT/tagger never
+    set the labeler-owned attributes: they appear after the labeler only.
+    """
+    from onoats.processors.diarization_labeler import DiarizationLabeler
+
+    seen_before_labeler: list = []
+    real_process = DiarizationLabeler.process_frame
+
+    async def spy(self, frame, direction):
+        if isinstance(frame, TranscriptionFrame):
+            seen_before_labeler.append(_has_any(frame, _ATTRS))
+        return await real_process(self, frame, direction)
+
+    monkeypatch.setattr(DiarizationLabeler, "process_frame", spy)
+
+    down, _up = await _run_socket_dual(
+        two_paths, diarization=True, factory=_stub_factory
+    )
+    _me, them = _split(down)
+    assert them
+    assert seen_before_labeler, "labeler never saw a transcript"
+    assert all(a == [] for a in seen_before_labeler), seen_before_labeler
+    for f in them:
+        assert isinstance(f.onoats_speakers, list) and f.onoats_speakers
+        assert f.onoats_overlap is False
+        assert f.onoats_segment_end_sample > f.onoats_segment_start_sample >= 0
+
+
+# ---- behaviour: wired-arm degrade never drops a transcript ------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "factory", [_raising_factory, _raising_feed_factory], ids=["factory", "feed"]
+)
+async def test_wired_arm_degrade_still_delivers_transcripts(two_paths, factory):
+    from pipecat.frames.frames import ErrorFrame
+
+    buffer = _Recorder()
+    down, up = await _run_socket_dual(
+        two_paths, diarization=True, factory=factory, buffer=buffer
+    )
+    _me, them = _split(down)
+    # Every them transcript reached the TranscriptBuffer slot, unlabelled.
+    assert them, "degraded diarizer dropped `them` transcripts"
+    assert {f.text for f in them} == {
+        f.text for f in buffer.transcripts if f.user_id == "them"
+    }
+    for f in them:
+        assert _has_any(f, _ATTRS) == []
+    # Session continued: mic transcripts unaffected; no ErrorFrame either way.
+    assert _me
+    assert not [f for f in list(down) + list(up) if isinstance(f, ErrorFrame)]
+
+
+@pytest.mark.anyio
+async def test_wired_arm_degrade_reaches_real_transcript_buffer(two_paths, tmp_path):
+    """Same degrade, with the real ``TranscriptBuffer`` as the sink."""
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    buffer = TranscriptBuffer(data_dir=tmp_path / "data", use_frame_source=True)
+    seen: list = []
+    real = buffer.process_frame
+
+    async def spy(frame, direction):
+        if isinstance(frame, TranscriptionFrame):
+            seen.append(frame)
+        return await real(frame, direction)
+
+    buffer.process_frame = spy  # type: ignore[method-assign]
+    await _run_socket_dual(
+        two_paths, diarization=True, factory=_raising_factory, buffer=buffer
+    )
+    assert [f for f in seen if f.user_id == "them"]

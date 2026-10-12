@@ -7,7 +7,12 @@ from datetime import datetime, timezone
 from pipecat.frames.frames import Frame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from onoats.frames import resolve_frame_source
+from onoats.frames import (
+    resolve_frame_overlap,
+    resolve_frame_source,
+    resolve_frame_speakers,
+)
+from onoats.render import compose_speaker_label
 
 
 def _display_label(source: str) -> str:
@@ -26,6 +31,11 @@ class LiveTerminalRenderer(FrameProcessor):
             source = resolve_frame_source(frame)
             if finalized and text and source:
                 stamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
-                print(f"[{stamp}] {_display_label(source)}: {text}", flush=True)
+                label = compose_speaker_label(
+                    _display_label(source),
+                    resolve_frame_speakers(frame),
+                    bool(resolve_frame_overlap(frame)),
+                )
+                print(f"[{stamp}] {label}: {text}", flush=True)
 
         await self.push_frame(frame, direction)

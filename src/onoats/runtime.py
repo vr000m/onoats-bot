@@ -56,6 +56,7 @@ from onoats._vendor.pid import (  # noqa: F401
 from onoats._vendor.pid import (
     read_pid_file as _read_pid_file,
 )
+from onoats.stt import diarization_model as _diarization_model
 
 # termios/tty/fcntl are Unix-only — guard for Windows compatibility
 if sys.platform != "win32":
@@ -78,6 +79,14 @@ class SttPreflightError(RuntimeError):
     Caught at the CLI entrypoints (``bot/__main__.py``, ``bot/dual.py``) so
     the user sees the actionable hint — not a Python traceback — when the
     LaunchAgent isn't loaded.
+    """
+
+
+class DiarizationPreflightError(SttPreflightError):
+    """Raised at startup when ``diarization`` is on but cannot work.
+
+    Subclasses :class:`SttPreflightError` so every entrypoint's existing
+    ``except SttPreflightError`` boundary maps it to a clean rc=1.
     """
 
 
@@ -131,9 +140,12 @@ def _env_float(
 # Graceful two-phase shutdown (see _shutdown_watcher in __main__/dual):
 #
 #   1. DRAIN — queue an EndFrame (``task.stop_when_done()``). An EndFrame, unlike
-#      a CancelFrame, lets an in-flight segment finish: SegmentedSTTService
-#      awaits ``run_stt`` inline in ``process_frame``, so the EndFrame queues
-#      behind it, the final ``TranscriptionFrame`` is delivered to
+#      a CancelFrame, lets an in-flight segment finish. On pipecat 1.3.0-1.8.x
+#      SegmentedSTTService awaits ``run_stt`` inline in ``process_frame``, so
+#      the EndFrame queues behind it; on 1.9+ segments go onto one in-order
+#      queue task, and the EndFrame's graceful ``stop()`` lets that task
+#      transcribe what is queued before it ends (only ``cancel()`` drops queued
+#      segments). Either way the final ``TranscriptionFrame`` is delivered to
 #      TranscriptBuffer, and only then does the pipeline end. This is what makes
 #      the terminal flush capture the last spoken segment. The drain ends as
 #      soon as the pipeline finishes, so the common (nothing-pending) case exits
@@ -1287,6 +1299,7 @@ async def _create_stt_service(
     *,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
+    stamp_segment_samples: bool = False,
 ) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -1335,6 +1348,11 @@ async def _create_stt_service(
     transcript first clears the shared ``stt`` warning (a session where
     only the second instance ever produces transcripts, e.g. system-audio
     only, would otherwise leave that warning pinned for the whole session).
+
+    ``stamp_segment_samples`` (websocket backend only) makes the service stamp
+    each ``TranscriptionFrame`` with its VAD span for them-channel diarization.
+    It is passed explicitly by the caller (system arm only) and is never
+    derived from config here.
     """
     from onoats.config import load_config
 
@@ -1453,6 +1471,7 @@ async def _create_stt_service(
             # token from `id(self)`, a memory address CPython reuses after
             # GC.
             instance_name=branch_instance,
+            stamp_segment_samples=stamp_segment_samples,
             on_recovery=live_on_recovery,
             on_preflight_confirmed=(
                 on_preflight_confirmed if recovered_in_preflight else None
@@ -1847,6 +1866,92 @@ def _refuse_if_live_recorder(pid_path: Path) -> None:
                 "file) — refusing to start over a possibly-live recorder. Stop it "
                 "(`onoats stop`) or remove the stale pid file, then retry."
             )
+
+
+# Aliases of the single owner (``onoats.stt.diarization_model``), shared with
+# the worker's loader so the preflight probes exactly what the loader needs.
+DIARIZATION_REPO_ID = _diarization_model.REPO_ID
+_DIARIZATION_INSTALL_HINT = (
+    "`uv sync --extra diarization` (checkout) or "
+    "`uv tool install 'onoats[macos,diarization]'` (tool install; "
+    "repeat any extras you already have)"
+)
+_DIARIZATION_DOWNLOAD_HINT = _diarization_model.DOWNLOAD_HINT
+
+# Repo ids whose config-independent probes (extra installed + weights cached)
+# passed, so the socket-mode double call (supervisor, then ``run_onoats_dual``)
+# skips them. The cfg-dependent backend check is never memoized: config is
+# reloaded between the two calls.
+_diarization_preflight_done: set[str] = set()
+
+
+def _diarization_extra_installed() -> bool:
+    """``find_spec`` only: never imports ``mlx_audio`` (no MLX state)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("mlx_audio") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+# Module attribute (not a direct call into the leaf) so tests can patch it.
+_diarization_weights_cached = _diarization_model.weights_cached
+
+
+def _preflight_diarization(cfg) -> None:
+    """Fail loud (before any capture side effect) if diarization can't run.
+
+    Import-free and non-downloading: ``find_spec`` for the extra plus a local
+    cache probe for the weights; no ``mlx_audio`` import, no model held, no
+    network. Called right after ``_acquire_instance_lock`` and ONLY when the
+    flag is on. The backend check reads ``cfg`` and runs on every call; the
+    extra + weights probes are memoized on success. The worker does the real
+    model load.
+
+    Raises :class:`DiarizationPreflightError` (an ``SttPreflightError``, so
+    callers map it to rc=1) after logging an ERROR with the remedy.
+    """
+
+    def _fail(message: str) -> None:
+        logger.error(message)
+        raise DiarizationPreflightError(message)
+
+    if cfg.stt_service != "websocket":
+        _fail(
+            "diarization is enabled but STT_SERVICE="
+            f"{cfg.stt_service!r}: only the 'websocket' backend can stamp "
+            "segment samples, so the flag would silently do nothing. Set "
+            "STT_SERVICE=websocket or disable ONOATS_DIARIZATION / "
+            "[stt].diarization."
+        )
+    if DIARIZATION_REPO_ID in _diarization_preflight_done:
+        return
+    # First, so a user on an unrecognised pipecat is not sent off to install the
+    # extra and download the weights only to hit this wall. Lazy import: the
+    # leaf pulls pipecat in only when the flag is on.
+    from onoats.stt.diarization_timeline import segmented_stt_orders_spans
+
+    if not segmented_stt_orders_spans():
+        _fail(
+            "diarization is enabled but the installed pipecat-ai does not "
+            "hand SegmentedSTTService segments to run_stt in VAD-stop order "
+            "(neither inline nor through one in-order queue task), so a VAD "
+            "span cannot be matched to its segment and speaker labels could "
+            "land on the wrong utterance. Upgrade onoats, or disable "
+            "ONOATS_DIARIZATION / [stt].diarization."
+        )
+    if not _diarization_extra_installed():
+        _fail(
+            "diarization is enabled but the 'mlx_audio' package is not "
+            f"installed. Install the extra: {_DIARIZATION_INSTALL_HINT}"
+        )
+    if not _diarization_weights_cached(DIARIZATION_REPO_ID):
+        _fail(
+            f"diarization is enabled but the model weights ({DIARIZATION_REPO_ID}) "
+            f"are not downloaded; run: {_DIARIZATION_DOWNLOAD_HINT}"
+        )
+    _diarization_preflight_done.add(DIARIZATION_REPO_ID)
 
 
 def _acquire_instance_lock(active_dir: Path) -> None:
