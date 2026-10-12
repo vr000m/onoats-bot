@@ -581,3 +581,18 @@ should NOT re-flag go here, one per line:
   markdown into a rendered label. onoats reads only files it wrote itself into
   its 0700 data dir; an attacker who can edit them can already edit the
   transcript text. (2026-10-11)
+- **[Logic] won't-fix**: `DiarizationLabeler`'s stall guard reads "coverage did
+  not advance" as "the diarizer is hung", but coverage also stalls when no audio
+  reaches the feeder (capture hiccup, device re-bind). More than ~3 s of silence
+  while two stamped frames are held degrades labels for the rest of the session
+  although the diarizer is healthy. Accepted: the socket capturer's silence
+  pacer keeps audio flowing, so it is unlikely, and fixing it means a design
+  change to the fail-open contract (only count a stall when the feeder has audio
+  queued or its counter has advanced). Transcription is never lost, only
+  unlabelled. (2026-10-11)
+- **[Logic] won't-fix**: stopping `onoats bot` while the diarizer model is still
+  loading leaves the daemon worker thread behind after the feeder's bounded join
+  (5 s). Tried to reproduce on 2026-10-11: five start-then-stop cycles with the
+  stop sent 0.1-0.6 s after the pipeline was ready (inside the load window), all
+  exit 0 in 3-4 s with no degraded WARNING, no traceback and no macOS crash
+  report. Not reproducible, so left as is. (2026-10-11)
