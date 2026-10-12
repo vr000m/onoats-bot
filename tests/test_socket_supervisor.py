@@ -518,6 +518,9 @@ def sup_env(short_root, fake_capturer, monkeypatch):
     monkeypatch.setenv("AUDIO_SOURCE", "socket")
     monkeypatch.setenv("ONOATS_CAPTURER_BIN", str(fake_capturer))
     monkeypatch.delenv("KODA_DATA_DIR", raising=False)
+    # Hermetic config: never read the developer's real config.toml (a local
+    # `[stt] diarization = true` made the flag-off preflight test fail).
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(short_root / "xdg"))
     # Don't leak socket paths in from a prior test/process.
     monkeypatch.delenv("ONOATS_MIC_SOCKET", raising=False)
     monkeypatch.delenv("ONOATS_SYSTEM_SOCKET", raising=False)
