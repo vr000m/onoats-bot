@@ -1,6 +1,6 @@
 # Task: Live speaker diarization on the "them" channel
 
-**Status**: In Progress
+**Status**: Complete (merged in PR #29; ships in v1.4.0)
 **Component**: recorder, stt
 **Assigned to**: Claude
 **Priority**: Medium
@@ -1095,7 +1095,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-09 @ 943a14e20133325d94f35d8c2848a5a5769d8de9 -->
+<!-- reviewed: 2026-10-09 @ 6db2153b908d5e002acb8fa8bcfd15d4bf72369c -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
