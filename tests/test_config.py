@@ -242,6 +242,24 @@ def test_diarization_resolves_from_config_file(tmp_path, monkeypatch):
     assert cfg.diarization is True
 
 
+def test_diarization_idle_remint_sec_resolution(monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    assert OnoatsConfig(raw={}).diarization_idle_remint_sec is None
+    toml = {"stt": {"diarization_idle_remint_sec": 900}}
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 900.0
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", "1800")
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 1800.0
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", "  ")
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 900.0
+
+
+@pytest.mark.parametrize("bad", ["soon", "0", "-5", "inf", "nan", True])
+def test_diarization_idle_remint_sec_invalid_falls_back_to_default(monkeypatch, bad):
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    cfg = OnoatsConfig(raw={"stt": {"diarization_idle_remint_sec": bad}})
+    assert cfg.diarization_idle_remint_sec is None
+
+
 def test_parse_diarization_value_distinguishes_absent_off_and_garbage():
     """One owner of the absent-vs-off rule for both the runtime reader and
     `onoats init`: absent (None / blank) is None, off is False, garbage raises."""

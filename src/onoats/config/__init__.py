@@ -435,6 +435,37 @@ class OnoatsConfig:
             )
         return False
 
+    @property
+    def diarization_idle_remint_sec(self) -> float | None:
+        """Seconds a diarizer slot may sit idle before it is given a new label.
+
+        env ``ONOATS_DIARIZATION_IDLE_REMINT_SEC`` > config.toml
+        ``[stt].diarization_idle_remint_sec`` > ``None`` (the timeline's own
+        default). A non-positive, non-finite or non-numeric value logs one
+        WARNING and falls back to the default, so a typo can never disable
+        re-minting or make every utterance a new speaker.
+        """
+        val = _env_or(
+            "ONOATS_DIARIZATION_IDLE_REMINT_SEC",
+            self.raw.get("stt", {}).get("diarization_idle_remint_sec"),
+        )
+        if val is None:
+            return None
+        try:
+            sec = float("nan") if isinstance(val, bool) else float(val)
+        except (TypeError, ValueError):
+            sec = float("nan")
+        if sec > 0 and sec != float("inf"):
+            return sec
+        text = f"idle_remint:{val}"
+        if text not in _warned_diarization_values:
+            _warned_diarization_values.add(text)
+            logger.warning(
+                f"STT: ignoring invalid diarization_idle_remint_sec {val!r} "
+                "(expected a positive number of seconds); using the default"
+            )
+        return None
+
     # ---- speakers (render-only display labels) ----
     @property
     def speaker_label_me(self) -> str:

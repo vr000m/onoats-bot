@@ -357,8 +357,9 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
 - **Labels are never reused within a run.** `DiarizationTimeline` keeps, per
   model slot, a list of generations `(first active sample, number)` from one
   monotonic counter (`record`, worker thread; `label_for` only reads). A slot
-  idle for more than `SLOT_IDLE_REMINT_SEC` (300 s) gets a new number on its
-  next active frame, and a window's label uses the generation in force at the
+  idle for more than `SLOT_IDLE_REMINT_SEC` (1200 s; override with
+  `[stt].diarization_idle_remint_sec` or `ONOATS_DIARIZATION_IDLE_REMINT_SEC`)
+  gets a new number on its next active frame, and a window's label uses the generation in force at the
   slot's last active frame in it, so numbers pass `S8` and the grammar is
   `^S[0-9]+$`. This errs toward splitting a speaker and cannot catch a swap while
   both speakers are active. Pinned by `tests/test_diarization_timeline.py`.

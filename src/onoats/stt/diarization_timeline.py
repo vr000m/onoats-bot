@@ -29,9 +29,9 @@ Slot -> ``S{n}`` mapping happens in ``record`` (worker thread), in the order
 each model slot first crosses ``ACTIVITY_THRESHOLD`` in the session, so the
 loop-side ``label_for`` never mutates mapping state. Numbers come from one
 monotonic counter and are never reused: a slot idle for more than
-``SLOT_IDLE_REMINT_SEC`` is given a fresh number on its next active frame, so a
-label does not silently move to a different speaker if the model recycles the
-slot. A slot therefore has a list of generations ``(start_sample, n)``.
+``SLOT_IDLE_REMINT_SEC`` (overridable per timeline) is given a fresh number on
+its next active frame, so a label does not silently move to a different speaker
+if the model recycles the slot. A slot therefore has a list of generations ``(start_sample, n)``.
 """
 
 from __future__ import annotations
@@ -70,9 +70,10 @@ HOLD_SEC = 1.5
 #: A model slot idle (no active frame) for longer than this is given a fresh
 #: label on its next active frame. This errs toward splitting one person in two
 #: (safe) rather than letting a recycled slot carry an old speaker's label; it
-#: cannot catch a swap while both speakers are active.
-SLOT_IDLE_REMINT_SEC = 300.0
-IDLE_REMINT_SAMPLES = int(SLOT_IDLE_REMINT_SEC * SAMPLE_RATE_HZ)
+#: cannot catch a swap while both speakers are active. 1200 s because a live
+#: 4-person call (2026-10-12) split every returning speaker at the earlier 300 s,
+#: after silences of 336-946 s; ``[stt].diarization_idle_remint_sec`` overrides it.
+SLOT_IDLE_REMINT_SEC = 1200.0
 #: Queue / segment-serialisation slack added to the ring capacity.
 RING_HEADROOM_SEC = 10.0
 #: How long after the labeler starts the worker may still be loading the model
@@ -599,8 +600,14 @@ class _Segment:
 class DiarizationTimeline:
     """Session-scoped speaker-probability timeline. See module docstring."""
 
-    def __init__(self, capacity_sec: float | None = None) -> None:
+    def __init__(
+        self,
+        capacity_sec: float | None = None,
+        idle_remint_sec: float | None = None,
+    ) -> None:
         cap = RING_CAPACITY_SEC if capacity_sec is None else float(capacity_sec)
+        idle = SLOT_IDLE_REMINT_SEC if idle_remint_sec is None else idle_remint_sec
+        self._idle_remint_samples = int(float(idle) * SAMPLE_RATE_HZ)
         self._capacity_samples = int(cap * SAMPLE_RATE_HZ)
         self._lock = threading.RLock()
         self._segments: list[_Segment] = []  # sorted by start
@@ -609,7 +616,7 @@ class DiarizationTimeline:
         self._slot_count: int | None = None
         # model slot -> [(first active sample, S{n} number)], sorted by start. A
         # new entry is appended when the slot first speaks and after every idle
-        # gap longer than SLOT_IDLE_REMINT_SEC; numbers are never reused.
+        # gap longer than the idle re-mint threshold; numbers are never reused.
         self._gens: dict[int, list[tuple[int, int]]] = {}
         self._last_active: dict[int, int] = {}  # slot -> end of its last active frame
         self._next_label = 1
@@ -660,9 +667,19 @@ class DiarizationTimeline:
         """Caller holds ``_lock``. Note activity of ``slot`` at sample ``pos``."""
         gens = self._gens.get(slot)
         if gens is None:
-            self._gens[slot] = [(pos, self._take_label())]
-        elif pos - self._last_active[slot] > IDLE_REMINT_SAMPLES:
-            gens.append((pos, self._take_label()))
+            label = self._take_label()
+            self._gens[slot] = [(pos, label)]
+            logger.info(
+                f"DiarizationTimeline: model slot {slot} first active -> S{label}"
+            )
+        elif pos - self._last_active[slot] > self._idle_remint_samples:
+            idle_sec = (pos - self._last_active[slot]) / SAMPLE_RATE_HZ
+            label = self._take_label()
+            logger.info(
+                f"DiarizationTimeline: model slot {slot} re-minted S{gens[-1][1]} -> "
+                f"S{label} after {idle_sec:.0f}s idle"
+            )
+            gens.append((pos, label))
         self._last_active[slot] = max(
             self._last_active.get(slot, 0), pos + FRAME_SAMPLES
         )

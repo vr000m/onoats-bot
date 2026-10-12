@@ -38,7 +38,7 @@ that and never rewrites `speakers` with display names. S-labels stay canonical.
   `speakers` is the truth.
 - Labels: run-scoped monotonic counter, never reused (`S1..S8`, then `S9`,
   `S10` after a re-mint). Grammar stays `^S[0-9]+$`. No hashes.
-- Re-mint rule: a slot idle for more than `SLOT_IDLE_REMINT_SEC` (300 s) gets a
+- Re-mint rule: a slot idle for more than `SLOT_IDLE_REMINT_SEC` (1200 s; was 300 s, see Findings) gets a
   new label on its next activity. This errs toward splitting one person in two
   (safe) and does not catch a swap while both speakers are active. How the
   model behaves on a 20-60 minute multi-speaker recording is still unverified
@@ -79,5 +79,6 @@ that and never rewrites `speakers` with display names. S-labels stay canonical.
 ## Findings
 
 - The integration test no longer bounds `S<n>` by the slot count: numbers can pass the model's 8 slots after a re-mint.
-- `SLOT_IDLE_REMINT_SEC = 300` was chosen to match the default silence-timeout; it is a named constant in `diarization_timeline.py` and not configurable. A speaker who is quiet for longer is split into a new label.
+- `SLOT_IDLE_REMINT_SEC` started at 300 s (the silence-timeout) and is now 1200 s, overridable per run; a speaker who is quiet for longer is split into a new label.
 - Not verified: behaviour of the model's slots over a 20-60 minute multi-speaker recording (the Phase 9 manual smoke is still open). The re-mint rule is a safeguard, not a guarantee.
+- 2026-10-12 live call (4 people, ~45 min): 12 labels were issued; every returning speaker was split after silences of 336-946 s (S2/S6/S12, S4/S7/S8/S11, S5/S9, S3/S10), all above the 300 s threshold. Default raised to 1200 s and made configurable (`[stt].diarization_idle_remint_sec`, `ONOATS_DIARIZATION_IDLE_REMINT_SEC`); each first activity and re-mint now logs the model slot and label. Open: the session file has no slot ids, so it is unknown whether those speakers kept one slot (a longer timeout fixes it) or the model gave them new slots (it does not). The next call's log answers that.

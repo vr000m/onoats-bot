@@ -248,9 +248,12 @@ suffix is appended to your configured `[speakers]` label for `them`. The `me`
 channel is never labelled. `S1`/`S2` are per-run slots, not identities, and
 can be wrong (a speaker may be split across slots, or a quiet or overlapped
 stretch left unlabelled). A number is never reused within a run: a model slot
-that has been silent for more than 5 minutes gets a fresh number (`S9`, `S10`,
+that has been silent for more than 20 minutes gets a fresh number (`S9`, `S10`,
 … are possible) when it next speaks, so a label cannot silently move to a
-different person, at the cost of splitting someone who was quiet that long. Names
+different person, at the cost of splitting someone who was quiet that long
+(tune it with `[stt].diarization_idle_remint_sec` or
+`ONOATS_DIARIZATION_IDLE_REMINT_SEC`, in seconds; a bad value falls back to the
+default with a warning). Names
 are not assigned by onoats; a consumer maps labels to names.
 
 - **Enable:** `[stt].diarization = true` in `config.toml`, or

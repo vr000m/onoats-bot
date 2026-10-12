@@ -294,9 +294,36 @@ def test_out_of_order_recording_does_not_remint():
     assert t.label_for(0, seconds(2)).speakers == ["S1"]
 
 
-def test_generations_are_pruned_with_ring_eviction(monkeypatch):
-    monkeypatch.setattr(dt, "IDLE_REMINT_SAMPLES", seconds(5))
-    t = DiarizationTimeline(capacity_sec=20)
+def test_idle_remint_threshold_is_per_timeline_and_defaults_to_the_constant():
+    assert dt.SLOT_IDLE_REMINT_SEC == 1200.0
+    gap = 600  # between a 300 s and a 1200 s threshold
+    for idle_remint_sec, expected in ((None, "S1"), (300, "S2")):
+        t = DiarizationTimeline(capacity_sec=3600, idle_remint_sec=idle_remint_sec)
+        t.set_slot_count(8)
+        t.record(0, probs(frames(2), s0=ON))
+        t.record(seconds(gap), probs(frames(2), s0=ON))
+        assert t.label_for(seconds(gap), seconds(gap + 2)).speakers == [expected]
+
+
+def test_first_activity_and_remint_are_logged_with_the_slot_and_label():
+    from loguru import logger
+
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), level="INFO")
+    try:
+        t = DiarizationTimeline(capacity_sec=3600, idle_remint_sec=60)
+        t.set_slot_count(8)
+        t.record(0, probs(frames(2), s3=ON))
+        t.record(seconds(120), probs(frames(2), s3=ON))
+    finally:
+        logger.remove(sink)
+    text = "".join(lines)
+    assert "model slot 3 first active -> S1" in text
+    assert "model slot 3 re-minted S1 -> S2 after 118s idle" in text
+
+
+def test_generations_are_pruned_with_ring_eviction():
+    t = DiarizationTimeline(capacity_sec=20, idle_remint_sec=5)
     t.set_slot_count(8)
     for i in range(60):  # a new generation every 10 s, far beyond the ring
         t.record(seconds(i * 10), probs(frames(1), s0=ON))

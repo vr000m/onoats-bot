@@ -177,6 +177,7 @@ def _build_dual_pipeline(
     call_id: str | None = None,
     diarization: bool = False,
     diarizer_factory=None,
+    idle_remint_sec: float | None = None,
 ):
     from pipecat.pipeline.parallel_pipeline import ParallelPipeline
     from pipecat.pipeline.pipeline import Pipeline
@@ -266,7 +267,7 @@ def _build_dual_pipeline(
         from onoats.processors.diarization_labeler import DiarizationLabeler
         from onoats.stt.diarization_timeline import DiarizationTimeline
 
-        timeline = DiarizationTimeline()
+        timeline = DiarizationTimeline(idle_remint_sec=idle_remint_sec)
         system_arm.extend(
             [
                 DiarizationFeeder(timeline, diarizer_factory),
@@ -598,6 +599,7 @@ async def run_onoats_dual(
         live_terminal=live_terminal,
         call_id=call_id,
         diarization=diarization_on,
+        idle_remint_sec=cfg.diarization_idle_remint_sec,
     )
 
     task = PipelineTask(

@@ -40,7 +40,8 @@ Annotated tags exist from `v0.9.0` forward.
   configured on. A consumer can treat equal `run_id`s as "same run" and a
   missing one as unknown.
 - **Speaker labels are never reused within a run.** A model slot idle for more
-  than 5 minutes (`SLOT_IDLE_REMINT_SEC`) is given a fresh label on its next
+  than 20 minutes (`SLOT_IDLE_REMINT_SEC`, 1200 s; override with
+  `[stt].diarization_idle_remint_sec` or `ONOATS_DIARIZATION_IDLE_REMINT_SEC`) is given a fresh label on its next
   speech, so `S1` cannot silently move to a different person; numbers continue
   past `S8`. Errs toward splitting one person in two; a swap while both speakers
   are active is not detected.
