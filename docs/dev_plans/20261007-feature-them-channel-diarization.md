@@ -1016,9 +1016,10 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
       contract/`num_speakers`/`frames_processed`, non-downloading cache-probe
       call, `uv lock` outcome (advisory, reverted), scratch estimates, 0-300 s
       slot stability
-- [ ] Phase 8b gate recorded in `## Findings`: worker-vs-loop latency, loop
+- [x] Phase 8b gate recorded in `## Findings`: worker-vs-loop latency, loop
       stall, GPU contention, added commit latency (p95) vs
-      `LATENCY_BUDGET_SEC`, long-recording slot stability / overflow
+      `LATENCY_BUDGET_SEC`, long-recording slot stability / overflow (stall/contention
+      by degrade WARNING only; see Findings)
 - [x] Unit: label policy — dominant, overlap above/below threshold,
       zero coverage, partial coverage, GAP, ring eviction, ring-capacity
       invariant, `coverage_high_water` semantics, slot first-activity
@@ -1094,7 +1095,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
   `tests/test_diarization_*.py`; the env-path fixture fallback skips by
   design when unset).
 
-<!-- reviewed: 2026-10-09 @ 8be9afa9728cff58ce53ba671fb5b4e3565d2958 -->
+<!-- reviewed: 2026-10-09 @ 943a14e20133325d94f35d8c2848a5a5769d8de9 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1109,7 +1110,7 @@ Spec: the "Phase 8" block under `## Files to Modify` and the Requirements it cit
 - [x] Phase 6: Persistence + render
 - [x] Phase 7: Wiring
 - [x] Phase 8: Dependency + contract
-- [ ] Phase 8b: Real-pipeline validation gate (latency, drops and slot stability recorded from the 2026-10-12 call; ratio/stall/contention numbers still open)
+- [x] Phase 8b: Real-pipeline validation gate (closed 2026-10-12 on the 47-minute call: latency, drops and slot stability recorded; ratio/stall/contention covered by the degrade WARNING, no new telemetry)
 - [x] Phase 9: Integration + smoke (live call 2026-10-12; see Findings)
 - [x] Phase 10: Docs
 
@@ -1145,7 +1146,7 @@ One real multi-speaker call: 47 min recorded (07:33-08:20 local; the owner recal
 - **Staging drops:** no recorder-side staging-drop WARNING. The capturer logged `send queue full (256)` once per branch at startup (total dropped 100 per branch, i.e. at most ~150 frames) while the recorder was still connecting, then nothing for 47 min. Not diarization related (it happens before the pipeline is ready); both arms drop the same frames before the recorder counts them, so the sample clock stays consistent.
 - **Slot stability:** 12 labels for 4 people (S1 is one stray line). Per the owner's listening, every label belonged to a single person (no label mixed two people), but each person was split: A = S2, S6, S12; B = S4, S7, S8, S11; C = S5, S9; D = S3, S10. All seven splits followed a silence of 336-946 s, i.e. an idle re-mint at the 300 s threshold. It is not known whether those speakers kept one model slot (a longer threshold merges them) or the model gave them new slots (it would not). Default raised to 1200 s and made configurable in `d794b91`/`15fca9d`; each first activity and re-mint now logs the model slot. Needs one more call (or a short run) to see the slot ids.
 - **Shutdown:** the capturer exited first (rc=0) when the app was stopped, so the supervisor logged `capturer exited mid-session (rc=0)` as an ERROR and rotated 969 entries into `pending/`; no data lost.
-- **Not measured here:** worker processing ratio, event-loop stall and GPU contention as numbers (Phase 8b), and a flag-off latency on the same channel. 8b stays open for those.
+- **Not measured as numbers, 8b closed anyway (owner decision, 2026-10-12):** worker processing ratio, event-loop stall, GPU contention, and a flag-off latency on the same channel. Contention is observable without new telemetry: the worker degrades with one WARNING (`processing over budget for N consecutive Ns windows`) after sustained over-budget windows, and a stalled loop shows as the labeler's stall-guard degrade or `them` latency above `LATENCY_BUDGET_SEC`. The 47-minute call logged none of these. Known blind spot: a feeder queue-full drop logs at DEBUG only (once per run), so a drop that does not reach a sustained overrun is invisible at INFO; promote it if contention is ever suspected.
 
 ### Conduct notes (workspace; not contract)
 
