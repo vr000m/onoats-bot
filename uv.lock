@@ -2280,7 +2280,7 @@ requires-dist = [
     { name = "mlx-whisper", marker = "extra == 'macos'", specifier = ">=0.4.0" },
     { name = "numpy", specifier = ">=1.26.4,<3" },
     { name = "pipecat-ai", extras = ["deepgram", "google", "local", "runner", "silero", "soundfile", "webrtc", "whisper"], specifier = ">=1.3.0,<2.0.0" },
-    { name = "pipecat-local-stt-server", specifier = ">=0.3.3,<0.4" },
+    { name = "pipecat-local-stt-server", specifier = ">=0.4.0,<0.5" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "websockets", specifier = ">=13.0" },
 ]
@@ -2498,14 +2498,14 @@ wheels = [
 
 [[package]]
 name = "pipecat-local-stt-server"
-version = "0.3.3"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dd/7a/7af0d646c5e0056ce9dff8e2b304c05e314eafa0a885b96606317a1e3da3/pipecat_local_stt_server-0.3.3.tar.gz", hash = "sha256:4ad50f6b60e9fc544bfc96548910ee758ec3ff719c05190fad2df6604d9f47a4", size = 305429, upload-time = "2026-06-28T08:57:50.35Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/b2/12c8952cd26b8016c8f316b48f34e126196e856b74350c6cb05c7775e591/pipecat_local_stt_server-0.4.0.tar.gz", hash = "sha256:0bfb4bc17bb7dcee309641865e1e21d85ef4fdb875351f9208839d7153bd9f2c", size = 467513, upload-time = "2026-10-25T20:21:50.028Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/89/bb/8bd99f174628339651f1446cba6d82031500c62999e448a75b39146f9726/pipecat_local_stt_server-0.3.3-py3-none-any.whl", hash = "sha256:ecf04ff7647362d51af7c22cd045299bd2c722813becf9f23cea75475e4cd423", size = 62135, upload-time = "2026-06-28T08:57:49.077Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/8b/796d18e3f6f18f8f2a4d2ca166c20c07bce3923fac375774872a0e19f054/pipecat_local_stt_server-0.4.0-py3-none-any.whl", hash = "sha256:1ef078514f831d5a9afeee7b5cf04d9316140d60ddcdbefd7c457a97ceb3c62c", size = 105474, upload-time = "2026-10-25T20:21:48.32Z" },
 ]
 
 [[package]]

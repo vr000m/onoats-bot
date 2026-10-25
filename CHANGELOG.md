@@ -15,6 +15,15 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `pipecat-local-stt-server` from `>=0.3.3,<0.4` to `>=0.4.0,<0.5`.
+  The wire protocol (`PROTOCOL_VERSION == "0.1"`), `stt_server.client` and
+  `stt_server.protocol` are unchanged, so the recorder's client code is too.
+  0.4.0 adds a sibling `<socket>.lock` (single-server flock, left on disk) next
+  to each STT socket; a second `serve` on a live socket now exits with
+  `EADDRINUSE` instead of replacing the running server.
+
 ## [1.4.0] - 2026-10-12
 
 ### Added
