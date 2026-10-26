@@ -200,6 +200,30 @@ def test_rerun_preserves_ws_host_and_port(_isolate_env, monkeypatch):
     assert cfg["stt"]["ws_port"] == 9865
 
 
+def test_rerun_warns_when_ws_socket_outranks_ws_host_port(
+    _isolate_env, monkeypatch, capsys
+):
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    from onoats.config import config_toml_path
+
+    path = config_toml_path()
+    path.write_text(
+        path.read_text().replace(
+            "[stt]\n",
+            '[stt]\nws_socket = "/tmp/old.sock"\nws_host = "127.0.0.1"\nws_port = 9865\n',
+        )
+    )
+
+    _force_tty(monkeypatch, value=False)
+    capsys.readouterr()
+    assert init_mod.main(["--no-preflight"]) == 0
+
+    assert "ws_socket is set alongside ws_host/ws_port" in capsys.readouterr().out
+    cfg = _load_toml(config_toml_path())
+    assert cfg["stt"]["ws_socket"] == "/tmp/old.sock"  # warned, not rewritten
+
+
 @pytest.mark.parametrize(
     "stt_lines",
     [

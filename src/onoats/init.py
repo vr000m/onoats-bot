@@ -184,13 +184,14 @@ def _configure_stt_interactive(existing: dict) -> tuple[dict, dict]:
     secrets: dict = {}
     if local:
         use_ws = _confirm(
-            "Use the local stt_server websocket socket (vs in-process Whisper-MLX)?",
+            "Use the local stt_server websocket (vs in-process Whisper-MLX)?",
             default=False,
         )
         if use_ws:
             stt["service"] = _LOCAL_WEBSOCKET
             sock = _prompt(
-                "stt_server socket path (blank to use STT_WS_* env at runtime)",
+                "stt_server Unix socket path (blank = ws_host/ws_port or STT_WS_* env, else "
+                "a live legacy stt.sock, else 127.0.0.1:9565)",
                 existing.get("ws_socket"),
             )
             if sock:
@@ -889,6 +890,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"{carried_host!r}/{carried_port!r} — both must be set (host "
                 "string, port 1-65535); not carried into the regenerated config.toml."
             )
+    if stt.get("ws_socket") and stt.get("ws_host"):
+        print(
+            "  note: [stt].ws_socket is set alongside ws_host/ws_port and "
+            "outranks them — remove ws_socket to use the TCP endpoint."
+        )
     # Verbatim, not re-rendered from `existing.raw["app"]` — see
     # `_extract_raw_section`'s docstring, `_render_config_toml`'s `[app]`
     # handling, and the comment above for why this section uses a different
