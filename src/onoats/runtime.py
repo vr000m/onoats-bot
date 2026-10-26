@@ -286,10 +286,12 @@ def _mlx_available() -> bool:
 
 
 # Built-in endpoint when nothing is configured: the whisper LaunchAgent that
-# pipecat-local-stt-server >=0.5 installs on loopback TCP (the old
-# ~/Library/Caches/pipecat-stt/stt.sock is removed on reinstall).
+# pipecat-local-stt-server >=0.5 installs on loopback TCP. A pre-0.5 agent
+# listens on the legacy socket below instead (0.5 deletes it on reinstall), so a
+# live legacy socket is preferred and the TCP endpoint is the fallback.
 _DEFAULT_STT_WS_HOST = "127.0.0.1"
 _DEFAULT_STT_WS_PORT = 9565
+_LEGACY_STT_WS_SOCKET = "~/Library/Caches/pipecat-stt/stt.sock"
 
 
 def _resolve_stt_ws_target(
@@ -298,7 +300,8 @@ def _resolve_stt_ws_target(
     """Resolve STT_WS_* env vars into the kwargs for ``WebSocketSTTService``.
 
     Delegates precedence handling to ``stt_server.client.resolve_endpoint_from_env``
-    and layers on the onoats default socket plus the ``STT_WS_TOKEN``
+    and layers on the onoats default endpoint (loopback TCP, or
+    ``STT_WS_DEFAULT_SOCKET`` when set) plus the ``STT_WS_TOKEN``
     bearer read. When operators point at a cleartext remote host, warn
     before attaching the token so a passive on-path observer cannot
     silently capture it.
@@ -320,10 +323,16 @@ def _resolve_stt_ws_target(
     uri = resolved["uri"]
     auth_token = (env.get("STT_WS_TOKEN") or "").strip() or None
 
-    if not (socket_path or host or uri):
+    # ``port is None`` matters: a lone port is an incomplete endpoint the
+    # preflight reports, not "nothing configured" to be replaced by the default
+    # (which would silently ignore the user's port).
+    if not (socket_path or host or port is not None or uri):
         default_socket = env.get("STT_WS_DEFAULT_SOCKET")
+        legacy_socket = os.path.expanduser(_LEGACY_STT_WS_SOCKET)
         if default_socket:
             socket_path = os.path.expanduser(default_socket)
+        elif Path(legacy_socket).is_socket():
+            socket_path = legacy_socket
         else:
             host, port = _DEFAULT_STT_WS_HOST, _DEFAULT_STT_WS_PORT
 
@@ -416,7 +425,7 @@ def _ws_env(cfg) -> dict[str, str]:
 
     ``cfg.stt_ws_*`` already resolve env-over-file, so assigning their values
     back is env-preserving. The socket path is ``expanduser``-ed so a ``~`` in
-    config.toml resolves the same way the built-in default socket does. This is
+    config.toml resolves to the home directory. This is
     what lets ``onoats init``'s written ``ws_socket`` actually reach the
     recorder — env vars are no longer the only source.
     """

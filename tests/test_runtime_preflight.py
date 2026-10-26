@@ -18,6 +18,7 @@ Two layers, in the order the dev plan calls for:
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 from onoats import _closing, runtime
@@ -2655,12 +2656,57 @@ def test_single_input_mode_flag_off_logs_nothing(
     assert not [m for m in records if "diarization" in m]
 
 
-def test_unconfigured_endpoint_defaults_to_loopback_tcp_whisper():
-    """With no socket/host/uri configured the built-in default is the whisper
-    LaunchAgent's loopback TCP endpoint, not the removed `stt.sock`."""
+@pytest.fixture
+def _no_legacy_socket(monkeypatch, tmp_path):
+    """Point the legacy-socket probe at a path that does not exist, so the
+    defaulting tests do not depend on this machine's real stt.sock."""
+    monkeypatch.setattr(runtime, "_LEGACY_STT_WS_SOCKET", str(tmp_path / "none.sock"))
+
+
+def test_unconfigured_endpoint_defaults_to_loopback_tcp_whisper(_no_legacy_socket):
+    """With no socket/host/uri configured and no legacy socket on disk, the
+    built-in default is the whisper LaunchAgent's loopback TCP endpoint."""
     kwargs = runtime._resolve_stt_ws_target({})
     assert kwargs["host"] == "127.0.0.1" and kwargs["port"] == 9565
     assert kwargs["socket_path"] is None and kwargs["uri"] is None
+
+
+def test_unconfigured_endpoint_prefers_a_live_legacy_socket(monkeypatch):
+    """A pre-0.5 agent still listens on stt.sock; with nothing configured onoats
+    must keep reaching it rather than refusing on the TCP default."""
+    import socket as socketlib
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:  # short: AF_UNIX path limit
+        path = os.path.join(d, "stt.sock")
+        srv = socketlib.socket(socketlib.AF_UNIX)
+        srv.bind(path)
+        try:
+            monkeypatch.setattr(runtime, "_LEGACY_STT_WS_SOCKET", path)
+            kwargs = runtime._resolve_stt_ws_target({})
+        finally:
+            srv.close()
+    assert kwargs["socket_path"] == path
+    assert kwargs["host"] is None and kwargs["port"] is None
+
+
+def test_a_regular_file_at_the_legacy_path_is_not_a_socket(monkeypatch, tmp_path):
+    f = tmp_path / "stt.sock"
+    f.write_text("")
+    monkeypatch.setattr(runtime, "_LEGACY_STT_WS_SOCKET", str(f))
+    kwargs = runtime._resolve_stt_ws_target({})
+    assert kwargs["socket_path"] is None and kwargs["port"] == 9565
+
+
+def test_a_lone_port_is_kept_and_rejected_not_replaced_by_the_default(
+    _no_legacy_socket,
+):
+    """A lone `STT_WS_PORT` must reach the preflight's incomplete-endpoint
+    error, not be silently swapped for the default 127.0.0.1:9565."""
+    kwargs = runtime._resolve_stt_ws_target({"STT_WS_PORT": "9865"})
+    assert kwargs["host"] is None and kwargs["port"] == 9865
+    with pytest.raises(SttPreflightError, match="incomplete endpoint"):
+        asyncio.run(_preflight_stt_ws(kwargs, "tcp:9865"))
 
 
 def test_configured_host_port_and_socket_beat_the_default():
@@ -2672,3 +2718,13 @@ def test_configured_host_port_and_socket_beat_the_default():
         {"STT_WS_SOCKET": "/tmp/x.sock", "STT_WS_HOST": "127.0.0.1", "STT_WS_PORT": "1"}
     )
     assert sock["socket_path"] == "/tmp/x.sock" and sock["host"] is None
+
+
+def test_default_socket_env_escape_hatch_beats_the_tcp_default():
+    """`STT_WS_DEFAULT_SOCKET` still selects a (``~``-expanded) socket when
+    nothing else is configured, e.g. to keep talking to a pre-0.5 server."""
+    kwargs = runtime._resolve_stt_ws_target(
+        {"STT_WS_DEFAULT_SOCKET": "~/pipecat-stt/stt.sock"}
+    )
+    assert kwargs["socket_path"] == os.path.expanduser("~/pipecat-stt/stt.sock")
+    assert kwargs["host"] is None and kwargs["port"] is None

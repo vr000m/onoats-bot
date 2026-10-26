@@ -874,7 +874,11 @@ def main(argv: list[str] | None = None) -> int:
         port_val: int | None = None
         if isinstance(carried_port, int) and not isinstance(carried_port, bool):
             port_val = carried_port
-        elif isinstance(carried_port, str) and carried_port.strip().isdigit():
+        elif (
+            isinstance(carried_port, str)
+            and carried_port.strip().isascii()  # '²'.isdigit() is True; int('²') raises
+            and carried_port.strip().isdigit()
+        ):
             port_val = int(carried_port.strip())
         if host_ok and port_val is not None and 1 <= port_val <= 65535:
             stt["ws_host"] = carried_host.strip()

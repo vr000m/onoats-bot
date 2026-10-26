@@ -208,9 +208,12 @@ def test_rerun_preserves_ws_host_and_port(_isolate_env, monkeypatch):
         'ws_host = "127.0.0.1"\nws_port = 0\n',  # out of range
         'ws_host = "127.0.0.1"\nws_port = true\n',  # bool is not a port
         'ws_host = ""\nws_port = 9865\n',  # blank host
+        'ws_host = "127.0.0.1"\nws_port = "\u00b2"\n',  # isdigit() but not int()able
     ],
 )
-def test_rerun_drops_an_invalid_ws_endpoint(_isolate_env, monkeypatch, stt_lines):
+def test_rerun_drops_an_invalid_ws_endpoint(
+    _isolate_env, monkeypatch, capsys, stt_lines
+):
     assert init_mod.main(["--no-preflight"]) == 0
 
     from onoats.config import config_toml_path
@@ -218,11 +221,34 @@ def test_rerun_drops_an_invalid_ws_endpoint(_isolate_env, monkeypatch, stt_lines
     path = config_toml_path()
     path.write_text(path.read_text().replace("[stt]\n", "[stt]\n" + stt_lines))
 
+    capsys.readouterr()  # drain the first run's output
     _force_tty(monkeypatch, value=False)
     assert init_mod.main(["--no-preflight"]) == 0
+    assert "ignoring invalid [stt].ws_host/ws_port" in capsys.readouterr().out
 
     cfg = _load_toml(config_toml_path())
     assert "ws_host" not in cfg["stt"] and "ws_port" not in cfg["stt"]
+
+
+def test_preflight_probes_the_configured_ws_host_and_port(monkeypatch):
+    """`_run_preflight` must hand a config.toml loopback endpoint to the resolver,
+    not fall through to the built-in default."""
+    from onoats import runtime
+
+    for var in ("STT_WS_URI", "STT_WS_SOCKET", "STT_WS_HOST", "STT_WS_PORT"):
+        monkeypatch.delenv(var, raising=False)
+    seen = {}
+
+    async def fake_probe(kwargs, target, **_):
+        seen["kwargs"] = kwargs
+        seen["target"] = target
+
+    monkeypatch.setattr(runtime, "_preflight_stt_ws", fake_probe)
+    init_mod._run_preflight(
+        {"service": "websocket", "ws_host": "127.0.0.1", "ws_port": 9865}, {}
+    )
+    assert (seen["kwargs"]["host"], seen["kwargs"]["port"]) == ("127.0.0.1", 9865)
+    assert seen["target"] == "127.0.0.1:9865"
 
 
 def test_rerun_preserves_a_quoted_launch_at_login_value(_isolate_env, monkeypatch):
