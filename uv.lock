@@ -2280,7 +2280,7 @@ requires-dist = [
     { name = "mlx-whisper", marker = "extra == 'macos'", specifier = ">=0.4.0" },
     { name = "numpy", specifier = ">=1.26.4,<3" },
     { name = "pipecat-ai", extras = ["deepgram", "google", "local", "runner", "silero", "soundfile", "webrtc", "whisper"], specifier = ">=1.3.0,<2.0.0" },
-    { name = "pipecat-local-stt-server", specifier = ">=0.4.0,<0.5" },
+    { name = "pipecat-local-stt-server", specifier = ">=0.4.0,<0.6" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "websockets", specifier = ">=13.0" },
 ]

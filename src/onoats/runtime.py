@@ -285,7 +285,11 @@ def _mlx_available() -> bool:
         return False
 
 
-_DEFAULT_STT_WS_SOCKET = "~/Library/Caches/pipecat-stt/stt.sock"
+# Built-in endpoint when nothing is configured: the whisper LaunchAgent that
+# pipecat-local-stt-server >=0.5 installs on loopback TCP (the old
+# ~/Library/Caches/pipecat-stt/stt.sock is removed on reinstall).
+_DEFAULT_STT_WS_HOST = "127.0.0.1"
+_DEFAULT_STT_WS_PORT = 9565
 
 
 def _resolve_stt_ws_target(
@@ -317,9 +321,11 @@ def _resolve_stt_ws_target(
     auth_token = (env.get("STT_WS_TOKEN") or "").strip() or None
 
     if not (socket_path or host or uri):
-        socket_path = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(
-            _DEFAULT_STT_WS_SOCKET
-        )
+        default_socket = env.get("STT_WS_DEFAULT_SOCKET")
+        if default_socket:
+            socket_path = os.path.expanduser(default_socket)
+        else:
+            host, port = _DEFAULT_STT_WS_HOST, _DEFAULT_STT_WS_PORT
 
     # Cleartext-token guard covers *any* cleartext-ws endpoint, not just
     # STT_WS_URI. host+port paths get lowered to ``ws://host:port/`` via

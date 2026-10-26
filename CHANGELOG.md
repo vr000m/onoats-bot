@@ -23,6 +23,18 @@ Annotated tags exist from `v0.9.0` forward.
   0.4.0 adds a sibling `<socket>.lock` (single-server flock, left on disk) next
   to each STT socket; a second `serve` on a live socket now exits with
   `EADDRINUSE` instead of replacing the running server.
+- The pin also allows `pipecat-local-stt-server` 0.5 (`<0.6`), which moves the
+  STT LaunchAgents from Unix sockets to loopback TCP. With nothing configured,
+  onoats now connects to the whisper agent at `127.0.0.1:9565` instead of the
+  old `~/Library/Caches/pipecat-stt/stt.sock`; `STT_WS_DEFAULT_SOCKET` still
+  overrides. **Upgrade note:** a `[stt].ws_socket` left in `config.toml` outranks
+  `ws_host`/`ws_port`, so remove it when you switch an agent to TCP.
+
+### Fixed
+
+- `onoats init` no longer drops a hand-set `[stt].ws_host` / `ws_port` on re-run
+  (and its preflight now probes that endpoint). A lone host, a lone port or an
+  out-of-range port is dropped with a note.
 
 ## [1.4.0] - 2026-10-12
 

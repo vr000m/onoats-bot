@@ -250,6 +250,9 @@ def _run_preflight(stt: dict, secrets: dict) -> None:
     env = dict(os.environ)
     if stt.get("ws_socket"):
         env["STT_WS_SOCKET"] = stt["ws_socket"]
+    if stt.get("ws_host") and stt.get("ws_port"):
+        env["STT_WS_HOST"] = stt["ws_host"]
+        env["STT_WS_PORT"] = str(stt["ws_port"])
     kwargs = _resolve_stt_ws_target(env)
     target = _display_target(kwargs)
     print(f"  preflight: probing stt_server at {target} …")
@@ -442,6 +445,9 @@ def _render_config_toml(
         lines.append(f'model = "{_toml_escape(stt["model"])}"')
     if stt.get("ws_socket"):
         lines.append(f'ws_socket = "{_toml_escape(stt["ws_socket"])}"')
+    if stt.get("ws_host") and stt.get("ws_port"):
+        lines.append(f'ws_host = "{_toml_escape(stt["ws_host"])}"')
+        lines.append(f"ws_port = {int(stt['ws_port'])}")
     if stt.get("language"):
         lines.append(f'language = "{_toml_escape(stt["language"])}"')
     if stt.get("launchd_label"):
@@ -856,6 +862,29 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if parsed_remint is not None:
             stt["diarization_idle_remint_sec"] = parsed_remint
+    # `ws_host` / `ws_port` (loopback TCP endpoint): never prompted, so carried
+    # over like the keys above. Both or neither: the resolver needs the pair, and
+    # a lone half would be inert at runtime. Validated rather than copied blind
+    # (host a non-blank string, port an int in 1..65535) so a hand-edited bad
+    # value cannot reach `_toml_escape`/`int()` in the renderer.
+    carried_host = existing_stt.get("ws_host")
+    carried_port = existing_stt.get("ws_port")
+    if carried_host is not None or carried_port is not None:
+        host_ok = isinstance(carried_host, str) and carried_host.strip()
+        port_val: int | None = None
+        if isinstance(carried_port, int) and not isinstance(carried_port, bool):
+            port_val = carried_port
+        elif isinstance(carried_port, str) and carried_port.strip().isdigit():
+            port_val = int(carried_port.strip())
+        if host_ok and port_val is not None and 1 <= port_val <= 65535:
+            stt["ws_host"] = carried_host.strip()
+            stt["ws_port"] = port_val
+        else:
+            print(
+                f"  note: ignoring invalid [stt].ws_host/ws_port "
+                f"{carried_host!r}/{carried_port!r} — both must be set (host "
+                "string, port 1-65535); not carried into the regenerated config.toml."
+            )
     # Verbatim, not re-rendered from `existing.raw["app"]` — see
     # `_extract_raw_section`'s docstring, `_render_config_toml`'s `[app]`
     # handling, and the comment above for why this section uses a different

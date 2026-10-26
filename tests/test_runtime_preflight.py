@@ -2653,3 +2653,22 @@ def test_single_input_mode_flag_off_logs_nothing(
     finally:
         logger.remove(sink_id)
     assert not [m for m in records if "diarization" in m]
+
+
+def test_unconfigured_endpoint_defaults_to_loopback_tcp_whisper():
+    """With no socket/host/uri configured the built-in default is the whisper
+    LaunchAgent's loopback TCP endpoint, not the removed `stt.sock`."""
+    kwargs = runtime._resolve_stt_ws_target({})
+    assert kwargs["host"] == "127.0.0.1" and kwargs["port"] == 9565
+    assert kwargs["socket_path"] is None and kwargs["uri"] is None
+
+
+def test_configured_host_port_and_socket_beat_the_default():
+    tcp = runtime._resolve_stt_ws_target(
+        {"STT_WS_HOST": "127.0.0.1", "STT_WS_PORT": "9865"}
+    )
+    assert (tcp["host"], tcp["port"]) == ("127.0.0.1", 9865)
+    sock = runtime._resolve_stt_ws_target(
+        {"STT_WS_SOCKET": "/tmp/x.sock", "STT_WS_HOST": "127.0.0.1", "STT_WS_PORT": "1"}
+    )
+    assert sock["socket_path"] == "/tmp/x.sock" and sock["host"] is None
