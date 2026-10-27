@@ -37,10 +37,10 @@ dependencies = [
     # trust-boundary hardening (0700 socket-dir enforcement + peer-cred 403);
     # 0.4.0 added `serve --supervised`, a single-server flock on `<socket>.lock`
     # and a Kyutai backend. Wire protocol stays "0.1", so the recorder's client
-    # code is unchanged. 0.5 moves the LaunchAgents to loopback TCP (whisper
-    # 9565 and kyutai 9665 are firm, parakeet/nemotron provisional); the library
-    # API is unchanged. <0.6 until the next minor is smoke-tested live.
-    "pipecat-local-stt-server>=0.4.0,<0.6",
+    # code is unchanged. 0.5.0 moves the LaunchAgents to loopback TCP (whisper
+    # 9565, kyutai 9665, parakeet 9765, nemotron 9865); the library API is
+    # unchanged. <0.6 until the next minor is smoke-tested live.
+    "pipecat-local-stt-server>=0.5.0,<0.6",
     "websockets>=13.0",
     # Imported directly by stt/diarization_timeline.py (and the feeder). It is
     # already a hard pipecat-ai requirement; same bounds so this adds no
