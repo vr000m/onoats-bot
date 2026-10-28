@@ -97,4 +97,5 @@ dev = ["pytest>=8", "ruff>=0.15,<0.16"]
 testpaths = ["tests"]
 markers = [
     "diarization_integration: local-only end-to-end diarization on a real clip and the real model (needs the diarization extra, cached weights and ONOATS_DIARIZATION_FIXTURE)",
+    "stt_ws_integration: local-only live smoke of WebSocketSTTService against a real STT server (needs ONOATS_STT_FIXTURE or ONOATS_DIARIZATION_FIXTURE and a reachable endpoint)",
 ]
