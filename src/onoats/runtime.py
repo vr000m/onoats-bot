@@ -2255,6 +2255,12 @@ def _mark_graceful_shutdown_requested() -> None:
     _graceful_shutdown_requested = True
 
 
+def reset_graceful_shutdown_requested() -> None:
+    """Clear the stop flag; the socket supervisor calls this when a session begins."""
+    global _graceful_shutdown_requested
+    _graceful_shutdown_requested = False
+
+
 def graceful_shutdown_requested() -> bool:
     """True once a stop signal (SIGINT/SIGTERM) has been received."""
     return _graceful_shutdown_requested
@@ -2274,8 +2280,6 @@ def _install_signal_handlers(
     - SIGTERM: graceful shutdown
     - SIGUSR1: flush current transcript, keep listening (used by ``onoats flush``)
     """
-    global _graceful_shutdown_requested
-    _graceful_shutdown_requested = False
 
     def _handle_shutdown(sig):
         if shutdown_event.is_set():

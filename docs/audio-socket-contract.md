@@ -230,9 +230,11 @@ the whole foreground process group) is **NOT relayed to the capturer**. The
 supervisor owns the capturer's lifecycle end to end: it stops the capturer
 **explicitly** (SIGTERM → bounded wait → SIGKILL, via `_stop_capturer`) **after
 the recorder finishes**, never via an inherited terminal signal. This is what
-makes a graceful Ctrl+C a *recorder-finishes-first* event (rc=0) rather than a
-spurious *capturer-died-mid-session* event (rc=1): the recorder always wins the
-shutdown race because the OS cannot kill the capturer out from under it.
+keeps a graceful Ctrl+C from being a spurious *capturer-died-mid-session* event
+(rc=1): the OS cannot kill the capturer out from under the recorder. The
+capturer can still exit *first* on a graceful stop, by seeing its sockets closed
+during the recorder's drain; that single `rc=0` case is exempted below (see
+"Default-device changes", last paragraph).
 
 **Process-group teardown.** Because the capturer is a process-group leader
 (`start_new_session=True`), its PGID equals its PID, and `_stop_capturer`

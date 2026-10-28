@@ -1064,7 +1064,10 @@ def test_capturer_exit_during_graceful_stop_is_clean_only_for_rc0(
                 runtime._mark_graceful_shutdown_requested()  # what the signal does
         finally:
             writer.close()  # the drain closes the sockets; the capturer follows
-        await asyncio.sleep(0.5)  # flush + rotate latency outlasts the capturer exit
+        # Flush + rotate latency must outlast the capturer exit even on a loaded
+        # CI box (same margin as _install_fake_recorder's post_eof_drain); a
+        # shorter sleep lets the recorder win the race and mask the branch.
+        await asyncio.sleep(1.5)
         session_queue.ensure_queue_dirs(data_dir)
         pending = session_queue.queue_dir("pending", data_dir)
         (pending / "session_fake_stop.jsonl").write_text(
@@ -1086,6 +1089,54 @@ def test_capturer_exit_during_graceful_stop_is_clean_only_for_rc0(
         f"mid-session ERROR presence must match fail-loud (expected_rc={expected_rc}); "
         f"records={log_sink.records!r}"
     )
+
+
+def test_stop_requested_recorder_drain_overrun_is_force_cancelled_and_stamped(
+    sup_env, monkeypatch, set_capturer_behaviour, log_sink
+):
+    """The stop-requested branch is bounded and never leaves a stale ``running``.
+
+    The capturer exits 0 after the stop request, but the recorder never finishes
+    draining: the supervisor must force-cancel it after the drain grace, exit
+    non-zero, and flip the lingering ``running=true`` record (a force-cancelled
+    recorder never writes its own stopped record) with a distinct reason.
+    """
+    from onoats import runtime
+    from onoats import status as status_file
+
+    data_dir, _pending_dir = sup_env
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 1.0, raising=False)
+    set_capturer_behaviour("exit-on-peer-close", rc=0)
+
+    async def _hung_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
+        from onoats._vendor.store import onoats_data_dir
+
+        status_file.write_running(
+            onoats_data_dir(), pid=os.getpid(), audio_source="socket", stt_label="fake"
+        )
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)  # handshake
+            await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT)  # streaming
+            runtime._mark_graceful_shutdown_requested()  # what the signal does
+        finally:
+            writer.close()  # the drain closes the sockets; the capturer follows
+        await asyncio.sleep(3600)  # ...but the drain itself never finishes
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _hung_run_onoats_dual)
+
+    rc = _run_supervisor_bounded()
+
+    assert rc == 1
+    assert any("force-cancelling" in r for r in log_sink.records), log_sink.records
+    st = status_file.read_status(data_dir)
+    assert st is not None and st.running is False
+    assert st.exit_reason == "recorder-drain-timeout"
+    assert st.supervisor_rc == 1
 
 
 # ---------------------------------------------------------------------------
