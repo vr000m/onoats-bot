@@ -83,6 +83,12 @@ TCC grants attribute to the terminal app, not to onoats (see "Launch from
 `~/Applications`" below); and a later `make build`/`make setup` recompile
 drops the bare binary's signature — re-run `setup-cli` after updates.
 
+`install-cli` (and so `install`, `setup`, `setup-cli`) installs the `macos`
+extra by default. `uv tool install` replaces the environment's extras, so a
+plain `make install` removes any other extra you added, such as
+`diarization`. Pass the full set to keep it:
+`make -C native install EXTRAS=macos,diarization`.
+
 What each kind of change needs:
 
 | Change                     | Needed action                                  |

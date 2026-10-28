@@ -271,7 +271,8 @@ are not assigned by onoats; a consumer maps labels to names.
 - **Install the extra** (Apple Silicon / macOS): from a checkout
   `uv sync --extra diarization`; for a tool install
   `uv tool install 'onoats[macos,diarization]'` (repeat any extras you already
-  have).
+  have); with the native install, `make -C native install EXTRAS=macos,diarization`
+  (a plain `make -C native install` resets the extras to `macos`).
 - **Download the weights yourself** — they are never fetched automatically:
   `uvx --from huggingface_hub hf download mlx-community/Nemotron-3-Diarization`
   (or plain `hf download ...` if you already have `hf` on PATH). If the extra or the

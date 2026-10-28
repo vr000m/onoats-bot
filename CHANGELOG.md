@@ -15,6 +15,13 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Changed
+
+- `native/Makefile`: `install-cli` (and so `install`, `setup`, `setup-cli`) takes
+  an `EXTRAS` variable, default `macos`. `uv tool install` replaces the tool
+  env's extras, so a plain `make install` used to uninstall the `diarization`
+  extra; use `make -C native install EXTRAS=macos,diarization` to keep it.
+
 ## [1.5.0] - 2026-10-28
 
 ### Changed
