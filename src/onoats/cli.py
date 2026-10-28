@@ -898,6 +898,7 @@ async def _run_recorder_with_capturer(
     import asyncio
     import time
 
+    from onoats import runtime
     from onoats import status as status_file
     from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
 
@@ -984,12 +985,40 @@ async def _run_recorder_with_capturer(
         # ALWAYS a fail-loud event, even on a clean rc=0. The supervisor outlives the
         # capturer by design — it stops the capturer when the recorder ends, never the
         # reverse — so any capturer-initiated exit means the audio stream ended
-        # mid-session and the recording is truncated regardless of exit code. We do
-        # not branch on rc==0 here. A future, deliberate "clean stop" signal and its
-        # supervisor semantics are reserved for the Phase-4 capturer exit-code
-        # contract (see docs/audio-socket-contract.md); honouring it would also mean
-        # redefining the transport's EOF-is-fatal rule, which is out of scope.
+        # mid-session and the recording is truncated regardless of exit code.
+        # The ONE exemption is a stop WE asked for: after the first SIGINT/SIGTERM
+        # the recorder's drain closes the capture sockets, so the capturer exits 0
+        # on "peer closed" before the drain ends (handled just below). A general
+        # capturer-originated "clean stop" signal stays reserved for the Phase-4
+        # exit-code contract (see docs/audio-socket-contract.md).
         rc = capturer_task.result()
+        if rc == 0 and runtime.graceful_shutdown_requested():
+            # A stop signal (onoats stop / Ctrl+C) arrived FIRST: the recorder's
+            # drain closed the capture sockets, so the capturer saw "peer closed"
+            # and exited 0 before the drain finished. That is the stop working,
+            # not the audio stream dying. Only rc=0 after the signal qualifies; a
+            # non-zero exit, or any exit before a signal, stays fail-loud below.
+            logger.info(
+                "Socket supervisor: capturer exited after the stop request (rc=0, "
+                "its sockets closed during the recorder's drain); waiting for the "
+                "recorder to finish"
+            )
+            try:
+                await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
+            except TimeoutError:
+                logger.warning(
+                    "Socket supervisor: recorder did not finish draining within "
+                    f"{_RECORDER_DRAIN_GRACE_SEC}s after the stop request — "
+                    "force-cancelling."
+                )
+                recorder_task.cancel()
+                try:
+                    await recorder_task
+                except asyncio.CancelledError:
+                    pass
+                return 1
+            recorder_rc = recorder_task.result()
+            return recorder_rc if recorder_rc is not None else 0
         logger.error(
             f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
             "branch surfaced an ErrorFrame and is rotating the partial session. "

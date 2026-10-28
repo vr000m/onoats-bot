@@ -357,11 +357,14 @@ the `me`/`them` timeline intact.
 Conversely, any capturer exit **before** the recorder ends is treated as
 fail-loud by the supervisor **regardless of exit code** (even `rc=0`): the
 supervisor outlives the capturer by design, so a capturer-initiated exit means
-the audio stream stopped mid-session and the recording is truncated. A deliberate
-"clean stop" signal (e.g. a capturer `rc=0` that the supervisor would honour as
-success) is **reserved for a future capturer exit-code contract** — adopting it
-would also require redefining the transport's EOF-is-fatal rule, so it is out of
-scope for v1.
+the audio stream stopped mid-session and the recording is truncated. The single
+exemption is a stop the recorder itself requested: after the first SIGINT/SIGTERM
+the recorder's drain closes the capture sockets, so a capturer that exits `rc=0`
+on "peer closed" is the stop working, and the supervisor returns the recorder's
+own rc. A capturer-originated "clean stop" signal (a capturer `rc=0` honoured as
+success with no stop request) is **reserved for a future capturer exit-code
+contract** — adopting it would also require redefining the transport's
+EOF-is-fatal rule, so it is out of scope for v1.
 
 ## Status-file schema (v2)
 

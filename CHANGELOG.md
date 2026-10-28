@@ -15,6 +15,16 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Fixed
+
+- A normal stop (`onoats stop`, Ctrl+C) in socket mode no longer exits rc=1 with
+  a `capturer exited mid-session (rc=0)` ERROR. The recorder's drain closes the
+  capture sockets, the capturer exits 0 on "peer closed" before the drain ends,
+  and the supervisor read that as the capturer dying. A capturer `rc=0` exit
+  after a stop signal is now a clean stop; a non-zero exit, or any exit before a
+  signal, is still fail-loud. The session was always rotated into `pending/`;
+  only the exit code and log were wrong.
+
 ### Changed
 
 - `native/Makefile`: `install-cli` (and so `install`, `setup`, `setup-cli`) takes

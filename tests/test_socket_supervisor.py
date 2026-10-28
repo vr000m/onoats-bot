@@ -111,6 +111,8 @@ def short_root():
 #   "crash"  -> write N frames, then exit (process death + EOF on the sockets)
 #   "silent" -> handshake only, never send a frame (hung-but-alive)
 #   "stream" -> stream frames until killed (clean-shutdown path)
+#   "exit-on-peer-close" -> stream, but exit (control-file rc) once the recorder
+#             closes its end of a socket (the real capturer's peer-closed path)
 #   "hang"   -> never bind a socket, stay alive (the pre-socket block a TCC
 #               prompt produces during the Phase-7 tap preflight)
 #
@@ -273,7 +275,11 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
                         i += 1
                         await asyncio.sleep(0.01)
             except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
-                pass
+                if BEHAVIOUR == "exit-on-peer-close":
+                    # The real capturer's "system socket closed by peer" path: the
+                    # recorder closed its end, so exit with the control-file rc.
+                    sys.stderr.flush()
+                    os._exit(int(_control.get("rc") or 0))
 
         return await asyncio.start_unix_server(on_conn, path=path)
 
@@ -1003,6 +1009,83 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
         f"alive) must yield rc=0, not be mis-classified as capturer-death; got {rc}"
     )
     assert state["frames_read"] > 0, "recorder read no frames from a streaming capturer"
+
+
+@pytest.mark.parametrize(
+    ("shutdown_requested", "capturer_rc", "expected_rc"),
+    [
+        # SIGINT/SIGTERM asked for a graceful stop; the recorder's drain closes its
+        # sockets, so the capturer sees "peer closed" and exits 0 BEFORE the
+        # recorder finishes draining. That is a clean stop, not capturer death.
+        (True, 0, 0),
+        # Same exit with NO stop request is a truncated recording: still fail-loud.
+        (False, 0, 1),
+        # A non-zero capturer exit is never clean, even during a requested stop.
+        (True, 3, 1),
+    ],
+    ids=["stop-requested-rc0", "no-stop-request-rc0", "stop-requested-rc3"],
+)
+def test_capturer_exit_during_graceful_stop_is_clean_only_for_rc0(
+    sup_env,
+    monkeypatch,
+    set_capturer_behaviour,
+    log_sink,
+    shutdown_requested,
+    capturer_rc,
+    expected_rc,
+):
+    """A normal ``onoats stop`` must not exit rc=1 with a "capturer died" ERROR.
+
+    Live repro (socket mode, SIGTERM): the recorder starts its graceful drain and
+    closes the capture sockets; the capturer reacts to "peer closed" and exits
+    rc=0 ~30 ms later, before the drain finishes. The supervisor races the two
+    tasks and used to read that as ``capturer exited mid-session``. The exemption
+    is deliberately narrow: only an rc=0 exit *after* the first stop signal.
+    """
+    from onoats import runtime
+
+    _data_dir, pending_dir = sup_env
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    set_capturer_behaviour("exit-on-peer-close", rc=capturer_rc)
+
+    async def _fake_run_onoats_dual(
+        *, live_terminal=False, locked_category=None, data_dir=None
+    ):
+        from onoats._vendor import session_queue
+        from onoats._vendor.store import onoats_data_dir
+
+        data_dir = onoats_data_dir()
+        mic = os.environ["ONOATS_MIC_SOCKET"]
+        reader, writer = await asyncio.open_unix_connection(mic)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=SUP_TIMEOUT)  # handshake
+            await asyncio.wait_for(reader.read(64), timeout=SUP_TIMEOUT)  # streaming
+            if shutdown_requested:
+                runtime._mark_graceful_shutdown_requested()  # what the signal does
+        finally:
+            writer.close()  # the drain closes the sockets; the capturer follows
+        await asyncio.sleep(0.5)  # flush + rotate latency outlasts the capturer exit
+        session_queue.ensure_queue_dirs(data_dir)
+        pending = session_queue.queue_dir("pending", data_dir)
+        (pending / "session_fake_stop.jsonl").write_text(
+            '{"type":"utterance","source":"me","text":"kept"}\n'
+        )
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", _fake_run_onoats_dual)
+
+    rc = _run_supervisor_bounded()
+
+    assert rc == expected_rc, (
+        f"stop_requested={shutdown_requested} capturer_rc={capturer_rc}: "
+        f"expected supervisor rc={expected_rc}, got {rc}"
+    )
+    assert _pending_files(pending_dir), "the session must still rotate into pending/"
+    died = any("capturer exited mid-session" in r for r in log_sink.records)
+    assert died is (expected_rc == 1), (
+        f"mid-session ERROR presence must match fail-loud (expected_rc={expected_rc}); "
+        f"records={log_sink.records!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

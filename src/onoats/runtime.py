@@ -2242,6 +2242,24 @@ def _write_status_stopped(
         logger.warning(f"Could not write status file (stop): {exc}")
 
 
+# Set by the first SIGINT/SIGTERM (``_handle_shutdown`` below). The socket
+# supervisor (``cli._run_recorder_with_capturer``) reads it to tell a capturer that
+# exited BECAUSE the recorder began a graceful stop (it closes the capture sockets
+# during the drain, the capturer sees "peer closed" and exits 0) from one that died
+# mid-session. Process-scoped on purpose: one recorder per process.
+_graceful_shutdown_requested = False
+
+
+def _mark_graceful_shutdown_requested() -> None:
+    global _graceful_shutdown_requested
+    _graceful_shutdown_requested = True
+
+
+def graceful_shutdown_requested() -> bool:
+    """True once a stop signal (SIGINT/SIGTERM) has been received."""
+    return _graceful_shutdown_requested
+
+
 def _install_signal_handlers(
     shutdown_event: asyncio.Event,
     force_exit_event: asyncio.Event,
@@ -2256,6 +2274,8 @@ def _install_signal_handlers(
     - SIGTERM: graceful shutdown
     - SIGUSR1: flush current transcript, keep listening (used by ``onoats flush``)
     """
+    global _graceful_shutdown_requested
+    _graceful_shutdown_requested = False
 
     def _handle_shutdown(sig):
         if shutdown_event.is_set():
@@ -2265,6 +2285,7 @@ def _install_signal_handlers(
             loop.call_soon_threadsafe(force_exit_event.set)
         else:
             logger.info(f"Received signal {sig.name} — initiating graceful shutdown")
+            _mark_graceful_shutdown_requested()
             loop.call_soon_threadsafe(shutdown_event.set)
 
     def _handle_flush(sig):
