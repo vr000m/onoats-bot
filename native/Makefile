@@ -17,7 +17,8 @@
 #   make rebuild  build + app + sign + dr in one go
 #   make print-bin  print the signed capturer path (for ONOATS_CAPTURER_BIN)
 #   make install-cli  uv tool install --editable the repo → ~/.local/bin/onoats
-#                     (idempotent; re-run after dependency changes = the update)
+#                     (idempotent; re-run after dependency changes = the update;
+#                      EXTRAS=macos,diarization keeps the diarization extra)
 #   make install  sign + install-cli + copy Onoats.app → ~/Applications
 #                 (update = `git pull && make install`. TCC grants survive:
 #                  they key on the DR — bundle id + cert — not path or cdhash.)
@@ -59,6 +60,7 @@ MENUBAR_SWIFTC_FLAGS := -O -target $(ARCH)-apple-macos$(DEPLOY) \
 	-parse-as-library -framework SwiftUI -framework AppKit -framework CoreAudio
 
 REPO        := $(abspath ..)
+EXTRAS      ?= macos
 INSTALL_DIR := $(HOME)/Applications
 
 .PHONY: build app sign dr cdhash rebuild print-bin clean check-identity \
@@ -120,8 +122,12 @@ print-bin:
 cert:
 	sh make_cert.sh
 
+# EXTRAS is the comma-separated extras list for the tool env. `uv tool install`
+# REPLACES the env's extras, so an install that omits one you already have
+# (e.g. diarization) uninstalls it: pass the full set, e.g.
+#   make -C native install EXTRAS=macos,diarization
 install-cli:
-	uv tool install --editable '$(REPO)[macos]'
+	uv tool install --editable '$(REPO)[$(EXTRAS)]'
 	@echo "✓ CLI shim: $$HOME/.local/bin/onoats (editable — Python edits apply"
 	@echo "  on next run; re-run this target after dependency changes)"
 
