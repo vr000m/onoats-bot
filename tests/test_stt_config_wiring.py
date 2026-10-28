@@ -167,7 +167,7 @@ def test_rss_probe_uses_config_socket_not_env_default(monkeypatch):
     asyncio.run(runtime.log_stt_server_rss("startup"))
 
     assert captured["socket_path"] == os.path.expanduser("~/x/nemotron.sock")
-    assert captured["socket_path"] != os.path.expanduser(runtime._DEFAULT_STT_WS_SOCKET)
+    assert captured["host"] is None and captured["port"] is None
 
 
 def test_rss_probe_redacts_leaky_connect_exception_text(monkeypatch):

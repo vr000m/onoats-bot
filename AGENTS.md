@@ -77,7 +77,7 @@ the GitHub `pypi` environment. One-time prerequisites: a PyPI trusted
 publisher (project `onoats`, repo `vr000m/onoats-bot`, workflow
 `release.yml`, environment `pypi`) and the GitHub `pypi` environment itself.
 PyPI rejects direct-URL `Requires-Dist` entries — dependencies must come
-from PyPI (this is why `pipecat-local-stt-server` is a `>=0.3.3,<0.4`
+from PyPI (this is why `pipecat-local-stt-server` is a `>=0.5.0,<0.6`
 registry dep, not a git pin).
 
 ## Supervisor ↔ capturer lifecycle (`cli._run_socket_supervisor`)
@@ -393,6 +393,9 @@ Regression tests: `tests/test_diarization_timeline.py`,
 `tests/test_diarization_integration.py` (local-only, `-m diarization_integration`;
 real model + real pipeline on a WAV named by `ONOATS_DIARIZATION_FIXTURE`, skips
 when unset),
+`tests/test_stt_ws_integration.py` (local-only, `-m stt_ws_integration`; real
+`WebSocketSTTService` + Silero VAD against a live STT server on a WAV named by
+`ONOATS_STT_FIXTURE`, skips when unset or the handshake fails),
 `tests/test_websocket_stt_stamping.py`, `tests/test_speaker_labels.py`,
 `tests/test_runtime_preflight.py`, `tests/test_dual_socket_source.py`.
 

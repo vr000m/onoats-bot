@@ -202,7 +202,11 @@ the terminal instead). It lives in the menu bar with no Dock icon.
 
 - `$XDG_CONFIG_HOME/onoats/config.toml` — `[storage]` (`data_dir`), `[devices]`
   (by name), `[stt]` (`service`, `model`, `language` — `"en"` default, `"auto"`
-  = detect; whisper + websocket backends only; `launchd_label` — optional
+  = detect; whisper + websocket backends only; `ws_socket` or `ws_host` +
+  `ws_port` — the websocket STT endpoint, a Unix socket path or loopback TCP
+  (`ws_socket` outranks the pair; the `STT_WS_*` env vars outrank both; unset =
+  a live legacy `~/Library/Caches/pipecat-stt/stt.sock`, else `127.0.0.1:9565`);
+  `launchd_label` — optional
   (overridable via the `STT_LAUNCHD_LABEL` env var, which takes precedence
   over the config.toml value), the `launchctl` label to kickstart when the
   websocket STT server is unreachable at startup or drops mid-session;

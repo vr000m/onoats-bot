@@ -364,7 +364,8 @@ class OnoatsConfig:
         return val or _DEFAULTS["stt"]["language"]
 
     # websocket endpoint (env wins; else config.toml [stt].ws_*). None when
-    # neither set — the runtime then falls back to the built-in default socket.
+    # neither set — the runtime then falls back to its built-in default endpoint
+    # (loopback TCP, or STT_WS_DEFAULT_SOCKET).
     @property
     def stt_ws_socket(self) -> str | None:
         return _env_or("STT_WS_SOCKET", self.raw.get("stt", {}).get("ws_socket"))

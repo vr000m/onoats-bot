@@ -2246,7 +2246,7 @@ wheels = [
 
 [[package]]
 name = "onoats"
-version = "1.4.0"
+version = "1.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "loguru" },
@@ -2280,7 +2280,7 @@ requires-dist = [
     { name = "mlx-whisper", marker = "extra == 'macos'", specifier = ">=0.4.0" },
     { name = "numpy", specifier = ">=1.26.4,<3" },
     { name = "pipecat-ai", extras = ["deepgram", "google", "local", "runner", "silero", "soundfile", "webrtc", "whisper"], specifier = ">=1.3.0,<2.0.0" },
-    { name = "pipecat-local-stt-server", specifier = ">=0.3.3,<0.4" },
+    { name = "pipecat-local-stt-server", specifier = ">=0.5.0,<0.6" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "websockets", specifier = ">=13.0" },
 ]
@@ -2498,14 +2498,14 @@ wheels = [
 
 [[package]]
 name = "pipecat-local-stt-server"
-version = "0.3.3"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dd/7a/7af0d646c5e0056ce9dff8e2b304c05e314eafa0a885b96606317a1e3da3/pipecat_local_stt_server-0.3.3.tar.gz", hash = "sha256:4ad50f6b60e9fc544bfc96548910ee758ec3ff719c05190fad2df6604d9f47a4", size = 305429, upload-time = "2026-06-28T08:57:50.35Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/96/2e/29dbdeabfdd6da1450f29c5d7f2afcb1cdcd08f6bd8d9eb1fb4af536cd73/pipecat_local_stt_server-0.5.0.tar.gz", hash = "sha256:910e451e0c3fa147162cb3059adce2083bfd8835a002c957b2eadf5116e34c14", size = 573796, upload-time = "2026-10-27T17:51:48.681Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/89/bb/8bd99f174628339651f1446cba6d82031500c62999e448a75b39146f9726/pipecat_local_stt_server-0.3.3-py3-none-any.whl", hash = "sha256:ecf04ff7647362d51af7c22cd045299bd2c722813becf9f23cea75475e4cd423", size = 62135, upload-time = "2026-06-28T08:57:49.077Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/c5/957278676a2584b760d8e64f22218c5aa8e4384fefcc213e10d826bb86c1/pipecat_local_stt_server-0.5.0-py3-none-any.whl", hash = "sha256:572fd9a501fd39fa81377a0629294b1ec1cc167c3cfcb913d2ee275dc8897211", size = 113397, upload-time = "2026-10-27T17:51:47.308Z" },
 ]
 
 [[package]]

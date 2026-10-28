@@ -15,6 +15,34 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-28
+
+### Changed
+
+- Bumped `pipecat-local-stt-server` from `>=0.3.3,<0.4` to `>=0.5.0,<0.6`.
+  The wire protocol (`PROTOCOL_VERSION == "0.1"`), `stt_server.client` and
+  `stt_server.protocol` are unchanged, so the recorder's client code is too.
+  0.4.0 adds a sibling `<socket>.lock` (single-server flock, left on disk) next
+  to each STT socket; a second `serve` on a live socket now exits with
+  `EADDRINUSE` instead of replacing the running server.
+- `pipecat-local-stt-server` 0.5 moves the STT LaunchAgents from Unix sockets
+  to loopback TCP (whisper 9565, kyutai 9665, parakeet 9765, nemotron 9865;
+  point `ws_host`/`ws_port` at the one you run). With nothing configured,
+  onoats connects to a live legacy `~/Library/Caches/pipecat-stt/stt.sock` if
+  one exists (a 0.4.x agent), else to the whisper agent at `127.0.0.1:9565`;
+  `STT_WS_DEFAULT_SOCKET` still overrides both. A lone `STT_WS_PORT` /
+  `ws_port` (no host) is now reported as an incomplete endpoint instead of being
+  silently replaced by the default. **Upgrade note:** a `[stt].ws_socket` left
+  in `config.toml` outranks `ws_host`/`ws_port`, so remove it when you switch an
+  agent to TCP. Loopback TCP has no peer-uid check, unlike the 0700 Unix socket;
+  set `STT_WS_TOKEN` (with the server's `--auth-token-file`) if that matters.
+
+### Fixed
+
+- `onoats init` no longer drops a hand-set `[stt].ws_host` / `ws_port` on re-run
+  (and its preflight now probes that endpoint). A lone host, a lone port or an
+  out-of-range port is dropped with a note.
+
 ## [1.4.0] - 2026-10-12
 
 ### Added
