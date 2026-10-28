@@ -15,7 +15,7 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
-## [1.5.0] - 2026-10-27
+## [1.5.0] - 2026-10-28
 
 ### Changed
 
