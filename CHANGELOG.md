@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-10-28
+
 ### Fixed
 
 - A normal stop (`onoats stop`, Ctrl+C) in socket mode no longer exits rc=1 with
