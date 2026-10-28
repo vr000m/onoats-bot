@@ -230,9 +230,11 @@ the whole foreground process group) is **NOT relayed to the capturer**. The
 supervisor owns the capturer's lifecycle end to end: it stops the capturer
 **explicitly** (SIGTERM → bounded wait → SIGKILL, via `_stop_capturer`) **after
 the recorder finishes**, never via an inherited terminal signal. This is what
-makes a graceful Ctrl+C a *recorder-finishes-first* event (rc=0) rather than a
-spurious *capturer-died-mid-session* event (rc=1): the recorder always wins the
-shutdown race because the OS cannot kill the capturer out from under it.
+keeps a graceful Ctrl+C from being a spurious *capturer-died-mid-session* event
+(rc=1): the OS cannot kill the capturer out from under the recorder. The
+capturer can still exit *first* on a graceful stop, by seeing its sockets closed
+during the recorder's drain; that single `rc=0` case is exempted below (see
+"Default-device changes", last paragraph).
 
 **Process-group teardown.** Because the capturer is a process-group leader
 (`start_new_session=True`), its PGID equals its PID, and `_stop_capturer`
@@ -357,11 +359,14 @@ the `me`/`them` timeline intact.
 Conversely, any capturer exit **before** the recorder ends is treated as
 fail-loud by the supervisor **regardless of exit code** (even `rc=0`): the
 supervisor outlives the capturer by design, so a capturer-initiated exit means
-the audio stream stopped mid-session and the recording is truncated. A deliberate
-"clean stop" signal (e.g. a capturer `rc=0` that the supervisor would honour as
-success) is **reserved for a future capturer exit-code contract** — adopting it
-would also require redefining the transport's EOF-is-fatal rule, so it is out of
-scope for v1.
+the audio stream stopped mid-session and the recording is truncated. The single
+exemption is a stop the recorder itself requested: after the first SIGINT/SIGTERM
+the recorder's drain closes the capture sockets, so a capturer that exits `rc=0`
+on "peer closed" is the stop working, and the supervisor returns the recorder's
+own rc. A capturer-originated "clean stop" signal (a capturer `rc=0` honoured as
+success with no stop request) is **reserved for a future capturer exit-code
+contract** — adopting it would also require redefining the transport's
+EOF-is-fatal rule, so it is out of scope for v1.
 
 ## Status-file schema (v2)
 

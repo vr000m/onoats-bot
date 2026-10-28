@@ -100,9 +100,19 @@ registry dep, not a git pin).
   non-zero exit + a WARNING/ERROR log, and a partial session still rotates into
   `pending/` — never a hang.
 - **Capturer-exit-before-recorder is always fail-loud, even on `rc=0`** — the
-  recording is truncated regardless of exit code. Default-input-device changes
-  (e.g. AirPods removal) are the **capturer's** job to absorb by re-binding and
-  continuing to stream; see `docs/audio-socket-contract.md`.
+  recording is truncated regardless of exit code. The one exemption is a stop
+  the recorder itself asked for: once `runtime.graceful_shutdown_requested()`
+  (set by the first SIGINT/SIGTERM), an `rc=0` capturer exit is the sockets
+  closing during the drain, not a crash, and the supervisor waits for the recorder
+  and returns its rc (bounded by the drain grace; an overrun force-cancels,
+  stamps `recorder-drain-timeout`, rc=1). A non-zero exit, or any exit before a
+  signal, stays fail-loud (`tests/test_socket_supervisor.py`, `…graceful_stop…`).
+  Only signals set the flag today; any NEW trigger of `shutdown_event` must also
+  call `runtime._mark_graceful_shutdown_requested()`, or a clean stop would read
+  as a crash again (loud, not silent). The supervisor resets the flag when a
+  session begins. Default-input-device changes (e.g. AirPods removal) are the **capturer's** job
+  to absorb by re-binding and continuing to stream; see
+  `docs/audio-socket-contract.md`.
 - Shared recorder arg handling lives in `dual._apply_recorder_args` — both
   `dual.main` and the supervisor route through it, so interactive/category
   handling can't drift.

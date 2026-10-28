@@ -152,7 +152,9 @@ class StatusRecord:
     last_error: str | None = None
     # e.g. "graceful", "fatal_error_frame", "capturer-crash", "mic-denied",
     # "system-audio-failed" (genuine tap API failure — a TCC denial never
-    # exits the capturer; denied taps deliver zeros and surface as `warning`).
+    # exits the capturer; denied taps deliver zeros and surface as `warning`),
+    # "recorder-drain-timeout" (a requested stop's drain overran the supervisor's
+    # grace and the recorder was force-cancelled).
     # Free-form but stable across producers.
     exit_reason: str | None = None
     supervisor_rc: int | None = None

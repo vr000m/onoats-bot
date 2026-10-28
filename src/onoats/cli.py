@@ -670,11 +670,11 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 # the capturer: the supervisor owns capturer teardown explicitly
                 # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the
                 # whole process group) AFTER the recorder finishes. This
-                # isolation is what makes the
-                # recorder-finishes-first branch in _run_recorder_with_capturer
-                # correct under Ctrl+C — without it, the capturer could win the
-                # race and a graceful shutdown would be mis-classified as
-                # capturer-death (rc=1).
+                # isolation is what keeps a terminal Ctrl+C from killing the
+                # capturer out from under the recorder (which would be
+                # mis-classified as capturer-death, rc=1). The capturer can still
+                # exit first on a graceful stop by seeing its sockets closed; that
+                # rc=0 case is handled in _run_recorder_with_capturer.
                 start_new_session=True,
             )
         except OSError as exc:
@@ -882,6 +882,60 @@ async def _wait_for_sockets(
         await asyncio.sleep(_SOCKET_WAIT_POLL_SEC)
 
 
+async def _drain_recorder_bounded(recorder_task, logger, cause: str) -> bool:
+    """Wait up to ``_RECORDER_DRAIN_GRACE_SEC`` for the recorder to finish.
+
+    Returns ``True`` if it finished in time, ``False`` if the grace expired and it
+    was force-cancelled (so the supervisor never hangs). An exception raised by the
+    recorder propagates to the caller. ``cause`` completes the overrun WARNING
+    ("... within Ns <cause> — force-cancelling.").
+    """
+    import asyncio
+
+    try:
+        await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
+        return True
+    except TimeoutError:
+        logger.warning(
+            "Socket supervisor: recorder did not finish draining within "
+            f"{_RECORDER_DRAIN_GRACE_SEC}s {cause} — force-cancelling."
+        )
+        recorder_task.cancel()
+        try:
+            await recorder_task
+        except asyncio.CancelledError:
+            pass
+        return False
+
+
+def _settle_recorder_rc(rc, logger, data_dir) -> int:
+    """Map a finished recorder's return code to the supervisor rc (fail-loud).
+
+    Shared by both paths on which the recorder finishes by itself — it won the
+    race against the capturer, or it drained after a stop request the capturer
+    outran — so a non-zero recorder rc (a fatal ErrorFrame) is logged and stamped
+    identically on both.
+    """
+    from onoats import status as status_file
+
+    rc = rc if rc is not None else 0
+    if rc != 0:
+        logger.error(
+            f"Socket supervisor: recorder exited non-zero (rc={rc}) — a "
+            "capture branch surfaced a fatal ErrorFrame (silent/failed "
+            "capturer); stopping capturer and exiting non-zero."
+        )
+        # The recorder already wrote running=false + a fatal_error_frame
+        # reason; enrich it with the supervisor's final rc so `onoats status`
+        # / the menu bar can show the exit code.
+        status_file.stamp_supervisor_failure(
+            data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
+        )
+    else:
+        logger.info("Socket supervisor: recorder exited; stopping capturer")
+    return rc
+
+
 async def _run_recorder_with_capturer(
     rest, capturer_proc, logger, data_dir, device_state=None
 ) -> int:
@@ -898,6 +952,7 @@ async def _run_recorder_with_capturer(
     import asyncio
     import time
 
+    from onoats import runtime
     from onoats import status as status_file
     from onoats.dual import _apply_recorder_args, _parse_args, run_onoats_dual
 
@@ -908,6 +963,10 @@ async def _run_recorder_with_capturer(
     rc = _apply_recorder_args(args)
     if rc is not None:
         return rc
+
+    # A stop flag left over from an earlier in-process run must not make a
+    # capturer death during this session's long startup look like a requested stop.
+    runtime.reset_graceful_shutdown_requested()
 
     # Any write_running at/after this instant belongs to THIS session — the
     # deferred device-apply task keys on it so it never stamps a stale record.
@@ -958,23 +1017,11 @@ async def _run_recorder_with_capturer(
                 await capturer_task
             except (asyncio.CancelledError, ProcessLookupError):
                 pass
-            rc = recorder_task.result()  # re-raise if the recorder failed
-            rc = rc if rc is not None else 0
-            if rc != 0:
-                logger.error(
-                    f"Socket supervisor: recorder exited non-zero (rc={rc}) — a "
-                    "capture branch surfaced a fatal ErrorFrame (silent/failed "
-                    "capturer); stopping capturer and exiting non-zero."
-                )
-                # The recorder already wrote running=false + a fatal_error_frame
-                # reason; enrich it with the supervisor's final rc so `onoats status`
-                # / the menu bar can show the exit code.
-                status_file.stamp_supervisor_failure(
-                    data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
-                )
-            else:
-                logger.info("Socket supervisor: recorder exited; stopping capturer")
-            return rc
+            return _settle_recorder_rc(
+                recorder_task.result(),  # re-raise if the recorder failed
+                logger,
+                data_dir,
+            )
 
         # Capturer finished first → it died mid-session. The recorder's own
         # ErrorFrame path is draining (flush + rotate). Give it a bounded grace, then
@@ -984,12 +1031,41 @@ async def _run_recorder_with_capturer(
         # ALWAYS a fail-loud event, even on a clean rc=0. The supervisor outlives the
         # capturer by design — it stops the capturer when the recorder ends, never the
         # reverse — so any capturer-initiated exit means the audio stream ended
-        # mid-session and the recording is truncated regardless of exit code. We do
-        # not branch on rc==0 here. A future, deliberate "clean stop" signal and its
-        # supervisor semantics are reserved for the Phase-4 capturer exit-code
-        # contract (see docs/audio-socket-contract.md); honouring it would also mean
-        # redefining the transport's EOF-is-fatal rule, which is out of scope.
+        # mid-session and the recording is truncated regardless of exit code.
+        # The ONE exemption is a stop WE asked for: after the first SIGINT/SIGTERM
+        # the recorder's drain closes the capture sockets, so the capturer exits 0
+        # on "peer closed" before the drain ends (handled just below). A general
+        # capturer-originated "clean stop" signal stays reserved for the Phase-4
+        # exit-code contract (see docs/audio-socket-contract.md).
         rc = capturer_task.result()
+        if rc == 0 and runtime.graceful_shutdown_requested():
+            # A stop signal (onoats stop / Ctrl+C) arrived FIRST: the recorder's
+            # drain closed the capture sockets, so the capturer saw "peer closed"
+            # and exited 0 before the drain finished. That is the stop working,
+            # not the audio stream dying. Only rc=0 after the signal qualifies; a
+            # non-zero exit, or any exit before a signal, stays fail-loud below.
+            logger.info(
+                "Socket supervisor: capturer exited after the stop request (rc=0, "
+                "its sockets closed during the recorder's drain); waiting for the "
+                "recorder to finish"
+            )
+            if not await _drain_recorder_bounded(
+                recorder_task, logger, "after the stop request"
+            ):
+                # Same as the capturer-death path below: a force-cancelled
+                # recorder may never have written its stopped record, so flip the
+                # lingering running=true one and name the cause.
+                status_file.stamp_supervisor_failure(
+                    data_dir,
+                    exit_reason="recorder-drain-timeout",
+                    supervisor_rc=1,
+                    last_error=(
+                        "recorder did not finish draining after the stop request; "
+                        "force-cancelled"
+                    ),
+                )
+                return 1
+            return _settle_recorder_rc(recorder_task.result(), logger, data_dir)
         logger.error(
             f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
             "branch surfaced an ErrorFrame and is rotating the partial session. "
@@ -997,17 +1073,7 @@ async def _run_recorder_with_capturer(
             "fail-loud, even on rc=0)."
         )
         try:
-            await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
-        except TimeoutError:
-            logger.warning(
-                "Socket supervisor: recorder did not finish draining within "
-                f"{_RECORDER_DRAIN_GRACE_SEC}s after capturer death — force-cancelling."
-            )
-            recorder_task.cancel()
-            try:
-                await recorder_task
-            except asyncio.CancelledError:
-                pass
+            await _drain_recorder_bounded(recorder_task, logger, "after capturer death")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
