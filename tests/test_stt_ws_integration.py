@@ -125,7 +125,14 @@ def _require_server(kwargs: dict[str, object]) -> None:
     try:
         asyncio.run(_probe())
     except Exception as exc:  # unreachable, auth, wrong service: all a skip here
-        pytest.skip(f"no STT server answered a handshake ({kwargs}): {exc!r}")
+        from onoats._redact import safe_exc_text
+
+        # Never format the raw kwargs/exception: they can carry the auth token
+        # or URI userinfo, and a skip reason lands in CI/terminal output.
+        pytest.skip(
+            f"no STT server answered a handshake ({_describe(kwargs)}): "
+            f"{type(exc).__name__}: {safe_exc_text(exc)}"
+        )
 
 
 def _describe(kwargs: dict[str, object]) -> str:
