@@ -14,7 +14,7 @@ Replace Onoats.app's flat menu with a compact window-style recording panel centr
 
 ## Context
 
-The current SwiftUI `MenuBarExtra` uses the default menu presentation. It places lifecycle controls, Seminar, device selection, STT selection, storage paths, diagnostics, and Quit in one flat list. The product owner confirmed the primary menu-bar workflow is narrower: open the menu-bar item, optionally select Seminar, then Start or Stop. Phase 1 validates that hierarchy in the signed native smoke before it becomes final.
+The current SwiftUI `MenuBarExtra` uses the default menu presentation. It places lifecycle controls, Seminar, device selection, STT selection, storage paths, diagnostics, and Quit in one flat list. The product owner confirmed the primary menu-bar workflow is narrower: open the menu-bar item, optionally select Seminar, then Start or Stop. Phase 1 validates the brand direction; Phase 6 validates the final control hierarchy in the signed native smoke.
 
 The recorder already exposes authoritative process liveness, warnings, start time, device names, and a running STT label. It does not expose per-branch activity, structured STT health, or a safe last-transcript preview. Those values must come from the runtime that owns the audio and STT connections; Swift must not infer them from an endpoint probe or stale session file.
 
@@ -29,15 +29,15 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
   - app-owned Stop terminates the retained supervisor `Process` gracefully;
   - external-session Stop invokes identity-checked `onoats stop`;
   - Flush invokes identity-checked `onoats flush`.
-- Show the Seminar control only before Start. Preserve its next-session-only, in-memory, reset-on-exit semantics. Show a read-only Seminar badge during a locked session.
+- Show the Seminar control only before Start. Preserve its next-session-only, in-memory, reset-on-exit semantics. During an app-owned locked session, keep that selected lock as the badge authority even if telemetry disappears. During an external session, show the badge only from fresh same-owner telemetry; otherwise show `Category unavailable` rather than assuming Seminar.
 - Keep warnings, failure detail, schema drift, external-session state, stopping/draining state, and login-item hints visible and accessible.
 - Keep STT operational state visible on the main panel. Put the STT service picker and advanced endpoint access inside the settings view.
 - Move microphone selection, data-directory selection, config access, CLI diagnostics, and Quit into an in-panel settings view reached by a gear button.
 - Preserve `config.toml` as the shared source of truth for recorder settings. UI-only presentation preferences may use `UserDefaults`.
 - Do not add a launch-at-login toggle. `config.toml` remains its only control surface.
-- Show Me/Them activity only when runtime telemetry is fresh. Never convert missing or stale data into a healthy signal.
+- Show Me/Them activity only when both the runtime snapshot and that branch's last audio observation are fresh. Hide a branch after one second without a new observation; never convert missing or stale data into a healthy signal.
 - Scope new activity telemetry to the CoreAudio/socket path used by Onoats.app. Preserve PortAudio and `bot-single` as unchanged CLI compatibility paths; an externally started unsupported session shows activity unavailable.
-- Present one combined STT row for the menu-bar app's two required branches: `failed` if either fails, `recovering` if either recovers, `starting` if either starts, `unknown` if either lacks confirmation, and `ready` only when both confirm ready. Show branch detail only when the aggregate is not ready.
+- Present one combined STT row for the menu-bar app's two required branches: `failed` if either fails, `recovering` if either recovers, `starting` if either starts, `unknown` if either lacks confirmation, and `ready` only when both confirm ready. Show branch detail only when the aggregate is not ready. Swift recomputes this aggregate and rejects a snapshot whose published aggregate disagrees.
 - Make the last-transcript preview opt-in and off by default. Bound its length and keep the full transcript only in the existing session JSONL.
 - Keep the lifecycle status schema at v2. Live display telemetry uses its own versioned, ephemeral contract.
 - Telemetry failures must fail open: they may degrade the panel, but must never stop capture, STT, transcript persistence, or shutdown.
@@ -46,7 +46,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
   - a full Onoats brand mark/wordmark for the app header and future website use;
   - a monochrome template icon that remains legible at macOS menu-bar sizes.
 - Keep canonical vector brand sources in the repository. Commit required native exports and copy them explicitly into the signed app bundle.
-- Pin status, PID, and telemetry reads to the active session's data directory until that recorder exits. A changed configured directory applies on the next Start.
+- Snapshot the configured data directory synchronously at Start and pin it until that recorder exits. Export it to the supervisor as `ONOATS_DATA_DIR`, use it for status/PID/telemetry reads and exit handling, and pass it explicitly to external Stop and Flush. A changed configured directory applies on the next Start.
 - When the configured directory changes mid-session, show both `Recording to: <active>` and `Next recording: <configured>` in the panel until convergence.
 - Expose `Open Log` on warning/failure surfaces and expose both `Open Log` and `Show Logs Folder` under Settings → Diagnostics. Fall back to the folder when the log file does not exist; do not embed a live log tail.
 - Do not change the website in this plan because its source is not present in this checkout.
@@ -63,6 +63,10 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Verify the native manual smoke matrix covers keyboard access, VoiceOver labels, panel dismissal, and all existing actions.
 - Verify the menu-bar scope does not add telemetry requirements to PortAudio or `bot-single`.
 - Verify log actions open only the canonical log file/folder and never render log content inside the popover.
+- Verify per-branch observation ages cannot be refreshed by a snapshot heartbeat and that aggregate STT drift is rejected.
+- Verify active-directory pinning governs process launch, reads, Flush, external Stop, and exit handling.
+- Verify the pre-PID permission-wait warning decorates only the matching app-owned starting attempt and never establishes recorder liveness.
+- Verify staged smoke and installation exercise the same verified app/CLI revision, with explicit clean-install and rollback-baseline behaviour.
 
 ## Implementation Checklist
 
@@ -86,15 +90,15 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 **Goal:** Runtime telemetry is display-only, branch-safe, stale-rejectable, bounded, and incapable of affecting recorder success or transcript durability.
 
 - Add a separate schema-v1 `.active/onoats.ui.json` snapshot. Do not add fields to `StatusRecord` or bump `STATUS_SCHEMA_VERSION`.
-- Define one exact record shape shared by Python tests and Swift decoding: schema, recorder PID/start epoch, update time, optional Me/Them levels, per-branch plus aggregate STT state/detail, optional bounded transcript preview/source/speaker label, and locked category.
+- Define one exact record shape shared by Python tests and Swift decoding: schema, recorder PID/start epoch, update time, optional Me/Them levels with per-branch observation timestamps, per-branch plus aggregate STT state/detail, optional bounded transcript preview/source/speaker label, and locked category.
 - Write snapshots by same-directory temporary file plus `os.replace`, with owner-only permissions. Because the file is ephemeral, do not `fsync` every meter update.
-- Define Python-owned constants and mirror them in Swift: schema `1`, file name `onoats.ui.json`, mode `0o600`, maximum write rate `4 Hz`, unchanged-state heartbeat `2 s`, stale expiry `5 s`, transcript limit `240` Unicode code points, detail limit `256` Unicode code points, and level range `[0.0, 1.0]`.
+- Define Python-owned constants and mirror them in Swift: schema `1`, file name `onoats.ui.json`, mode `0o600`, maximum write rate `4 Hz`, unchanged-state heartbeat `2 s`, snapshot expiry `5 s`, per-branch audio-observation expiry `1 s`, transcript limit `240` Unicode code points, detail limit `256` Unicode code points, and level range `[0.0, 1.0]`.
 - Let audio/STT/transcript callbacks update memory only. Coalesce changed snapshots and heartbeats through one bounded background task; no callback performs filesystem I/O or awaits persistence.
-- Suppress redundant intermediate snapshots, but write an unchanged heartbeat every 2 seconds so healthy telemetry never expires.
+- Suppress redundant intermediate snapshots, but write an unchanged heartbeat every 2 seconds so healthy telemetry never expires. A heartbeat updates only snapshot time; it never advances either branch's audio-observation timestamp.
 - Reject non-finite or out-of-range level values and clamp accepted levels to `[0, 1]` at the publisher boundary.
 - Construct telemetry only for `audio_source == "socket"`. Inject source-labelled level observers into the two existing socket transports; keep the transport generic and preserve one socket to one branch. PortAudio and `bot-single` remain unchanged.
 - Publish transcript preview data from final `TranscriptionFrame` handling without changing JSONL entries or render-time speaker composition.
-- Track mic and system STT state independently. Aggregate by fixed precedence `failed > recovering > starting > unknown > ready`; `ready` requires both branches ready. Use `unknown` for backends without a trustworthy confirmation hook.
+- Track mic and system STT state independently. Aggregate by fixed precedence `failed > recovering > starting > unknown > ready`; `ready` requires both branches ready. Use `unknown` for backends without a trustworthy confirmation hook. Treat branch states as the aggregate's source of truth.
 - Sanitize STT detail through existing URI/exception redaction before it reaches telemetry.
 - Mint one run epoch before PID/status publication. Pass the exact value to the PID file, lifecycle status, telemetry ownership, and cleanup; enable telemetry writes only after PID then running-status publication succeeds.
 - Make producer and cleanup errors warning-only. Cleanup may unlink only a snapshot that still belongs to the same PID/start epoch.
@@ -106,15 +110,17 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 **Goal:** The menu app accepts only fresh telemetry for the same live recorder and degrades to neutral UI without changing recorder liveness.
 
 - Add a Swift mirror of the UI telemetry schema without modifying the existing `StatusRecord` mirror.
-- Resolve the configured directory while stopped. On the first verified live identity, pin its active directory until that PID/start epoch exits; read status, PID, and telemetry only from the pinned directory during the run.
+- Resolve and snapshot the configured directory synchronously before an app-owned Start. Export it as `ONOATS_DATA_DIR`, retain it until that PID/start epoch exits, read status/PID/telemetry and exit status only from it, and pass `--data-dir <active>` to external Stop and Flush. For an externally discovered session, pin the directory that supplied the verified identity.
 - Retain the changed configured directory as `nextDataDir` and publish active/next display values when they differ.
-- Accept telemetry only when schema, PID, start epoch, freshness window, numeric ranges, and optional-string bounds pass validation.
+- Accept telemetry only when schema, PID, start epoch, snapshot freshness, per-branch observation freshness, numeric ranges, and optional-string bounds pass validation. Recompute aggregate STT state from the two branches and reject any mismatch with the published aggregate.
 - Keep PID identity/liveness authoritative. Telemetry must never create `.running`, `.stopped`, or `.failed` state.
-- Clear activity, STT health, category badge, and preview when telemetry is missing, stale, malformed, or owned by another run.
+- Clear activity, STT health, telemetry-derived category, and preview when telemetry is missing, stale, malformed, or owned by another run. Preserve the app-owned in-memory Seminar lock as its badge authority; for an external session without trustworthy category telemetry, show `Category unavailable`.
+- While the retained app-owned supervisor is alive but no recorder PID exists, accept `write_prestart_waiting` detail only when its status PID matches `Process.processIdentifier` and its start time is no older than that Start attempt. It may decorate `.starting` but must never create `.running` or override PID liveness; clear it on supervisor exit or authoritative recorder publication.
 - Poll live telemetry at 4 Hz and animate between samples; keep status/PID polling at its existing cadence.
 - Persist only the transcript-preview visibility preference in `UserDefaults`, defaulting to off.
-- Add source-reading parity tests for the telemetry schema, allowed STT states, bounds, and file name.
-- Add a small native decoder harness with shared JSON fixtures. Execute valid, malformed, stale, foreign-owner, boundary, and non-finite cases instead of relying only on source-reading tests.
+- Add source-reading parity tests for the telemetry schema, allowed STT states, aggregate precedence, bounds, freshness constants, and file name.
+- Add a small native decoder harness with shared JSON fixtures. Execute valid, malformed, stale, foreign-owner, boundary, non-finite, aggregate-mismatch, and non-ASCII 239/240/241-scalar cases instead of relying only on source-reading tests.
+- Add a native `RecorderModel` harness with injectable file/process operations. Exercise directory changes, PID reuse, old-run exit, next-run adoption, owned termination, external `onoats stop --data-dir`, `onoats flush --data-dir`, pre-PID permission detail, and drain-state convergence.
 - Compile with `make -C native build/Onoats` after each model change.
 
 ### Phase 4: Native Resource Pipeline and Stateful Menu Icon (manual native phase; not `/conduct`-driven)
@@ -129,7 +135,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Use the full brand mark only in the panel header and app icon, never as a detailed colour menu-bar image.
 - Add release-metadata/source-reading assertions for resource names, bundle-copy steps, template handling, and Info.plist icon metadata.
 - Verify the assembled bundle contains every resource before codesigning and that `codesign --verify --deep --strict` succeeds after signing.
-- Capture the installed app's designated requirement before assembly and byte-compare it with the staged signed bundle before installation.
+- If an installed app exists, validate its signature and designated requirement before treating it as a comparison or rollback baseline. A missing or invalid baseline does not block a clean install after staged verification and must never be used for rollback.
 
 ### Phase 5: Window-Style Recording Panel and In-Panel Settings (manual native phase; not `/conduct`-driven)
 
@@ -137,10 +143,12 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 
 - Apply `.menuBarExtraStyle(.window)` and replace the flat `MenuContent` with a fixed-width main panel plus an in-panel settings destination.
 - Main stopped/failed state: brand header, concise readiness/failure state, warning banners, Seminar toggle, and a full-width Start button.
-- Main running state: elapsed time, read-only Seminar badge when locked, Me/Them CoreAudio activity rows, one aggregated STT state with unhealthy branch detail, optional one-line transcript preview, full-width Stop, and secondary Flush.
+- Main running state: elapsed time, read-only Seminar badge from the app-owned lock or fresh same-owner external telemetry, Me/Them CoreAudio activity rows, one aggregated STT state with unhealthy branch detail, optional one-line transcript preview, full-width Stop, and secondary Flush. Show `Category unavailable` for an external session whose category cannot be established.
 - If active and configured data directories differ, show `Recording to: <active>` and `Next recording: <configured>` until the active recorder exits.
 - Keep Start disabled when the CLI is unavailable. Keep Stop disabled only for the existing in-flight external-stop guard.
 - Preserve the distinction between app-owned and external sessions, including the “started outside the menu bar” disclosure. Unsupported external capture paths show activity unavailable without gaining new telemetry requirements.
+- Keep pre-PID permission-wait detail visible in the matching app-owned starting state without treating it as recorder liveness.
+- Route external Stop and Flush through the pinned active directory with explicit `--data-dir`; never let a next-session directory setting retarget the active recorder.
 - Settings: microphone picker, system-output display, STT service picker, Open `config.toml`, data-directory picker, transcript-preview toggle, and Quit/Stop & Quit.
 - Settings → Diagnostics: Open Log, Show Logs Folder, CLI path/status, active data directory, and next-recording directory. `Open Log` opens the canonical file or falls back to the folder when absent.
 - Warning and failure surfaces include an `Open Log` action. Do not tail or render log contents inside the popover.
@@ -164,9 +172,10 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Run `uv run ruff format` and `uv run ruff check` before the full suite.
 - Run `uv run pytest` in full.
 - Build the unsigned compile-smoke binaries with `make -C native build`.
-- Run pre-merge documentation, code, security, and full review gates before final signing. Apply every accepted fix, then rerun affected focused tests and native smoke cases.
-- Assemble and sign a staged Onoats.app, verify its resource allowlist, signature, and byte-identical designated requirement, then perform the manual smoke matrix against that staged bundle before installation.
-- Before installation, record the installed app path/version, CLI path/version, and a recoverable app backup. Install app and CLI as one pair; if post-install smoke fails, restore the prior app and CLI pairing and verify it starts.
+- Run pre-merge documentation, code, security, and full review gates before final signing. Apply every accepted fix, then rerun Ruff format/check, review-marker validation, the full pytest suite, and the native build before affected focused tests and native smoke cases.
+- Assemble and sign a staged Onoats.app and matching CLI from the same revision. Verify the resource allowlist, signature, designated requirement, and both artifact hashes. Point the staged app at that CLI with a recorded `cliPath` override before running the manual smoke matrix.
+- Preflight any installed app/CLI pair before treating it as a rollback baseline: require both artifacts, executable/version agreement, a valid app signature, and the expected designated requirement. A missing or invalid pair is a clean-install case, not a rollback source.
+- Install the exact staged app and CLI bytes that passed smoke without invoking a target that rebuilds or re-signs them; verify their post-copy hashes. If post-install smoke fails, restore and verify only a preflight-approved prior pair. For a clean install, report the failure and do not claim rollback.
 - Run the post-install smoke only after the staged bundle passes. Installation is not the first acceptance test.
 - Before any commit, inspect only explicitly staged paths for secrets, credentials, private transcripts, PII, and unintended binary metadata.
 
@@ -175,10 +184,10 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 ### Files to Modify
 
 - `native/onoats-menubar/Sources/OnoatsMenuBarApp.swift` — window-style scene, main-panel state, stateful template icon.
-- `native/onoats-menubar/Sources/RecorderModel.swift` — telemetry state, pinned active/next directories, log/folder actions, validated refresh integration, retained lifecycle actions.
+- `native/onoats-menubar/Sources/RecorderModel.swift` — telemetry state, authoritative active/next directories for launch/read/signal/exit, pre-PID warning detail, log/folder actions, validated refresh integration, retained lifecycle actions.
 - `native/onoats-menubar/Sources/ConfigStore.swift` — only if settings navigation needs an existing-key read/write helper; do not broaden it into a full TOML parser.
 - `native/onoats-menubar/Info.plist` — app icon metadata only.
-- `native/Makefile` — explicit resource assembly and verification inputs.
+- `native/Makefile` — explicit resource assembly and verification inputs plus installation of already-verified staged bytes without rebuild.
 - `src/onoats/transports/socket_audio.py` — optional source-labelled audio-observation callback after frame validation.
 - `src/onoats/dual.py` — telemetry lifecycle, branch wiring, STT state wiring, owner-checked shutdown.
 - `src/onoats/processors/transcript_buffer.py` — optional finalized-utterance observation hook.
@@ -205,8 +214,10 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - `native/onoats-menubar/Sources/RecordingPanelView.swift` — main recording-control panel.
 - `native/onoats-menubar/Sources/SettingsPanelView.swift` — in-panel settings destination.
 - `native/onoats-menubar/Tests/UiTelemetryDecoderHarness.swift` — executable strict-decoder harness for shared JSON fixtures.
+- `native/onoats-menubar/Tests/RecorderModelHarness.swift` — executable model harness for directory authority, lifecycle routing, and pre-PID warning detail.
 - `tests/fixtures/ui_telemetry/` — shared valid, malformed, stale, foreign-owner, boundary, and non-finite JSON vectors.
 - `native/test_ui_telemetry.sh` — compile and run the decoder harness on macOS without introducing Swift Package Manager.
+- `native/test_recorder_model.sh` — compile and run the model harness on macOS without introducing Swift Package Manager.
 - `assets/brand/onoats-mark.svg` — canonical standalone mark.
 - `assets/brand/onoats-wordmark.svg` — canonical mark plus wordmark.
 - `assets/brand/README.md` — palette, clear space, small-size, export, and template-icon rules.
@@ -219,13 +230,13 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Path: `<data_dir>/.active/onoats.ui.json`.
 - Schema: independent integer `1`; it does not share `STATUS_SCHEMA_VERSION`.
 - Ownership tuple: recorder PID plus one caller-minted run epoch shared byte-for-byte with PID line 4 and lifecycle `start_time`.
-- Freshness: maximum 4 writes per second, heartbeat at least every 2 seconds, and consumer expiry after 5 seconds. Swift also requires the authoritative PID record to be live.
-- Activity: optional normalized peaks for `me` and `them`. Missing means unknown, not zero and not healthy.
-- STT state: mic/system each use `starting | ready | recovering | failed | unknown`; aggregate precedence is `failed > recovering > starting > unknown > ready`, and ready requires both branches.
+- Freshness: maximum 4 writes per second, heartbeat at least every 2 seconds, and snapshot expiry after 5 seconds. Each activity branch carries its own observation timestamp and expires after 1 second without a new frame. Swift also requires the authoritative PID record to be live.
+- Activity: optional normalized peaks plus observation timestamps for `me` and `them`. Missing or branch-stale means unknown, not zero and not healthy; a snapshot heartbeat never refreshes branch age.
+- STT state: mic/system each use `starting | ready | recovering | failed | unknown`; aggregate precedence is `failed > recovering > starting > unknown > ready`, and ready requires both branches. Swift recomputes and rejects disagreement with the published aggregate.
 - Transcript preview: optional text capped at 240 Unicode code points plus canonical source and render-time speaker label. It never replaces the durable JSONL entry.
 - STT detail: optional, redacted, and capped at 256 Unicode code points.
 - File mode: `0o600`; level values are finite and within `[0.0, 1.0]`.
-- Category: optional locked category. The panel renders a Seminar badge only for the exact canonical Seminar category.
+- Category: optional locked category. The app-owned in-memory lock remains authoritative for its run; an external session uses only fresh same-owner telemetry. The panel renders a Seminar badge only for the exact canonical Seminar category and otherwise shows `Category unavailable` when external category authority is absent.
 - Durability: none. Writes are atomic but deliberately not fsynced. The file may disappear or be stale after a crash.
 - Failure policy: best-effort and warning-only. Repeated failures are rate-limited.
 
@@ -235,9 +246,14 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - **Decision (grilled):** Scope new meters and telemetry to Onoats.app's CoreAudio/socket session. Preserve PortAudio and `bot-single` without new UI telemetry requirements; show unavailable for unsupported external sessions.
 - **Decision (grilled):** Combine the menu-bar app's two STT instances into one row. Green requires both ready; unhealthy states expose branch detail.
 - **Decision (grilled):** Publish at 4 Hz maximum, heartbeat every 2 seconds, and expire after 5 seconds to balance meter response and filesystem load.
-- **Decision (grilled):** Pin the active data directory until recorder exit. When settings change it mid-run, show active and next-recording paths.
+- **Decision (grilled):** Snapshot the configured data directory synchronously at Start and use that pinned path for supervisor environment, status/PID/telemetry reads, exit handling, external Stop, and Flush until the recorder exits. When settings change it mid-run, show active and next-recording paths.
 - **Decision (grilled):** Show Python's redacted running STT label on the main panel. Keep the service picker and config-file endpoint access in settings.
 - **Decision (grilled):** Offer Open Log plus Show Logs Folder. Warnings link to the file, with folder fallback; the popover never tails logs.
+- **Decision (grilled):** Treat the app-owned Seminar selection as badge authority even if telemetry disappears. External sessions require fresh same-owner category telemetry and otherwise display `Category unavailable`.
+- **Decision (grilled):** Show a pre-PID permission-wait warning only for the matching retained app-owned supervisor. It decorates `.starting` but never establishes recorder liveness.
+- **Decision (grilled):** Carry per-branch audio-observation timestamps and hide a branch after one second without a new frame; the five-second snapshot expiry continues to govern the overall telemetry record.
+- **Decision (grilled):** Permit a clean install after staged app/CLI verification when no trustworthy prior pair exists. Use rollback only when both prior artifacts pass preflight.
+- **Decision (grilled):** Swift recomputes aggregate STT state from the two branches and rejects telemetry when the published aggregate disagrees.
 - Compute Me/Them peaks after socket-frame validation and before staging. The callback receives its source from branch construction, not from mutable frame metadata.
 - Keep audio callbacks memory-only and coalesce persistence through one bounded background task. UI animation interpolates between bounded snapshots.
 - Let Python publish STT state. Swift performs no network probe and does not duplicate authentication, URI, reconnect, or launchd logic.
@@ -258,14 +274,15 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 
 | Seam | Writer | Caller | Contract |
 |---|---|---|---|
-| Audio activity | Socket input transport | UI telemetry publisher | Validated PCM, fixed branch source, no await/backpressure mutation, normalized finite peak |
+| Audio activity | Socket input transport | UI telemetry publisher | Validated PCM, fixed branch source, no await/backpressure mutation, normalized finite peak plus producer observation time; 1 s branch expiry |
 | Transcript preview | `TranscriptBuffer` | UI telemetry publisher | Final non-empty utterance, bounded copy only, durable JSONL unchanged |
-| STT health | Two runtime STT instances | UI telemetry publisher | Branch-labelled states, fixed aggregate precedence, both-ready green rule, redacted details |
+| STT health | Two runtime STT instances | UI telemetry publisher | Branch-labelled states, fixed aggregate precedence, both-ready green rule, Swift aggregate consistency check, redacted details |
 | UI snapshot | UI telemetry publisher | Swift telemetry reader | Atomic schema-v1 JSON, 4 Hz cap, 2 s heartbeat, 5 s expiry, shared PID/epoch, mode 0600 |
-| Lifecycle state | Status/PID files | `RecorderModel` | PID identity remains authoritative; telemetry cannot change recorder state |
-| Recorder settings | Swift `ConfigStore` | Python config loader | Existing narrow TOML edits preserve unrelated content; pin active directory and apply new directory next Start |
+| Lifecycle state | Status/PID files | `RecorderModel` | PID identity remains authoritative; telemetry cannot change recorder state; matching pre-PID detail may decorate app-owned starting only |
+| Recorder settings | Swift `ConfigStore` | Python config loader and CLI actions | Existing narrow TOML edits preserve unrelated content; one Start-time directory snapshot governs launch/read/signal/exit while changes apply next Start |
 | Diagnostics | Canonical log path | Panel and settings | Open file when present, otherwise reveal folder; never tail content in the popover |
 | Native assets | Canonical SVG/exports | Makefile and Swift panel | Explicit filenames, template semantics, resource copy before signing |
+| Install pairing | Verified staged app and CLI | Native install workflow | Same revision and recorded hashes; no rebuild after smoke; rollback only to a preflight-approved pair |
 | Historic plans | Current plan | Prior decision records | Dated correction and cross-link only when a prior decision is materially superseded |
 
 ## Architecture & Call Flow
@@ -321,13 +338,14 @@ sequenceDiagram
 ### Automated Test Approach
 
 - Unit-test UI telemetry schema, numeric validation, truncation, permissions, atomic replacement, throttling, freshness, owner-checking, cleanup, and fail-open writes.
-- Mutation-test ownership/freshness by substituting stale PID, same PID with a different start epoch, stale update time, schema drift, malformed JSON, and non-finite levels. Assert the one minted epoch is identical in PID, status, and telemetry.
-- Fake-clock changed writes, unchanged 2-second heartbeats, 4 Hz suppression, 5-second expiry, repeated-failure warning suppression, recovery logging, and fail-open cleanup.
+- Mutation-test ownership/freshness by substituting stale PID, same PID with a different start epoch, stale update time, branch observation older than 1 second, schema drift, malformed JSON, and non-finite levels. Assert the one minted epoch is identical in PID, status, and telemetry.
+- Fake-clock changed writes, unchanged 2-second heartbeats, 4 Hz suppression, 1-second branch expiry, 5-second snapshot expiry, repeated-failure warning suppression, recovery logging, and fail-open cleanup. Assert heartbeats do not advance branch observation times.
 - Exercise the menu-bar source matrix: Me/Them, socket telemetry present/absent, unsupported external capture, transcript preview enabled/disabled, and owned/external session. PortAudio and `bot-single` remain outside new telemetry scope.
 - Assert level callbacks preserve one socket to one branch and do not alter staging, byte caps, drop policy, or fatal error behaviour.
-- Assert every mic/system STT state pair and callback ordering against the fixed aggregate precedence, including startup, recovery, confirmation, auth/protocol failure, and unknown backend support.
+- Assert every mic/system STT state pair and callback ordering against the fixed aggregate precedence, including startup, recovery, confirmation, auth/protocol failure, unknown backend support, and every aggregate/branch mismatch.
 - Assert URI userinfo/query secrets cannot reach the telemetry file or Swift display.
-- Source-read Swift contracts and execute the native decoder harness against shared JSON vectors for telemetry fields, allowed states, exact bounds, freshness, ownership, and rejection cases.
+- Source-read Swift contracts and execute the native decoder harness against shared JSON vectors for telemetry fields, allowed states, exact bounds, freshness, ownership, aggregate mismatches, and rejection cases. Include 239/240/241-scalar strings using combining marks, astral characters, and ZWJ sequences.
+- Execute the native model harness across directory changes, PID reuse, old-run exit, next-run adoption, owned termination, external Stop, Flush, pre-PID permission detail, and drain-state convergence.
 - Keep existing status, CLI, socket, supervisor, diarization, release metadata, and parity suites green.
 
 ### Manual Native Smoke Matrix
@@ -335,18 +353,18 @@ sequenceDiagram
 - Stopped: panel opens at a stable size; Seminar is editable; Start is dominant; settings are reachable and return preserves state.
 - Starting/running/stopping/failed: every transition has a truthful label and the main action cannot double-fire.
 - Owned and external sessions: Stop follows the correct path; Flush still works; draining never renders as stopped early.
-- Seminar: selected before Start, shown read-only during recording, passed as `--category seminars`, and reset after exit.
-- Me/Them: speak/play each side independently; only its meter responds; silence decays; stale telemetry becomes unknown.
+- Seminar: selected before Start, shown read-only during an app-owned recording even if telemetry disappears, passed as `--category seminars`, and reset after exit; external sessions without fresh category telemetry show `Category unavailable`.
+- Me/Them: speak/play each side independently; only its meter responds; silence decays; a branch freezes to unavailable after one second without frames; stale snapshots become unknown after five seconds.
 - STT: confirmed ready, recovering, failed, and unknown render distinct states without false green.
 - Transcript preview: off by default; enabling shows one bounded latest line; disabling removes it immediately; stale prior-run text never appears.
 - Warnings: all-zero input, STT recovery, login-item hint, schema drift, Flush/Stop failure, and failed-session detail wrap without panel expansion.
 - Settings: microphone, STT service, data directory, config open, CLI diagnostics, and Quit/Stop & Quit retain current behaviour.
-- Directory transition: change the configured directory during a run; confirm the panel keeps reading the active directory, shows active/next paths, and adopts the new directory only after the next Start.
+- Directory transition: change the configured directory during a run; confirm the panel keeps launching/reading/signalling/exiting through the active directory, shows active/next paths, and adopts the new directory only after the next Start.
 - Diagnostics: Open Log opens the canonical file; Show Logs Folder reveals the folder; absent-file Open Log falls back to the folder; no transcript/log tail appears in-panel.
 - Dismissal: Escape and click-away close the panel; reopen and settings/back preserve correct state while recording continues.
 - Accessibility: Tab/Shift-Tab focus order, Space/Return activation, VoiceOver labels, tooltip text, contrast, Reduce Motion, and light/dark menu bars.
 - Branding: header and app icon render sharply; custom menu icon remains legible at supported scales and shows each state.
-- Bundle: staged signed app passes resource allowlist and codesign checks; before/after `codesign -dr` outputs are byte-identical; installation retains microphone/system-audio grants.
+- Bundle: staged signed app passes resource allowlist and codesign checks; app and CLI hashes match the installed bytes; a valid baseline preserves byte-identical designated requirements and grants, while a missing baseline follows the documented clean-install path.
 
 ### Test Results
 
@@ -355,31 +373,33 @@ sequenceDiagram
 - [ ] Full `uv run pytest` passes.
 - [ ] `make -C native build` passes.
 - [ ] `native/test_ui_telemetry.sh` passes on macOS.
+- [ ] `native/test_recorder_model.sh` passes on macOS.
 - [ ] Signed bundle verification passes.
-- [ ] Designated-requirement bytes match the installed baseline.
+- [ ] Designated-requirement bytes match the verified installed baseline when one exists; clean-install evidence is recorded otherwise.
 - [ ] Manual native smoke matrix passes.
 
 ## Acceptance Criteria
 
 - The menu-bar item opens a window-style panel whose dominant action is Start when stopped and Stop when running.
-- Seminar is one interaction away before Start, remains next-session-only, and displays read-only during a locked run.
+- Seminar is one interaction away before Start, remains next-session-only, and displays read-only during an app-owned locked run even without telemetry. External sessions require fresh matching category telemetry or show `Category unavailable`.
 - Every existing control remains available either on the main panel or in its settings destination.
 - Owned Stop, external Stop, Flush, Quit, liveness, warnings, and drain semantics remain unchanged and covered.
-- Me/Them indicators use separate fresh CoreAudio/socket values; stale, missing, malformed, or unsupported external telemetry renders unavailable.
-- The primary combined STT row never shows green unless both menu-bar branches confirm ready; non-ready states identify unhealthy branches.
+- Me/Them indicators use separate fresh CoreAudio/socket values with producer observation times; a branch older than one second and any stale, missing, malformed, or unsupported external telemetry renders unavailable.
+- The primary combined STT row never shows green unless both menu-bar branches confirm ready; non-ready states identify unhealthy branches, and Swift rejects a published aggregate that disagrees with its branches.
 - Transcript preview is opt-in, bounded, redacted where applicable, and never leaks a previous run.
 - Telemetry writes are versioned, atomic, mode 0600, capped at 4 Hz, heartbeated every 2 seconds, expired after 5 seconds, owner-checked, asynchronously coalesced, and fail open.
 - PID, lifecycle status, and telemetry carry one identical caller-minted run epoch; telemetry begins only after authoritative identity publication.
-- Changing the data directory during a run leaves the active session pinned, shows active/next paths, and applies on the next recording.
+- Changing the data directory during a run leaves one Start-time path authoritative for launch, reads, external Stop, Flush, and exit handling; the panel shows active/next paths and applies the change on the next recording.
+- A matching pre-PID permission-wait status may decorate only the app-owned starting state and never creates recorder liveness.
 - Warning/failure surfaces can open the canonical log; Settings → Diagnostics can open the file or reveal its folder without embedding log content.
 - `STATUS_SCHEMA_VERSION` remains 2 and all existing Swift/Python parity tests pass.
 - A user-approved canonical SVG brand, app icon, and monochrome template menu icon are committed with reuse guidance.
-- The assembled clean staged app contains only allowlisted resources and passes signature plus byte-identical designated-requirement verification before installation.
+- The assembled clean staged app contains only allowlisted resources and passes signature verification. Staged smoke and installation use the exact same hashed app/CLI pair; rollback uses only a verified prior pair, while an absent baseline follows the clean-install path.
 - README/native docs describe the final UI and telemetry meanings; only materially superseded historic decisions receive dated corrections.
-- Focused tests, full pytest, Ruff format/check, review-marker validation, native compile, signed-app verification, and manual smoke all pass.
+- After accepted review fixes, focused tests, full pytest, Ruff format/check, review-marker validation, native compile, signed-app verification, and manual smoke all pass on the final bytes.
 - Pre-merge documentation, code, security, and full review gates report no unresolved findings.
 
-<!-- reviewed: 2026-10-28 @ 32e48ea9fc76b7efd408c103f5c8f08913fc5da4 -->
+<!-- reviewed: 2026-10-29 @ ae087b8772158725e9273d9aab305d856cb0feff -->
 
 ## Progress
 
