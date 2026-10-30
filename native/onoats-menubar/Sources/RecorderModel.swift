@@ -1,24 +1,10 @@
-// Recorder state for the menu bar: poll the Phase-5a status file (read-only
-// consumer, schema-guarded) + the pid-file liveness backstop, and own the
-// Start/Stop/Flush process control.
-//
-// Lifecycle invariant (dev plan Phase 5b): Stop signals the `onoats bot`
-// SUPERVISOR process (SIGTERM → graceful drain, runtime.py installs the
-// handler), NEVER the capturer — the supervisor owns the capturer lifecycle;
-// killing the capturer directly would surface as a fatal capturer-crash.
-//
-// Liveness mirrors status.resolve_liveness(): the pid file is authoritative
-// for the live/stopped VERDICT, the status file supplies the DETAIL (source,
-// STT label, start time, why a start failed). A stale status file must never
-// render a dead recorder as running.
+// Recorder state for the menu bar. PID identity is the sole liveness
+// authority; lifecycle status and UI telemetry only decorate that verdict.
 import AppKit
 import CoreAudio
 import Foundation
 import SwiftUI
 
-/// Mirror of `src/onoats/status.py` `StatusRecord` (STATUS_SCHEMA_VERSION=2).
-/// v2 adds the optional `warning` (live capture anomaly, supervisor-managed)
-/// and `mic_device`/`system_device` (populated from Phase 5 onward).
 struct StatusRecord: Decodable {
     let schema: Int
     let pid: Int32
@@ -37,15 +23,152 @@ struct StatusRecord: Decodable {
 
 enum RecorderState: Equatable {
     case stopped
-    case starting        // we spawned `onoats bot`; recorder pid not yet alive
+    case starting
     case running(ours: Bool)
-    case stopping        // SIGTERM sent; draining
+    case stopping
     case failed(reason: String, detail: String?)
+}
+
+protocol ProcessHandle: AnyObject {
+    var pid: Int32 { get }
+    var isRunning: Bool { get }
+    var terminationStatus: Int32 { get }
+    func terminate()
+}
+
+protocol PollHandle: AnyObject { func cancel() }
+
+struct ProcessRequest {
+    let executable: URL
+    let arguments: [String]
+    let environment: [String: String]?
+    let appendOutputTo: URL?
+}
+
+/// Keeps optional Process.arguments construction semantics while process
+/// creation itself remains wholly behind SystemOps.
+private struct ProcessArguments {
+    var arguments: [String]?
+}
+
+/// All process, signal, file, clock and polling effects used by the model.
+@MainActor
+protocol SystemOps: AnyObject {
+    func spawn(
+        _ request: ProcessRequest,
+        onExit: @escaping @MainActor (ProcessHandle) -> Void
+    ) throws -> ProcessHandle
+    func processIsAlive(_ pid: Int32) -> Bool
+    func commandLine(_ pid: Int32) -> String?
+    func readData(at url: URL) -> Data?
+    func readText(at url: URL) -> String?
+    func write(_ data: Data, to url: URL) throws
+    func delete(at url: URL) throws
+    func fileExists(at url: URL) -> Bool
+    func isExecutable(at url: URL) -> Bool
+    func now() -> Date
+    func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
+        -> PollHandle
+}
+
+private final class NativeProcessHandle: ProcessHandle {
+    let process: Process
+    init(_ process: Process) { self.process = process }
+    var pid: Int32 { process.processIdentifier }
+    var isRunning: Bool { process.isRunning }
+    var terminationStatus: Int32 { process.terminationStatus }
+    func terminate() { process.terminate() }
+}
+
+private final class NativePollHandle: PollHandle {
+    let timer: Timer
+    init(_ timer: Timer) { self.timer = timer }
+    func cancel() { timer.invalidate() }
+}
+
+@MainActor
+final class NativeSystemOps: SystemOps {
+    func spawn(
+        _ request: ProcessRequest,
+        onExit: @escaping @MainActor (ProcessHandle) -> Void
+    ) throws -> ProcessHandle {
+        let process = Process()
+        let handle = NativeProcessHandle(process)
+        process.executableURL = request.executable
+        process.arguments = request.arguments
+        process.environment = request.environment
+        if let log = request.appendOutputTo {
+            let manager = FileManager.default
+            try manager.createDirectory(
+                at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !manager.fileExists(atPath: log.path) {
+                guard manager.createFile(atPath: log.path, contents: nil) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            }
+            let output = try FileHandle(forWritingTo: log)
+            try output.seekToEnd()
+            process.standardOutput = output
+            process.standardError = output
+        }
+        process.terminationHandler = { [weak handle] _ in
+            guard let handle else { return }
+            Task { @MainActor in onExit(handle) }
+        }
+        do {
+            try process.run()
+        } catch {
+            process.terminationHandler = nil
+            throw error
+        }
+        return handle
+    }
+
+    func processIsAlive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
+
+    func commandLine(_ pid: Int32) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", "\(pid)", "-o", "command="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
+    }
+
+    func readData(at url: URL) -> Data? { try? Data(contentsOf: url) }
+    func readText(at url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+    func write(_ data: Data, to url: URL) throws { try data.write(to: url, options: .atomic) }
+    func delete(at url: URL) throws { try FileManager.default.removeItem(at: url) }
+    func fileExists(at url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+    func isExecutable(at url: URL) -> Bool {
+        FileManager.default.isExecutableFile(atPath: url.path)
+    }
+    func now() -> Date { Date() }
+    func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
+        -> PollHandle {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in action() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        return NativePollHandle(timer)
+    }
 }
 
 @MainActor
 final class RecorderModel: ObservableObject {
     static let statusSchemaVersion = 2
+    static let sttServices = ["whisper", "websocket", "deepgram"]
+    static let seminarCategory = "seminars"
+    static let dataDirEnvironment = "ONOATS_DATA_DIR"
+    static let dataDirArgument = "--data-dir"
+    static let transcriptPreviewDefaultsKey = "showTranscriptPreview"
 
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"
@@ -55,87 +178,72 @@ final class RecorderModel: ObservableObject {
     @Published var sttLabel: String?
     @Published var audioSource: String?
     @Published var startTime: Date?
-    /// Schema-v2 live capture anomaly (the capturer's all-zero-input detector,
-    /// written/cleared by the supervisor). Session-scoped: only shown while
-    /// the recorder is alive — a stale record's warning is not a live warning.
     @Published var warning: String?
     @Published var schemaDrift = false
-    /// Configured STT service from config.toml (next-start value, distinct
-    /// from `sttLabel`, which is what the *running* session reports).
     @Published var sttService = "whisper"
-    /// "Seminar" toggle: when on, the NEXT Start locks the session to the
-    /// `seminars` category (`onoats bot --category seminars`). Deliberately
-    /// in-memory and per-session, not persisted or written to config.toml: a
-    /// forgotten toggle would otherwise mislabel every later recording (other
-    /// categories are classified downstream, so "off" is the safe default).
-    /// Reset by `handleExit` once the session it applied to ends.
     @Published var seminarMode = false
     @Published var dataDirDisplay = ""
-    /// Non-nil when the last Flush failed — shown in the menu, cleared on the
-    /// next Flush or Start.
+    @Published private(set) var activeDataDir: URL?
+    @Published private(set) var nextDataDir: URL
+    @Published private(set) var activeDataDirDisplay: String?
+    @Published private(set) var nextDataDirDisplay = ""
     @Published var flushNote: String?
-    /// Cosmetic "external stop in flight" flag for a handle-less session. Set
-    /// synchronously by `stopExternal()` BEFORE the `onoats stop` subprocess
-    /// spawn, and the direct argument to the Stop button's `.disabled(...)` — so
-    /// a verified external/orphaned session can't be double-stopped while it
-    /// drains. Writers: `stopExternal()` sets it on entry and clears it on either
-    /// error path (spawn threw, OR the CLI exited non-zero = SIGTERM not
-    /// delivered) so a failed/stale-CLI stop can't wedge the sole Stop button;
-    /// `refresh()` clears it level-triggered once the supervisor is actually gone
-    /// (`!alive`) on the SUCCESS path. No other writer. We deliberately do NOT
-    /// use the `.stopping` enum case for external stops: `.stopping` is cleared
-    /// by `handleExit`, which never fires without a `Process` handle.
     @Published var stopRequested = false
-    // The recorder pid `stopExternal()` asked to stop, paired with that
-    // recorder's start epoch (pid-file line 4). `refresh()` clears `stopRequested`
-    // once THAT recorder is gone — its pid is no longer live — OR once a DIFFERENT
-    // recorder is live: a different pid, OR the SAME pid number with a different
-    // start epoch (a same-pid recycle — without the epoch check the new session
-    // would inherit a stuck-disabled Stop button). nil when no external stop is in
-    // flight, or when the pid couldn't be read at stop time (then refresh falls
-    // back to the plain `!alive` clear).
-    private var stopRequestedForPid: Int32?
-    private var stopRequestedForStartEpoch: Double?
+    @Published private(set) var prestartDetail: String?
 
-    /// Valid `[stt].service` values — mirror of runtime.py
-    /// `VALID_STT_SERVICES` (parity-checked by
-    /// tests/test_native_contract_parity.py).
-    static let sttServices = ["whisper", "websocket", "deepgram"]
+    @Published private(set) var meActivity: UiTelemetryActivity?
+    @Published private(set) var themActivity: UiTelemetryActivity?
+    @Published private(set) var meStt: UiTelemetrySttBranch?
+    @Published private(set) var themStt: UiTelemetrySttBranch?
+    @Published private(set) var aggregateStt: UiSttState?
+    @Published private(set) var telemetryCategory: String?
+    @Published private(set) var transcriptPreview: UiTelemetryTranscript?
+    @Published private(set) var telemetryAvailable = false
+    @Published private(set) var transcriptPreviewEnabled: Bool
 
-    /// Category the Seminar toggle passes to `onoats bot --category`. Python
-    /// validates it against `[categories] set` in config.toml and rejects an
-    /// unknown name with a non-zero exit, so `seminars` must be in that set.
-    static let seminarCategory = "seminars"
+    var categoryForDisplay: String? {
+        if proc != nil, seminarMode { return Self.seminarCategory }
+        return telemetryCategory == Self.seminarCategory ? Self.seminarCategory : nil
+    }
+    var categoryUnavailable: Bool {
+        if case .running(ours: false) = state { return categoryForDisplay == nil }
+        return false
+    }
 
-    private var proc: Process?
+    private let ops: SystemOps
+    private let defaults: UserDefaults
+    private let dataDirResolver: () -> URL
+    private var proc: ProcessHandle?
+    private var auxiliary: [ObjectIdentifier: ProcessHandle] = [:]
     private var userRequestedStop = false
     private var spawnedAt: Date?
-    private var timer: Timer?
+    private var statusPoll: PollHandle?
+    private var telemetryPoll: PollHandle?
+    private var stopRequestedForPid: Int32?
+    private var stopRequestedForStartEpoch: Double?
+    private var fingerprintCache: [Int32: (match: Bool, at: Date)] = [:]
+    private let fingerprintTTL: TimeInterval = 30
 
-    // ------------------------------------------------------------------ paths
+    private struct TelemetryAuthority: Equatable {
+        let directory: URL
+        let pid: Int32
+        let startEpoch: Double
+    }
+    private var telemetryAuthority: TelemetryAuthority?
 
-    /// CLI shim installed by `make install-cli` (uv tool install --editable).
-    /// Override: `defaults write net.varunsingh.onoats cliPath /abs/path`.
     var cliPath: String {
-        if let override = UserDefaults.standard.string(forKey: "cliPath"), !override.isEmpty {
+        if let override = defaults.string(forKey: "cliPath"), !override.isEmpty {
             return (override as NSString).expandingTildeInPath
         }
         return NSHomeDirectory() + "/.local/bin/onoats"
     }
-
-    var cliAvailable: Bool { FileManager.default.isExecutableFile(atPath: cliPath) }
-
-    var capturerPath: String {
-        Bundle.main.bundlePath + "/Contents/MacOS/onoats-capturer"
+    var cliAvailable: Bool { ops.isExecutable(at: URL(fileURLWithPath: cliPath)) }
+    var capturerPath: String { Bundle.main.bundlePath + "/Contents/MacOS/onoats-capturer" }
+    var dataDir: URL { nextDataDir }
+    private var logURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/Onoats/onoats-bot.log")
     }
 
-    /// Mirrors the Python resolution (store.py onoats_data_dir) as seen from
-    /// a LaunchServices app. Python's full chain is ONOATS_DATA_DIR env >
-    /// legacy env var > XDG_DATA_HOME/onoats > ~/.local/share/onoats; a GUI
-    /// app inherits no shell env, so the three env steps are intentionally
-    /// unreachable here and only config.toml `[storage].data_dir` >
-    /// `~/.local/share/onoats` remain. The XDG-default literal is
-    /// parity-checked against store.py by tests/test_native_contract_parity.py.
     static func resolveDataDir() -> URL {
         if let value = ConfigStore.readValue(section: "storage", key: "data_dir") {
             return URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
@@ -143,37 +251,45 @@ final class RecorderModel: ObservableObject {
         return URL(fileURLWithPath: NSHomeDirectory() + "/.local/share/onoats")
     }
 
-    var dataDir: URL { Self.resolveDataDir() }
-
-    private var logURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/Onoats/onoats-bot.log")
-    }
-
-    // ------------------------------------------------------------------ init
-
-    init() {
+    init(
+        systemOps: SystemOps? = nil,
+        userDefaults: UserDefaults = .standard,
+        resolveDataDir: (() -> URL)? = nil,
+        startPolling: Bool = true
+    ) {
+        ops = systemOps ?? NativeSystemOps()
+        defaults = userDefaults
+        dataDirResolver = resolveDataDir ?? Self.resolveDataDir
+        nextDataDir = dataDirResolver()
+        transcriptPreviewEnabled = userDefaults.bool(forKey: Self.transcriptPreviewDefaultsKey)
         refresh()
-        // .common so the poll keeps firing during menu tracking.
-        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+        if startPolling {
+            statusPoll = ops.schedule(every: 1.0) { [weak self] in self?.refresh() }
+            telemetryPoll = ops.schedule(every: 0.25) { [weak self] in self?.refreshTelemetry() }
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
     }
 
     deinit {
-        timer?.invalidate()
+        statusPoll?.cancel()
+        telemetryPoll?.cancel()
     }
 
-    // ------------------------------------------------------------------ reads
+    private func displayPath(_ url: URL) -> String {
+        url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+    }
+    private func refreshDirectoryDisplays(configured: URL) {
+        nextDataDir = configured
+        nextDataDirDisplay = displayPath(configured)
+        dataDirDisplay = nextDataDirDisplay
+        activeDataDirDisplay = activeDataDir.map(displayPath)
+    }
 
-    private func readStatus(under dataDir: URL) -> StatusRecord? {
-        let path = dataDir.appendingPathComponent(".active/onoats.status.json")
-        guard let data = try? Data(contentsOf: path) else { return nil }
-        // Schema guard first (the whole point of the schema int): a drifted
-        // file must surface as drift, never be silently mis-rendered.
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let schema = obj["schema"] as? Int, schema != Self.statusSchemaVersion {
+    private func readStatus(under directory: URL) -> StatusRecord? {
+        let url = directory.appendingPathComponent(".active/onoats.status.json")
+        guard let data = ops.readData(at: url) else { return nil }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let schema = object["schema"] as? Int,
+           schema != Self.statusSchemaVersion {
             schemaDrift = true
             return nil
         }
@@ -181,77 +297,36 @@ final class RecorderModel: ObservableObject {
         return try? JSONDecoder().decode(StatusRecord.self, from: data)
     }
 
-    /// Pid-file read, mirroring `_vendor/pid.py`: line 1 pid, line 2 must be
-    /// the "onoats-bot" identity marker, else the file is ignored.
-    private func readPid(under dataDir: URL) -> (pid: Int32, cmdline: String, startEpoch: Double)? {
-        let path = dataDir.appendingPathComponent(".active/onoats.pid")
-        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+    private func readPid(under directory: URL) -> (pid: Int32, cmdline: String, startEpoch: Double)? {
+        let url = directory.appendingPathComponent(".active/onoats.pid")
+        guard let text = ops.readText(at: url) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            .components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0])
-        else { return nil }
-        // Line 3 is the recorder's `ps -o command=` self-fingerprint (empty for
-        // legacy pid files) — mirror of _vendor/pid.py PidRecord. Line 4 is the
-        // wall-clock start epoch: the ONLY on-disk discriminator between two
-        // same-version recorders that land on the SAME pid number (identical
-        // cmdline), used by refresh() to clear `stopRequested` on a same-pid
-        // recycle. 0 for legacy/incomplete files.
-        return (
-            pid,
-            lines.count >= 3 ? lines[2] : "",
-            lines.count >= 4 ? (Double(lines[3]) ?? 0) : 0
-        )
+            .components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0]) else {
+            return nil
+        }
+        return (pid, lines.count >= 3 ? lines[2] : "",
+                lines.count >= 4 ? (Double(lines[3]) ?? 0) : 0)
     }
 
-    /// Cached fingerprint verdicts so the 1 s poll doesn't spawn `ps` every
-    /// tick. Re-verified after `fingerprintTTL` — a recycled pid that lands
-    /// on the SAME number as a stale pid file is the (rare) case this bounds.
-    private var fingerprintCache: [Int32: (match: Bool, at: Date)] = [:]
-    private let fingerprintTTL: TimeInterval = 30
-
-    /// kill(0) liveness hardened against pid recycling: when the pid file
-    /// carries a cmdline fingerprint, the live process must match it
-    /// (mirror of _vendor/pid.py — resolve_flush_target uses the same check
-    /// before signalling). Legacy fingerprint-less files degrade to kill(0).
     private func processAlive(_ pid: Int32, storedCmdline: String) -> Bool {
-        guard kill(pid, 0) == 0 || errno == EPERM else {
+        guard ops.processIsAlive(pid) else {
             fingerprintCache[pid] = nil
             return false
         }
         if storedCmdline.isEmpty { return true }
         if let cached = fingerprintCache[pid],
-            Date().timeIntervalSince(cached.at) < fingerprintTTL
-        {
-            return cached.match
-        }
-        let match = psCommand(pid) == storedCmdline
-        fingerprintCache[pid] = (match, Date())
+           ops.now().timeIntervalSince(cached.at) < fingerprintTTL { return cached.match }
+        let match = ops.commandLine(pid) == storedCmdline
+        fingerprintCache[pid] = (match, ops.now())
         return match
     }
 
-    /// `ps -p <pid> -o command=` — must stay byte-identical to the recorder's
-    /// own fingerprint capture (runtime._own_ps_cmdline) for genuine matches.
-    /// MainActor-isolated deliberately (not `nonisolated`): its only caller
-    /// (`processAlive`) and the `fingerprintCache` it feeds are MainActor-bound;
-    /// an off-actor caller would race the cache.
-    private func psCommand(_ pid: Int32) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/ps")
-        p.arguments = ["-p", "\(pid)", "-o", "command="]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
-        let out = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (out?.isEmpty == false) ? out : nil
+    private func setTelemetryAuthority(_ authority: TelemetryAuthority?) {
+        if telemetryAuthority != authority { clearTelemetry() }
+        telemetryAuthority = authority
+        if authority == nil { clearTelemetry() }
     }
-
-    // ---------------------------------------------------------------- refresh
 
     func refresh() {
         micDevice = AudioDevices.defaultInputName()
@@ -259,56 +334,61 @@ final class RecorderModel: ObservableObject {
         inputDevices = AudioDevices.inputDevices()
         defaultInputID = AudioDevices.defaultInputID()
         sttService = ConfigStore.readValue(section: "stt", key: "service") ?? "whisper"
-        // One data-dir resolution per refresh cycle: status and pid must be
-        // read from the SAME directory even if config.toml changes mid-cycle
-        // (mirrors the supervisor's one-resolution-per-session rule).
-        let dataDir = Self.resolveDataDir()
-        dataDirDisplay = dataDir.path.replacingOccurrences(
-            of: NSHomeDirectory(), with: "~")
 
-        let status = readStatus(under: dataDir)
-        let pid = readPid(under: dataDir)
+        let configured = dataDirResolver()
+        let directory = activeDataDir ?? configured
+        refreshDirectoryDisplays(configured: configured)
+        let status = readStatus(under: directory)
+        let pid = readPid(under: directory)
         let alive = pid.map { processAlive($0.pid, storedCmdline: $0.cmdline) } ?? false
-
-        if let s = status {
-            sttLabel = s.stt_label.isEmpty ? nil : s.stt_label
-            audioSource = s.audio_source.isEmpty ? nil : s.audio_source
-            startTime = alive ? Date(timeIntervalSince1970: s.start_time) : nil
-            warning = alive ? s.warning : nil
-        } else {
-            sttLabel = nil
-            audioSource = nil
-            startTime = nil
-            warning = nil
+        if proc == nil, alive, activeDataDir == nil {
+            activeDataDir = directory
+            activeDataDirDisplay = displayPath(directory)
         }
 
-        if let p = proc {
-            if p.isRunning {
-                if case .stopping = state { return }  // SIGTERM sent; draining
-                state = alive ? .running(ours: true) : .starting
+        let ownedPublication: Bool = {
+            guard let handle = proc, handle.isRunning, alive, let pid, let attempt = spawnedAt
+            else { return false }
+            return pid.pid == handle.pid && pid.startEpoch >= attempt.timeIntervalSince1970
+        }()
+        let externalPublication = proc == nil && alive
+        let authority: TelemetryAuthority? = {
+            guard (ownedPublication || externalPublication), let pid else { return nil }
+            return TelemetryAuthority(
+                directory: directory, pid: pid.pid, startEpoch: pid.startEpoch)
+        }()
+        setTelemetryAuthority(authority)
+
+        let matchingStatus: StatusRecord? = {
+            guard let authority, let status,
+                  status.pid == authority.pid, status.start_time == authority.startEpoch
+            else { return nil }
+            return status
+        }()
+        sttLabel = matchingStatus.flatMap { $0.stt_label.isEmpty ? nil : $0.stt_label }
+        audioSource = matchingStatus.flatMap { $0.audio_source.isEmpty ? nil : $0.audio_source }
+        startTime = matchingStatus.map { Date(timeIntervalSince1970: $0.start_time) }
+        warning = matchingStatus?.warning
+
+        if let handle = proc, handle.isRunning {
+            if ownedPublication {
+                prestartDetail = nil
+                if case .stopping = state {} else { state = .running(ours: true) }
+            } else {
+                if let status, let attempt = spawnedAt,
+                   status.pid == handle.pid,
+                   status.start_time >= attempt.timeIntervalSince1970,
+                   status.running {
+                    prestartDetail = status.warning
+                } else { prestartDetail = nil }
+                if case .stopping = state {} else { state = .starting }
             }
-            // Exited but handleExit hasn't run yet (it clears `proc` LAST,
-            // after the state assignment): leave state alone so the poll
-            // can't clobber an imminent .failed with .stopped.
             return
         }
-        // External-stop convergence (handle-less session): clear the cosmetic
-        // stopRequested flag once the supervisor we asked to stop is GONE —
-        // process exit (kill(0) false), NOT pid-file removal — OR once a DIFFERENT
-        // pid is live (a new session started before we observed the stopped one's
-        // exit; without this the new session's Stop button stays wedged disabled).
-        // Placed AFTER the owned-proc early-return above so an owned session's
-        // `.stopping` drain never touches it. Sole clearing site for the success
-        // path (see the `stopRequested` invariant).
-        // A DIFFERENT recorder is live: a different pid, OR the same pid number
-        // recycled onto a new session (distinguished by start epoch — two
-        // same-version recorders share a cmdline, so the epoch is the only
-        // discriminator). Either way the recorder we stopped is gone and the new
-        // one must not inherit a stuck-disabled Stop button.
-        let stoppedTargetGone =
-            stopRequestedForPid != nil
-            && (pid?.pid != stopRequestedForPid
-                || pid?.startEpoch != stopRequestedForStartEpoch)
+        if proc != nil { return }
+
+        let stoppedTargetGone = stopRequestedForPid != nil
+            && (pid?.pid != stopRequestedForPid || pid?.startEpoch != stopRequestedForStartEpoch)
         if !alive || stoppedTargetGone {
             stopRequested = false
             stopRequestedForPid = nil
@@ -316,165 +396,173 @@ final class RecorderModel: ObservableObject {
         }
         if alive {
             state = .running(ours: false)
-        } else if case .failed = state {
-            // Sticky until the next Start so the user actually sees it.
         } else {
-            state = .stopped
+            prestartDetail = nil
+            clearTelemetry()
+            activeDataDir = nil
+            activeDataDirDisplay = nil
+            if case .failed = state {} else { state = .stopped }
         }
     }
 
-    // ---------------------------------------------------------------- actions
+    /// Four-hertz display poll. This method deliberately never assigns state.
+    func refreshTelemetry() {
+        guard let authority = telemetryAuthority,
+              let data = ops.readData(at: authority.directory.appendingPathComponent(
+                ".active/\(UiTelemetryContract.fileName)")),
+              let snapshot = UiTelemetryDecoder.decode(
+                data, expectedPid: authority.pid, expectedStartEpoch: authority.startEpoch,
+                now: ops.now())
+        else {
+            clearTelemetry()
+            return
+        }
+        telemetryAvailable = true
+        meActivity = snapshot.me
+        themActivity = snapshot.them
+        meStt = snapshot.meStt
+        themStt = snapshot.themStt
+        aggregateStt = snapshot.aggregateStt
+        telemetryCategory = snapshot.lockedCategory
+        transcriptPreview = transcriptPreviewEnabled ? snapshot.transcript : nil
+    }
+
+    private func clearTelemetry() {
+        telemetryAvailable = false
+        meActivity = nil
+        themActivity = nil
+        meStt = nil
+        themStt = nil
+        aggregateStt = nil
+        telemetryCategory = nil
+        transcriptPreview = nil
+    }
+
+    func setTranscriptPreviewEnabled(_ enabled: Bool) {
+        transcriptPreviewEnabled = enabled
+        defaults.set(enabled, forKey: Self.transcriptPreviewDefaultsKey)
+        if enabled { refreshTelemetry() } else { transcriptPreview = nil }
+    }
 
     func start() {
-        guard proc == nil || proc?.isRunning == false else { return }
+        guard proc == nil, cliAvailable else { return }
         userRequestedStop = false
         flushNote = nil
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: cliPath)
-        p.arguments = ["bot"]
+        prestartDetail = nil
+        setTelemetryAuthority(nil)
+        let pinned = dataDirResolver()
+        activeDataDir = pinned
+        refreshDirectoryDisplays(configured: pinned)
+        let attempt = ops.now()
+        spawnedAt = attempt
+        var environment = ProcessInfo.processInfo.environment
+        environment["AUDIO_SOURCE"] = "socket"
+        environment["ONOATS_CAPTURER_BIN"] = capturerPath
+        environment[Self.dataDirEnvironment] = pinned.path
+        var p = ProcessArguments(arguments: ["bot"])
         if seminarMode { p.arguments? += ["--category", Self.seminarCategory] }
-        var env = ProcessInfo.processInfo.environment
-        env["AUDIO_SOURCE"] = "socket"
-        env["ONOATS_CAPTURER_BIN"] = capturerPath
-        p.environment = env
-
-        if let log = openLog() {
-            p.standardOutput = log
-            p.standardError = log
-        }
-        p.terminationHandler = { [weak self] proc in
-            Task { @MainActor in self?.handleExit(proc) }
-        }
+        let request = ProcessRequest(
+            executable: URL(fileURLWithPath: cliPath), arguments: p.arguments ?? ["bot"],
+            environment: environment, appendOutputTo: logURL)
         do {
-            try p.run()
-            proc = p
-            spawnedAt = Date()
+            let handle = try ops.spawn(request) { [weak self] handle in self?.handleExit(handle) }
+            proc = handle
             state = .starting
         } catch {
+            spawnedAt = nil
+            activeDataDir = nil
+            activeDataDirDisplay = nil
             state = .failed(reason: "spawn-failed", detail: error.localizedDescription)
         }
     }
 
-    /// SIGTERM the supervisor we spawned (graceful drain). External sessions
-    /// (started from a terminal) are displayed but not signalled — the safe
-    /// identity-checked signalling lives in the Python CLI, not here.
     func stop() {
-        guard let p = proc, p.isRunning else { return }
+        guard let handle = proc, handle.isRunning else { return }
         userRequestedStop = true
         state = .stopping
-        p.terminate()  // SIGTERM → runtime's graceful-shutdown handler
+        handle.terminate()
     }
 
-    /// Quit must never orphan a GUI-started session: a relaunched app would
-    /// see it as `running(ours: false)` with Stop disabled — unstoppable from
-    /// the GUI. SIGTERM the supervisor first; it drains and rotates
-    /// independently of this process exiting, so quitting immediately after
-    /// is safe. External (CLI-started) sessions are left alone — their
-    /// terminal owns them.
     func quitApp() {
-        if let p = proc, p.isRunning { p.terminate() }
+        if let handle = proc, handle.isRunning { handle.terminate() }
         NSApp.terminate(nil)
     }
 
-    /// Runs `onoats flush` and surfaces a non-zero exit in the menu (fail-loud
-    /// like everything else). Deliberately works for EXTERNAL sessions too:
-    /// the CLI does its own identity-checked pid signalling (marker +
-    /// fingerprint), so flushing a terminal-started session from here is safe.
-    ///
-    /// Near-clone: `stopExternal()` mirrors this (it execs `onoats stop` instead
-    /// of `flush`, plus the `stopRequested` flag). Keep the two in sync — e.g. a
-    /// future `--data-dir` argument must be added to both.
     func flush() {
         flushNote = nil
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: cliPath)
-        p.arguments = ["flush"]
-        if let log = openLog() {
-            p.standardOutput = log
-            p.standardError = log
+        guard let directory = activeDataDir else {
+            flushNote = "Flush failed: no active recorder directory"
+            return
         }
-        p.terminationHandler = { [weak self] proc in
-            Task { @MainActor in
-                if proc.terminationStatus != 0 {
-                    self?.flushNote =
-                        "Flush failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
-                }
-            }
-        }
-        do {
-            try p.run()
-        } catch {
-            flushNote = "Flush spawn failed: \(error.localizedDescription)"
-        }
+        spawnAuxiliary(
+            arguments: ["flush", "--data-dir", directory.path],
+            logOwnedOutput: proc?.isRunning == true, failureAction: "Flush")
     }
 
-    /// Runs `onoats stop` for a session this app does NOT own — one started from
-    /// a terminal, or (the motivating case) a GUI-started session orphaned by an
-    /// app crash and seen as `running(ours: false)` on relaunch. Mirrors
-    /// `flush()`: the CLI does the identity-checked pid signalling (marker +
-    /// fingerprint + liveness → SIGTERM), so stopping a session we have no
-    /// `Process` handle for is safe and never signals a recycled pid.
-    ///
-    /// We do NOT block on exit and do NOT set the `.stopping` enum case (no
-    /// `handleExit` fires without a handle); convergence to `.stopped` is driven
-    /// by `refresh()` observing the supervisor exit (`processAlive` → false). The
-    /// cosmetic `stopRequested` flag is set HERE, synchronously, BEFORE the spawn
-    /// so a second `onoats stop` subprocess can't be launched mid-drain (the
-    /// button is `.disabled(stopRequested)`).
     func stopExternal() {
+        guard proc == nil, let directory = activeDataDir else { return }
         stopRequested = true
-        // Remember which recorder we're stopping (pid + start epoch) so refresh()
-        // can clear the flag if a DIFFERENT session appears — including a same-pid
-        // recycle (see `stopRequestedForPid`). nil-safe: if the pid can't be read,
-        // refresh falls back to the plain `!alive` clear.
-        let stopping = readPid(under: Self.resolveDataDir())
+        let stopping = readPid(under: directory)
         stopRequestedForPid = stopping?.pid
         stopRequestedForStartEpoch = stopping?.startEpoch
         flushNote = nil
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: cliPath)
-        p.arguments = ["stop"]
-        if let log = openLog() {
-            p.standardOutput = log
-            p.standardError = log
-        }
-        p.terminationHandler = { [weak self] proc in
-            Task { @MainActor in
-                if proc.terminationStatus != 0 {
-                    // Non-zero rc means the CLI did NOT deliver SIGTERM — it
-                    // refused (stale / identity mismatch), errored, or is a stale
-                    // installed CLI lacking the `stop` subcommand (argparse rc 2).
-                    // The supervisor may still be ALIVE, so re-enable the button:
-                    // `refresh()` only clears stopRequested on `!alive`, and would
-                    // otherwise leave the sole Stop control wedged until restart.
-                    // A delivered SIGTERM (rc 0) leaves the flag set; refresh()
-                    // clears it when the supervisor actually exits.
-                    self?.stopRequested = false
-                    self?.stopRequestedForPid = nil
-                    self?.stopRequestedForStartEpoch = nil
-                    self?.flushNote =
-                        "Stop failed (rc \(proc.terminationStatus)) — see onoats-bot.log"
+        spawnAuxiliary(
+            arguments: ["stop", "--data-dir", directory.path],
+            logOwnedOutput: false, failureAction: "Stop", clearExternalStopOnFailure: true)
+    }
+
+    private func spawnAuxiliary(
+        arguments: [String], logOwnedOutput: Bool, failureAction: String,
+        clearExternalStopOnFailure: Bool = false
+    ) {
+        let request = ProcessRequest(
+            executable: URL(fileURLWithPath: cliPath), arguments: arguments,
+            environment: nil, appendOutputTo: logOwnedOutput ? logURL : nil)
+        do {
+            let handle = try ops.spawn(request) { [weak self] handle in
+                guard let self else { return }
+                self.auxiliary[ObjectIdentifier(handle)] = nil
+                if handle.terminationStatus != 0 {
+                    if clearExternalStopOnFailure { self.clearExternalStopRequest() }
+                    self.flushNote = "\(failureAction) failed (rc \(handle.terminationStatus))"
                 }
             }
-        }
-        do {
-            try p.run()
+            auxiliary[ObjectIdentifier(handle)] = handle
         } catch {
-            // The subprocess never launched, so nothing is in flight — re-enable
-            // the button (the one writer other than refresh(), guarded to the
-            // spawn-failure path) so a missing/!executable CLI can be retried.
-            stopRequested = false
-            stopRequestedForPid = nil
-            stopRequestedForStartEpoch = nil
-            flushNote = "Stop spawn failed: \(error.localizedDescription)"
+            if clearExternalStopOnFailure { clearExternalStopRequest() }
+            flushNote = "\(failureAction) spawn failed: \(error.localizedDescription)"
         }
     }
 
-    // --------------------------------------------------------------- settings
-    // All settings write config.toml — the same file the CLI reads — so GUI
-    // and terminal sessions share one source of truth. A change while a
-    // session is recording applies on the NEXT start (config loads at start).
+    private func clearExternalStopRequest() {
+        stopRequested = false
+        stopRequestedForPid = nil
+        stopRequestedForStartEpoch = nil
+    }
+
+    private func handleExit(_ handle: ProcessHandle) {
+        guard let owned = proc, owned === handle else { return }
+        let directory = activeDataDir
+        prestartDetail = nil
+        setTelemetryAuthority(nil)
+        if userRequestedStop || handle.terminationStatus == 0 {
+            state = .stopped
+        } else {
+            var status = directory.flatMap { readStatus(under: $0) }
+            if let value = status, let attempt = spawnedAt,
+               value.start_time < attempt.timeIntervalSince1970 { status = nil }
+            state = .failed(
+                reason: status?.exit_reason ?? "exit code \(handle.terminationStatus)",
+                detail: status?.last_error)
+        }
+        userRequestedStop = false
+        seminarMode = false
+        proc = nil
+        activeDataDir = nil
+        activeDataDirDisplay = nil
+        spawnedAt = nil
+        refreshDirectoryDisplays(configured: dataDirResolver())
+    }
 
     func setSTTService(_ service: String) {
         try? ConfigStore.writeValue(section: "stt", key: "service", value: service)
@@ -486,16 +574,13 @@ final class RecorderModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
-        panel.directoryURL = dataDir
+        panel.directoryURL = nextDataDir
         panel.message = "Choose the onoats data directory (config.toml [storage].data_dir)"
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try ConfigStore.writeValue(
-                section: "storage", key: "data_dir", value: url.path)
+            try ConfigStore.writeValue(section: "storage", key: "data_dir", value: url.path)
         } catch {
-            // Rejected write (control character in the path) — say so rather
-            // than silently keeping the old dir.
             let alert = NSAlert()
             alert.messageText = "Could not save data directory"
             alert.informativeText = "\(error)"
@@ -504,54 +589,9 @@ final class RecorderModel: ObservableObject {
         refresh()
     }
 
-    func openConfig() {
-        NSWorkspace.shared.open(ConfigStore.configURL)
-    }
-
-    /// Sets the macOS DEFAULT input device (system-wide) — the only knob that
-    /// actually applies on the socket path, since the capturer binds the
-    /// system default at start. A running session keeps the device it bound;
-    /// the change takes effect on the next Start.
+    func openConfig() { NSWorkspace.shared.open(ConfigStore.configURL) }
     func setMicDevice(_ device: AudioInputDevice) {
         AudioDevices.setDefaultInput(device.id)
         refresh()
-    }
-
-    private func handleExit(_ p: Process) {
-        if userRequestedStop || p.terminationStatus == 0 {
-            state = .stopped
-        } else {
-            // Fail-loud surface: the supervisor stamps exit_reason/last_error
-            // into the status file on the way down — show *why*, not just rc.
-            // FRESHNESS GUARD (observed live: a mic-denial start rendered as
-            // "failed: graceful"): only trust a record written for THIS
-            // session — a record whose start_time predates our spawn is the
-            // previous session's and its exit_reason is a lie here.
-            var status = readStatus(under: Self.resolveDataDir())
-            if let s = status, let spawned = spawnedAt,
-               Date(timeIntervalSince1970: s.start_time) < spawned.addingTimeInterval(-5) {
-                status = nil
-            }
-            let reason = status?.exit_reason ?? "exit code \(p.terminationStatus)"
-            state = .failed(reason: reason, detail: status?.last_error)
-        }
-        userRequestedStop = false
-        seminarMode = false
-        // Cleared LAST: refresh() treats a non-nil exited proc as
-        // "exit-in-flight" and leaves state alone, so the poll timer can
-        // never clobber the .failed assignment above with .stopped.
-        proc = nil
-    }
-
-    private func openLog() -> FileHandle? {
-        let fm = FileManager.default
-        try? fm.createDirectory(
-            at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: logURL.path) {
-            fm.createFile(atPath: logURL.path, contents: nil)
-        }
-        guard let handle = try? FileHandle(forWritingTo: logURL) else { return nil }
-        handle.seekToEndOfFile()
-        return handle
     }
 }

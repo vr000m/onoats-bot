@@ -1,0 +1,246 @@
+// Strict, display-only consumer for src/onoats/ui_telemetry.py.
+//
+// Recorder liveness never comes from this file.  Callers must first establish
+// a live pid-file identity and pass that identity to `decode`; the returned
+// value is only decoration for that already-live recorder.
+import Foundation
+
+enum UiTelemetryContract {
+    static let schemaVersion = 1
+    static let fileName = "onoats.ui.json"
+    static let maxWriteHz = 4.0
+    static let heartbeatSeconds = 2.0
+    static let snapshotExpirySeconds: TimeInterval = 5.0
+    static let audioObservationExpirySeconds: TimeInterval = 1.0
+    static let audioObservationRefreshSeconds = 0.5
+    static let transcriptLimit = 240
+    static let detailLimit = 256
+    static let levelMin = 0.0
+    static let levelMax = 1.0
+    static let levelMinimum = levelMin
+    static let levelMaximum = levelMax
+    static let seminarCategory = "seminars"
+    static let sttStates = ["failed", "recovering", "starting", "unknown", "ready"]
+    static let sttPrecedence = ["failed", "recovering", "starting", "unknown", "ready"]
+}
+
+enum UiSttState: String, Decodable, CaseIterable {
+    case failed, recovering, starting, unknown, ready
+}
+
+struct UiTelemetryActivity: Equatable {
+    let level: Double
+    let observedAt: Date
+}
+
+struct UiTelemetrySttBranch: Equatable {
+    let state: UiSttState
+    let detail: String?
+}
+
+struct UiTelemetryTranscript: Equatable {
+    let text: String
+    let source: String?
+    let speakerLabel: String?
+}
+
+struct UiTelemetrySnapshot: Equatable {
+    let pid: Int32
+    let startEpoch: Double
+    let updatedAt: Date
+    /// nil means that branch has no observation or its observation is stale.
+    let me: UiTelemetryActivity?
+    let them: UiTelemetryActivity?
+    let meStt: UiTelemetrySttBranch
+    let themStt: UiTelemetrySttBranch
+    let aggregateStt: UiSttState
+    let transcript: UiTelemetryTranscript?
+    let lockedCategory: String?
+}
+
+enum UiTelemetryDecoder {
+    private struct WireAudio: Decodable {
+        let level: Double
+        let observed_at: Double
+    }
+
+    private struct WireSttBranch: Decodable {
+        let state: String
+        let detail: String?
+    }
+
+    private struct WireStt: Decodable {
+        let me: WireSttBranch
+        let them: WireSttBranch
+        let aggregate: String
+    }
+
+    private struct WireTranscript: Decodable {
+        let text: String
+        let source: String?
+        let speaker_label: String?
+    }
+
+    private struct WireRecord: Decodable {
+        let schema: Int
+        let pid: Int32
+        let start_epoch: Double
+        let updated_at: Double
+        let audio: [String: WireAudio?]
+        let stt: WireStt
+        let transcript: WireTranscript?
+        let locked_category: String?
+    }
+
+    private static func scalars(_ value: String) -> Int {
+        value.unicodeScalars.count
+    }
+
+    private static func exactKeys(
+        _ object: Any?, required: Set<String>, optional: Set<String> = []
+    ) -> Bool {
+        guard let dictionary = object as? [String: Any] else { return false }
+        let keys = Set(dictionary.keys)
+        return required.isSubset(of: keys) && keys.isSubset(of: required.union(optional))
+    }
+
+    private static func validateShape(_ data: Data) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: data),
+              exactKeys(
+                root,
+                required: ["schema", "pid", "start_epoch", "updated_at", "audio", "stt"],
+                optional: ["transcript", "locked_category"]
+              ),
+              let dictionary = root as? [String: Any],
+              let audio = dictionary["audio"] as? [String: Any],
+              Set(audio.keys) == Set(["me", "them"]),
+              let stt = dictionary["stt"],
+              exactKeys(stt, required: ["me", "them", "aggregate"]),
+              let sttDictionary = stt as? [String: Any],
+              exactKeys(sttDictionary["me"], required: ["state"], optional: ["detail"]),
+              exactKeys(sttDictionary["them"], required: ["state"], optional: ["detail"])
+        else { return false }
+
+        for branch in ["me", "them"] {
+            if audio[branch] is NSNull { continue }
+            guard exactKeys(audio[branch], required: ["level", "observed_at"]) else {
+                return false
+            }
+        }
+        if let transcript = dictionary["transcript"], !(transcript is NSNull),
+           !exactKeys(
+             transcript, required: ["text"], optional: ["source", "speaker_label"]
+           ) {
+            return false
+        }
+        return true
+    }
+
+    static func aggregate(_ me: UiSttState, _ them: UiSttState) -> UiSttState {
+        for raw in UiTelemetryContract.sttPrecedence {
+            guard let state = UiSttState(rawValue: raw) else { continue }
+            if me == state || them == state { return state }
+        }
+        return .unknown
+    }
+
+    /// Decode only telemetry belonging to the already-verified live recorder.
+    /// Any contract failure returns nil and therefore degrades the UI to its
+    /// neutral/unavailable presentation.
+    static func decode(
+        _ data: Data,
+        expectedPid: Int32,
+        expectedStartEpoch: Double,
+        now: Date = Date()
+    ) -> UiTelemetrySnapshot? {
+        guard validateShape(data),
+              let wire = try? JSONDecoder().decode(WireRecord.self, from: data),
+              wire.schema == UiTelemetryContract.schemaVersion,
+              wire.pid > 0,
+              wire.pid == expectedPid,
+              wire.start_epoch.isFinite,
+              wire.start_epoch == expectedStartEpoch,
+              wire.updated_at.isFinite
+        else { return nil }
+
+        let nowEpoch = now.timeIntervalSince1970
+        let snapshotAge = nowEpoch - wire.updated_at
+        guard snapshotAge <= UiTelemetryContract.snapshotExpirySeconds,
+              wire.updated_at <= nowEpoch + UiTelemetryContract.snapshotExpirySeconds else {
+            return nil
+        }
+
+        func sttBranch(_ value: WireSttBranch) -> UiTelemetrySttBranch? {
+            guard let state = UiSttState(rawValue: value.state) else { return nil }
+            if let detail = value.detail,
+               scalars(detail) > UiTelemetryContract.detailLimit { return nil }
+            return UiTelemetrySttBranch(state: state, detail: value.detail)
+        }
+        guard let meStt = sttBranch(wire.stt.me),
+              let themStt = sttBranch(wire.stt.them),
+              let publishedAggregate = UiSttState(rawValue: wire.stt.aggregate),
+              publishedAggregate == aggregate(meStt.state, themStt.state)
+        else { return nil }
+
+        func activity(_ value: WireAudio?) -> UiTelemetryActivity? {
+            guard let value,
+                  value.level.isFinite,
+                  value.level >= UiTelemetryContract.levelMin,
+                  value.level <= UiTelemetryContract.levelMax,
+                  value.observed_at.isFinite,
+                  value.observed_at <= wire.updated_at
+            else { return nil }
+            let age = nowEpoch - value.observed_at
+            guard age >= 0,
+                  age <= UiTelemetryContract.audioObservationExpirySeconds else {
+                return nil
+            }
+            return UiTelemetryActivity(
+                level: value.level == 0 ? 0 : value.level,
+                observedAt: Date(timeIntervalSince1970: value.observed_at)
+            )
+        }
+
+        // Invalid numeric observations reject the whole snapshot.  Missing or
+        // old observations are the only cases that become a per-branch nil.
+        for value in [wire.audio["me"] ?? nil, wire.audio["them"] ?? nil] {
+            if let value,
+               (!value.level.isFinite
+                || value.level < UiTelemetryContract.levelMin
+                || value.level > UiTelemetryContract.levelMax
+                || !value.observed_at.isFinite
+                || value.observed_at > wire.updated_at) {
+                return nil
+            }
+        }
+
+        var transcript: UiTelemetryTranscript?
+        if let value = wire.transcript {
+            guard !value.text.isEmpty,
+                  scalars(value.text) <= UiTelemetryContract.transcriptLimit,
+                  value.source == nil || value.source == "me" || value.source == "them",
+                  value.speaker_label.map({ scalars($0) <= UiTelemetryContract.detailLimit })
+                    ?? true
+            else { return nil }
+            transcript = UiTelemetryTranscript(
+                text: value.text, source: value.source, speakerLabel: value.speaker_label)
+        }
+        if let category = wire.locked_category,
+           category.isEmpty || scalars(category) > UiTelemetryContract.detailLimit {
+            return nil
+        }
+
+        return UiTelemetrySnapshot(
+            pid: wire.pid,
+            startEpoch: wire.start_epoch,
+            updatedAt: Date(timeIntervalSince1970: wire.updated_at),
+            me: activity(wire.audio["me"] ?? nil),
+            them: activity(wire.audio["them"] ?? nil),
+            meStt: meStt,
+            themStt: themStt,
+            aggregateStt: publishedAggregate,
+            transcript: transcript,
+            lockedCategory: wire.locked_category
+        )
+    }
+}

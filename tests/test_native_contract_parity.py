@@ -24,6 +24,7 @@ the same change whenever the Swift writer changes.
 from __future__ import annotations
 
 import re
+import json
 import tomllib
 from pathlib import Path
 
@@ -40,6 +41,8 @@ def _swift_escape(value: str) -> str:
 RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel.swift"
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
 SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
+UI_TELEMETRY = REPO / "native" / "onoats-menubar" / "Sources" / "UiTelemetry.swift"
+UI_FIXTURES = REPO / "tests" / "fixtures" / "ui_telemetry"
 
 
 def _extract(pattern: str, path: Path) -> str:
@@ -542,10 +545,12 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
     """
     from onoats.categories import InvalidCategoryError, validate_category
     from onoats.config import OnoatsConfig
+    from onoats.ui_telemetry import SEMINAR_CATEGORY
 
     swift = RECORDER_MODEL.read_text()
     category = re.search(r'seminarCategory\s*=\s*"([^"]+)"', swift)
     assert category, "RecorderModel.seminarCategory literal not found"
+    assert category.group(1) == SEMINAR_CATEGORY
     assert re.search(
         r'if seminarMode \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
         swift,
@@ -557,3 +562,140 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
     assert validate_category(category.group(1), config=configured) == category.group(1)
     with pytest.raises(InvalidCategoryError):
         validate_category(category.group(1), config=OnoatsConfig(raw={}))
+
+
+def test_ui_telemetry_contract_matches_swift():
+    """Every consumer-side telemetry literal mirrors the Python leaf module."""
+    from onoats import ui_telemetry as py
+
+    swift = UI_TELEMETRY.read_text(encoding="utf-8")
+    numeric = {
+        "schemaVersion": py.UI_TELEMETRY_SCHEMA_VERSION,
+        "maxWriteHz": py.MAX_WRITE_HZ,
+        "heartbeatSeconds": py.HEARTBEAT_SECONDS,
+        "snapshotExpirySeconds": py.SNAPSHOT_EXPIRY_SECONDS,
+        "audioObservationExpirySeconds": py.AUDIO_OBSERVATION_EXPIRY_SECONDS,
+        "audioObservationRefreshSeconds": py.AUDIO_OBSERVATION_REFRESH_SECONDS,
+        "transcriptLimit": py.TRANSCRIPT_LIMIT,
+        "detailLimit": py.DETAIL_LIMIT,
+        "levelMin": py.LEVEL_MIN,
+        "levelMax": py.LEVEL_MAX,
+    }
+    for name, expected in numeric.items():
+        match = re.search(
+            rf"(?:static\s+)?let\s+{name}\s*(?::[^=]+)?=\s*([0-9.]+)", swift
+        )
+        assert match, f"UiTelemetry.swift missing {name}"
+        assert float(match.group(1)) == float(expected), name
+
+    filename = re.search(
+        r'(?:static\s+)?let\s+fileName\s*(?::[^=]+)?=\s*"([^"]+)"', swift
+    )
+    assert filename and filename.group(1) == py.UI_TELEMETRY_FILENAME
+
+    state_array = re.search(r"sttStates\s*(?::[^=]+)?=\s*\[([^\]]+)\]", swift)
+    assert state_array, "UiTelemetry.swift missing sttStates literal"
+    assert set(re.findall(r'"([^"]+)"', state_array.group(1))) == set(py.STT_STATES)
+
+    precedence = re.search(r"sttPrecedence\s*(?::[^=]+)?=\s*\[([^\]]+)\]", swift)
+    assert precedence, "UiTelemetry.swift missing sttPrecedence literal"
+    assert tuple(re.findall(r'"([^"]+)"', precedence.group(1))) == py.STT_PRECEDENCE
+
+
+def test_ui_telemetry_shared_decoder_vectors_match_python_contract(tmp_path: Path):
+    """Keep native fixtures live against the producer-side tolerant reader."""
+    from onoats.ui_telemetry import read_snapshot
+
+    cases = json.loads((UI_FIXTURES / "decoder_cases.json").read_text())
+    assert cases
+    for case in cases:
+        snapshot_path = tmp_path / f"{case['name']}.json"
+        snapshot_path.write_text(json.dumps(case["snapshot"]), encoding="utf-8")
+        result = read_snapshot(
+            snapshot_path,
+            pid=case["owner_pid"],
+            start_epoch=case["owner_start_epoch"],
+            now=case["now"],
+        )
+        # PID liveness is deliberately Swift-only: Python's reader receives an
+        # already-authoritative owner tuple and therefore has no owner_alive arg.
+        expected = case["accepted"] if case["owner_alive"] else True
+        assert (result is not None) is expected, case["name"]
+
+    for name in ("malformed.json", "nonfinite_nan.json", "nonfinite_infinity.json"):
+        path = UI_FIXTURES / name
+        assert (
+            read_snapshot(path, pid=4242, start_epoch=1699999900.0, now=1700000000.0)
+            is None
+        )
+
+
+def test_ui_telemetry_string_boundary_vectors_cover_unicode_scalars():
+    """The shared vector table pins exact inclusive/exclusive string bounds."""
+    from onoats.ui_telemetry import DETAIL_LIMIT, TRANSCRIPT_LIMIT
+
+    cases = json.loads((UI_FIXTURES / "string_boundaries.json").read_text())
+    assert {(case["field"], case["scalar_count"]) for case in cases} == {
+        ("transcript", TRANSCRIPT_LIMIT - 1),
+        ("transcript", TRANSCRIPT_LIMIT),
+        ("transcript", TRANSCRIPT_LIMIT + 1),
+        ("detail", DETAIL_LIMIT),
+        ("detail", DETAIL_LIMIT + 1),
+        ("speaker_label", DETAIL_LIMIT),
+        ("speaker_label", DETAIL_LIMIT + 1),
+        ("locked_category", DETAIL_LIMIT),
+        ("locked_category", DETAIL_LIMIT + 1),
+    }
+    # Six Unicode scalars per motif: combining mark, astral characters, and
+    # the scalar components of a ZWJ sequence. Swift must count unicodeScalars,
+    # not UTF-16 code units or extended grapheme clusters.
+    motif = "e\u0301🙂👩\u200d💻"
+    for case in cases:
+        text = (motif * ((case["scalar_count"] // len(motif)) + 1))[
+            : case["scalar_count"]
+        ]
+        assert len(text) == case["scalar_count"]
+
+
+def test_level_verdict_vectors_match_python_producer():
+    from onoats.ui_telemetry import UITelemetryState
+
+    cases = json.loads((UI_FIXTURES / "level_verdicts.json").read_text())
+    for case in cases:
+        state = UITelemetryState(4242, 1.0, clock=lambda: 2.0)
+        accepted = state.observe_level("me", float(case["input"]))
+        assert accepted is case["accepted"], case["input"]
+        if accepted:
+            assert state.snapshot()["audio"]["me"]["level"] == case["published"]
+
+
+def test_swift_model_pins_data_directory_contract():
+    """Start env and identity-checked signals must use the pinned active dir."""
+    store = (REPO / "src" / "onoats" / "_vendor" / "store.py").read_text()
+    cli = (REPO / "src" / "onoats" / "cli.py").read_text()
+    swift = RECORDER_MODEL.read_text(encoding="utf-8")
+
+    assert '"ONOATS_DATA_DIR"' in store
+    environment = _extract(
+        r'dataDirEnvironment\s*(?::[^=]+)?=\s*"([^"]+)"', RECORDER_MODEL
+    )
+    argument = _extract(r'dataDirArgument\s*(?::[^=]+)?=\s*"([^"]+)"', RECORDER_MODEL)
+    assert environment == "ONOATS_DATA_DIR"
+    assert argument == "--data-dir"
+    assert cli.count('"--data-dir"') >= 2
+    assert "environment[Self.dataDirEnvironment]" in swift
+    assert re.search(
+        r'arguments:\s*\["stop",\s*"--data-dir",\s*directory\.path\]',
+        swift,
+    )
+    assert re.search(
+        r'arguments:\s*\["flush",\s*"--data-dir",\s*directory\.path\]',
+        swift,
+    )
+
+
+def test_swift_telemetry_consumer_has_no_network_probe():
+    for path in (UI_TELEMETRY, RECORDER_MODEL):
+        text = path.read_text(encoding="utf-8")
+        assert "URLSession" not in text, path
+        assert "NWConnection" not in text, path

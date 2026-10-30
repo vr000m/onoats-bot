@@ -484,7 +484,7 @@ sequenceDiagram
 - [x] Phase 1: Brand Direction and Canonical Assets
 - [x] Phase 2: Ephemeral UI Telemetry Contract and Runtime Producer
 - [x] Phase 3: Accepted Review Remediation for Completed Runtime Work
-- [ ] Phase 4: Swift Telemetry Consumer
+- [x] Phase 4: Swift Telemetry Consumer
 - [ ] Phase 5: Native Resource Pipeline and Stateful Menu Icon
 - [ ] Phase 6: Window-Style Recording Panel and In-Panel Settings
 - [ ] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
@@ -512,6 +512,11 @@ sequenceDiagram
   synchronous telemetry stop-request seam. The focused gate passed 120 tests;
   Ruff validation passed. Its one-shot reviewer found two shutdown-boundary
   defects, both fixed before the phase boundary.
+- 2026-10-30 — Phase 4 added strict Swift telemetry decoding and a model seam
+  that keeps PID identity and liveness authoritative. The focused gate passed
+  both native harnesses and 34 parity tests; the native app build validated.
+  Its one-shot reviewer found six ownership, lifecycle, cleanup, isolation,
+  fixture, and polling findings, all fixed before the phase boundary.
 
 ## Issues & Solutions
 
@@ -521,6 +526,13 @@ sequenceDiagram
 - A second signal arriving during the normal 0.5-second telemetry wait could
   still be delayed. The helper now races the owned task against the live
   `force_exit_event` and cancels immediately when force-exit wins.
+- The first Swift consumer could reclaim `.stopping`, accept an unrelated PID
+  as app-owned, and poll identity at telemetry cadence. Lifecycle refresh now
+  preserves draining state and caches only a current-attempt PID/start tuple;
+  the 4 Hz telemetry poll decodes against that cache without probing liveness.
+- The native process callback retained its handle and the harness wrote host
+  preferences. The callback now captures weakly and clears on spawn failure;
+  the harness runs with an isolated home and removes every test suite domain.
 
 ## Final Results
 
