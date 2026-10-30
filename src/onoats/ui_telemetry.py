@@ -215,6 +215,12 @@ class UITelemetryPublisher:
             self._task = asyncio.create_task(self.run(), name="ui_telemetry_publisher")
         return self._task
 
+    def request_stop(self) -> asyncio.Task[None] | None:
+        """Synchronously request shutdown and return the one publisher task."""
+        self._stopping = True
+        self._wake.set()
+        return self._task
+
     async def run(self) -> None:
         self.state.set_notifier(self._notify)
         self._wake.set()
@@ -295,9 +301,7 @@ class UITelemetryPublisher:
                     pass
 
     async def stop(self, timeout: float = 0.5) -> None:
-        self._stopping = True
-        self._wake.set()
-        task = self._task
+        task = self.request_stop()
         if task is None or task is asyncio.current_task():
             return
         try:

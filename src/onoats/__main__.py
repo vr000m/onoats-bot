@@ -468,12 +468,17 @@ def main(argv: list[str] | None = None) -> int:
     """Console entrypoint for the single-input recorder (``onoats bot-single``)."""
     args = _parse_args(argv)
     if args.category:
-        from onoats.categories import InvalidCategoryError, validate_category
+        from onoats.categories import (
+            INVALID_CATEGORY_ERROR_TAG,
+            InvalidCategoryError,
+            validate_category,
+        )
 
         try:
             args.category = validate_category(args.category)
         except InvalidCategoryError as exc:
-            print(f"Error: {exc}")
+            print(INVALID_CATEGORY_ERROR_TAG, file=sys.stderr)
+            print(f"Error: {exc}", file=sys.stderr)
             return 1
     try:
         asyncio.run(

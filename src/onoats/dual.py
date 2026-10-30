@@ -156,6 +156,49 @@ async def _shutdown_stt_service(stt_service, label: str) -> None:
             logger.warning(f"Shutdown: failed to clean up {label} STT service: {exc}")
 
 
+async def _stop_telemetry_publisher(publisher, *, force_exit_event) -> None:
+    """Bound shutdown of the publisher's one concrete background task."""
+
+    def _consume_task_result(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(f"Could not stop UI telemetry publisher: {exc}")
+
+    publisher_task = publisher.request_stop()
+    if publisher_task is None or publisher_task is asyncio.current_task():
+        return
+    if publisher_task.done():
+        _consume_task_result(publisher_task)
+        return
+
+    force_waiter = asyncio.create_task(
+        force_exit_event.wait(), name="ui_telemetry_force_exit_waiter"
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {publisher_task, force_waiter},
+            timeout=0.5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if publisher_task in done:
+            _consume_task_result(publisher_task)
+            return
+
+        publisher_task.cancel()
+        await asyncio.gather(publisher_task, return_exceptions=True)
+        if force_waiter not in done:
+            logger.warning(
+                "UI telemetry publisher did not stop within the shutdown bound"
+            )
+    finally:
+        if not force_waiter.done():
+            force_waiter.cancel()
+        await asyncio.gather(force_waiter, return_exceptions=True)
+
+
 def _generate_call_id() -> str:
     """Return a per-session id for shadow + dump output joining.
 
@@ -762,8 +805,8 @@ async def run_onoats_dual(
         # Display telemetry is not allowed to delay the recorder's force-exit
         # path. Its bounded stop cancels a task that owns no durable data.
         if telemetry_publisher is not None:
-            await telemetry_publisher.stop(
-                timeout=0.0 if force_exit_event.is_set() else 0.5
+            await _stop_telemetry_publisher(
+                telemetry_publisher, force_exit_event=force_exit_event
             )
 
         # Single-writer shutdown tail: status-stopped BEFORE pid removal, plus
@@ -908,11 +951,16 @@ def _apply_recorder_args(args: argparse.Namespace) -> int | None:
             "Running in silent mode."
         )
     if args.category:
-        from onoats.categories import InvalidCategoryError, validate_category
+        from onoats.categories import (
+            INVALID_CATEGORY_ERROR_TAG,
+            InvalidCategoryError,
+            validate_category,
+        )
 
         try:
             args.category = validate_category(args.category)
         except InvalidCategoryError as exc:
+            print(INVALID_CATEGORY_ERROR_TAG, file=sys.stderr)
             print(f"Error: {exc}", file=sys.stderr)
             return 1
     return None

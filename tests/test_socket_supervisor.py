@@ -2451,6 +2451,155 @@ def test_shutdown_tail_default_has_no_telemetry_side_effect(tmp_path, monkeypatc
     assert events == ["stopped", "terminal", "pid-removed"]
 
 
+def test_telemetry_shutdown_uses_synchronous_request_and_owned_task(
+    tmp_path, monkeypatch
+):
+    """Never wrap an arbitrary cancellation-resistant ``publisher.stop``."""
+    import asyncio
+
+    from onoats import dual
+
+    events: list[str] = []
+
+    class CancellationResistantPublisher:
+        def __init__(self):
+            self.stop_requested = asyncio.Event()
+            self.task = asyncio.create_task(
+                self._run(), name="test-owned-ui-telemetry-publisher"
+            )
+
+        async def _run(self):
+            await self.stop_requested.wait()
+            events.append("publisher-owned-task-stopped")
+
+        def request_stop(self):
+            events.append("publisher-request-stop")
+            self.stop_requested.set()
+            return self.task
+
+        async def stop(self, *, timeout):
+            events.append(f"publisher-stop-called:{timeout}")
+            while True:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    events.append("publisher-stop-resisted-cancel")
+
+        def cleanup(self):
+            events.append("telemetry-cleanup")
+
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active" / "onoats.pid"
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(dual, "_restore_terminal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    async def scenario():
+        publisher = CancellationResistantPublisher()
+        await dual._stop_telemetry_publisher(
+            publisher, force_exit_event=asyncio.Event()
+        )
+        dual._finalize_shutdown_status(
+            data_dir,
+            pid_path,
+            ended_by_error=False,
+            telemetry_cleanup=publisher.cleanup,
+        )
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        return [
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+
+    pending_tasks = asyncio.run(scenario())
+
+    assert "publisher-stop-called:0.5" not in events
+    assert "publisher-stop-resisted-cancel" not in events
+    assert events[:2] == [
+        "publisher-request-stop",
+        "publisher-owned-task-stopped",
+    ]
+    assert events.index("stopped") < events.index("telemetry-cleanup")
+    assert events.index("telemetry-cleanup") < events.index("pid-removed")
+    assert pending_tasks == []
+
+
+def test_late_force_exit_interrupts_normal_telemetry_wait_promptly():
+    """A second signal interrupts the already-started normal 0.5 s wait."""
+    import asyncio
+
+    from onoats import dual
+
+    class PublisherWithOwnedTask:
+        def __init__(self):
+            self.requested = asyncio.Event()
+            self.task = asyncio.create_task(
+                self._run(), name="test-owned-ui-telemetry-publisher"
+            )
+
+        async def _run(self):
+            await asyncio.Future()
+
+        def request_stop(self):
+            self.requested.set()
+            return self.task
+
+        async def stop(self, *, timeout):
+            pytest.fail("shutdown must use request_stop(), not publisher.stop()")
+
+    async def scenario():
+        force_exit_event = asyncio.Event()
+        publisher = PublisherWithOwnedTask()
+        helper_task = asyncio.create_task(
+            dual._stop_telemetry_publisher(
+                publisher, force_exit_event=force_exit_event
+            ),
+            name="test-stop-telemetry-helper",
+        )
+        await publisher.requested.wait()
+        await asyncio.sleep(0)
+
+        started = asyncio.get_running_loop().time()
+        force_exit_event.set()
+        await asyncio.wait_for(
+            helper_task,
+            timeout=0.2,
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        pending = [
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+        return elapsed, publisher.task.done(), pending
+
+    elapsed, publisher_done, pending_tasks = asyncio.run(scenario())
+
+    assert elapsed < 0.2
+    assert publisher_done
+    assert pending_tasks == []
+
+
+def test_run_shutdown_uses_bounded_telemetry_stop_before_finalization():
+    """Pin the helper into the real nested shutdown path, not only unit tests."""
+    import inspect
+
+    from onoats import dual
+
+    source = inspect.getsource(dual.run_onoats_dual)
+    stop_at = source.index("await _stop_telemetry_publisher(")
+    finalize_at = source.index("_finalize_shutdown_status(", stop_at)
+    assert stop_at < finalize_at
+
+
 def test_pid_status_and_telemetry_share_the_caller_minted_epoch(tmp_path):
     """All three run-ownership surfaces carry one byte-identical epoch."""
     import json

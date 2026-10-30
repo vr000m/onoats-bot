@@ -145,6 +145,34 @@ def test_bot_single_routes_to_main(monkeypatch):
     assert called["argv"] == ["--category", "work"]
 
 
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        pytest.param("onoats.__main__", id="bot-single"),
+        pytest.param("onoats.dual", id="bot"),
+    ],
+)
+def test_invalid_category_emits_exact_machine_tag_and_separate_explanation(
+    entrypoint, capsys
+):
+    """Producer output keeps the machine contract independent of human prose."""
+    from importlib import import_module
+
+    from onoats.categories import INVALID_CATEGORY_ERROR_TAG
+
+    module = import_module(entrypoint)
+    rc = module.main(["--category", "seminars"])
+
+    captured = capsys.readouterr()
+    lines = captured.err.splitlines()
+    assert rc == 1
+    assert captured.out == ""
+    assert lines[0] == INVALID_CATEGORY_ERROR_TAG
+    assert lines[1].startswith("Error: --category must be one of:")
+    assert "seminars" in lines[1]
+    assert INVALID_CATEGORY_ERROR_TAG not in lines[1]
+
+
 def test_convert_routes_and_defaults_to_once(monkeypatch):
     called = {}
     monkeypatch.setattr("onoats.convert.main", _recorder(called))

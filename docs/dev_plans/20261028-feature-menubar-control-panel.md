@@ -483,7 +483,7 @@ sequenceDiagram
 
 - [x] Phase 1: Brand Direction and Canonical Assets
 - [x] Phase 2: Ephemeral UI Telemetry Contract and Runtime Producer
-- [ ] Phase 3: Accepted Review Remediation for Completed Runtime Work
+- [x] Phase 3: Accepted Review Remediation for Completed Runtime Work
 - [ ] Phase 4: Swift Telemetry Consumer
 - [ ] Phase 5: Native Resource Pipeline and Stateful Menu Icon
 - [ ] Phase 6: Window-Style Recording Panel and In-Panel Settings
@@ -508,10 +508,19 @@ sequenceDiagram
 - 2026-10-30 — This run is a clean-install release. The Phase 1 record did not
   capture the exact prior CLI `EXTRAS` or branch/detached state before work
   began, so the installed baseline must not be used for rollback.
+- 2026-10-30 — Phase 3 added the stable invalid-category machine tag and a
+  synchronous telemetry stop-request seam. The focused gate passed 120 tests;
+  Ruff validation passed. Its one-shot reviewer found two shutdown-boundary
+  defects, both fixed before the phase boundary.
 
 ## Issues & Solutions
 
-- (append issues and resolutions here as work proceeds)
+- A cancellation-resistant arbitrary `publisher.stop()` wrapper could survive
+  until `asyncio.run` teardown. The fix requests stop synchronously and bounds
+  only the publisher-owned task.
+- A second signal arriving during the normal 0.5-second telemetry wait could
+  still be delayed. The helper now races the owned task against the live
+  `force_exit_event` and cancels immediately when force-exit wins.
 
 ## Final Results
 
