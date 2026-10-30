@@ -447,7 +447,7 @@ sequenceDiagram
 
 ## Progress
 
-- [ ] Phase 1: Brand Direction and Canonical Assets
+- [x] Phase 1: Brand Direction and Canonical Assets
 - [ ] Phase 2: Ephemeral UI Telemetry Contract and Runtime Producer
 - [ ] Phase 3: Swift Telemetry Consumer
 - [ ] Phase 4: Native Resource Pipeline and Stateful Menu Icon
@@ -456,7 +456,14 @@ sequenceDiagram
 
 ## Findings
 
-- (append findings here as work proceeds)
+- 2026-10-30 — Phase 1 approved the grain-wave direction committed at
+  `e19323cdc544dabf298179f1df1830d1ce4a0538`. Rollback baseline before any
+  Phase 2 code change: `git status --porcelain` was empty; `command -v onoats`
+  resolved to `/Users/vr000m/.local/bin/onoats`; the installed app was
+  `/Users/vr000m/Applications/Onoats.app`; its designated requirement was
+  `identifier "net.varunsingh.onoats" and certificate leaf =
+  H"aac7e2b994e42bed55fad8e292cf3ba1a4629cee"`; and its cdhash was
+  `4491f6d250ae237fed30a388a5a76aa35f7468ac`.
 
 ## Issues & Solutions
 
