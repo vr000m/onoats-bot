@@ -65,9 +65,13 @@ timeout each surface a **fatal** ``ErrorFrame`` (pushed upstream via
 from __future__ import annotations
 
 import asyncio
+import array
 import base64
 import binascii
 import json
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -234,6 +238,7 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         max_buffered_bytes: int = DEFAULT_MAX_BUFFERED_BYTES,
         backpressure_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST,
         expected_nonce: str | None = None,
+        on_level: Callable[[float], None] | None = None,
         **kwargs,
     ):
         """Initialize the socket input transport.
@@ -278,6 +283,8 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
         self._max_buffered_bytes = max(1, max_buffered_bytes)
         self._backpressure_policy = backpressure_policy
         self._expected_nonce = expected_nonce
+        self._on_level = on_level
+        self._last_level_warning = float("-inf")
 
         self._expected_rate = params.audio_in_sample_rate or DEFAULT_SAMPLE_RATE
         # Width is pinned to PCM16: the handshake validates width == 2 and refuses
@@ -432,6 +439,7 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                         f"capturer closed socket {self._socket_path!r} (EOF); ending branch"
                     )
                     return
+                self._observe_level(frame.audio)
                 await self._stage_frame(frame)
         except asyncio.CancelledError:
             raise
@@ -454,6 +462,26 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
             await self._surface_error(
                 f"socket read error on {self._socket_path!r}: {exc}; ending branch"
             )
+
+    def _observe_level(self, pcm: bytes) -> None:
+        """Report a normalized PCM16 peak without affecting frame delivery."""
+        callback = self._on_level
+        if callback is None or not pcm:
+            return
+        samples = array.array("h")
+        samples.frombytes(pcm)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        peak = max((abs(sample) for sample in samples), default=0) / 32768.0
+        try:
+            callback(peak)
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self._last_level_warning >= 60.0:
+                logger.warning(
+                    f"Socket transport {self._socket_path!r} level observer failed: {exc}"
+                )
+                self._last_level_warning = now
 
     async def _read_one_frame(self) -> InputAudioRawFrame | None:
         """Read one length-prefixed framed payload.
@@ -794,6 +822,7 @@ class UnixSocketAudioTransport(BaseTransport):
         max_buffered_bytes: int = DEFAULT_MAX_BUFFERED_BYTES,
         backpressure_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST,
         expected_nonce: str | None = None,
+        on_level: Callable[[float], None] | None = None,
         name: str | None = None,
         input_name: str | None = None,
         **kwargs,
@@ -842,6 +871,7 @@ class UnixSocketAudioTransport(BaseTransport):
             max_buffered_bytes=max_buffered_bytes,
             backpressure_policy=backpressure_policy,
             expected_nonce=expected_nonce,
+            on_level=on_level,
             name=input_name,
             **kwargs,
         )

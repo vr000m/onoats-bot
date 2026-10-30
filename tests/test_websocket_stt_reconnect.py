@@ -325,6 +325,75 @@ def test_on_recovery_fires_only_on_next_successful_connect_after_kickstart(
     assert "restarted automatically" in recovered[0]
 
 
+def test_ui_callbacks_transition_failed_recovering_ready_and_redact_detail(
+    monkeypatch,
+):
+    """Published health follows the instance handshake, never endpoint config."""
+    leaky = OSError("ws://secret:hunter2@stt.example/v1?token=private refused")
+    failure = {"exc": leaky}
+    _install_fake_client_factory(monkeypatch, lambda: failure["exc"])
+    events: list[tuple[str, str | None]] = []
+    svc = _make_service(
+        on_failed=lambda detail: events.append(("failed", detail)),
+        on_recovering=lambda: events.append(("recovering", None)),
+        on_ready=lambda: events.append(("ready", None)),
+    )
+
+    with pytest.raises(OSError):
+        asyncio.run(svc._ensure_connected())
+    assert events[0][0] == "failed"
+    assert "secret" not in events[0][1]
+    assert "hunter2" not in events[0][1]
+    assert "token=private" not in events[0][1]
+
+    failure["exc"] = None
+
+    async def _reconnect() -> None:
+        await svc._ensure_connected()
+        assert [event for event, _detail in events] == [
+            "failed",
+            "recovering",
+            "ready",
+        ]
+        await svc.cancel(None)
+
+    asyncio.run(_reconnect())
+
+
+def test_lost_established_connection_fires_recovering_once(monkeypatch):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    events: list[str] = []
+    svc = _make_service(
+        on_ready=lambda: events.append("ready"),
+        on_recovering=lambda: events.append("recovering"),
+    )
+
+    async def _run() -> None:
+        client = await _connect_and_drain_session_ready(svc)
+        assert svc._reader_task is not None
+        await client._events.put(None)
+        await asyncio.wait_for(svc._reader_task, timeout=1.0)
+
+    asyncio.run(_run())
+    assert events == ["ready", "recovering"]
+
+
+def test_raising_ui_ready_callback_does_not_discard_connection(monkeypatch):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+
+    def _raise() -> None:
+        raise RuntimeError("telemetry consumer gone")
+
+    svc = _make_service(on_ready=_raise)
+
+    async def _run() -> None:
+        await svc._ensure_connected()
+        assert svc._connected is True
+        await svc.cancel(None)
+
+    asyncio.run(_run())
+
+
 def test_reset_path_clears_cooldown_and_fires_on_recovery_none_then_rekickstarts(
     monkeypatch,
 ):

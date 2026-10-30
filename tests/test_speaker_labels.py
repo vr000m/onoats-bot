@@ -119,6 +119,105 @@ def test_transcript_buffer_jsonl_source_is_canonical_enum(tmp_path):
     assert utterances[0]["source"] != "Them"
 
 
+def test_transcript_preview_callback_observes_final_text_without_changing_jsonl(
+    tmp_path,
+):
+    """The display hook mirrors a final utterance; JSONL remains authoritative."""
+    import asyncio
+    import json
+
+    from pipecat.frames.frames import TranscriptionFrame
+
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    observed: list[tuple[str, str | None, str | None]] = []
+
+    async def _run() -> None:
+        buf = TranscriptBuffer(
+            data_dir=tmp_path,
+            use_frame_source=True,
+            on_transcript=lambda text, source, label: observed.append(
+                (text, source, label)
+            ),
+        )
+        frame = TranscriptionFrame(text=" final words ", user_id="them", timestamp="t")
+        setattr(frame, "onoats_source", "them")
+        setattr(frame, "onoats_speakers", ["S2"])
+        setattr(frame, "onoats_overlap", False)
+        await buf._handle_transcription(frame)
+
+    asyncio.run(_run())
+
+    assert observed == [("final words", "them", "Them (S2)")]
+    (path,) = (tmp_path / ".active").glob("*.jsonl")
+    entries = [json.loads(line) for line in path.read_text().splitlines()]
+    utterance = next(entry for entry in entries if entry["type"] == "utterance")
+    assert utterance["text"] == "final words"
+    assert utterance["source"] == "them"
+    assert "speaker_label" not in utterance
+
+
+def test_raising_transcript_preview_callback_does_not_lose_durable_utterance(tmp_path):
+    """A display-only callback failure cannot affect transcript durability."""
+    import asyncio
+    import json
+
+    from pipecat.frames.frames import TranscriptionFrame
+
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    def _raise(*_args) -> None:
+        raise RuntimeError("panel closed")
+
+    async def _run() -> None:
+        buf = TranscriptBuffer(data_dir=tmp_path, on_transcript=_raise)
+        await buf._handle_transcription(
+            TranscriptionFrame(text="must persist", user_id="me", timestamp="t")
+        )
+
+    asyncio.run(_run())
+
+    (path,) = (tmp_path / ".active").glob("*.jsonl")
+    entries = [json.loads(line) for line in path.read_text().splitlines()]
+    assert any(entry.get("text") == "must persist" for entry in entries)
+
+
+def test_raising_preview_label_composition_does_not_lose_durable_utterance(
+    tmp_path, monkeypatch
+):
+    """All preview preparation is warning-only after the durable JSONL write."""
+    import asyncio
+    import json
+
+    from pipecat.frames.frames import TranscriptionFrame
+
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    def _raise(*_args) -> str:
+        raise RuntimeError("bad display label")
+
+    monkeypatch.setattr("onoats.render.compose_speaker_label", _raise)
+
+    async def _run() -> None:
+        buf = TranscriptBuffer(
+            data_dir=tmp_path,
+            use_frame_source=True,
+            on_transcript=lambda *_args: None,
+        )
+        frame = TranscriptionFrame(
+            text="composition must persist", user_id="them", timestamp="t"
+        )
+        setattr(frame, "onoats_source", "them")
+        setattr(frame, "onoats_speakers", ["S3"])
+        await buf._handle_transcription(frame)
+
+    asyncio.run(_run())
+
+    (path,) = (tmp_path / ".active").glob("*.jsonl")
+    entries = [json.loads(line) for line in path.read_text().splitlines()]
+    assert any(entry.get("text") == "composition must persist" for entry in entries)
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 — diarization label persistence + render
 # ---------------------------------------------------------------------------

@@ -442,6 +442,23 @@ def test_guard_accepts_distinct_paths(two_paths):
     assert mic_label != system_label
 
 
+def test_socket_level_callbacks_stay_bound_to_their_branch(two_paths):
+    """The builder wires fixed Me/Them observers without a shared fan-out."""
+    _base, mic, system = two_paths
+    mic_levels: list[float] = []
+    system_levels: list[float] = []
+
+    mic_t, system_t, _mic_label, _system_label = _socket_builder()(
+        _cfg(mic, system),
+        on_mic_level=mic_levels.append,
+        on_system_level=system_levels.append,
+    )
+
+    assert mic_t.input()._on_level.__self__ is mic_levels
+    assert system_t.input()._on_level.__self__ is system_levels
+    assert mic_t.input()._on_level is not system_t.input()._on_level
+
+
 # ---------------------------------------------------------------------------
 # Generation nonce: cfg.capturer_nonce must reach the transport handshake gate
 # ---------------------------------------------------------------------------

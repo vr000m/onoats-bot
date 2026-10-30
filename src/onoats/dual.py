@@ -58,6 +58,7 @@ from onoats.runtime import (  # noqa: E402
     _create_stt_service,
     _install_signal_handlers,
     _mark_status_rotation,
+    _mint_start_epoch,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -81,6 +82,7 @@ def _finalize_shutdown_status(
     *,
     ended_by_error: bool,
     old_terminal_settings: object | None = None,
+    telemetry_cleanup=None,
 ) -> None:
     """Single-writer shutdown tail: write status-stopped BEFORE removing the pid.
 
@@ -112,6 +114,11 @@ def _finalize_shutdown_status(
         )
     else:
         _write_status_stopped(data_dir, exit_reason="graceful")
+    if telemetry_cleanup is not None:
+        try:
+            telemetry_cleanup()
+        except Exception as exc:
+            logger.warning(f"Could not clean up UI telemetry: {exc}")
     _restore_terminal(old_terminal_settings)
     _remove_pid_file(pid_path, owner_pid=os.getpid())
     # The single-instance lock is intentionally NOT released here: it is held for
@@ -346,7 +353,7 @@ def _build_portaudio_transports(cfg):
     return mic_transport, system_transport, mic_dev, system_dev
 
 
-def _build_socket_transports(cfg):
+def _build_socket_transports(cfg, *, on_mic_level=None, on_system_level=None):
     """Build the two ``UnixSocketAudioTransport`` branches (``AUDIO_SOURCE=socket``).
 
     Reads the per-branch socket paths from the config loader (``ONOATS_MIC_SOCKET``
@@ -404,12 +411,16 @@ def _build_socket_transports(cfg):
     # Pass the EXPANDED paths to the transports (so ~ actually connects); the
     # returned labels stay fully resolved for the startup banner.
     mic_transport = UnixSocketAudioTransport(
-        str(mic_path), sample_rate=PIPELINE_SAMPLE_RATE, expected_nonce=expected_nonce
+        str(mic_path),
+        sample_rate=PIPELINE_SAMPLE_RATE,
+        expected_nonce=expected_nonce,
+        on_level=on_mic_level,
     )
     system_transport = UnixSocketAudioTransport(
         str(system_path),
         sample_rate=PIPELINE_SAMPLE_RATE,
         expected_nonce=expected_nonce,
+        on_level=on_system_level,
     )
     return mic_transport, system_transport, str(mic_resolved), str(system_resolved)
 
@@ -447,6 +458,21 @@ async def run_onoats_dual(
 
     cfg = load_config()
     audio_source = cfg.audio_source
+    start_epoch = _mint_start_epoch()
+
+    # Display-only state exists before transports/services so every callback has
+    # a target, but no publisher (and therefore no file) exists until PID and
+    # running status publication both succeed below.
+    telemetry_state = None
+    if audio_source == "socket":
+        from onoats.ui_telemetry import UITelemetryState
+
+        telemetry_state = UITelemetryState(
+            os.getpid(), start_epoch, locked_category=locked_category
+        )
+        initial_stt_state = "starting" if cfg.stt_service == "websocket" else "unknown"
+        telemetry_state.set_stt_state("me", initial_stt_state)
+        telemetry_state.set_stt_state("them", initial_stt_state)
 
     # Diarization config-time gate: right after the lock, before PortAudio opens
     # or the socket transports are built. Only when the flag is on. The backend
@@ -468,7 +494,13 @@ async def run_onoats_dual(
     # resolved socket path in socket mode. Name them source-neutrally here.
     if audio_source == "socket":
         mic_transport, system_transport, mic_input_label, system_input_label = (
-            _build_socket_transports(cfg)
+            _build_socket_transports(
+                cfg,
+                on_mic_level=lambda level: telemetry_state.observe_level("me", level),
+                on_system_level=lambda level: telemetry_state.observe_level(
+                    "them", level
+                ),
+            )
         )
     elif audio_source == "portaudio":
         mic_transport, system_transport, mic_input_label, system_input_label = (
@@ -500,6 +532,13 @@ async def run_onoats_dual(
         # with. A runtime degrade does not change it; per-utterance `speakers`
         # is the truth about whether a line was labelled.
         diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
+        on_transcript=(
+            lambda text, source, speaker_label: telemetry_state.set_transcript(
+                text, source, speaker_label
+            )
+        )
+        if telemetry_state is not None
+        else None,
     )
     flush_lock = asyncio.Lock()
 
@@ -548,6 +587,7 @@ async def run_onoats_dual(
     system_vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE)
     )
+
     # Recovery message capture: only the *first* call's preflight actually
     # probes the endpoint (the second is a `_preflight_cache` hit for the
     # same resolved kwargs — see `_preflight_stt_ws`'s docstring), so at
@@ -563,7 +603,22 @@ async def run_onoats_dual(
     # `stt` branch (one probe, one server), so whichever instance's first
     # transcript event lands first clears it — a system-audio-only session
     # (no mic transcript ever) still clears the shared warning.
-    mic_result = await _create_stt_service(data_dir=data_dir, branch_instance="mic")
+    def _stt_callbacks(branch: str) -> dict:
+        if telemetry_state is None:
+            return {}
+        return {
+            "on_ready": lambda: telemetry_state.set_stt_state(branch, "ready"),
+            "on_recovering": lambda: telemetry_state.set_stt_state(
+                branch, "recovering"
+            ),
+            "on_failed": lambda detail: telemetry_state.set_stt_state(
+                branch, "failed", detail
+            ),
+        }
+
+    mic_result = await _create_stt_service(
+        data_dir=data_dir, branch_instance="mic", **_stt_callbacks("me")
+    )
     mic_stt = mic_result.service
     # Resolved once; Phase 7 reuses this bool for `_build_dual_pipeline`. Only
     # the system ("them") arm stamps VAD spans; the mic arm never does.
@@ -572,6 +627,7 @@ async def run_onoats_dual(
         data_dir=data_dir,
         branch_instance="system",
         stamp_segment_samples=diarization_on,
+        **_stt_callbacks("them"),
     )
     system_stt = system_result.service
     preflight_recovery_warning = (
@@ -622,16 +678,23 @@ async def run_onoats_dual(
         silence_detector,
         loop,
     )
-    pid_path = _write_pid_file(data_dir)
+    pid_path = _write_pid_file(data_dir, start_epoch=start_epoch)
     # Write ordering (status-file contract): pid file FIRST, then status. So a
     # reader that catches us mid-start sees pid-alive (backstop) before the rich
     # status record exists, never the reverse.
-    _write_status_running(
+    status_published = _write_status_running(
         data_dir,
         audio_source=audio_source,
         stt_label=stt_banner(),
+        start_epoch=start_epoch,
         warning=preflight_recovery_warning,
     )
+    telemetry_publisher = None
+    if telemetry_state is not None and status_published:
+        from onoats.ui_telemetry import UITelemetryPublisher
+
+        telemetry_publisher = UITelemetryPublisher(data_dir, telemetry_state)
+        telemetry_publisher.start()
 
     shutdown_started = False
     shutdown_complete = asyncio.Event()
@@ -696,6 +759,13 @@ async def run_onoats_dual(
         await _shutdown_stt_service(system_stt, "system")
         await log_stt_server_rss("shutdown")
 
+        # Display telemetry is not allowed to delay the recorder's force-exit
+        # path. Its bounded stop cancels a task that owns no durable data.
+        if telemetry_publisher is not None:
+            await telemetry_publisher.stop(
+                timeout=0.0 if force_exit_event.is_set() else 0.5
+            )
+
         # Single-writer shutdown tail: status-stopped BEFORE pid removal, plus
         # terminal restore. Extracted to a module-level helper so the write
         # ordering is exercisable at runtime without booting the recorder stack
@@ -706,6 +776,9 @@ async def run_onoats_dual(
             pid_path,
             ended_by_error=ended_by_error,
             old_terminal_settings=old_terminal_settings,
+            telemetry_cleanup=(
+                telemetry_publisher.cleanup if telemetry_publisher is not None else None
+            ),
         )
         logger.info("Shutdown: complete")
 

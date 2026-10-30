@@ -533,7 +533,13 @@ def sup_env(short_root, fake_capturer, monkeypatch):
 
     # Shorten the supervisor's internal grace windows so a hang surfaces fast.
     monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 5.0, raising=False)
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 5.0, raising=False)
+    # This budget is not part of the behavior under test: it must merely leave
+    # enough room for the separately spawned Python fixture to import and emit
+    # its startup event/exit under a loaded CI host. Individual timeout tests
+    # override it with their own bounded semantic budget below.
+    monkeypatch.setattr(
+        cli, "_SOCKET_WAIT_TIMEOUT_SEC", max(5.0, SUP_TIMEOUT), raising=False
+    )
     monkeypatch.setattr(cli, "_CAPTURER_TERM_GRACE_SEC", 2.0, raising=False)
 
     pending_dir = data_dir / "sessions" / "pending"
@@ -2169,7 +2175,9 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
     from onoats import status as status_file
 
     data_dir, _ = sup_env
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 1.0)
+    # Leave enough room for the Python fixture to start and announce the
+    # pending prompt; the 2.5s bind delay still forces the extension branch.
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 2.0)
     monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", float(SUP_TIMEOUT))
     set_capturer_behaviour(
         "stream",
@@ -2177,7 +2185,7 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
             "ONOATS-EVENT waiting-for-permission branch=system "
             "hint=tap creation pending the TCC prompt"
         ],
-        bind_delay=2.5,  # > the 1.0s base budget: without the extension this
+        bind_delay=2.5,  # > the 2.0s base budget: without the extension this
         # run is a capturer-start-timeout
     )
 
@@ -2225,7 +2233,11 @@ def test_waiting_for_permission_timeout_names_the_prompt(
     from onoats import status as status_file
 
     data_dir, _ = sup_env
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 0.5)
+    # The assertion is that the announced prompt grants one bounded extension,
+    # not that a fresh Python subprocess imports and emits the event in <500ms.
+    # Keep startup scheduling out of the contract while preserving a short,
+    # explicitly bounded base + extension window.
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 2.0)
     monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", 1.0)
     set_capturer_behaviour(
         "hang",
@@ -2329,8 +2341,14 @@ def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
 
     # Start-of-session: real pid file + real running status (pid FIRST, then
     # status — the start half of the same ordering contract).
-    pid_path = runtime._write_pid_file(data_dir)
-    runtime._write_status_running(data_dir, audio_source="socket", stt_label="fake-stt")
+    start_epoch = 900.25
+    pid_path = runtime._write_pid_file(data_dir, start_epoch=start_epoch)
+    runtime._write_status_running(
+        data_dir,
+        audio_source="socket",
+        stt_label="fake-stt",
+        start_epoch=start_epoch,
+    )
     assert pid_path.exists()
     start_rec = status_file.read_status(data_dir)
     assert start_rec is not None and start_rec.running is True
@@ -2378,6 +2396,89 @@ def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
     assert end_rec.audio_source == "socket", (
         "stop must preserve start-of-session detail"
     )
+
+
+def test_shutdown_tail_cleans_telemetry_between_stopped_status_and_pid_removal(
+    tmp_path, monkeypatch
+):
+    """Cleanup is owner-checked at the only safe shutdown ordering seam."""
+    from onoats import dual
+
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active" / "onoats.pid"
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(
+        dual, "_restore_terminal", lambda *a, **k: events.append("terminal")
+    )
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    dual._finalize_shutdown_status(
+        data_dir,
+        pid_path,
+        ended_by_error=False,
+        telemetry_cleanup=lambda: events.append("telemetry-cleanup"),
+    )
+
+    assert events.index("stopped") < events.index("telemetry-cleanup")
+    assert events.index("telemetry-cleanup") < events.index("pid-removed")
+
+
+def test_shutdown_tail_default_has_no_telemetry_side_effect(tmp_path, monkeypatch):
+    """The optional seam preserves the pre-telemetry shutdown behaviour."""
+    from onoats import dual
+
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active" / "onoats.pid"
+    events: list[str] = []
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(
+        dual, "_restore_terminal", lambda *a, **k: events.append("terminal")
+    )
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    dual._finalize_shutdown_status(data_dir, pid_path, ended_by_error=False)
+
+    assert events == ["stopped", "terminal", "pid-removed"]
+
+
+def test_pid_status_and_telemetry_share_the_caller_minted_epoch(tmp_path):
+    """All three run-ownership surfaces carry one byte-identical epoch."""
+    import json
+
+    from onoats import runtime
+    from onoats import status as status_file
+    from onoats.ui_telemetry import UITelemetryPublisher, UITelemetryState
+
+    data_dir = tmp_path / "data"
+    start_epoch = 1_793_000_000.125
+    pid_path = runtime._write_pid_file(data_dir, start_epoch=start_epoch)
+    assert runtime._write_status_running(
+        data_dir,
+        audio_source="socket",
+        stt_label="fake-stt",
+        start_epoch=start_epoch,
+    )
+    publisher = UITelemetryPublisher(
+        data_dir, UITelemetryState(os.getpid(), start_epoch)
+    )
+    assert publisher.write_once(now=start_epoch + 0.25)
+
+    pid_epoch = float(pid_path.read_text(encoding="utf-8").splitlines()[3])
+    status_epoch = status_file.read_status(data_dir).start_time
+    telemetry_epoch = json.loads(
+        (data_dir / ".active" / "onoats.ui.json").read_text(encoding="utf-8")
+    )["start_epoch"]
+    assert pid_epoch == status_epoch == telemetry_epoch == start_epoch
 
 
 def test_diarization_preflight_fails_loud_before_capturer_spawn(sup_env, monkeypatch):

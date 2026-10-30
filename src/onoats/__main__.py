@@ -71,6 +71,7 @@ from onoats.runtime import (  # noqa: E402
     _acquire_instance_lock,
     _create_stt_service,
     _install_signal_handlers,
+    _mint_start_epoch,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -307,7 +308,8 @@ async def run_onoats(
     # (after signal handlers so SIGUSR1 is already wired by the time
     # the PID file is visible.)
     # ----------------------------------------------------------------
-    pid_path = _write_pid_file(data_dir)
+    start_epoch = _mint_start_epoch()
+    pid_path = _write_pid_file(data_dir, start_epoch=start_epoch)
 
     _shutdown_started = False
     _shutdown_complete = asyncio.Event()

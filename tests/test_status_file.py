@@ -660,9 +660,15 @@ def test_dual_wires_producers_at_start_rotation_stop():
     assert stop_idx < pid_rm_idx, "status-stopped must be written before pid removal"
 
     # And the start producer runs AFTER the pid file is written (pid first).
-    pid_write_idx = src.index("_write_pid_file(data_dir)")
+    pid_write_idx = src.index("_write_pid_file(data_dir, start_epoch=")
     start_idx = src.index("_write_status_running(")
     assert pid_write_idx < start_idx, "pid file must be written before status (start)"
+
+    # Ephemeral display telemetry has no authority until both identity surfaces
+    # have been published successfully.
+    publisher_idx = src.index("UITelemetryPublisher(")
+    assert start_idx < publisher_idx
+    assert "if telemetry_state is not None and status_published:" in src
 
 
 def test_dual_threads_captured_recovery_warning_into_status_running():
@@ -986,7 +992,7 @@ def test_write_pid_file_refuses_verified_live_recorder(tmp_path, monkeypatch):
             "onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot"
         )
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)
+            _write_pid_file(tmp_path, start_epoch=100.0)
         # The draining recorder's pid file MUST survive the refused start.
         assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
     finally:
@@ -1009,7 +1015,7 @@ def test_write_pid_file_overwrites_stale_dead_recorder(tmp_path):
     proc.wait(timeout=5)
     _seed_pid_file(tmp_path, proc.pid)
 
-    pid_path = _write_pid_file(tmp_path)
+    pid_path = _write_pid_file(tmp_path, start_epoch=100.0)
     # Overwritten with OUR pid — start proceeds.
     assert pid_path.read_text(encoding="utf-8").startswith(f"{_os.getpid()}\n")
 
@@ -1050,7 +1056,7 @@ def test_write_pid_file_refuses_live_recorder_with_indeterminate_probe(
         # kill(0) succeeds (process alive) but the identity readback fails.
         monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)
+            _write_pid_file(tmp_path, start_epoch=100.0)
         # The live recorder's pid file MUST survive — never overwritten.
         assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
     finally:
@@ -1069,7 +1075,7 @@ def test_write_pid_file_refuses_live_legacy_fingerprintless_pid(tmp_path):
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(f"{proc.pid}\nonoats-bot\n", encoding="utf-8")  # no line 3
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)
+            _write_pid_file(tmp_path, start_epoch=100.0)
         assert pid_path.exists()
     finally:
         proc.terminate()
@@ -1121,7 +1127,7 @@ def test_write_pid_file_is_atomic_via_os_replace(tmp_path, monkeypatch):
         return real_replace(src, dst)
 
     monkeypatch.setattr(_runtime.os, "replace", _spy_replace)
-    pid_path = _write_pid_file(tmp_path)
+    pid_path = _write_pid_file(tmp_path, start_epoch=100.0)
 
     # Final record landed via os.replace into the real path — not written in place.
     assert pid_path in replace_dests, "pid file must be published via os.replace"
@@ -1152,7 +1158,7 @@ def test_write_pid_file_refuses_concurrent_start_holding_instance_lock(tmp_path)
     _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # instance 1 holds the slot
     try:
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)  # instance 2 loses the race
+            _write_pid_file(tmp_path, start_epoch=100.0)  # instance 2 loses the race
         assert not (active / PID_FILENAME).exists(), (
             "the start that lost the instance-lock race must not publish a pid file"
         )

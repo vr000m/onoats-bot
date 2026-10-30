@@ -1315,6 +1315,9 @@ async def _create_stt_service(
     data_dir: Path | None = None,
     branch_instance: str | None = None,
     stamp_segment_samples: bool = False,
+    on_ready: Callable[[], None] | None = None,
+    on_recovering: Callable[[], None] | None = None,
+    on_failed: Callable[[str], None] | None = None,
 ) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -1488,6 +1491,9 @@ async def _create_stt_service(
             instance_name=branch_instance,
             stamp_segment_samples=stamp_segment_samples,
             on_recovery=live_on_recovery,
+            on_ready=on_ready,
+            on_recovering=on_recovering,
+            on_failed=on_failed,
             on_preflight_confirmed=(
                 on_preflight_confirmed if recovered_in_preflight else None
             ),
@@ -2052,7 +2058,12 @@ def _release_instance_lock() -> None:
     _instance_lock_fd = None
 
 
-def _write_pid_file(data_dir: Path) -> Path:
+def _mint_start_epoch() -> float:
+    """Mint the one wall-clock run identity shared by PID/status/telemetry."""
+    return time.time()
+
+
+def _write_pid_file(data_dir: Path, *, start_epoch: float) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint.
 
     Single-instance enforcement lives in ``_acquire_instance_lock`` (the flock +
@@ -2096,7 +2107,6 @@ def _write_pid_file(data_dir: Path) -> Path:
     # Wall-clock start_epoch is included as the 4th line so live-view
     # readers can distinguish a freshly-started bot from one that
     # happens to have inherited a recycled pid (see onoats._vendor.pid).
-    start_epoch = time.time()
     payload = f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n"
     # Atomic replace (temp + os.replace in the SAME dir) — never truncate the pid
     # file in place. A draining recorder's owner-checked `_remove_pid_file` reads
@@ -2181,8 +2191,9 @@ def _write_status_running(
     *,
     audio_source: str,
     stt_label: str,
+    start_epoch: float,
     warning: str | None = None,
-) -> None:
+) -> bool:
     """Write the start-of-session status (``running=true``). Best-effort.
 
     ``warning`` threads a preflight-path kickstart-recovery message straight
@@ -2195,10 +2206,13 @@ def _write_status_running(
             pid=os.getpid(),
             audio_source=audio_source,
             stt_label=stt_label,
+            start_time=start_epoch,
             warning=warning,
         )
+        return True
     except OSError as exc:
         logger.warning(f"Could not write status file (start): {exc}")
+        return False
 
 
 def _mark_status_rotation(data_dir: Path) -> None:

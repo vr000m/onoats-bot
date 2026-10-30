@@ -644,6 +644,31 @@ def test_create_stt_service_never_derives_stamp_from_config(monkeypatch):
     }
     svc = _ws_service(monkeypatch, raw=raw)
     assert svc._stamp_segment_samples is False
+
+
+def test_create_stt_service_threads_ui_state_callbacks(monkeypatch):
+    raw = {"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
+
+    def ready():
+        pass
+
+    def recovering():
+        pass
+
+    def failed(_detail):
+        pass
+
+    svc = _ws_service(
+        monkeypatch,
+        raw=raw,
+        on_ready=ready,
+        on_recovering=recovering,
+        on_failed=failed,
+    )
+
+    assert svc._on_ready is ready
+    assert svc._on_recovering is recovering
+    assert svc._on_failed is failed
     svc = _ws_service(monkeypatch, raw=raw, branch_instance="system")
     assert svc._stamp_segment_samples is False
 
