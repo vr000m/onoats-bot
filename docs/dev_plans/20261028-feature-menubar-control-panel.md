@@ -485,7 +485,7 @@ sequenceDiagram
 - [x] Phase 2: Ephemeral UI Telemetry Contract and Runtime Producer
 - [x] Phase 3: Accepted Review Remediation for Completed Runtime Work
 - [x] Phase 4: Swift Telemetry Consumer
-- [ ] Phase 5: Native Resource Pipeline and Stateful Menu Icon
+- [x] Phase 5: Native Resource Pipeline and Stateful Menu Icon
 - [ ] Phase 6: Window-Style Recording Panel and In-Panel Settings
 - [ ] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
 
@@ -517,6 +517,12 @@ sequenceDiagram
   both native harnesses and 34 parity tests; the native app build validated.
   Its one-shot reviewer found six ownership, lifecycle, cleanup, isolation,
   fixture, and polling findings, all fixed before the phase boundary.
+- 2026-10-30 — Phase 5 added clean resource assembly, exact allowlist checks,
+  state-specific template glyphs, strict signing verification, and staged
+  install/rollback targets. The focused gate passed 65 tests and the signed
+  bundle validation. Missing and unexpected resource probes both failed as
+  required. Its one-shot reviewer found two rollback-boundary defects, both
+  fixed before the phase boundary.
 
 ## Issues & Solutions
 
@@ -533,6 +539,14 @@ sequenceDiagram
 - The native process callback retained its handle and the harness wrote host
   preferences. The callback now captures weakly and clears on spawn failure;
   the harness runs with an isolated home and removes every test suite domain.
+- Designated-requirement command output includes a path-bearing `Executable=`
+  line and may prefix the requirement with `# `. The installer now extracts
+  exactly one normalized requirement expression and rejects zero or multiple
+  matches; ad-hoc signed execution tests cover three distinct app paths.
+- An existing app is not sufficient evidence for rollback approval. The
+  staged installer now defaults to clean-install mode and clears stale approval;
+  archive creation requires explicit expected requirement and cdhash evidence,
+  while approved mode fails closed before removing the installed app.
 
 ## Final Results
 

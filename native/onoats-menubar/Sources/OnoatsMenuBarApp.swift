@@ -60,11 +60,12 @@ struct OnoatsMenuBarApp: App {
         MenuBarExtra {
             MenuContent(model: model, launch: launch)
         } label: {
-            Image(systemName: menuSymbol)
+            Image(nsImage: menuImage)
+                .accessibilityLabel("Onoats")
         }
     }
 
-    private var menuSymbol: String {
+    private var menuImageName: String {
         switch model.state {
         // A live capture warning (all-zero input — likely a denied grant or a
         // muted mic) changes the icon so the anomaly is visible without
@@ -72,13 +73,29 @@ struct OnoatsMenuBarApp: App {
         case .running:
             // An external stop in flight reuses the draining glyph so the icon
             // tracks the menu's "stopping…" affordance.
-            if model.stopRequested { return "ellipsis.circle" }
+            if model.stopRequested { return "OnoatsMenuBarTemplateBusy" }
             return model.warning == nil
-                ? "waveform.circle.fill" : "waveform.badge.exclamationmark"
-        case .starting, .stopping: return "ellipsis.circle"
-        case .failed: return "exclamationmark.triangle.fill"
-        case .stopped: return "waveform.circle"
+                ? "OnoatsMenuBarTemplateRecording"
+                : "OnoatsMenuBarTemplateWarning"
+        case .starting, .stopping: return "OnoatsMenuBarTemplateBusy"
+        case .failed: return "OnoatsMenuBarTemplateFailed"
+        case .stopped: return "OnoatsMenuBarTemplateIdle"
         }
+    }
+
+    /// AppKit template rendering adapts the pre-rendered monochrome glyph to
+    /// light and dark menu bars. Recorder state is carried by shape, not tint.
+    private var menuImage: NSImage {
+        guard let image = Bundle.main.image(forResource: menuImageName) else {
+            let fallback = NSImage(
+                systemSymbolName: "waveform.circle",
+                accessibilityDescription: "Onoats"
+            ) ?? NSImage(size: NSSize(width: 18, height: 18))
+            fallback.isTemplate = true
+            return fallback
+        }
+        image.isTemplate = true
+        return image
     }
 }
 

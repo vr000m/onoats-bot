@@ -43,6 +43,14 @@ SOURCES := $(wildcard $(SRC_DIR)/Sources/*.swift)
 MENUBAR_SRC_DIR := onoats-menubar
 MENUBAR_SOURCES := $(wildcard $(MENUBAR_SRC_DIR)/Sources/*.swift)
 PLIST           := $(MENUBAR_SRC_DIR)/Info.plist
+RESOURCE_DIR    := $(MENUBAR_SRC_DIR)/Resources
+RESOURCE_NAMES  := Onoats.icns \
+	OnoatsHeader.png OnoatsHeader@2x.png \
+	OnoatsMenuBarTemplateIdle.png OnoatsMenuBarTemplateIdle@2x.png \
+	OnoatsMenuBarTemplateRecording.png OnoatsMenuBarTemplateRecording@2x.png \
+	OnoatsMenuBarTemplateWarning.png OnoatsMenuBarTemplateWarning@2x.png \
+	OnoatsMenuBarTemplateBusy.png OnoatsMenuBarTemplateBusy@2x.png \
+	OnoatsMenuBarTemplateFailed.png OnoatsMenuBarTemplateFailed@2x.png
 
 BUILD := build
 APP   := Onoats.app
@@ -62,9 +70,17 @@ MENUBAR_SWIFTC_FLAGS := -O -target $(ARCH)-apple-macos$(DEPLOY) \
 REPO        := $(abspath ..)
 EXTRAS      ?= macos
 INSTALL_DIR := $(HOME)/Applications
+BACKUP_DIR := $(HOME)/Library/Application Support/Onoats/app-backups
+ROLLBACK_RECORD := $(BACKUP_DIR)/approved-rollback.txt
+# Rollback is opt-in. The operator may set these only after verifying the
+# complete pre-change app/CLI baseline recorded by the release workflow.
+ROLLBACK_BASELINE_APPROVED ?= 0
+ROLLBACK_BASELINE_DR_HASH ?=
+ROLLBACK_BASELINE_CDHASH ?=
 
-.PHONY: build app sign dr cdhash rebuild print-bin clean check-identity \
-	cert install-cli install setup sign-cli setup-cli
+.PHONY: build app verify-resources sign dr cdhash rebuild print-bin clean \
+	check-identity cert install-cli install install-staged rollback setup \
+	sign-cli setup-cli
 
 build: $(BUILD)/onoats-capturer $(BUILD)/Onoats
 
@@ -79,11 +95,39 @@ $(BUILD)/Onoats: $(MENUBAR_SOURCES)
 	@echo "✓ compiled $@ (menu-bar app)"
 
 app: build
-	mkdir -p $(APP)/Contents/MacOS
+	rm -rf $(APP)
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp $(BUILD)/Onoats $(MAIN_BIN)
 	cp $(BUILD)/onoats-capturer $(BIN)
 	cp $(PLIST) $(APP)/Contents/Info.plist
+	cp $(RESOURCE_DIR)/Onoats.icns $(APP)/Contents/Resources/Onoats.icns
+	cp $(RESOURCE_DIR)/OnoatsHeader.png $(APP)/Contents/Resources/OnoatsHeader.png
+	cp $(RESOURCE_DIR)/OnoatsHeader@2x.png $(APP)/Contents/Resources/OnoatsHeader@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed@2x.png
 	@echo "✓ assembled $(APP)"
+
+# The resource directory is an equality-checked allowlist. This catches both a
+# stale file surviving assembly and a required export disappearing before the
+# bundle is signed.
+verify-resources:
+	@set -eu; \
+	resources="$(APP)/Contents/Resources"; \
+	[ -d "$$resources" ] || { echo "✗ missing $$resources"; exit 1; }; \
+	expected=$$(mktemp); actual=$$(mktemp); \
+	trap 'rm -f "$$expected" "$$actual"' EXIT; \
+	printf '%s\n' $(RESOURCE_NAMES) | LC_ALL=C sort > "$$expected"; \
+	find "$$resources" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort > "$$actual"; \
+	diff -u "$$expected" "$$actual" || { echo "✗ bundle resource allowlist mismatch"; exit 1; }; \
+	echo "✓ verified bundle resource allowlist"
 
 # Deliberately NOT find-identity -v: a self-signed root fails the keychain
 # *trust* evaluation so -v hides it, but codesign still signs with it and TCC
@@ -103,8 +147,10 @@ check-identity:
 # it must get its own explicit codesign line here — an unsigned addition
 # silently invalidates the outer signature.
 sign: app check-identity
+	$(MAKE) verify-resources APP="$(APP)"
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(BIN)
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(APP)
+	codesign --verify --deep --strict $(APP)
 	@echo "--- designated requirement (must be byte-stable across rebuilds) ---"
 	@codesign -dr - $(APP)
 
@@ -139,6 +185,101 @@ install: sign install-cli
 	rm -rf $(INSTALL_DIR)/$(APP)
 	ditto $(APP) $(INSTALL_DIR)/$(APP)
 	@echo "✓ installed $(INSTALL_DIR)/$(APP)"
+
+# Install exactly the already-signed staged bytes. The default is deliberately
+# a clean install, even when an app already exists. A rollback archive is made
+# only when the operator explicitly approves a complete baseline and supplies
+# its expected designated-requirement hash and cdhash.
+# No build/sign prerequisite is intentional: post-gauntlet smoke and install
+# must operate on the same bytes.
+install-staged:
+	@set -eu; \
+	staged="$(APP)"; installed="$(INSTALL_DIR)/$(APP)"; \
+	backup_dir="$(HOME)/Library/Application Support/Onoats/app-backups"; record="$(ROLLBACK_RECORD)"; \
+	extract_dr() { \
+	  dr_output=$$(codesign -dr - "$$1" 2>&1) || { echo "✗ cannot read designated requirement: $$1" >&2; return 1; }; \
+	  dr_count=$$(printf '%s\n' "$$dr_output" | awk '/^designated => / || /^# designated => / { count += 1 } END { print count + 0 }'); \
+	  [ "$$dr_count" -eq 1 ] || { echo "✗ expected exactly one designated requirement: $$1" >&2; return 1; }; \
+	  printf '%s\n' "$$dr_output" | sed -n -e 's/^designated => //p' -e 's/^# designated => //p'; \
+	}; \
+	rm -f "$$record"; \
+	[ -d "$$staged" ] || { echo "✗ staged app missing: $$staged"; exit 1; }; \
+	$(MAKE) -s verify-resources APP="$$staged"; \
+	codesign --verify --deep --strict "$$staged"; \
+	staged_dr=$$(extract_dr "$$staged"); \
+	staged_dr_hash=$$(printf '%s' "$$staged_dr" | shasum -a 256 | awk '{print $$1}'); \
+	staged_tree_hash=$$(cd "$$staged" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
+	mkdir -p "$(INSTALL_DIR)" "$$backup_dir"; \
+	if [ "$(ROLLBACK_BASELINE_APPROVED)" = "1" ]; then \
+	  expected_dr_hash="$(ROLLBACK_BASELINE_DR_HASH)"; expected_cdhash="$(ROLLBACK_BASELINE_CDHASH)"; \
+	  [ -n "$$expected_dr_hash" ] && [ -n "$$expected_cdhash" ] || { echo "✗ approved rollback requires ROLLBACK_BASELINE_DR_HASH and ROLLBACK_BASELINE_CDHASH"; exit 1; }; \
+	  [ "$${#expected_dr_hash}" -eq 64 ] || { echo "✗ invalid rollback baseline designated-requirement hash"; exit 1; }; \
+	  case "$$expected_dr_hash$$expected_cdhash" in *[!0-9A-Fa-f]*) echo "✗ rollback baseline identity must be hexadecimal"; exit 1;; esac; \
+	  [ -d "$$installed" ] || { echo "✗ approved rollback baseline app is missing: $$installed"; exit 1; }; \
+	  codesign --verify --deep --strict "$$installed"; \
+	  baseline_dr=$$(extract_dr "$$installed"); \
+	  baseline_dr_hash=$$(printf '%s' "$$baseline_dr" | shasum -a 256 | awk '{print $$1}'); \
+	  [ "$$baseline_dr_hash" = "$$expected_dr_hash" ] || { echo "✗ installed baseline designated requirement differs from approved evidence"; exit 1; }; \
+	  [ "$$baseline_dr_hash" = "$$staged_dr_hash" ] || { echo "✗ installed baseline designated requirement differs from staged app"; exit 1; }; \
+	  baseline_cdhash=$$(codesign -dvvv "$$installed" 2>&1 | awk -F= 'tolower($$1)=="cdhash" {print $$2; exit}'); \
+	  [ -n "$$baseline_cdhash" ] || { echo "✗ installed baseline has no cdhash"; exit 1; }; \
+	  [ "$$baseline_cdhash" = "$$expected_cdhash" ] || { echo "✗ installed baseline cdhash differs from approved evidence"; exit 1; }; \
+	  timestamp=$$(date -u +%Y%m%dT%H%M%SZ); \
+	  archive="$$backup_dir/Onoats-$$timestamp.zip"; \
+	  ditto -c -k --keepParent "$$installed" "$$archive"; \
+	  archive_hash=$$(shasum -a 256 "$$archive" | awk '{print $$1}'); \
+	  verify_dir=$$(mktemp -d); \
+	  trap 'rm -rf "$$verify_dir"' EXIT; \
+	  ditto -x -k "$$archive" "$$verify_dir"; \
+	  extracted="$$verify_dir/$(APP)"; \
+	  codesign --verify --deep --strict "$$extracted"; \
+	  extracted_dr=$$(extract_dr "$$extracted"); \
+	  extracted_dr_hash=$$(printf '%s' "$$extracted_dr" | shasum -a 256 | awk '{print $$1}'); \
+	  extracted_cdhash=$$(codesign -dvvv "$$extracted" 2>&1 | awk -F= 'tolower($$1)=="cdhash" {print $$2; exit}'); \
+	  [ "$$extracted_dr_hash" = "$$baseline_dr_hash" ] && [ "$$extracted_cdhash" = "$$baseline_cdhash" ] || { echo "✗ rollback archive identity mismatch"; exit 1; }; \
+	  printf 'archive=%s\nhash=%s\ndr_hash=%s\ncdhash=%s\n' "$$archive" "$$archive_hash" "$$baseline_dr_hash" "$$baseline_cdhash" > "$$record"; \
+	  echo "✓ approved rollback archive $$archive (sha256 $$archive_hash)"; \
+	else \
+	  [ "$(ROLLBACK_BASELINE_APPROVED)" = "0" ] || { echo "✗ ROLLBACK_BASELINE_APPROVED must be 0 or 1"; exit 1; }; \
+	  echo "ℹ rollback baseline not explicitly approved; proceeding as a clean install"; \
+	fi; \
+	rm -rf $(INSTALL_DIR)/$(APP); \
+	ditto $(APP) $(INSTALL_DIR)/$(APP); \
+	codesign --verify --deep --strict "$$installed"; \
+	installed_tree_hash=$$(cd "$$installed" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
+	[ "$$installed_tree_hash" = "$$staged_tree_hash" ] || { echo "✗ installed app differs from staged bytes"; exit 1; }; \
+	echo "✓ installed exact staged app at $$installed"
+
+# Restore only the archive and identity persisted by install-staged. The
+# archive is re-hashed and preflighted before the installed app is removed,
+# then the restored tree is verified again after extraction.
+rollback:
+	@set -eu; \
+	record="$(ROLLBACK_RECORD)"; backup_dir="$(HOME)/Library/Application Support/Onoats/app-backups"; \
+	[ -f "$$record" ] || { echo "✗ no approved rollback record in $$backup_dir"; exit 1; }; \
+	archive=$$(awk -F= '$$1=="archive" {sub(/^archive=/, ""); print; exit}' "$$record"); \
+	expected_hash=$$(awk -F= '$$1=="hash" {print $$2; exit}' "$$record"); \
+	expected_dr_hash=$$(awk -F= '$$1=="dr_hash" {print $$2; exit}' "$$record"); \
+	expected_cdhash=$$(awk -F= '$$1=="cdhash" {print $$2; exit}' "$$record"); \
+	case "$$archive" in "$$backup_dir"/Onoats-*.zip) ;; *) echo "✗ invalid recorded archive path"; exit 1;; esac; \
+	[ -f "$$archive" ] || { echo "✗ approved archive missing"; exit 1; }; \
+	actual_hash=$$(shasum -a 256 "$$archive" | awk '{print $$1}'); \
+	[ "$$actual_hash" = "$$expected_hash" ] || { echo "✗ approved archive hash mismatch"; exit 1; }; \
+	rm -rf $(INSTALL_DIR)/$(APP); \
+	ditto -x -k "$$archive" "$(INSTALL_DIR)"; \
+	restored="$(INSTALL_DIR)/$(APP)"; \
+	extract_dr() { \
+	  dr_output=$$(codesign -dr - "$$1" 2>&1) || { echo "✗ cannot read designated requirement: $$1" >&2; return 1; }; \
+	  dr_count=$$(printf '%s\n' "$$dr_output" | awk '/^designated => / || /^# designated => / { count += 1 } END { print count + 0 }'); \
+	  [ "$$dr_count" -eq 1 ] || { echo "✗ expected exactly one designated requirement: $$1" >&2; return 1; }; \
+	  printf '%s\n' "$$dr_output" | sed -n -e 's/^designated => //p' -e 's/^# designated => //p'; \
+	}; \
+	codesign --verify --deep --strict "$$restored"; \
+	restored_dr=$$(extract_dr "$$restored"); \
+	restored_dr_hash=$$(printf '%s' "$$restored_dr" | shasum -a 256 | awk '{print $$1}'); \
+	restored_cdhash=$$(codesign -dvvv "$$restored" 2>&1 | awk -F= 'tolower($$1)=="cdhash" {print $$2; exit}'); \
+	[ "$$restored_dr_hash" = "$$expected_dr_hash" ] && [ "$$restored_cdhash" = "$$expected_cdhash" ] || { echo "✗ restored app identity mismatch"; exit 1; }; \
+	echo "✓ restored approved app archive $$archive"
 
 # Fresh-clone bootstrap. cert is idempotent (make_cert.sh exits 0 — and never
 # regenerates — when the identity exists). init runs only on a missing

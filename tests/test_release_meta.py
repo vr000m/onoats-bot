@@ -6,12 +6,49 @@ otherwise verbatim) and pyproject declares the matching PEP 639 SPDX string.
 """
 
 import re
+import hashlib
+import os
+import plistlib
+import shutil
+import stat
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
+import pytest
 from packaging.requirements import Requirement
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+NATIVE_MAKEFILE = REPO_ROOT / "native" / "Makefile"
+MENUBAR_PLIST = REPO_ROOT / "native" / "onoats-menubar" / "Info.plist"
+
+NATIVE_RESOURCES = (
+    "Onoats.icns",
+    "OnoatsHeader.png",
+    "OnoatsHeader@2x.png",
+    "OnoatsMenuBarTemplateIdle.png",
+    "OnoatsMenuBarTemplateIdle@2x.png",
+    "OnoatsMenuBarTemplateRecording.png",
+    "OnoatsMenuBarTemplateRecording@2x.png",
+    "OnoatsMenuBarTemplateWarning.png",
+    "OnoatsMenuBarTemplateWarning@2x.png",
+    "OnoatsMenuBarTemplateBusy.png",
+    "OnoatsMenuBarTemplateBusy@2x.png",
+    "OnoatsMenuBarTemplateFailed.png",
+    "OnoatsMenuBarTemplateFailed@2x.png",
+)
+
+
+def _make_target(text: str, target: str) -> tuple[str, str]:
+    """Return one literal Make target's prerequisites and recipe/body."""
+    match = re.search(
+        rf"(?m)^{re.escape(target)}\s*:(?P<prereqs>[^\n]*)\n"
+        rf"(?P<body>(?:(?:\t|#|\s*$).*\n)*)",
+        text,
+    )
+    assert match, f"native/Makefile has no {target!r} target"
+    return match.group("prereqs").strip(), match.group("body")
 
 
 def _load_pyproject() -> dict:
@@ -133,6 +170,451 @@ def test_version_surfaces_agree():
     assert m.group(1) == version, (
         f"Info.plist has {m.group(1)}, pyproject has {version}"
     )
+
+
+# --- native bundle resources and staged installation (menu-bar Phase 5) ---
+
+
+def test_native_resource_source_set_is_exact():
+    resource_dir = REPO_ROOT / "native" / "onoats-menubar" / "Resources"
+    actual = tuple(
+        sorted(path.name for path in resource_dir.iterdir() if path.is_file())
+    )
+    assert actual == tuple(sorted(NATIVE_RESOURCES))
+
+
+def test_native_app_recreates_bundle_and_copies_each_resource_explicitly():
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    _, app = _make_target(makefile, "app")
+
+    remove = app.find("rm -rf $(APP)")
+    create = app.find("mkdir -p $(APP)/Contents/MacOS")
+    assert -1 not in (remove, create) and remove < create, (
+        "app assembly must remove the entire staging bundle before recreating it"
+    )
+    assert "Contents/Resources" in app
+    for name in NATIVE_RESOURCES:
+        assert re.search(rf"(?m)^\tcp\s+[^\n]*\b{re.escape(name)}\b[^\n]*$", app), (
+            f"app target must copy {name} explicitly"
+        )
+    assert not re.search(r"(?m)^\tcp\s+[^\n]*Resources/[^\s]*[*?]", app), (
+        "resource assembly must not use a wildcard copy"
+    )
+
+
+def _run_resource_verifier(app: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["make", "-s", "verify-resources", f"APP={app}"],
+        cwd=REPO_ROOT / "native",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _codesign_output(app: Path, *flags: str) -> str:
+    result = subprocess.run(
+        ["codesign", *flags, str(app)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout + result.stderr
+
+
+def _designated_requirement(app: Path) -> tuple[str, str]:
+    output = _codesign_output(app, "-dr", "-")
+    requirements = [
+        re.sub(r"^(?:# )?designated => ", "", line)
+        for line in output.splitlines()
+        if re.match(r"^(?:# )?designated => ", line)
+    ]
+    assert len(requirements) == 1, output
+    return requirements[0], output
+
+
+def _cdhash(app: Path) -> str:
+    output = _codesign_output(app, "-dvvv")
+    matches = re.findall(r"(?mi)^cdhash=(\S+)$", output)
+    assert len(matches) == 1, output
+    return matches[0]
+
+
+def _make_adhoc_app(path: Path) -> None:
+    contents = path / "Contents"
+    executable = contents / "MacOS" / "Onoats"
+    resources = contents / "Resources"
+    executable.parent.mkdir(parents=True)
+    resources.mkdir()
+    shutil.copyfile("/usr/bin/true", executable)
+    os.chmod(executable, 0o755)
+    with (contents / "Info.plist").open("wb") as fh:
+        plistlib.dump(
+            {
+                "CFBundleExecutable": "Onoats",
+                "CFBundleIdentifier": "net.varunsingh.onoats.tests",
+                "CFBundleName": "Onoats",
+                "CFBundlePackageType": "APPL",
+                "CFBundleVersion": "1",
+            },
+            fh,
+        )
+    for name in NATIVE_RESOURCES:
+        (resources / name).write_bytes(f"test resource: {name}\n".encode())
+    result = subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _copy_file_without_flags(source: str, destination: str) -> str:
+    shutil.copyfile(source, destination)
+    os.chmod(destination, stat.S_IMODE(os.stat(source).st_mode))
+    return destination
+
+
+def _run_install_staged(
+    work: Path,
+    *,
+    approved: bool = False,
+    designated_requirement_sha256: str | None = None,
+    cdhash: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        "make",
+        "-s",
+        "install-staged",
+        "APP=Onoats.app",
+        f"INSTALL_DIR={work / 'installed'}",
+        f"ROLLBACK_BASELINE_APPROVED={int(approved)}",
+    ]
+    if designated_requirement_sha256 is not None:
+        command.append(f"ROLLBACK_BASELINE_DR_HASH={designated_requirement_sha256}")
+    if cdhash is not None:
+        command.append(f"ROLLBACK_BASELINE_CDHASH={cdhash}")
+    env = os.environ.copy()
+    env["HOME"] = str(work / "home")
+    return subprocess.run(
+        command,
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.fixture
+def staged_install_workflow(tmp_path: Path) -> Path:
+    if sys.platform != "darwin":
+        pytest.skip("native codesign regression requires macOS")
+    missing = [tool for tool in ("codesign", "ditto", "make") if not shutil.which(tool)]
+    if missing:
+        pytest.skip(f"native install tools unavailable: {', '.join(missing)}")
+    shutil.copy2(NATIVE_MAKEFILE, tmp_path / "Makefile")
+    _make_adhoc_app(tmp_path / "Onoats.app")
+    (tmp_path / "installed").mkdir()
+    return tmp_path
+
+
+def test_resource_allowlist_rejects_missing_and_unexpected_files(tmp_path: Path):
+    """The verifier is an equality check, not merely an existence check."""
+    app = tmp_path / "Onoats.app"
+    resources = app / "Contents" / "Resources"
+    resources.mkdir(parents=True)
+    source = REPO_ROOT / "native" / "onoats-menubar" / "Resources"
+    for name in NATIVE_RESOURCES:
+        (resources / name).write_bytes((source / name).read_bytes())
+
+    complete = _run_resource_verifier(app)
+    assert complete.returncode == 0, complete.stdout + complete.stderr
+
+    (resources / "unexpected.txt").write_text("stale", encoding="utf-8")
+    unexpected = _run_resource_verifier(app)
+    assert unexpected.returncode != 0, "unexpected bundle resource was accepted"
+    (resources / "unexpected.txt").unlink()
+
+    (resources / NATIVE_RESOURCES[0]).unlink()
+    missing = _run_resource_verifier(app)
+    assert missing.returncode != 0, "missing bundle resource was accepted"
+
+
+def test_resource_verification_precedes_codesigning():
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    _, sign = _make_target(makefile, "sign")
+    verify = sign.find("verify-resources")
+    first_codesign = sign.find("codesign --force")
+    post_sign_verify = sign.find("codesign --verify --deep --strict")
+    assert -1 not in (verify, first_codesign, post_sign_verify)
+    assert verify < first_codesign < post_sign_verify, (
+        "resource allowlist must be checked before signing and the signed bundle "
+        "must receive strict verification"
+    )
+
+
+def test_designated_requirement_extraction_is_path_independent_and_fail_closed():
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    assert re.search(r"\^designated => ", makefile), (
+        "codesign output must be reduced to the designated requirement line"
+    )
+    assert re.search(r"(?:!=|-(?:eq|ne))\s*1|count\s*==\s*1", makefile), (
+        "designated-requirement extraction must reject zero or multiple matches"
+    )
+    assert not re.search(
+        r"printf\s+'%s(?:\\n)?'\s+\"\$\$dr_output\"\s*\|\s*shasum",
+        makefile,
+    ), "the full path-bearing codesign stderr must never be hashed"
+
+
+def test_adhoc_designated_requirement_normalizes_across_bundle_paths(tmp_path: Path):
+    if sys.platform != "darwin" or not shutil.which("codesign"):
+        pytest.skip("native codesign regression requires macOS")
+    original = tmp_path / "staged" / "Onoats.app"
+    original.parent.mkdir()
+    _make_adhoc_app(original)
+    copies = [
+        tmp_path / "installed" / "Onoats.app",
+        tmp_path / "extracted" / "nested" / "Onoats.app",
+    ]
+    for copy in copies:
+        copy.parent.mkdir(parents=True)
+        shutil.copytree(original, copy, copy_function=_copy_file_without_flags)
+
+    observations = [_designated_requirement(app) for app in [original, *copies]]
+    assert len({requirement for requirement, _ in observations}) == 1
+    executable_lines = [
+        next(line for line in output.splitlines() if line.startswith("Executable="))
+        for _, output in observations
+    ]
+    assert len(set(executable_lines)) == len(executable_lines), (
+        "the regression needs distinct absolute paths to prove normalization"
+    )
+
+
+def test_info_plist_adds_icon_without_identity_or_tcc_drift():
+    with MENUBAR_PLIST.open("rb") as fh:
+        plist = plistlib.load(fh)
+    assert plist["CFBundleIconFile"] == "Onoats.icns"
+    assert plist["CFBundleIdentifier"] == "net.varunsingh.onoats"
+    assert plist["CFBundleExecutable"] == "Onoats"
+    assert plist["CFBundleName"] == "Onoats"
+    assert plist["LSMinimumSystemVersion"] == "14.4"
+    assert plist["NSMicrophoneUsageDescription"] == (
+        'onoats records your microphone ("me") for transcription.'
+    )
+    assert plist["NSAudioCaptureUsageDescription"] == (
+        'onoats records system audio ("them") for transcription.'
+    )
+
+
+def test_install_staged_requires_explicit_rollback_approval_before_archiving():
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    prerequisites, body = _make_target(makefile, "install-staged")
+    assert prerequisites == "", (
+        "install-staged must not rebuild or re-sign staged bytes"
+    )
+    for variable in (
+        "ROLLBACK_BASELINE_APPROVED",
+        "ROLLBACK_BASELINE_DR_HASH",
+        "ROLLBACK_BASELINE_CDHASH",
+    ):
+        assert re.search(rf"(?m)^{variable}\s*\?=", makefile)
+        assert f"$({variable})" in body
+    assert "ditto -c -k --keepParent" in body
+    assert "app-backups" in body and "Onoats-" in body and ".zip" in body
+    assert re.search(r"sha(?:sum|256sum)\b[^\n]*256|shasum\s+-a\s+256", body)
+    assert "mktemp -d" in body
+    assert "ditto -x -k" in body
+
+    remove = body.find("rm -rf $(INSTALL_DIR)/$(APP)")
+    copy = body.find("ditto $(APP) $(INSTALL_DIR)/$(APP)")
+    assert -1 not in (remove, copy) and remove < copy
+    for evidence in (
+        "codesign --verify --deep --strict",
+        "codesign -dr -",
+        "cdhash",
+    ):
+        position = body.find(evidence)
+        assert position != -1 and position < remove, (
+            f"installed baseline {evidence!r} verification must precede removal"
+        )
+
+    # The approved archive path and its digest must be persisted together for
+    # rollback, rather than rediscovered later from a directory glob.
+    before_remove = body[:remove]
+    assert re.search(r"(?:printf|echo)[^\n]*(?:archive|ARCHIVE)", before_remove)
+    assert re.search(r"(?:printf|echo)[^\n]*(?:hash|HASH|sha)", before_remove)
+
+
+def test_clean_install_ignores_invalid_existing_app_and_clears_stale_approval(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    installed = work / "installed" / "Onoats.app"
+    installed.mkdir()
+    (installed / "invalid-baseline").write_text("not signed", encoding="utf-8")
+    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    backup_dir.mkdir(parents=True)
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text("stale approval", encoding="utf-8")
+
+    result = _run_install_staged(work)
+    assert result.returncode == 0, result.stdout + result.stderr
+    _codesign_output(installed, "--verify", "--deep", "--strict")
+    assert not record.exists(), "clean install retained stale rollback approval"
+    assert not list(backup_dir.glob("Onoats-*.zip")), (
+        "clean install created a rollback archive without approval"
+    )
+
+
+def test_clean_install_does_not_archive_an_unapproved_valid_app(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    installed = work / "installed" / "Onoats.app"
+    shutil.copytree(
+        work / "Onoats.app", installed, copy_function=_copy_file_without_flags
+    )
+
+    result = _run_install_staged(work)
+    assert result.returncode == 0, result.stdout + result.stderr
+    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    assert not list(backup_dir.glob("Onoats-*.zip"))
+    assert not (backup_dir / "approved-rollback.txt").exists()
+
+
+def _rollback_approval(app: Path, **overrides: str) -> dict[str, str]:
+    requirement, _ = _designated_requirement(app)
+    fields = {
+        "designated_requirement_sha256": hashlib.sha256(
+            requirement.encode()
+        ).hexdigest(),
+        "cdhash": _cdhash(app),
+    }
+    fields.update(overrides)
+    return fields
+
+
+@pytest.mark.parametrize(
+    ("approval_kind", "overrides"),
+    [
+        ("missing", None),
+        ("designated requirement", {"designated_requirement_sha256": "0" * 64}),
+        ("cdhash", {"cdhash": "0" * 40}),
+    ],
+)
+def test_approved_mode_fails_closed_before_removal_when_evidence_is_invalid(
+    staged_install_workflow: Path,
+    approval_kind: str,
+    overrides: dict[str, str] | None,
+):
+    work = staged_install_workflow
+    installed = work / "installed" / "Onoats.app"
+    shutil.copytree(
+        work / "Onoats.app", installed, copy_function=_copy_file_without_flags
+    )
+    inode_before = installed.stat().st_ino
+    evidence = _rollback_approval(installed, **(overrides or {}))
+    if overrides is None:
+        evidence = {}
+
+    result = _run_install_staged(
+        work,
+        approved=True,
+        designated_requirement_sha256=evidence.get("designated_requirement_sha256"),
+        cdhash=evidence.get("cdhash"),
+    )
+    assert result.returncode != 0, (
+        f"approved mode accepted invalid {approval_kind} evidence\n"
+        f"{result.stdout}{result.stderr}"
+    )
+    expected_error = {
+        "missing": "approved rollback requires",
+        "designated requirement": "designated requirement differs",
+        "cdhash": "cdhash differs",
+    }[approval_kind]
+    assert expected_error in result.stdout + result.stderr
+    assert installed.stat().st_ino == inode_before, (
+        "installed app was removed before approval evidence passed"
+    )
+
+
+def test_complete_explicit_approval_creates_verified_rollback_record(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    installed = work / "installed" / "Onoats.app"
+    shutil.copytree(
+        work / "Onoats.app", installed, copy_function=_copy_file_without_flags
+    )
+    evidence = _rollback_approval(installed)
+
+    result = _run_install_staged(
+        work,
+        approved=True,
+        designated_requirement_sha256=evidence["designated_requirement_sha256"],
+        cdhash=evidence["cdhash"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    archives = list(backup_dir.glob("Onoats-*.zip"))
+    assert len(archives) == 1
+    record = backup_dir / "approved-rollback.txt"
+    assert record.is_file()
+    record_text = record.read_text(encoding="utf-8")
+    assert str(archives[0]) in record_text
+    assert hashlib.sha256(archives[0].read_bytes()).hexdigest() in record_text
+
+
+def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    _, install_body = _make_target(makefile, "install-staged")
+    _, body = _make_target(makefile, "rollback")
+    assert "app-backups" in body
+    assert re.search(r"sha(?:sum|256sum)\b[^\n]*256|shasum\s+-a\s+256", body)
+    assert "ditto -x -k" in body
+    assert "codesign --verify --deep --strict" in body
+    assert "codesign -dr -" in body
+    assert "cdhash" in body
+    assert not re.search(r"app-backups/[^\n]*[*?]", body), (
+        "rollback must not select an archive by glob"
+    )
+    approval_vars = set(
+        re.findall(r"\$\(([A-Z_]*(?:APPROV|MANIFEST|RECORD)[A-Z_]*)\)", install_body)
+    ) & set(re.findall(r"\$\(([A-Z_]*(?:APPROV|MANIFEST|RECORD)[A-Z_]*)\)", body))
+    assert approval_vars, (
+        "install-staged and rollback must share one persisted approval record; "
+        "rollback may not accept an arbitrary archive path"
+    )
+
+    remove = body.find("rm -rf $(INSTALL_DIR)/$(APP)")
+    unpack = body.find("ditto -x -k")
+    assert -1 not in (remove, unpack) and remove < unpack
+    assert body.find("codesign --verify --deep --strict", unpack) > unpack
+    assert body.find("codesign -dr -", unpack) > unpack
+    assert body.find("cdhash", unpack) > unpack
+
+
+def test_existing_install_and_setup_contracts_are_unchanged():
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    install_prerequisites, install = _make_target(makefile, "install")
+    assert install_prerequisites.split() == ["sign", "install-cli"]
+    assert (
+        install.find("mkdir -p $(INSTALL_DIR)")
+        < install.find("rm -rf $(INSTALL_DIR)/$(APP)")
+        < install.find("ditto $(APP) $(INSTALL_DIR)/$(APP)")
+    )
+
+    setup_prerequisites, setup = _make_target(makefile, "setup")
+    assert setup_prerequisites == ""
+    assert setup.find("$(MAKE) cert") < setup.find("$(MAKE) install")
+    assert 'config.toml"' in setup
+    assert "skipping 'onoats init'" in setup
+    assert '"$$HOME/.local/bin/onoats" init' in setup
 
 
 # --- diarization contract wiring (Phase 8) ---------------------------------

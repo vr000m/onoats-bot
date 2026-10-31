@@ -42,6 +42,7 @@ RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
 SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
 UI_TELEMETRY = REPO / "native" / "onoats-menubar" / "Sources" / "UiTelemetry.swift"
+MENU_BAR_APP = REPO / "native" / "onoats-menubar" / "Sources" / "OnoatsMenuBarApp.swift"
 UI_FIXTURES = REPO / "tests" / "fixtures" / "ui_telemetry"
 
 
@@ -699,3 +700,37 @@ def test_swift_telemetry_consumer_has_no_network_probe():
         text = path.read_text(encoding="utf-8")
         assert "URLSession" not in text, path
         assert "NWConnection" not in text, path
+
+
+def test_menu_bar_uses_distinct_template_images_for_every_recorder_state():
+    """Template rendering is explicit and state is carried by glyph shape.
+
+    A runtime tint cannot be the only discriminator: macOS discards source
+    colour for template images, and light/dark menu bars need the same mapping.
+    """
+    swift = MENU_BAR_APP.read_text(encoding="utf-8")
+    expected = {
+        "Idle": "OnoatsMenuBarTemplateIdle",
+        "Recording": "OnoatsMenuBarTemplateRecording",
+        "Warning": "OnoatsMenuBarTemplateWarning",
+        "Busy": "OnoatsMenuBarTemplateBusy",
+        "Failed": "OnoatsMenuBarTemplateFailed",
+    }
+    for state, resource in expected.items():
+        assert f'"{resource}"' in swift, f"missing {state.lower()} menu image"
+
+    assert len(set(expected.values())) == len(expected), (
+        "each recorder presentation state must use a distinct pre-rendered image"
+    )
+    assert re.search(r"\.isTemplate\s*=\s*true", swift), (
+        "the custom menu glyph must be marked as an AppKit template image"
+    )
+
+    # The state switch must cover idle, recording, warning, busy
+    # (starting/stopping), and failed rather than selecting one colour asset
+    # and attempting to tint it at runtime.
+    for case in ("stopped", "starting", "running", "stopping", "failed"):
+        assert re.search(rf"case\s+\.{case}\b", swift), case
+    assert "OnoatsHeader" not in swift.split("MenuBarExtra", 1)[1].split("}", 1)[0], (
+        "the full-colour header mark must not be used as the menu-bar glyph"
+    )
