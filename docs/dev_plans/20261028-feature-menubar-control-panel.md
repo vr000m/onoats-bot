@@ -487,7 +487,7 @@ sequenceDiagram
 - [x] Phase 4: Swift Telemetry Consumer
 - [x] Phase 5: Native Resource Pipeline and Stateful Menu Icon
 - [x] Phase 6: Window-Style Recording Panel and In-Panel Settings
-- [ ] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
+- [x] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
 
 ## Findings
 
@@ -529,6 +529,13 @@ sequenceDiagram
   native build passed. Its one-shot reviewer found four lifecycle, logging,
   append, and wording defects; all were fixed before the phase boundary. The
   interaction, VoiceOver, and visual matrix remains a post-gauntlet manual gate.
+- 2026-10-30 — Phase 7 synchronized the user and maintainer documentation,
+  appended narrow corrections to the two superseded historic UI decisions,
+  and preserved every reviewed marker. The focused gate passed 153 tests; the
+  native-access full suite passed 7,193 tests with 3 skips; Ruff and the unsigned
+  native build passed. Its one-shot reviewer found three documentation/test
+  scope issues, all fixed before the phase boundary. The full review gauntlet
+  and post-gauntlet manual release steps remain pending.
 
 ## Issues & Solutions
 

@@ -47,3 +47,14 @@ The diagnostic reproduced the stall on 2026-09-25 21:31: `WARNING mic: bind stil
 - Known limit: a rebind/retry that itself blocks in `AudioDeviceStart` can still park `rebindQueue`, making `stop()`'s `rebindQueue.sync` wait; the supervisor's SIGTERM→SIGKILL bound covers it.
 
 **Root cause found (2026-09-26).** Bisected with selftests: `AudioDeviceStart` on the built-in mic blocks for tens of seconds to minutes when a process tap already exists in the same process. Mic-only always bound fast; tap→mic stalled every run (also after `killall coreaudiod`); mic→tap bound in 0.04 s. Fix: `main.swift` starts the mic before the tap preflight (frames dropped by a `LateBoundWriter` until the mic writer attaches). Verified 20/20 real-socket capturer runs: bind 0.04–0.05 s, both branches streaming. The earlier Milestone B note (tap creation flaky with an AVAudioEngine already running) applied to the old AVAudioEngine mic; the mic is now a HAL IOProc, and no tap failure appeared in 20 runs. The background retries are useless (they block in the same HAL calls) but harmless; bounded first bind + stale-data rebind stay as a backstop. Not tested: supervisor path from the signed app after install.
+
+## Findings
+
+- **2026-10-30 correction — the flat-menu toggle presentation is superseded.**
+  Seminar remains an in-memory, next-recording-only `--category seminars` lock,
+  but it now appears beside the dominant Start action in the window-style panel,
+  disappears as an editable control after Start, and renders as a read-only badge
+  for the app-owned locked session. It still resets on exit. A missing `seminars`
+  category now has a specific failed-Start explanation with Open Config and Open
+  Log actions. See `20261028-feature-menubar-control-panel.md`; the original
+  implementation and diagnostic history above remain unchanged.

@@ -462,6 +462,13 @@ its scope; this list is a pointer, not the contract itself.
   `close_quietly` and by `_graceful_close` (which cannot use
   `close_quietly` for its whole sequence because it must join the reader
   task *between* the two closers).
+- `src/onoats/ui_telemetry.py` — the stdlib-only, display-only live snapshot
+  contract and its in-memory state/publisher. Telemetry is fail-open: producer,
+  persistence, and cleanup failures may degrade the menu-bar panel but must not
+  affect capture, STT, transcript persistence, or shutdown. Exactly one bounded
+  publisher task owns filesystem writes for a run; callbacks update memory only.
+  Audio levels must be finite and inside `[0.0, 1.0]`; invalid values are rejected
+  without advancing the branch observation time, never clamped.
 
 ## Wire-format contract
 

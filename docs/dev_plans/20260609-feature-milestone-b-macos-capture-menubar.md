@@ -617,6 +617,18 @@ denial smoke, PR description refresh, un-draft, merge.
 
 ## Findings
 
+- **2026-10-30 correction — the original flat menu and single status-file UI
+  model are superseded.** The current menu-bar surface is a compact window panel
+  with Start/Stop dominant, Seminar available before Start and locked read-only
+  during an app-owned run, and infrequent controls under in-panel Settings and
+  Diagnostics. The lifecycle status file remains authoritative for identity and
+  liveness; a separate ephemeral, owner/freshness-checked telemetry file supplies
+  display-only Me/Them levels, STT health, locked category, and an opt-in (off by
+  default) bounded transcript preview. App-owned runs now use per-run logs, and
+  the configured data directory is pinned from Start through exit. See
+  `20261028-feature-menubar-control-panel.md`; the original implementation record
+  below remains historical evidence.
+
 - **Post-review-fix verification PASSED (2026-06-10).** After the external
   review fixes (RT-thread drop logging moved to the worker, unbind
   serialization, Teardown registration order), the rebuilt capturer passed

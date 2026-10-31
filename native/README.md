@@ -113,8 +113,9 @@ both binaries are signed with the same identity + identifier (capturer first,
 then the bundle), so the DR is unchanged from the capturer-only bundle and
 existing TCC grants carry over.
 
-Day-to-day usage (Start/Flush/Stop, mic picker, Settings, status, log
-location, first-run TCC prompts) lives in the top-level
+Day-to-day usage (the window panel's Start/Stop/Seminar hierarchy, Flush,
+Settings/Diagnostics, live display telemetry, per-run logs, and first-run TCC
+prompts) lives in the top-level
 [Menu bar (macOS)](../README.md#menu-bar-macos) section. The internals behind
 that surface:
 
@@ -126,16 +127,27 @@ that surface:
   `ONOATS_CAPTURER_BIN` pointing at the embedded capturer. Override the CLI
   path with `defaults write net.varunsingh.onoats cliPath /abs/path`.
 - **Stop** SIGTERMs the supervisor it spawned (graceful drain) — never the
-  capturer directly.
-- The "Mic (me)" picker sets the macOS **default input device** because the
+  capturer directly. A verified external session routes Stop through the
+  identity-checked CLI path; Flush uses the same identity gate with its own
+  signal.
+- The Settings "Mic (me)" picker sets the macOS **default input device** because the
   capturer binds the system default at start — the only selection that
   actually applies. Named device+STT profiles are a follow-up (need capturer
   `--mic-uid`).
-- The running indicator reads the Phase-5a status file
+- The lifecycle model reads the Phase-5a status file
   (`<data_dir>/.active/onoats.status.json`, schema-guarded) with the pid file
-  as liveness backstop. Data dir resolves from `~/.config/onoats/config.toml`
-  `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
-  env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
+  as liveness backstop. Display-only live data comes from the separate,
+  versioned `<data_dir>/.active/onoats.ui.json`: fresh per-branch levels,
+  branch/aggregate STT state, locked category, and the optional bounded
+  transcript preview. The consumer rejects stale ownership, freshness, schema,
+  numeric, and aggregate mismatches; missing telemetry degrades the panel and
+  never changes recorder liveness or success.
+- Data dir resolves from `~/.config/onoats/config.toml` `[storage].data_dir`,
+  else `~/.local/share/onoats` (a GUI app sees no shell env, so
+  `ONOATS_DATA_DIR`/XDG exports don't apply here). The model snapshots this path
+  at Start and uses it for launch, status/PID/telemetry reads, Stop/Flush, and
+  exit handling until that run ends. A mid-run config change is shown as the
+  next recording directory rather than silently moving the active run.
 - **First Start after a fresh install / permission reset:** the system-audio
   TCC prompt fires at tap creation. Since release-plan Phase 7 the capturer
   creates the tap **before** its sockets exist (announced by `ONOATS-EVENT
@@ -156,6 +168,23 @@ that surface:
   `docs/audio-socket-contract.md` "Capturer event lines".
 - **Settings** writes go through a surgical single-key TOML editor — every
   other line of `config.toml`, comments included, stays byte-identical.
+- **Diagnostics and logs:** every app-owned Start reserves one
+  `~/Library/Logs/Onoats/onoats-bot-<spawnEpoch>.log` with exclusive creation;
+  recorder, Stop, and Flush writers append to it and the newest ten are kept.
+  Open Log resolves the current app process's latest run first; Show Logs Folder
+  always reveals the containing directory. External-session Stop and Flush
+  output is not written to an app-owned run log, and no log tail is displayed
+  in the panel.
+- **Brand resources:** `../assets/brand/` owns the canonical grain-wave SVG mark,
+  wordmark, palette, spacing, and export map. `onoats-menubar/Resources/` contains
+  only the required native exports: header art, `.icns`, and state-specific
+  monochrome template icons. `make app` starts from a clean bundle and copies
+  each named resource explicitly; `make verify-resources` equality-checks that
+  allowlist before `make sign`. After the gauntlet, hash and smoke the
+  already-signed staged bundle before installation. Then run
+  `make install-staged` to install those exact verified bytes without rebuilding
+  or re-signing them. Do not fix or otherwise mutate the bundle after signing;
+  any fix requires rebuilding, re-running the gauntlet, and signing again.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

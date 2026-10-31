@@ -148,32 +148,49 @@ either Deepgram or a TCP-reachable `pipecat-local-stt-server`.
 `make -C native install` puts **Onoats.app** in `~/Applications`. Launch it
 from there — GUI launch matters: LaunchServices makes the app its own TCC
 permission subject (a terminal launch would attribute the permission grants to
-the terminal instead). It lives in the menu bar with no Dock icon.
+the terminal instead). It lives in the menu bar with no Dock icon. Clicking its
+stateful icon opens a compact window panel: Start or Stop is the dominant
+action, Seminar is immediately beside that workflow, and the gear opens the
+less-frequent settings and diagnostics without leaving the panel.
 
 - **Start / Stop / Flush** — Start runs the recorder (`onoats bot` with the
   native capturer); Stop ends the session gracefully (the recorder drains
   in-flight audio before rotating the buffer into the queue); Flush rotates
-  the current buffer into the queue mid-session.
-- **Seminar toggle** — turns on `--category seminars` for the *next* Start only
-  (other categories are classified downstream). It resets when that session ends.
-  Add `seminars` to `[categories] set` in `config.toml` first, or Start fails with
-  the CLI's "--category must be one of" error.
-- **Mic (me) picker** — the submenu lists input devices; selecting one sets
+  the current buffer into the queue mid-session. App-owned Stop terminates the
+  retained supervisor; a verified external session uses the identity-checked
+  `onoats stop` path instead.
+- **Seminar** — before Start, the toggle adds `--category seminars` to that next
+  recording only (other categories are classified downstream). It becomes a
+  read-only lock badge during the app-owned session and resets when the session
+  ends. Add `seminars` to `[categories] set` in `config.toml` first; otherwise
+  the failed-Start panel explains the configuration error and offers Open Config.
+- **Settings** — the gear opens the mic picker, STT service picker, data-directory
+  chooser, transcript-preview preference, config access, and Diagnostics. The
+  mic picker lists input devices; selecting one sets
   the macOS **default input device** (system-wide — disclosed in the submenu),
   because the capturer binds the system default at Start. A running session
-  keeps its device; changes apply on the next Start.
-- **Devices line** — the menu shows the current system default input/output,
+  keeps its device; recorder-setting changes apply on the next Start. Diagnostics
+  reports CLI availability and provides Open Log and Show Logs Folder. These
+  settings edit the same `~/.config/onoats/config.toml` the CLI reads — one
+  source of truth — except the UI-only transcript-preview preference.
+- **Devices** — Settings shows the current system default input/output,
   i.e. the devices the capturer will actually bind (a guard against silently
   recording the wrong device).
-- **Settings** — STT service picker (whisper / websocket / deepgram), data-dir
-  chooser, and an "Open config.toml…" escape hatch. These edit the same
-  `~/.config/onoats/config.toml` the CLI reads — one source of truth; every
-  other line of the file is left byte-identical. Changes apply on the next
-  Start.
-- **Status** — a running indicator backed by the recorder's status file;
-  failed starts surface the exit reason / last error in the menu. Sessions
-  started from a terminal show as "external" and are not signalled from the
-  GUI.
+- **Status and activity** — the lifecycle status file remains authoritative for
+  recorder identity, liveness, warnings, and failures. A separate display-only
+  telemetry snapshot supplies fresh Me/Them levels, per-branch STT health, the
+  locked category, and (when enabled) a bounded latest-transcript preview.
+  `No signal` means that branch has not published a fresh audio observation;
+  `Unavailable` means telemetry is missing, stale, malformed, unsupported, or
+  belongs to another run. STT is ready only when both websocket branches report
+  ready; whisper and deepgram show neutral `status not reported`. Telemetry
+  failure never stops recording or transcript persistence.
+- **Transcript privacy** — the latest-transcript preview is off by default and
+  can be enabled in Settings. It is bounded and display-only; complete utterances
+  remain in the session JSONL.
+- **Active data directory** — the configured directory is snapshotted at Start
+  and stays authoritative for that run. If it changes while recording, the panel
+  shows both `Recording to:` and `Next recording:` until the next Start adopts it.
 - **Capture warning** — if a stream delivers only silence for ~30 s (e.g. the
   system-audio permission was denied, or the mic is hardware-muted), the icon
   gains a warning badge and the menu shows a hint naming the likely cause.
@@ -184,7 +201,11 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   fails, the menu shows a `⚠` hint naming the problem (e.g. an unrecognized
   config value, or the register/unregister error). Syncing is best-effort on
   every launch; the warning does not block Start/Stop.
-- **Logs** — recorder output lands in `~/Library/Logs/Onoats/onoats-bot.log`.
+- **Logs** — each app-owned Start creates
+  `~/Library/Logs/Onoats/onoats-bot-<spawnEpoch>.log`; the newest ten are kept.
+  Warning/failure surfaces can Open Log, while Settings ▸ Diagnostics can also
+  reveal the folder. External sessions are labelled as not captured by the menu
+  bar, and log content is never rendered in the panel.
 - **First run (TCC prompts)** — the first Start prompts for **Microphone**
   and records a **Screen & System Audio Recording** grant ("Onoats" appears
   in both panes of System Settings ▸ Privacy & Security). The system-audio
@@ -195,6 +216,12 @@ the terminal instead). It lives in the menu bar with no Dock icon.
   Grants persist across rebuilds and reinstalls (they key on the
   signing identity, not the binary — see
   [`native/README.md`](native/README.md)).
+
+The canonical grain-wave mark and wordmark live in [`assets/brand`](assets/brand),
+with the palette, spacing, and export rules in its README. The native header,
+app icon, and state-specific monochrome template icons are explicit exports in
+`native/onoats-menubar/Resources`; website work should reuse the canonical SVGs,
+not upscale those native raster files.
 
 ## Configuration
 
