@@ -49,6 +49,8 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Snapshot the configured data directory synchronously at Start and pin it until that recorder exits. Export it to the supervisor as `ONOATS_DATA_DIR`, use it for status/PID/telemetry reads and exit handling, and pass it explicitly to external Stop and Flush. A changed configured directory applies on the next Start.
 - When the configured directory changes mid-session, show both `Recording to: <active>` and `Next recording: <configured>` in the panel until convergence.
 - Expose `Open Log` on warning/failure surfaces of app-owned sessions and failed app-owned starts only, and expose both `Open Log` and `Show Logs Folder` under Settings → Diagnostics. The canonical log is the app-captured stdout/stderr file of the most recent app-owned run: one `onoats-bot-<spawnEpoch>.log` per run in the existing Logs folder, newest 10 kept. `<spawnEpoch>` is the Swift app's Start-attempt time in integer epoch milliseconds, taken just before the spawn; it is unrelated to the Python-minted recorder run epoch. `Open Log` opens the in-memory path of the most recent app-owned run of this app process; if that file is gone it reveals the Logs folder. Only when the app holds no in-memory path (fresh launch) does it first scan for the newest `onoats-bot-<spawnEpoch>.log`, still falling back to the folder when none exists. App-owned Flush and Stop output appends to that run's file; external Stop and Flush output is not written to a run log. An external session's warning says `Log not captured (started outside the menu bar)` and offers no `Open Log`. Fall back to the folder when the log file does not exist; do not embed a live log tail.
+- Give the panel a compact text identity that renders `Oats - Organized Transcript System` without depending on transparent padding inside the header bitmap. Keep the canonical mark available for app/icon reuse, but use native typography and a small mark in the panel header. Present Seminar as a labelled next-recording option with a native switch, explanatory secondary text, and a grouped control surface rather than a bare checkbox row.
+- A successful Start is not sufficient recording evidence. Add a deterministic full recorder-path integration test that feeds known speech PCM into the mic socket and requires a durable `source=me` utterance. Add a signed installed-app smoke that exercises the real app-owned capturer/TCC path, requires a fresh non-zero Me observation, then requires a new durable Me utterance after Stop. The smoke must fail when only process/socket readiness is observed.
 - Do not change the website in this plan because its source is not present in this checkout.
 
 ## Review Focus
@@ -67,6 +69,11 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Verify active-directory pinning governs process launch, reads, Flush, external Stop, and exit handling.
 - Verify the pre-PID permission-wait warning decorates only the matching app-owned starting attempt and never establishes recorder liveness.
 - Verify staged smoke and installation exercise the same verified app hash and CLI git revision, with explicit clean-install and rollback-baseline behaviour.
+- Verify telemetry cleanup is bounded, regular-file-only, descriptor-read, and compare-and-unlink safe against replacement races.
+- Verify run-log output keeps descriptor/inode authority from exclusive reservation through every app-owned child writer; no child reopens the pathname.
+- Verify installer archive checks and extraction consume one immutable descriptor-backed snapshot, normalise or reject unsafe copied metadata, and never leave a second `.app` after cleanup failure.
+- Verify the panel renders the `Oats - Organized Transcript System` identity, an elegant next-recording Seminar switch, and truthful Silent/Signal/No signal labels.
+- Verify recording acceptance reaches durable Me transcription through both a deterministic socket fixture and the signed installed-app microphone path.
 
 ## Implementation Checklist
 
@@ -213,18 +220,44 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Run `python3 scripts/check_review_markers.py`.
 - Build the unsigned compile-smoke binaries with `make -C native build`.
 - Before any commit, inspect only explicitly staged paths for secrets, credentials, private transcripts, PII, and unintended binary metadata.
-- This phase ends before any signing. `Review Gates: full` then auto-chains the review gauntlet once over the finished branch. The Post-Gauntlet Release Steps start only after the gauntlet converges, so no accepted fix can land after the post-gauntlet bytes have been signed, smoked, or installed (the Phase 5 sign is a throwaway verification sign and does not count).
-- Operator workflow: Phase 1 is the completed human design gate, and Phase 2 is the immutable completed runtime phase. `/conduct --resume` walks Phases 3 through 7 in document order, skipping the already checked Phases 1 and 2; each remaining phase has explicit implementation files, test files, a canonical test command, a validation command, and a goal. Phase 3 carries accepted review remediation that crosses the completed-phase boundary. Conduct owns implementation and automated verification for Phases 3–7. The gauntlet fires after Phase 7, the last parsed phase. Signing, interaction/accessibility smoke, exact-byte installation, and rollback validation remain exclusively in the unnumbered Post-Gauntlet Release Steps.
+- This phase ends before any signing. The initial auto-chained gauntlet found contract-level defects; Phase 8 owns their reviewed redesign plus installed-branch feedback. The Post-Gauntlet Release Steps start only after Phase 8 and a fresh gauntlet converge, so no accepted fix can land after the final bytes have been signed, smoked, or installed (the Phase 5 sign is a throwaway verification sign and does not count).
+- Operator workflow: Phase 1 is the completed human design gate, and Phases 2–7 remain completed evidence. `/conduct --resume` executes the newly reviewed Phase 8 only. Conduct owns its implementation and automated verification. The gauntlet fires after Phase 8, now the last parsed phase. Signing, interaction/accessibility smoke, exact-byte installation, and rollback validation remain exclusively in the unnumbered Post-Gauntlet Release Steps.
+
+### Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
+
+**Impl files:** `src/onoats/ui_telemetry.py, src/onoats/stt/websocket_stt_service.py, native/install_staged.py, native/Makefile, native/onoats-menubar/Sources/RecorderModel.swift, native/onoats-menubar/Sources/RecordingPanelView.swift, native/README.md`
+**Test files:** `tests/test_ui_telemetry.py, tests/test_websocket_stt_reconnect.py, tests/test_release_meta.py, tests/test_native_contract_parity.py, tests/test_recording_integration.py, native/onoats-menubar/Tests/RecorderModelHarness.swift, native/test_recorder_model.sh, native/installed_recording_smoke.py`
+**Test command:** `uv run pytest tests/test_ui_telemetry.py tests/test_websocket_stt_reconnect.py tests/test_release_meta.py tests/test_native_contract_parity.py tests/test_recording_integration.py -q && native/test_recorder_model.sh`
+**Validation cmd:** `uv run ruff format && uv run ruff check && uv run pytest && python3 scripts/check_review_markers.py && make -C native build`
+**Goal:** Filesystem authority stays descriptor-bound and failure-atomic, the panel communicates Oats clearly, and recording proof reaches durable microphone transcription rather than stopping at process readiness.
+
+- Replace both telemetry cleanup entry points with one descriptor-safe primitive; the async publisher cleanup and the shutdown callback delegate to it rather than implementing path reads independently. The primitive performs one bounded `O_NONBLOCK | O_NOFOLLOW` descriptor read, requires a regular file, parses ownership within the telemetry byte cap, compares the opened `(st_dev, st_ino)` to `lstat` immediately before unlink, and leaves any replacement untouched. Cancellation and cleanup remain bounded on FIFOs, devices, symlinks, oversized files, malformed data, and replacement races.
+- Route websocket decode-timeout/reset transitions through the existing STT state callback owner. A timed-out decode must publish `recovering` before reconnect work and may return to `ready` only after that branch's next confirmed handshake.
+- Redesign run-log creation around a retained `RunLogSink`/equivalent descriptor authority. Exclusive reservation returns the open append descriptor; `ProcessRequest` carries a descriptor-backed sink instead of a URL; and the app-owned recorder plus owned Flush helpers receive duplicated `O_APPEND` descriptors for the same inode. App-owned Stop remains retained-supervisor termination and creates no Stop child; the owner descriptor stays open through graceful recorder exit. Bounded invalid-category tag detection reads through the retained sink before release, never through the replaceable pathname. The owner closes only after all duplicated writers exit. Preserve newest-10 pruning and Open Log's documented path behavior as presentation-only operations.
+- Make install publication commit-aware. The commit boundary includes atomic publication, verification of the installed identity, and rollback-record publication when an approved rollback baseline exists. Before that boundary, every failure is fatal and restores the prior installed app. After it, old-tree and temporary cleanup failures are warnings and cannot report the transaction as uncommitted. The exchange candidate itself has no `.app` suffix. Do not assume suffix alone controls discovery: query LaunchServices registration before and after injected cleanup failures and require that only the canonical installed bundle path is registered for `net.varunsingh.onoats`.
+- Consume rollback archives through one immutable descriptor-backed snapshot: open no-follow, require a regular file, copy from that descriptor into a private file, verify that snapshot, and extract only that snapshot. Never verify a pathname and later reopen it for extraction.
+- Define the copied-metadata policy explicitly. Reject symlinks and non-regular resource entries; include executable modes in tree identity; strip or reject ACL entries that grant write access beyond the owner; and verify the installed tree against the same normalised metadata policy. Preserve code-signing metadata required by `codesign` and fail closed on unsupported entry types.
+- Make resource allowlisting type-aware: expected directories must be directories and every expected resource must be a regular, non-symlink file. Missing, extra, or wrong-type entries fail before signing or installation.
+- Correct the documented native commands so each command is valid from its stated working directory. Document every rollback-capable install flag and preflight input; the clean-install command remains distinct and cannot imply rollback approval.
+- Replace the padded bitmap header presentation with a compact native header containing `Oats` and `Organized Transcript System`, exposed to accessibility as `Oats - Organized Transcript System`. Retain a small canonical mark without allowing transparent image bounds to create empty panel space.
+- Present Seminar in a rounded grouped row with a leading semantic icon, title, `Applies to the next recording` secondary text, and a trailing native switch. Keep its existing next-session-only behavior, focus order, keyboard activation, and accessibility hint.
+- Make activity wording truthful: a fresh positive level is `Signal`, a fresh zero level is `Silent`, and an absent/stale observation is `No signal` or `Unavailable` under the existing freshness rules.
+- Add `tests/test_recording_integration.py`. Its deterministic path runs the real supervisor, socket transports, dual pipeline, SourceTagger, and TranscriptBuffer against a fixture-fed fake capturer and deterministic STT test double; it requires a newly persisted `source=me` utterance and fails when the mic branch supplies only silence or process/socket readiness.
+- Add an opt-in live variant using the existing `ONOATS_STT_FIXTURE` and real websocket STT endpoint. It feeds the same 16 kHz mono PCM speech fixture through the full socket/supervisor recording path and asserts a durable Me utterance without committing audio or transcript text.
+- Add `native/installed_recording_smoke.py` for the signed app gate with explicit `--app`, `--data-dir`, and per-stage timeout inputs. It snapshots session files; resolves the one running signed app PID for the expected bundle path and identity; walks the recorder PID's process ancestry to prove descent from that app; waits boundedly for matching status and fresh telemetry; requires at least one Me level above a conservative non-zero floor while the operator speaks; waits boundedly for graceful Stop; then requires a new JSONL utterance whose canonical source is `me`. Each wait reports a stage-specific timeout without transcript text. The smoke fails on readiness-only, stale, external-session, system-only, wrong-ancestor, or multiple-app evidence. Timeout regressions cover every wait.
+- Record the installed feedback and the terminal-attributed mic-permission diagnostic below the marker. The terminal denial is not treated as evidence about Onoats.app's grant; only the signed installed-app smoke is authoritative for app-owned TCC capture.
+- After focused tests pass, run the full suite, Ruff format/check, review-marker validation, and native build. Inspect explicitly staged files for secrets, PII, private transcripts, audio, credentials, and unintended binary metadata before committing. Phase 8 completes at that implementation-and-verification commit. Conduct then runs the post-phase gauntlet; any accepted fix reopens Phase 8, reruns its affected gates, and produces a new commit before the gauntlet restarts.
 
 ### Post-Gauntlet Release Steps (manual; not a `/conduct` phase)
 
-**Goal:** The bytes that pass smoke are exactly the bytes that are installed, and they are the post-gauntlet bytes. A failed install can only roll back to a verified prior baseline. These steps change no code; any fix goes back through Phase 7 and the gauntlet, then re-smokes.
+**Goal:** The bytes that pass smoke are exactly the bytes that are installed, and they are the post-gauntlet bytes. A failed install can only roll back to a verified prior baseline. These steps change no code; any fix goes back through Phase 8 and the gauntlet, then re-smokes.
 
-- After the gauntlet converges, rerun Phase 7's documentation and historic-decision audit against the final diff, then run Ruff format/check, review-marker validation, the full pytest suite, and `make -C native build` on the post-gauntlet tree before signing. Run focused tests for every file the gauntlet touched. If the documentation audit changes any file, rerun the marker check and gauntlet; repeat until both code and documentation reach a fixed point.
+- After the gauntlet converges, rerun Phase 7's documentation and historic-decision audit plus Phase 8's recording proof against the final diff, then run Ruff format/check, review-marker validation, the full pytest suite, and `make -C native build` on the post-gauntlet tree before signing. Run focused tests for every file the gauntlet touched. If the documentation audit changes any file, rerun the marker check and gauntlet; repeat until both code and documentation reach a fixed point.
 - Assemble and sign a staged `Onoats.app`. Verify the resource allowlist, signature, designated requirement, and canonical app identity with `make -s -C native app-tree-hash`, plus `make -C native cdhash`. Record the CLI identity: `git rev-parse HEAD` with an empty `git status --porcelain`, plus `command -v onoats`. Resolve the shim interpreter and installed distribution metadata, then run an import probe and require `Path(onoats.__file__).resolve()` to belong to this checkout before accepting the CLI identity. Before staged smoke, snapshot `config.toml` bytes and every touched Onoats `UserDefaults` key, including `cliPath` and transcript-preview visibility, and use a dedicated temporary smoke data directory. Restore and byte/value-verify all settings in a finally-style cleanup before `install-staged` and again after post-install smoke.
+- Run the complete manual native matrix, including `native/installed_recording_smoke.py --app <staged-app> --data-dir <temporary-smoke-dir>`, against the signed staged app before baseline preflight or installation. Record the app tree hash and CLI identity beside the smoke result. A staged smoke that lacks non-zero Me evidence and a durable Me utterance fails even when process, sockets, and STT are ready.
 - Hash and byte-copy claims apply to `Onoats.app` only. The CLI is `uv tool install --editable` of the working tree and has no hashable bytes of its own. Any commit or edit between staged smoke and install forces a re-smoke.
 - Preflight any installed app and CLI before treating them as a rollback baseline: require every Phase 1 field, a valid app signature, the expected designated requirement, an installed-app cdhash equal to the recorded baseline, and a prior CLI SHA that still resolves (`git cat-file -e <sha>`). There is no version-string check: the version is 1.5.1 on both sides and the CLI has no `--version` flag. This run's Phase 1 record lacks the exact prior `EXTRAS` and branch/detached state, so it is explicitly a clean-install case and must not claim or attempt rollback. Future runs may use rollback only when every field was recorded before implementation.
-- Install the exact staged app identity that passed smoke using `make -C native install-staged STAGED_APP_TREE_HASH=<app-tree-hash-output>`. If post-install smoke fails, run `make -C native rollback` for the app, then `git switch --detach <recorded prior SHA>` and `make -C native install-cli` with the same EXTRAS, but only when the baseline passed preflight. Because the editable CLI is the working tree, rollback leaves it detached at the prior SHA by design: report this and print `git switch <recorded branch>`, and do not switch back automatically. For a clean install, report the failure and do not claim rollback.
+- Immediately before installation, revalidate the recorded CLI SHA, empty worktree, shim path and interpreter/distribution metadata, and checkout-owned `onoats.__file__` import path; every value must equal the staged-smoke record. Install the exact staged app identity that passed smoke using the documented clean-install flags, or the separately documented rollback-approval and baseline identity flags when a complete baseline passed preflight. If post-install smoke fails, run `make -C native rollback` for the app, then `git switch --detach <recorded prior SHA>` and `make -C native install-cli` with the same EXTRAS, but only when the baseline passed preflight. Because the editable CLI is the working tree, rollback leaves it detached at the prior SHA by design: report this and print `git switch <recorded branch>`, and do not switch back automatically. For a clean install, report the failure and do not claim rollback.
 - Run the post-install smoke only after the staged bundle passes. Installation is not the first acceptance test.
 
 ## Technical Specifications
@@ -233,6 +266,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 
 - `native/onoats-menubar/Sources/OnoatsMenuBarApp.swift` — window-style scene, main-panel state, stateful template icon.
 - `native/onoats-menubar/Sources/RecorderModel.swift` — `ProcessHandle` plus `SystemOps` seams, telemetry state, authoritative active/next directories for launch/read/signal/exit, pre-PID warning detail, per-run log files and log/folder actions, stable-tag category-error detection, validated refresh integration, retained lifecycle actions.
+- `native/onoats-menubar/Sources/RecordingPanelView.swift` — compact `Oats - Organized Transcript System` identity, grouped Seminar switch, truthful activity labels, and existing lifecycle surfaces.
 - `native/onoats-menubar/Sources/ConfigStore.swift` — only if settings navigation needs an existing-key read/write helper; do not broaden it into a full TOML parser.
 - `native/onoats-menubar/Info.plist` — app icon metadata only.
 - `native/Makefile` and `native/install_staged.py` — explicit resource assembly and verification inputs (Phase 5), a canonical `app-tree-hash` producer, and failure-atomic `install-staged`/`rollback` targets that validate private snapshots before atomic exchange. `install` and `setup` stay unchanged.
@@ -252,6 +286,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - `tests/test_status_file.py` — lifecycle status remains v2 and warning rendering remains intact.
 - `tests/test_socket_supervisor.py` — shared run epoch, identity publication order, `_finalize_shutdown_status` `telemetry_cleanup` ordering, and paired status/PID evidence.
 - `tests/test_release_meta.py` — resource, Info.plist, canonical identity, archive allocation, and failure-atomic `install-staged`/`rollback` contract matrices.
+- `tests/test_recording_integration.py` — deterministic full supervisor-to-durable-Me path plus an opt-in real-STT fixture variant.
 - `README.md`, `native/README.md` — user and maintainer documentation.
 - `AGENTS.md` — Leaf modules entry for `ui_telemetry.py` and the telemetry invariants.
 - `docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md` — dated correction under its existing `## Findings` (below its marker), only if its menu-presentation decision is stale.
@@ -268,6 +303,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - `native/onoats-menubar/Tests/RecorderModelHarness.swift` — executable model harness for directory authority, lifecycle routing, and pre-PID warning detail.
 - `tests/fixtures/ui_telemetry/` — shared valid, malformed, stale, foreign-owner, boundary, and non-finite vectors, each snapshot with a `now` field (non-finite snapshots are raw text carrying `NaN`/`Infinity` tokens), plus the boundary verdict table with string-encoded level inputs.
 - `native/test_ui_telemetry.sh` — compile and run the decoder harness on macOS without introducing Swift Package Manager.
+- `native/installed_recording_smoke.py` — privacy-preserving signed-app smoke that requires non-zero Me telemetry and a new durable Me utterance.
 - `native/test_recorder_model.sh` — compile and run the model harness on macOS without introducing Swift Package Manager.
 - `assets/brand/onoats-mark.svg` — canonical standalone mark.
 - `assets/brand/onoats-wordmark.svg` — canonical mark plus wordmark.
@@ -306,7 +342,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - **Decision (grilled):** Show a pre-PID permission-wait warning only for the matching retained app-owned supervisor. It decorates `.starting` but never establishes recorder liveness.
 - **Decision (grilled):** Carry per-branch audio-observation timestamps. Judge branch age per branch after snapshot acceptance, so one stale branch never drops the other branch or STT state. A stale branch renders as a visible greyed `No signal` row, not a hidden row, so panel height stays stable. A branch with continuing frames publishes an observation-time refresh at least every 500 ms inside the 4 Hz cap; heartbeats never advance branch age. The five-second snapshot expiry continues to govern the overall telemetry record. Producers reject, never clamp, out-of-range levels.
 - **Decision (grilled):** Permit a clean install after staged app verification when no trustworthy prior app and CLI baseline exists. Use rollback only when the prior baseline passes preflight.
-- **Decision (grilled):** Split the old Phase 6. Renumbered Phase 7 is conduct-driven documentation, historic-plan corrections, lint, tests, review-marker validation, and the unsigned native build. `Review Gates: full` auto-chains the review gauntlet once after it. The Post-Gauntlet Release Steps are an unnumbered manual section, not a `### Phase N:` heading, so `/conduct` and the gauntlet auto-chain treat Phase 7 as the last phase. They cover staged signing, hashed smoke, install of the exact staged bytes, and rollback preflight, all on post-gauntlet bytes. All code they need (`install-staged`, `rollback`) lands earlier in Phase 5, so the gauntlet reviews it and no accepted fix can invalidate signed or installed bytes.
+- **Decision (grilled):** Phase 8 is now the last conduct-driven phase. `Review Gates: full` auto-chains the review gauntlet only after Phase 8 reaches its implementation-and-verification commit; accepted fixes reopen Phase 8 and restart the gauntlet. The Post-Gauntlet Release Steps remain an unnumbered manual section, so signing, staged smoke, exact-byte installation, and rollback preflight happen only after convergence.
 - **Decision (grilled):** The CLI is `uv tool install --editable` of the working tree and has no hashable bytes. Its verified identity is `git rev-parse HEAD` with an empty `git status --porcelain`, plus `command -v onoats` resolving to the editable-install shim, recorded beside the `Onoats.app` tree digest. No `--version` flag is added. Hash, byte-copy, and post-copy-hash claims apply to `Onoats.app` only. Any commit or edit between staged smoke and install forces a re-smoke. CLI rollback means `git switch --detach` to the recorded prior SHA and running `make install-cli` with the same EXTRAS; the tree stays detached by design and the recorded branch is reported, not auto-restored.
 - **Decision (grilled):** Back up the installed app as a zip archive outside LaunchServices-scanned folders (`~/Library/Application Support/Onoats/app-backups/`), never as a second launchable `.app` sharing the bundle identifier. `rollback` unpacks it with `ditto -x -k` and re-verifies signature and designated requirement.
 - **Decision (grilled):** STT state definitions live once in the UI Telemetry Contract. `ready` is this instance's own latest successful handshake, never the shared preflight cache; `unknown` is permanent for non-websocket backends and renders neutral grey `status not reported (<service>)`, never green. The confirmed `transcript.*` signal stays the kickstart-cooldown concept and is not a UI readiness gate. STT callbacks enter through new keyword-only `_create_stt_service` parameters; the internally built `on_recovery` is not one of them.
@@ -350,9 +386,11 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 | Lifecycle state | Status/PID files | `RecorderModel` | PID identity remains authoritative; telemetry cannot change recorder state; matching pre-PID detail may decorate app-owned starting only |
 | Recorder settings | Swift `ConfigStore` | Python config loader and CLI actions | Existing narrow TOML edits preserve unrelated content; one Start-time directory snapshot governs launch/read/signal/exit while changes apply next Start |
 | Diagnostics | Per-run app-captured log (`onoats-bot-<spawnEpoch>.log`) of the most recent app-owned run | Panel and settings | Open this process's most recent run file when present, otherwise reveal folder (newest-file scan only after relaunch); Open Log on warning surfaces only for app-owned sessions; never tail content in the popover |
+| Log output authority | Exclusively reserved append descriptor | App-owned recorder and owned Flush helpers | Every child receives a duplicate of the retained descriptor; owned Stop terminates the retained supervisor; category-tag reads use the retained sink; no writer or machine reader reopens the pathname |
 | Category-error detection | App-captured run log | `RecorderModel` | Bounded tail read, matched against the stable `ONOATS-ERROR invalid-category` tag only on a non-zero exit with no recorder PID ever published; human prose is display-only |
 | Native assets | Canonical SVG/exports | Makefile and Swift panel | Explicit filenames, template semantics, resource copy before signing |
 | Install pairing | Verified staged app hash and CLI identity (SHA, clean tree, shim metadata, import path) | Native install workflow (`install-staged`, `rollback`) | App bytes stay unchanged after smoke; rollback requires a complete prior baseline and the exact extracted-and-verified archive before installed-app removal |
+| Recording proof | Fixture-fed mic socket or signed app-owned microphone | Full recorder pipeline and session JSONL | Readiness is insufficient; acceptance requires fresh non-zero Me evidence and a durable canonical `source=me` utterance |
 | Historic plans | Current plan | Prior decision records | Dated correction and cross-link only when a prior decision is materially superseded |
 
 ## Architecture & Call Flow
@@ -421,6 +459,10 @@ sequenceDiagram
 - Source-read Swift contracts and execute the native decoder harness against shared JSON vectors for telemetry fields, allowed states, exact bounds, freshness, ownership, aggregate mismatches, and rejection cases. Include 239/240/241-scalar strings using combining marks, astral characters, and ZWJ sequences. Also source-read the new Swift files and assert they contain no `URLSession` or `NWConnection` use.
 - Execute the native model harness across directory changes, PID reuse, old-run exit, next-run adoption, owned termination, external Stop, Flush, pre-PID permission detail including stale/equal timestamps and both clearing transitions, drain-state convergence, per-run log naming and newest-10 pruning, stable category-error tag detection, missing-CLI behavior, and the Open Log resolution rule.
 - Keep existing status, CLI, socket, supervisor, diarization, release metadata, and parity suites green.
+- Exercise cleanup against FIFO, device/non-regular entry, symlink, oversized file, malformed owner, and same-path inode replacement; every case stays bounded and preserves a replacement.
+- Exercise archive pathname replacement between verification and extraction; symlink, FIFO, device, and directory archive inputs; unsafe ACL/mode metadata; wrong resource entry types; pre-commit failure; post-commit cleanup failure; and leftover temporary names. Each case stays bounded, and LaunchServices reports only the canonical app path.
+- Exercise descriptor-owned logging by replacing the reserved pathname before recorder and Flush spawns and before invalid-category detection. Assert every duplicate carries `O_APPEND`, all output and the bounded tag read target the originally reserved inode, the owner survives overlapping children and graceful Stop, and all descriptors close after the final writer exits.
+- Exercise recording in two layers: deterministic full-path persistence in automated tests, then real signed-app mic/TCC persistence in the installed smoke.
 
 ### Manual Native Smoke Matrix
 
@@ -439,6 +481,8 @@ sequenceDiagram
 - Dismissal: Escape and click-away close the panel; reopen and settings/back preserve correct state while recording continues.
 - Accessibility (precondition: Keyboard navigation on): Tab/Shift-Tab focus order, Space/Return activation, VoiceOver labels, tooltip text, contrast, Reduce Motion, and light/dark menu bars.
 - Branding: header and app icon render sharply; custom menu icon remains legible at supported scales and shows each state.
+- Panel refinement: the header visibly reads `Oats - Organized Transcript System`; the Seminar option renders as a grouped native switch; no transparent header padding creates a blank region.
+- Recording proof: speak during an app-owned signed session; Me becomes non-zero and the stopped run creates a new durable Me utterance. A connected process with no Me utterance fails smoke.
 - Bundle (post-gauntlet release steps): staged signed app passes resource allowlist and codesign checks; the app tree digest matches the installed bytes and the CLI git identity (SHA, clean tree, `command -v onoats`) matches the one recorded at smoke; a valid baseline preserves byte-identical designated requirements and grants, while a missing baseline follows the documented clean-install path.
 
 ### Test Results
@@ -453,6 +497,8 @@ sequenceDiagram
 - [ ] Signed bundle verification passes (the post-gauntlet staged app; the Phase 5 sign is a throwaway).
 - [ ] Designated-requirement bytes match the verified installed baseline when one exists; clean-install evidence is recorded otherwise.
 - [ ] Manual native smoke matrix passes.
+- [ ] Deterministic recording integration persists a canonical Me utterance.
+- [ ] Signed installed-app recording smoke observes non-zero Me audio and persists a canonical Me utterance.
 
 ## Acceptance Criteria
 
@@ -473,11 +519,16 @@ sequenceDiagram
 - The assembled clean staged app contains only allowlisted resources and passes signature verification. Staged smoke and installation use the exact same hashed app bytes and the same verified CLI identity (SHA, clean tree, shim metadata, and import path); rollback uses only the exact extracted-and-verified archive from a complete prior baseline. This run is explicitly clean-install because its Phase 1 baseline is incomplete.
 - README/native docs describe the final UI and telemetry meanings; only materially superseded historic decisions receive dated corrections.
 - After accepted review fixes, focused tests, full pytest, Ruff format/check, review-marker validation, native compile, signed-app verification, and manual smoke all pass on the final bytes.
-- Pre-merge documentation, code, security, and full review gates (the auto-chained gauntlet after Phase 7) report no unresolved findings before the Post-Gauntlet Release Steps sign anything.
+- Pre-merge documentation, code, security, and full review gates (the auto-chained gauntlet after Phase 8) report no unresolved findings before the Post-Gauntlet Release Steps sign anything.
 - The STT row shows `ready` only for the websocket backend with both branches' own handshakes confirmed; `whisper` and `deepgram` sessions show neutral grey `status not reported`.
 - A failed app-owned Start on a missing `seminars` category explains the cause and offers `Open Config`.
+- The panel visibly identifies itself as `Oats - Organized Transcript System`, uses a grouped Seminar switch, and distinguishes `Signal`, `Silent`, and stale `No signal` states.
+- Telemetry cleanup is bounded and compare-and-unlink safe; a non-regular or replaced snapshot cannot block shutdown or be removed.
+- App-owned log writers retain descriptor/inode authority from reservation through exit; pathname replacement cannot retarget recorder, Flush, or Stop output.
+- Installer verification and extraction consume one immutable archive snapshot, enforce entry/metadata policy, and leave at most one LaunchServices-visible Onoats app across every failure point.
+- Automated recording integration and signed installed-app smoke both require durable canonical `source=me` evidence; process, socket, or STT readiness alone cannot pass.
 
-<!-- reviewed: 2026-10-31 @ 9da502c600ea13fc5c3a5ad0a65644a711a26032 -->
+<!-- reviewed: 2026-10-31 @ 620a686b513b4108595a6c0cd2bcb5afea7fff6b -->
 
 ## Progress
 
@@ -488,6 +539,7 @@ sequenceDiagram
 - [x] Phase 5: Native Resource Pipeline and Stateful Menu Icon
 - [x] Phase 6: Window-Style Recording Panel and In-Panel Settings
 - [x] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
+- [ ] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
 
 ## Findings
 
@@ -536,6 +588,27 @@ sequenceDiagram
   native build passed. Its one-shot reviewer found three documentation/test
   scope issues, all fixed before the phase boundary. The full review gauntlet
   and post-gauntlet manual release steps remain pending.
+- 2026-10-31 — The first gauntlet produced two fix commits, `7439623` and
+  `9a6ef3d`, whose complete suites passed 7,200 and 7,215 tests respectively.
+  Round 3 approved the native code-review and adversarial gates but found 13
+  deep-review issues. The seam tripwire stopped a third automatic fix because
+  the redesigned RecorderModel filesystem seam and operator workflow moved
+  again. Phase 8 is the operator-approved contract redesign for those findings.
+- 2026-10-31 — Installed-branch feedback found that the panel lacked visible
+  product identity, presented Seminar as a bare checkbox, and produced no
+  durable Me utterance during an app-owned recording. The run log showed the
+  signed app bound `MacBook Pro Microphone`, connected both socket transports,
+  and reached STT readiness, but readiness created no session artifact. A
+  terminal-launched raw capturer check was denied microphone access; that is
+  terminal TCC evidence only and does not diagnose the signed app. Phase 8 adds
+  full-path and installed-app recording proofs that cannot pass on readiness.
+- 2026-10-31 — The Phase 8 contract review ran five clean-context lenses plus
+  a post-reconciliation contradiction pass. It produced 17 unique findings
+  with no dropped records: two Critical entries for the same phase/gauntlet
+  dependency cycle and 15 Important ownership, installer, logging, smoke, and
+  test-matrix gaps. All recommended resolutions were incorporated before the
+  marker refresh. Phase 8 now completes before the auto-chained gauntlet;
+  accepted gauntlet fixes reopen the phase rather than creating a cycle.
 
 ## Issues & Solutions
 
