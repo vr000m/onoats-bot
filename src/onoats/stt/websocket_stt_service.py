@@ -515,6 +515,11 @@ class WebSocketSTTService(SegmentedSTTService):
                     logger.warning(
                         f"{self.name}: decode timed out — resetting connection"
                     )
+                    # Decode timeout revokes this branch's last confirmed
+                    # handshake.  Publish recovery before tearing the socket
+                    # down; only _ensure_connected's next completed handshake
+                    # may move the branch back to ready.
+                    self._fire_ui_callback("recovering")
                     await self._discard_stale()
                     yield ErrorFrame(error="stt_server decode timed out")
                     return

@@ -260,6 +260,10 @@ private func testDirectoryAuthority(_ root: URL) throws {
     try require(model.nextDataDir == new, "exit did not adopt next-run directory")
 
     model.start()
+    try require(ops.requests.count == 2,
+                "next Start raced the still-running owned Flush writer")
+    ops.finish(ops.processes[1], status: 0)
+    model.start()
     try require(ops.requests.last?.environment?[RecorderModel.dataDirEnvironment] == new.path,
                 "next Start did not adopt changed directory")
 }
@@ -602,7 +606,10 @@ private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
         model.flush()
         try require(ops.requests.last?.appendOutputTo == log,
                     "owned Flush did not append to the active run log")
-        ops.finish(ops.processes[ops.processes.count - 2], status: 0)
+        let recorder = ops.processes[ops.processes.count - 2]
+        let flush = ops.processes[ops.processes.count - 1]
+        ops.finish(recorder, status: 0)
+        ops.finish(flush, status: 0)
     }
 
     try require(!ops.fileExists(at: runLogs[0]), "11th run did not prune the oldest log")
@@ -624,6 +631,34 @@ private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
     external.stopExternal()
     try require(externalOps.requests.last?.appendOutputTo == nil,
                 "external Stop was written to an app-owned run log")
+}
+
+@MainActor
+private func testRunLogOwnerOutlivesOverlappingFlush(_ root: URL) throws {
+    let directory = root.appendingPathComponent("owner-lifetime-data")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.owner-lifetime",
+        directory: DirectoryChoice(directory))
+    model.start()
+    model.flush()
+    let recorder = ops.processes[0]
+    let flush = ops.processes[1]
+    guard let recorderSink = ops.requests[0].outputSink,
+          let flushSink = ops.requests[1].outputSink else {
+        throw HarnessFailure(description: "owned writer request lost its sink")
+    }
+    try require(recorderSink === flushSink,
+                "owned recorder and Flush did not share one retained sink")
+
+    ops.finish(recorder, status: 0)
+    model.start()
+    try require(ops.requests.count == 2,
+                "a new run started while the prior Flush still owned a log duplicate")
+    ops.finish(flush, status: 0)
+    model.start()
+    try require(ops.requests.count == 3,
+                "run-log owner was not released after the final child exited")
 }
 
 @MainActor
@@ -738,20 +773,34 @@ private func testRunLogCollisionReservesFreshPath(_ root: URL) throws {
 private func testNativeAppendIsAtomicAcrossSeparateWriters(_ root: URL) throws {
     let log = root.appendingPathComponent("atomic-append/onoats-bot-1.log")
     let ops = NativeSystemOps()
+    guard let sink = try ops.reserveRunLogSink(at: log) else {
+        throw HarnessFailure(description: "could not reserve descriptor-owned run log")
+    }
+    let probe = try sink.duplicateOutputHandle()!
+    defer { try? probe.close() }
+    try require(Darwin.fcntl(probe.fileDescriptor, F_GETFL) & O_APPEND != 0,
+                "duplicated run-log writer lost O_APPEND")
+
+    // Replace the presentation pathname after reservation. Every child and
+    // the bounded tag reader must remain attached to the reserved inode.
+    let reservedInode = log.appendingPathExtension("reserved-inode")
+    try FileManager.default.moveItem(at: log, to: reservedInode)
+    try Data("replacement-path\n".utf8).write(to: log)
     let recorderLine = "RECORDER-COMPLETE-" + String(repeating: "r", count: 4096) + "\n"
     let auxiliaryLine = "AUXILIARY-COMPLETE-" + String(repeating: "a", count: 4096) + "\n"
+    let tagLine = RecorderModel.invalidCategoryErrorTag + "\n"
     let harness = URL(fileURLWithPath: CommandLine.arguments[0])
     let recorder = try ops.spawn(
         ProcessRequest(
             executable: harness,
-            arguments: ["--append-writer", "0.2", recorderLine],
-            environment: nil, appendOutputTo: log),
+            arguments: ["--append-writer", "0.2", recorderLine + tagLine],
+            environment: nil, outputSink: sink),
         onExit: { _ in })
     let auxiliary = try ops.spawn(
         ProcessRequest(
             executable: harness,
             arguments: ["--append-writer", "0", auxiliaryLine],
-            environment: nil, appendOutputTo: log),
+            environment: nil, outputSink: sink),
         onExit: { _ in })
 
     let deadline = Date().addingTimeInterval(3)
@@ -762,13 +811,23 @@ private func testNativeAppendIsAtomicAcrossSeparateWriters(_ root: URL) throws {
                 "concurrent append regression exceeded its bounded deadline")
     try require(recorder.terminationStatus == 0 && auxiliary.terminationStatus == 0,
                 "concurrent append fixture writer failed")
-    let contents = try String(contentsOf: log, encoding: .utf8)
+    let contents = try String(contentsOf: reservedInode, encoding: .utf8)
     try require(contents.components(separatedBy: recorderLine).count == 2,
                 "recorder output was overwritten or split by the auxiliary writer")
     try require(contents.components(separatedBy: auxiliaryLine).count == 2,
                 "auxiliary output was overwritten or split by the recorder writer")
-    try require(contents.utf8.count == recorderLine.utf8.count + auxiliaryLine.utf8.count,
+    try require(contents.utf8.count == recorderLine.utf8.count
+                    + auxiliaryLine.utf8.count + tagLine.utf8.count,
                 "concurrent writers left truncated or interleaved output")
+    let replacementContents = try String(contentsOf: log, encoding: .utf8)
+    try require(replacementContents == "replacement-path\n",
+                "child output was retargeted through the replaced pathname")
+    try require(sink.readTail(maxBytes: 65_536)?.contains(
+                    RecorderModel.invalidCategoryErrorTag) == true,
+                "bounded invalid-category read reopened the replaced pathname")
+    sink.closeOwner()
+    try require(sink.readTail(maxBytes: 65_536) == nil,
+                "run-log owner descriptor remained usable after explicit release")
 }
 
 @MainActor
@@ -919,6 +978,7 @@ struct RecorderModelHarness {
         try testOwnedSeminarBadgeSurvivesTelemetryLoss(root)
         try testMissingCliDisablesStart(root)
         try testPerRunLogsPruningAndOwnedRouting(home)
+        try testRunLogOwnerOutlivesOverlappingFlush(home)
         try testActiveRunLogSurvivesClockRollback(home)
         try testReservationFailureClearsPriorRunAuthority(home)
         try testNativeBoundedReadStateSpace(home)
@@ -936,6 +996,7 @@ struct RecorderModelHarness {
             "onoats.harness.deallocation-failed",
             "onoats.harness.panel-telemetry", "onoats.harness.owned-seminar",
             "onoats.harness.missing-cli", "onoats.harness.logs",
+            "onoats.harness.owner-lifetime",
             "onoats.harness.clock-rollback", "onoats.harness.reservation-failure",
             "onoats.harness.logs-external", "onoats.harness.open-log",
             "onoats.harness.log-collision", "onoats.harness.open-log-relaunch",

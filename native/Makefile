@@ -125,12 +125,17 @@ app: build
 verify-resources:
 	@set -eu; \
 	resources="$(APP)/Contents/Resources"; \
-	[ -d "$$resources" ] || { echo "✗ missing $$resources"; exit 1; }; \
+	[ -d "$$resources" ] && [ ! -L "$$resources" ] || { echo "✗ invalid $$resources"; exit 1; }; \
 	expected=$$(mktemp); actual=$$(mktemp); \
 	trap 'rm -f "$$expected" "$$actual"' EXIT; \
 	printf '%s\n' $(RESOURCE_NAMES) | LC_ALL=C sort > "$$expected"; \
 	find "$$resources" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort > "$$actual"; \
 	diff -u "$$expected" "$$actual" || { echo "✗ bundle resource allowlist mismatch"; exit 1; }; \
+	for name in $(RESOURCE_NAMES); do \
+	  [ -f "$$resources/$$name" ] && [ ! -L "$$resources/$$name" ] || { \
+	    echo "✗ resource must be a regular non-symlink file: $$name"; exit 1; \
+	  }; \
+	done; \
 	echo "✓ verified bundle resource allowlist"
 
 # Deliberately NOT find-identity -v: a self-signed root fails the keychain
@@ -204,14 +209,16 @@ install-staged:
 		--record "$(ROLLBACK_RECORD)" --expected-identity "$(STAGED_APP_TREE_HASH)" \
 		--approved "$(ROLLBACK_BASELINE_APPROVED)" \
 		--baseline-dr-hash "$(ROLLBACK_BASELINE_DR_HASH)" \
-		--baseline-cdhash "$(ROLLBACK_BASELINE_CDHASH)" --makefile-dir "$(CURDIR)"
+		--baseline-cdhash "$(ROLLBACK_BASELINE_CDHASH)" --makefile-dir "$(CURDIR)" \
+		--bundle-id "$(BUNDLE_ID)"
 
 # Restore only a private, fully verified extraction of the recorded archive.
 # Atomic exchange keeps the current app installed on every validation failure.
 rollback:
 	@python3 $(INSTALL_STAGED_SCRIPT) rollback --app-name "$(APP)" \
 		--install-dir "$(INSTALL_DIR)" --backup-dir "$(BACKUP_DIR)" \
-		--record "$(ROLLBACK_RECORD)"
+		--record "$(ROLLBACK_RECORD)" --makefile-dir "$(CURDIR)" \
+		--bundle-id "$(BUNDLE_ID)"
 
 # Fresh-clone bootstrap. cert is idempotent (make_cert.sh exits 0 — and never
 # regenerates — when the identity exists). init runs only on a missing

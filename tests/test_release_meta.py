@@ -6,6 +6,7 @@ otherwise verbatim) and pyproject declares the matching PEP 639 SPDX string.
 """
 
 import re
+import argparse
 import hashlib
 import importlib.util
 import os
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tomllib
+import warnings
 from pathlib import Path
 
 import pytest
@@ -397,6 +399,272 @@ def test_verified_replacement_is_failure_atomic_over_full_state_space(
         assert (candidate / "identity").read_text(encoding="utf-8") == "new"
 
 
+def test_post_commit_old_tree_cleanup_failure_is_warning_only(tmp_path, monkeypatch):
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "exchange-candidate"
+    for path, value in ((installed, "old"), (candidate, "new")):
+        path.mkdir()
+        (path / "identity").write_text(value, encoding="utf-8")
+
+    def exchange(left: Path, right: Path) -> None:
+        temporary = tmp_path / "exchange"
+        left.rename(temporary)
+        right.rename(left)
+        temporary.rename(right)
+
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", exchange)
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_remove_path",
+        lambda _path: (_ for _ in ()).throw(OSError("injected cleanup failure")),
+    )
+    INSTALL_STAGED._replace_verified(
+        candidate,
+        installed,
+        lambda path: (path / "identity").read_text(encoding="utf-8") == "new",
+        lambda: None,
+    )
+    assert (installed / "identity").read_text(encoding="utf-8") == "new"
+    assert (candidate / "identity").read_text(encoding="utf-8") == "old"
+
+
+def test_exchange_candidate_is_not_a_launchservices_app_bundle(tmp_path, monkeypatch):
+    source = tmp_path / "Onoats.app"
+    source.mkdir()
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+
+    def fake_run(*argv: str, cwd=None):
+        shutil.copytree(Path(argv[-2]), Path(argv[-1]))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
+    parent, candidate = INSTALL_STAGED._copy_snapshot(source, install_dir, source.name)
+    try:
+        assert candidate.suffix != ".app"
+        assert candidate.is_dir()
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_launchservices_uniqueness_rejects_any_second_registered_bundle(
+    tmp_path, monkeypatch
+):
+    installed = tmp_path / "Onoats.app"
+    duplicate = tmp_path / "another-volume" / "leftover.app"
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_launchservices_paths",
+        lambda _bundle_id: {installed.resolve(), duplicate.resolve()},
+    )
+    with pytest.raises(INSTALL_STAGED.InstallError, match="duplicate LaunchServices"):
+        INSTALL_STAGED._verify_single_registration(installed, "net.varunsingh.onoats")
+
+
+def test_post_publication_launchservices_failure_restores_prior_app_before_commit(
+    tmp_path, monkeypatch
+):
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    for path, identity in ((installed, "old"), (candidate, "new")):
+        path.mkdir()
+        (path / "identity").write_text(identity, encoding="utf-8")
+
+    def exchange(left: Path, right: Path) -> None:
+        temporary = tmp_path / "exchange"
+        left.rename(temporary)
+        right.rename(left)
+        temporary.rename(right)
+
+    committed = False
+
+    def reject_duplicate_registration() -> None:
+        nonlocal committed
+        assert (installed / "identity").read_text(encoding="utf-8") == "new"
+        raise INSTALL_STAGED.InstallError(
+            "duplicate LaunchServices bundle registration: /Elsewhere/Onoats.app"
+        )
+
+    def commit() -> None:
+        nonlocal committed
+        reject_duplicate_registration()
+        committed = True
+
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", exchange)
+    with pytest.raises(INSTALL_STAGED.InstallError, match="LaunchServices"):
+        INSTALL_STAGED._replace_verified(
+            candidate,
+            installed,
+            lambda path: (path / "identity").read_text(encoding="utf-8") == "new",
+            commit,
+        )
+
+    assert committed is False
+    assert (installed / "identity").read_text(encoding="utf-8") == "old"
+    assert (candidate / "identity").read_text(encoding="utf-8") == "new"
+
+
+def test_install_keeps_final_launchservices_uniqueness_as_fatal_commit_gate(
+    tmp_path, monkeypatch
+):
+    staged = tmp_path / "staged" / "Onoats.app"
+    staged.mkdir(parents=True)
+    install_dir = tmp_path / "installed"
+    installed = install_dir / "Onoats.app"
+    installed.mkdir(parents=True)
+    (installed / "identity").write_text("old", encoding="utf-8")
+    parent = install_dir / ".onoats-install-test"
+    candidate = parent / "candidate"
+    candidate.mkdir(parents=True)
+    (candidate / "identity").write_text("new", encoding="utf-8")
+    expected_identity = "1" * 64
+    checks: list[str] = []
+
+    def verify_registration(path: Path, _bundle_id: str) -> None:
+        checks.append((path / "identity").read_text(encoding="utf-8"))
+        if checks == ["old", "new"]:
+            raise INSTALL_STAGED.InstallError(
+                "duplicate LaunchServices bundle registration: /Elsewhere/Onoats.app"
+            )
+
+    def exchange(left: Path, right: Path) -> None:
+        temporary = tmp_path / "exchange"
+        left.rename(temporary)
+        right.rename(left)
+        temporary.rename(right)
+
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_verify_single_registration", verify_registration
+    )
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_copy_snapshot", lambda *_args: (parent, candidate)
+    )
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_app",
+        lambda *_args, **_kwargs: (expected_identity, "2" * 64, "3" * 40),
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_resources", lambda *_args: None)
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", exchange)
+
+    args = argparse.Namespace(
+        app=str(staged),
+        install_dir=str(install_dir),
+        backup_dir=str(tmp_path / "backups"),
+        record=str(tmp_path / "backups/approved-rollback.txt"),
+        expected_identity=expected_identity,
+        approved=0,
+        baseline_dr_hash="",
+        baseline_cdhash="",
+        bundle_id="net.varunsingh.onoats",
+        makefile_dir=str(tmp_path),
+    )
+    with pytest.raises(INSTALL_STAGED.InstallError, match="LaunchServices"):
+        INSTALL_STAGED.install(args)
+
+    assert checks == ["old", "new"]
+    assert (installed / "identity").read_text(encoding="utf-8") == "old"
+    assert not parent.exists()
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+def test_temporary_cleanup_warns_only_after_install_commit(
+    tmp_path, monkeypatch, after_commit
+):
+    staged = tmp_path / "staged" / "Onoats.app"
+    staged.mkdir(parents=True)
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    parent = install_dir / ".onoats-install-test"
+    candidate = parent / "candidate"
+    candidate.mkdir(parents=True)
+    backup_dir = tmp_path / "backups"
+    record = backup_dir / "approved-rollback.txt"
+    expected_identity = "1" * 64
+
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_single_registration", lambda *_: None)
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_copy_snapshot", lambda *_args: (parent, candidate)
+    )
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_app",
+        lambda *_args, **_kwargs: (expected_identity, "2" * 64, "3" * 40),
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_resources", lambda *_args: None)
+
+    def replace(_candidate, _installed, _verify, commit):
+        if not after_commit:
+            raise INSTALL_STAGED.InstallError("injected pre-commit failure")
+        commit()
+
+    monkeypatch.setattr(INSTALL_STAGED, "_replace_verified", replace)
+    monkeypatch.setattr(
+        INSTALL_STAGED.shutil,
+        "rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("injected temp cleanup failure")),
+    )
+    args = argparse.Namespace(
+        app=str(staged),
+        install_dir=str(install_dir),
+        backup_dir=str(backup_dir),
+        record=str(record),
+        expected_identity=expected_identity,
+        approved=0,
+        baseline_dr_hash="",
+        baseline_cdhash="",
+        bundle_id="net.varunsingh.onoats",
+        makefile_dir=str(tmp_path),
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if after_commit:
+            INSTALL_STAGED.install(args)
+        else:
+            with pytest.raises(OSError, match="temp cleanup"):
+                INSTALL_STAGED.install(args)
+
+    if after_commit:
+        assert [str(item.message) for item in caught] == [
+            "installed app committed; temporary cleanup failed: "
+            "injected temp cleanup failure"
+        ]
+    else:
+        assert caught == []
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "group-writable"])
+def test_private_tree_metadata_policy_rejects_unsafe_entries(tmp_path, kind):
+    app = tmp_path / "candidate"
+    app.mkdir(mode=0o700)
+    unsafe = app / "unsafe"
+    if kind == "symlink":
+        unsafe.symlink_to(app)
+    elif kind == "fifo":
+        os.mkfifo(unsafe)
+    else:
+        unsafe.write_bytes(b"x")
+        unsafe.chmod(0o620)
+    with pytest.raises(INSTALL_STAGED.InstallError):
+        INSTALL_STAGED._normalise_private_tree(app)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
+def test_archive_snapshot_rejects_non_regular_input_boundedly(tmp_path, kind):
+    archive = tmp_path / "approved.zip"
+    if kind == "symlink":
+        target = tmp_path / "target.zip"
+        target.write_bytes(b"zip")
+        archive.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(archive)
+    else:
+        archive.mkdir()
+    with pytest.raises((INSTALL_STAGED.InstallError, OSError)):
+        INSTALL_STAGED._copy_archive_snapshot(archive, tmp_path / "snapshot", "0" * 64)
+
+
 def test_same_second_archive_allocation_never_overwrites_an_approved_archive(
     tmp_path: Path, monkeypatch
 ):
@@ -445,6 +713,7 @@ def _run_install_staged(
         "-s",
         "install-staged",
         "APP=Onoats.app",
+        "BUNDLE_ID=net.varunsingh.onoats.install-test",
         f"INSTALL_DIR={install_dir}",
         f"ROLLBACK_BASELINE_APPROVED={int(approved)}",
         f"STAGED_APP_TREE_HASH={staged_app_tree_hash}",
@@ -499,6 +768,29 @@ def test_resource_allowlist_rejects_missing_and_unexpected_files(tmp_path: Path)
     (resources / NATIVE_RESOURCES[0]).unlink()
     missing = _run_resource_verifier(app)
     assert missing.returncode != 0, "missing bundle resource was accepted"
+
+
+@pytest.mark.parametrize("wrong_type", ["directory", "symlink"])
+def test_resource_allowlist_rejects_expected_name_with_wrong_type(
+    tmp_path: Path, wrong_type: str
+):
+    app = tmp_path / "Onoats.app"
+    resources = app / "Contents" / "Resources"
+    resources.mkdir(parents=True)
+    source = REPO_ROOT / "native" / "onoats-menubar" / "Resources"
+    for name in NATIVE_RESOURCES:
+        (resources / name).write_bytes((source / name).read_bytes())
+    victim = resources / NATIVE_RESOURCES[0]
+    victim.unlink()
+    if wrong_type == "directory":
+        victim.mkdir()
+    else:
+        victim.symlink_to(resources / NATIVE_RESOURCES[1])
+
+    result = _run_resource_verifier(app)
+    assert result.returncode != 0, (
+        f"resource verifier accepted {wrong_type} at expected file name"
+    )
 
 
 def test_resource_verification_precedes_codesigning():
@@ -784,6 +1076,59 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     )
     replace = installer.index("_replace_verified(", verify)
     assert unpack < verify < replace
+
+
+def test_rollback_extracts_one_private_archive_snapshot_not_replaced_path(
+    tmp_path, monkeypatch
+):
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    archive = backup_dir / "Onoats-approved.zip"
+    original = b"immutable-approved-archive"
+    archive.write_bytes(original)
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text(
+        "\n".join(
+            (
+                f"archive={archive}",
+                f"hash={hashlib.sha256(original).hexdigest()}",
+                f"tree_hash={'1' * 64}",
+                f"dr_hash={'2' * 64}",
+                f"cdhash={'3' * 40}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    install_dir = tmp_path / "installed"
+    extraction_sources: list[Path] = []
+
+    def fake_run(*argv: str, cwd=None):
+        if len(argv) >= 5 and argv[1:3] == ("-x", "-k"):
+            source = Path(argv[3])
+            extraction_sources.append(source)
+            archive.write_bytes(b"attacker replacement")
+            assert source != archive
+            assert source.read_bytes() == original
+            (Path(argv[4]) / "Onoats.app").mkdir()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_app",
+        lambda *_args, **_kwargs: ("1" * 64, "2" * 64, "3" * 40),
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_replace_verified", lambda *_args: None)
+    INSTALL_STAGED.rollback(
+        argparse.Namespace(
+            install_dir=str(install_dir),
+            backup_dir=str(backup_dir),
+            record=str(record),
+            app_name="Onoats.app",
+        )
+    )
+    assert len(extraction_sources) == 1
 
 
 def test_existing_install_and_setup_contracts_are_unchanged():

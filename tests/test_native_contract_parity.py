@@ -844,6 +844,28 @@ def test_recording_panel_keeps_primary_actions_and_live_distinctions_visible():
     assert "model.transcriptPreview" in recording
 
 
+def test_phase8_panel_identity_seminar_switch_and_activity_wording_are_explicit():
+    _, recording, _ = _panel_sources()
+    assert 'Text("Oats")' in recording
+    assert 'Text("Organized Transcript System")' in recording
+    assert 'accessibilityLabel("Oats - Organized Transcript System")' in recording
+    assert 'Image("OnoatsHeader"' not in recording, (
+        "transparent bitmap bounds must not determine the panel header layout"
+    )
+
+    assert "Toggle(isOn: $model.seminarMode)" in recording
+    assert 'Text("Applies to the next recording")' in recording
+    assert "RoundedRectangle" in recording
+    assert "systemImage:" in recording
+    assert 'accessibilityHint("Applies to the next recording only")' in recording
+
+    for label in ('"Signal"', '"Silent"', '"No signal"', '"Unavailable"'):
+        assert label in recording
+    assert re.search(r"activity\.level\s*>\s*0", recording), (
+        "fresh zero must render Silent rather than Signal"
+    )
+
+
 def test_settings_panel_preserves_every_existing_control_and_diagnostics():
     app, _, settings = _panel_sources()
     assert re.search(r"SettingsPanelView\s*\(", app)

@@ -39,11 +39,59 @@ protocol ProcessHandle: AnyObject {
 
 protocol PollHandle: AnyObject { func cancel() }
 
+/// Retained authority for one exclusively-created app-owned run log. The URL
+/// is presentation metadata only; child output and machine reads stay on the
+/// reserved inode through duplicated descriptors.
+protocol RunLogSink: AnyObject {
+    var url: URL { get }
+    func duplicateOutputHandle() throws -> FileHandle?
+    func readTail(maxBytes: Int) -> String?
+    func closeOwner()
+}
+
+/// Compatibility sink for injected SystemOps implementations. Production
+/// NativeSystemOps overrides reservation with DescriptorRunLogSink below.
+private final class URLRunLogSink: RunLogSink {
+    let url: URL
+    private let tailReader: ((Int) -> String?)?
+    init(url: URL, tailReader: ((Int) -> String?)? = nil) {
+        self.url = url
+        self.tailReader = tailReader
+    }
+    func duplicateOutputHandle() throws -> FileHandle? { nil }
+    func readTail(maxBytes: Int) -> String? {
+        if let tailReader { return tailReader(maxBytes) }
+        guard maxBytes > 0, let data = try? Data(contentsOf: url) else { return nil }
+        return String(decoding: data.suffix(maxBytes), as: UTF8.self)
+    }
+    func closeOwner() {}
+}
+
 struct ProcessRequest {
     let executable: URL
     let arguments: [String]
     let environment: [String: String]?
-    let appendOutputTo: URL?
+    let outputSink: RunLogSink?
+    var appendOutputTo: URL? { outputSink?.url }
+
+    init(
+        executable: URL, arguments: [String], environment: [String: String]?,
+        outputSink: RunLogSink?
+    ) {
+        self.executable = executable
+        self.arguments = arguments
+        self.environment = environment
+        self.outputSink = outputSink
+    }
+
+    init(
+        executable: URL, arguments: [String], environment: [String: String]?,
+        appendOutputTo: URL?
+    ) {
+        self.init(
+            executable: executable, arguments: arguments, environment: environment,
+            outputSink: appendOutputTo.map { URLRunLogSink(url: $0) })
+    }
 }
 
 /// Keeps optional Process.arguments construction semantics while process
@@ -67,6 +115,7 @@ protocol SystemOps: AnyObject {
     func readTail(at url: URL, maxBytes: Int) -> String?
     func write(_ data: Data, to url: URL) throws
     func reserveFile(at url: URL) throws -> Bool
+    func reserveRunLogSink(at url: URL) throws -> RunLogSink?
     func deleteRegularFile(at url: URL) throws
     func fileExists(at url: URL) -> Bool
     func isRegularFile(at url: URL) -> Bool
@@ -99,6 +148,12 @@ extension SystemOps {
         try write(Data(), to: url)
         return true
     }
+    func reserveRunLogSink(at url: URL) throws -> RunLogSink? {
+        guard try reserveFile(at: url) else { return nil }
+        return URLRunLogSink(url: url) { [weak self] maxBytes in
+            self?.readTail(at: url, maxBytes: maxBytes)
+        }
+    }
     func open(_ url: URL) { NSWorkspace.shared.open(url) }
 }
 
@@ -119,6 +174,51 @@ private final class NativeProcessHandle: ProcessHandle {
     }
 }
 
+private final class DescriptorRunLogSink: RunLogSink {
+    let url: URL
+    private var descriptor: Int32
+
+    init(url: URL, descriptor: Int32) {
+        self.url = url
+        self.descriptor = descriptor
+    }
+
+    deinit { closeOwner() }
+
+    func duplicateOutputHandle() throws -> FileHandle? {
+        guard descriptor >= 0 else { throw POSIXError(.EBADF) }
+        let duplicate = Darwin.fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicate >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
+    }
+
+    func readTail(maxBytes: Int) -> String? {
+        guard descriptor >= 0, maxBytes > 0 else { return nil }
+        let duplicate = Darwin.dup(descriptor)
+        guard duplicate >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        do {
+            try handle.seek(toOffset: offset)
+            guard let data = try handle.read(upToCount: maxBytes) else { return nil }
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return nil
+        }
+    }
+
+    func closeOwner() {
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+            descriptor = -1
+        }
+    }
+}
+
 private final class NativePollHandle: PollHandle {
     let timer: Timer
     init(_ timer: Timer) { self.timer = timer }
@@ -136,16 +236,8 @@ final class NativeSystemOps: SystemOps {
         process.arguments = request.arguments
         process.environment = request.environment
         var capturedOutput: FileHandle?
-        if let log = request.appendOutputTo {
-            try FileManager.default.createDirectory(
-                at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let descriptor = Darwin.open(
-                log.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
-                S_IRUSR | S_IWUSR)
-            guard descriptor >= 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            let output = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        if let sink = request.outputSink,
+           let output = try sink.duplicateOutputHandle() {
             capturedOutput = output
             process.standardOutput = output
             process.standardError = output
@@ -238,6 +330,18 @@ final class NativeSystemOps: SystemOps {
         if errno == EEXIST { return false }
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
+    func reserveRunLogSink(at url: URL) throws -> RunLogSink? {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let descriptor = Darwin.open(
+            url.path, O_RDWR | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR)
+        if descriptor >= 0 {
+            return DescriptorRunLogSink(url: url, descriptor: descriptor)
+        }
+        if errno == EEXIST { return nil }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
     func deleteRegularFile(at url: URL) throws {
         guard let handle = openRegularFile(at: url) else {
             throw POSIXError(.EINVAL)
@@ -321,6 +425,8 @@ final class RecorderModel: ObservableObject {
     @Published private(set) var seminarConfigurationFailure = false
     @Published private(set) var lastFailureWasAppOwned = false
     @Published private(set) var mostRecentRunLogURL: URL?
+    private var mostRecentRunLogSink: RunLogSink?
+    private var runLogFinishing = false
     private var runLogReservationAttempted = false
     @Published private(set) var mostRecentRunStartedAt: Date?
 
@@ -592,7 +698,7 @@ final class RecorderModel: ObservableObject {
     }
 
     func start() {
-        guard proc == nil, cliAvailable else { return }
+        guard proc == nil, mostRecentRunLogSink == nil, cliAvailable else { return }
         userRequestedStop = false
         flushNote = nil
         prestartDetail = nil
@@ -608,8 +714,9 @@ final class RecorderModel: ObservableObject {
         runLogReservationAttempted = true
         mostRecentRunLogURL = nil
         mostRecentRunStartedAt = nil
+        runLogFinishing = false
         let initialSpawnEpoch = Int64((attempt.timeIntervalSince1970 * 1000).rounded(.down))
-        let runLog: URL
+        let runLog: RunLogSink
         do {
             runLog = try reserveRunLog(startingAt: initialSpawnEpoch)
         } catch {
@@ -620,7 +727,8 @@ final class RecorderModel: ObservableObject {
             state = .failed(reason: "log-reservation-failed", detail: error.localizedDescription)
             return
         }
-        mostRecentRunLogURL = runLog
+        mostRecentRunLogSink = runLog
+        mostRecentRunLogURL = runLog.url
         mostRecentRunStartedAt = attempt
         var environment = ProcessInfo.processInfo.environment
         environment["AUDIO_SOURCE"] = "socket"
@@ -630,13 +738,15 @@ final class RecorderModel: ObservableObject {
         if seminarMode { p.arguments? += ["--category", Self.seminarCategory] }
         let request = ProcessRequest(
             executable: URL(fileURLWithPath: cliPath), arguments: p.arguments ?? ["bot"],
-            environment: environment, appendOutputTo: runLog)
+            environment: environment, outputSink: runLog)
         do {
             let handle = try ops.spawn(request) { [weak self] handle in self?.handleExit(handle) }
             proc = handle
             state = .starting
             pruneRunLogs()
         } catch {
+            runLog.closeOwner()
+            mostRecentRunLogSink = nil
             spawnedAt = nil
             activeDataDir = nil
             activeDataDirDisplay = nil
@@ -687,11 +797,12 @@ final class RecorderModel: ObservableObject {
     ) {
         let request = ProcessRequest(
             executable: URL(fileURLWithPath: cliPath), arguments: arguments,
-            environment: nil, appendOutputTo: logOwnedOutput ? mostRecentRunLogURL : nil)
+            environment: nil, outputSink: logOwnedOutput ? mostRecentRunLogSink : nil)
         do {
             let handle = try ops.spawn(request) { [weak self] handle in
                 guard let self else { return }
                 self.auxiliary[ObjectIdentifier(handle)] = nil
+                self.releaseRunLogSinkIfIdle()
                 if handle.terminationStatus != 0 {
                     if clearExternalStopOnFailure { self.clearExternalStopRequest() }
                     self.flushNote = "\(failureAction) failed (rc \(handle.terminationStatus))"
@@ -733,6 +844,8 @@ final class RecorderModel: ObservableObject {
         userRequestedStop = false
         seminarMode = false
         proc = nil
+        runLogFinishing = true
+        releaseRunLogSinkIfIdle()
         activeDataDir = nil
         activeDataDirDisplay = nil
         spawnedAt = nil
@@ -752,12 +865,12 @@ final class RecorderModel: ObservableObject {
             && !status.stt_label.isEmpty
     }
 
-    private func reserveRunLog(startingAt initialEpoch: Int64) throws -> URL {
+    private func reserveRunLog(startingAt initialEpoch: Int64) throws -> RunLogSink {
         var epoch = initialEpoch
         while true {
             let candidate = logsDirectory.appendingPathComponent(
                 "\(Self.runLogPrefix)\(epoch)\(Self.runLogSuffix)")
-            if try ops.reserveFile(at: candidate) { return candidate }
+            if let sink = try ops.reserveRunLogSink(at: candidate) { return sink }
             guard epoch < Int64.max else { throw CocoaError(.fileWriteFileExists) }
             epoch += 1
         }
@@ -820,11 +933,20 @@ final class RecorderModel: ObservableObject {
     func showLogsFolder() { ops.open(logsDirectory) }
 
     private func runLogTailContainsInvalidCategoryTag() -> Bool {
-        guard let url = mostRecentRunLogURL,
-              let text = ops.readTail(at: url, maxBytes: Self.categoryErrorTailBytes) else {
+        guard let sink = mostRecentRunLogSink,
+              let text = sink.readTail(maxBytes: Self.categoryErrorTailBytes) else {
             return false
         }
         return text.components(separatedBy: .newlines).contains(Self.invalidCategoryErrorTag)
+    }
+
+    private func releaseRunLogSinkIfIdle() {
+        guard runLogFinishing, auxiliary.isEmpty, let sink = mostRecentRunLogSink else {
+            return
+        }
+        sink.closeOwner()
+        mostRecentRunLogSink = nil
+        runLogFinishing = false
     }
 
     func setSTTService(_ service: String) {

@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import stat
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -32,6 +33,7 @@ TRANSCRIPT_LIMIT = 240
 DETAIL_LIMIT = 256
 LEVEL_MIN = 0.0
 LEVEL_MAX = 1.0
+MAX_SNAPSHOT_BYTES = 64 * 1024
 
 STT_STATES = frozenset({"failed", "recovering", "starting", "unknown", "ready"})
 STT_PRECEDENCE = ("failed", "recovering", "starting", "unknown", "ready")
@@ -312,13 +314,11 @@ class UITelemetryPublisher:
 
     def cleanup(self) -> bool:
         try:
-            record = json.loads(self.path.read_text(encoding="utf-8"))
-            if (
-                record.get("pid") != self.state.pid
-                or record.get("start_epoch") != self.state.start_epoch
-            ):
+            removed = _cleanup_owned_snapshot(
+                self.path, pid=self.state.pid, start_epoch=self.state.start_epoch
+            )
+            if not removed:
                 return False
-            self.path.unlink()
             if self._cleanup_failed:
                 _LOG.warning("UI telemetry cleanup recovered")
                 self._cleanup_failed = False
@@ -403,13 +403,111 @@ def cleanup_snapshot(data_dir: Path, *, pid: int, start_epoch: float) -> bool:
     """Unlink the ephemeral file only when it still belongs to this run."""
     path = Path(data_dir) / ".active" / UI_TELEMETRY_FILENAME
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("pid") != pid or record.get("start_epoch") != start_epoch:
-            return False
-        path.unlink()
-        return True
+        return _cleanup_owned_snapshot(path, pid=pid, start_epoch=start_epoch)
     except FileNotFoundError:
         return False
     except Exception as exc:
         _LOG.warning("Could not clean up UI telemetry: %s", exc)
         return False
+
+
+def _cleanup_owned_snapshot(path: Path, *, pid: int, start_epoch: float) -> bool:
+    """Quarantine and remove only the descriptor-owned ephemeral snapshot.
+
+    Reads are non-blocking, no-follow, and bounded.  A private sibling
+    directory gives the rename an absent destination, so publication-path
+    replacement can only move either the opened inode or a foreign replacement
+    into quarantine; it can never be overwritten.  A foreign moved entry is
+    restored without overwriting a newer public-path replacement.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    quarantine_dir: Path | None = None
+    quarantined: Path | None = None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return False
+        if not _descriptor_has_owner(
+            descriptor, opened, pid=pid, start_epoch=start_epoch
+        ):
+            return False
+
+        # This is advisory only: the subsequent rename and quarantine inode
+        # check, not this pathname observation, decide what may be removed.
+        os.lstat(path)
+
+        quarantine_dir = Path(
+            tempfile.mkdtemp(prefix=".onoats-ui-cleanup-", dir=path.parent)
+        )
+        os.chmod(quarantine_dir, 0o700)
+        quarantined = quarantine_dir / "snapshot"
+        os.rename(path, quarantined)
+
+        moved = os.lstat(quarantined)
+        if (opened.st_dev, opened.st_ino) != (moved.st_dev, moved.st_ino):
+            _restore_quarantined(quarantined, path)
+            return False
+
+        # Ownership may have changed while the public name was live.  Re-read
+        # the same opened inode only after it has been isolated in quarantine.
+        if not _descriptor_has_owner(
+            descriptor, os.fstat(descriptor), pid=pid, start_epoch=start_epoch
+        ):
+            _restore_quarantined(quarantined, path)
+            return False
+
+        try:
+            os.unlink(quarantined)
+        except Exception:
+            _restore_quarantined(quarantined, path)
+            raise
+        quarantined = None
+        return True
+    finally:
+        os.close(descriptor)
+        if quarantine_dir is not None and (
+            quarantined is None or not os.path.lexists(quarantined)
+        ):
+            try:
+                quarantine_dir.rmdir()
+            except OSError:
+                pass
+
+
+def _descriptor_has_owner(
+    descriptor: int,
+    info: os.stat_result,
+    *,
+    pid: int,
+    start_epoch: float,
+) -> bool:
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SNAPSHOT_BYTES:
+        return False
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    payload = os.read(descriptor, MAX_SNAPSHOT_BYTES + 1)
+    if len(payload) > MAX_SNAPSHOT_BYTES:
+        return False
+    record = json.loads(payload.decode("utf-8"))
+    return (
+        isinstance(record, dict)
+        and record.get("pid") == pid
+        and record.get("start_epoch") == start_epoch
+    )
+
+
+def _restore_quarantined(quarantined: Path, public_path: Path) -> None:
+    """Restore a moved replacement without overwriting a newer publication."""
+    try:
+        os.link(quarantined, public_path, follow_symlinks=False)
+    except FileExistsError:
+        # A newer public-path replacement wins; preserve the moved entry in its
+        # private quarantine rather than deleting either replacement.
+        return
+    except OSError:
+        # The raced entry may not be linkable (for example a directory).  Keep
+        # it quarantined; cleanup is best-effort and must not destroy it.
+        return
+    os.unlink(quarantined)

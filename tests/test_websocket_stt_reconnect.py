@@ -378,6 +378,35 @@ def test_lost_established_connection_fires_recovering_once(monkeypatch):
     assert events == ["ready", "recovering"]
 
 
+def test_decode_timeout_publishes_recovering_until_next_confirmed_handshake(
+    monkeypatch,
+):
+    """A reset caused by decode timeout is itself an STT health transition.
+
+    The panel must turn non-green before any demand-driven reconnect begins;
+    only the next instance handshake may publish ready again.
+    """
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    monkeypatch.setattr(wss_module, "_DECODE_TIMEOUT_SECONDS", 0.01)
+    events: list[str] = []
+    svc = _make_service(
+        on_ready=lambda: events.append("ready"),
+        on_recovering=lambda: events.append("recovering"),
+    )
+
+    async def _run() -> None:
+        frames = [frame async for frame in svc.run_stt(b"\x00\x00" * 160)]
+        assert frames, "decode timeout must remain fail-loud to the pipeline"
+        assert events == ["ready", "recovering"]
+        assert svc._connected is False
+
+        await svc._ensure_connected()
+        assert events == ["ready", "recovering", "ready"]
+        await svc.cancel(None)
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=2))
+
+
 def test_raising_ui_ready_callback_does_not_discard_connection(monkeypatch):
     _install_fake_client_factory(monkeypatch, lambda: None)
 

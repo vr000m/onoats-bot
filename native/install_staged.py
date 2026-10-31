@@ -13,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import warnings
 
 
 IDENTITY_VERSION = b"onoats-app-identity-v1\0"
@@ -54,6 +55,28 @@ def app_identity(app: Path) -> str:
         for value in (relative, kind, f"{mode:04o}".encode(), payload):
             _field(digest, value)
     return digest.hexdigest()
+
+
+def _normalise_private_tree(app: Path) -> None:
+    """Apply the installer's copied-metadata policy to a private snapshot.
+
+    ACLs are not part of the signed bundle identity and are stripped from the
+    private copy. Group/other-writable entries and unsupported node types fail
+    closed. Extended attributes (including code-signing metadata) are retained.
+    """
+    entries = [app, *app.rglob("*")]
+    for path in entries:
+        info = path.lstat()
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise InstallError(f"unsupported copied entry type: {path}")
+        if stat.S_IMODE(info.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+            raise InstallError(f"copied entry is writable beyond owner: {path}")
+    if os.uname().sysname == "Darwin":
+        result = subprocess.run(
+            ("chmod", "-RN", str(app)), capture_output=True, text=True
+        )
+        if result.returncode:
+            raise InstallError(f"could not strip copied ACL metadata: {result.stderr}")
 
 
 def _run(*argv: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -102,6 +125,11 @@ def _verify_app(
     return identity, hashlib.sha256(requirement.encode()).hexdigest(), _cdhash(app)
 
 
+def _verify_resources(app: Path, makefile_dir: Path | None) -> None:
+    if makefile_dir is not None:
+        _run("make", "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
+
+
 def _remove_path(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink()
@@ -143,18 +171,106 @@ def _replace_verified(candidate: Path, installed: Path, verify, commit=None) -> 
     except Exception:
         _exchange(candidate, installed)
         raise
-    _remove_path(candidate)
+    try:
+        _remove_path(candidate)
+    except Exception as exc:
+        warnings.warn(f"installed app committed; old-tree cleanup failed: {exc}")
 
 
 def _copy_snapshot(source: Path, install_dir: Path, app_name: str) -> tuple[Path, Path]:
     parent = Path(tempfile.mkdtemp(prefix=".onoats-install-", dir=install_dir))
-    candidate = parent / app_name
+    # Deliberately not an .app path: an exchanged old tree must not become a
+    # second LaunchServices-discoverable bundle while cleanup is pending.
+    candidate = parent / "candidate"
     try:
         _run("ditto", str(source), str(candidate))
+        _normalise_private_tree(candidate)
     except Exception:
         shutil.rmtree(parent, ignore_errors=True)
         raise
     return parent, candidate
+
+
+def _copy_archive_snapshot(archive: Path, parent: Path, expected_hash: str) -> Path:
+    """Copy one no-follow regular archive descriptor into a private snapshot."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(archive, flags)
+    snapshot = parent / "rollback.zip"
+    digest = hashlib.sha256()
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise InstallError("approved archive is not a regular file")
+        with snapshot.open("xb") as output:
+            os.chmod(snapshot, 0o600)
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                output.write(chunk)
+    finally:
+        os.close(descriptor)
+    if digest.hexdigest() != expected_hash:
+        snapshot.unlink(missing_ok=True)
+        raise InstallError("approved archive hash mismatch")
+    return snapshot
+
+
+def _launchservices_paths(bundle_id: str) -> set[Path]:
+    """Return registered paths for a bundle id when LaunchServices is present."""
+    if os.uname().sysname != "Darwin":
+        return set()
+    tool = Path(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+        "LaunchServices.framework/Support/lsregister"
+    )
+    if not tool.is_file():
+        raise InstallError("LaunchServices registration tool is unavailable")
+    output = _run(str(tool), "-dump").stdout
+    paths: set[Path] = set()
+    record: dict[str, list[str]] = {}
+
+    def finish_record() -> None:
+        identifiers = {
+            value.strip().strip('"')
+            for key in ("bundleid", "identifier")
+            for value in record.get(key, ())
+        }
+        if bundle_id not in identifiers:
+            return
+        for key in ("path", "bundlepath"):
+            for value in record.get(key, ()):
+                raw_path = value.strip().split(" (0x", 1)[0]
+                if raw_path:
+                    paths.add(Path(raw_path).resolve())
+
+    for raw_line in [*output.splitlines(), ""]:
+        line = raw_line.strip()
+        if not line or (len(line) >= 8 and set(line) == {"-"}):
+            if record:
+                finish_record()
+                record = {}
+            continue
+        key, separator, value = line.partition(":")
+        if not separator:
+            key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        normalised_key = "".join(
+            character for character in key.lower() if character.isalnum()
+        )
+        record.setdefault(normalised_key, []).append(value.strip())
+    return paths
+
+
+def _verify_single_registration(installed: Path, bundle_id: str) -> None:
+    registered = _launchservices_paths(bundle_id)
+    unexpected = registered - {installed.resolve()}
+    if unexpected:
+        rendered = ", ".join(str(path) for path in sorted(unexpected, key=str))
+        raise InstallError(f"duplicate LaunchServices bundle registration: {rendered}")
 
 
 def _write_record(record: Path, fields: dict[str, str]) -> None:
@@ -222,6 +338,7 @@ def _archive_baseline(
         with tempfile.TemporaryDirectory(prefix="onoats-archive-verify-") as directory:
             _run("ditto", "-x", "-k", str(archive), directory)
             extracted = Path(directory) / installed.name
+            _normalise_private_tree(extracted)
             extracted_tree, extracted_dr, extracted_cdhash = _verify_app(extracted)
         if (extracted_tree, extracted_dr, extracted_cdhash) != (
             tree_hash,
@@ -258,12 +375,15 @@ def install(args: argparse.Namespace) -> None:
         raise InstallError("ROLLBACK_BASELINE_APPROVED must be 0 or 1")
 
     install_dir.mkdir(parents=True, exist_ok=True)
+    _verify_single_registration(installed, args.bundle_id)
     parent, candidate = _copy_snapshot(staged, install_dir, staged.name)
     archive: Path | None = None
+    committed = False
     try:
         candidate_identity, candidate_dr, _candidate_cdhash = _verify_app(
-            candidate, expected_identity=expected, makefile_dir=Path(args.makefile_dir)
+            candidate, expected_identity=expected
         )
+        _verify_resources(candidate, Path(args.makefile_dir))
         record_fields = None
         if args.approved:
             if not args.baseline_dr_hash or not args.baseline_cdhash:
@@ -280,22 +400,49 @@ def install(args: argparse.Namespace) -> None:
                 )
 
         def verify(path: Path) -> tuple[str, str, str]:
-            return _verify_app(path, expected_identity=candidate_identity)
+            return _verify_app(
+                path,
+                expected_identity=candidate_identity,
+                makefile_dir=Path(args.makefile_dir),
+            )
 
         def commit() -> None:
-            nonlocal archive
+            nonlocal archive, committed
+            # Installed identity verification has already succeeded inside
+            # _replace_verified.  Registration uniqueness and rollback-record
+            # publication are part of that same rollback-capable boundary.
+            _verify_single_registration(installed, args.bundle_id)
             if record_fields is not None:
                 _write_record(record, record_fields)
                 archive = None
             else:
                 record.unlink(missing_ok=True)
+            committed = True
 
         _replace_verified(candidate, installed, verify, commit)
         print(f"✓ installed exact staged app at {installed}")
     finally:
         if archive is not None:
-            archive.unlink(missing_ok=True)
-        shutil.rmtree(parent, ignore_errors=True)
+            try:
+                archive.unlink(missing_ok=True)
+            except Exception as exc:
+                if committed:
+                    warnings.warn(
+                        f"installed app committed; archive cleanup failed: {exc}"
+                    )
+                else:
+                    raise
+        try:
+            shutil.rmtree(parent)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            if committed:
+                warnings.warn(
+                    f"installed app committed; temporary cleanup failed: {exc}"
+                )
+            else:
+                raise
 
 
 def rollback(args: argparse.Namespace) -> None:
@@ -303,26 +450,51 @@ def rollback(args: argparse.Namespace) -> None:
     backup_dir = Path(args.backup_dir)
     fields = _read_record(Path(args.record), backup_dir)
     archive = Path(fields["archive"])
-    if not archive.is_file() or archive.is_symlink():
-        raise InstallError("approved archive missing")
-    if hashlib.sha256(archive.read_bytes()).hexdigest() != fields["hash"]:
-        raise InstallError("approved archive hash mismatch")
     install_dir.mkdir(parents=True, exist_ok=True)
+    installed = install_dir / args.app_name
+    bundle_id = getattr(args, "bundle_id", "net.varunsingh.onoats")
+    makefile_dir = getattr(args, "makefile_dir", None)
+    _verify_single_registration(installed, bundle_id)
     parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
-    candidate = parent / args.app_name
+    candidate = parent / "candidate"
+    committed = False
     try:
+        archive = _copy_archive_snapshot(archive, parent, fields["hash"])
         _run("ditto", "-x", "-k", str(archive), str(parent))
+        extracted = parent / args.app_name
+        _normalise_private_tree(extracted)
+        os.rename(extracted, candidate)
         observed = _verify_app(candidate, expected_identity=fields["tree_hash"])
+        _verify_resources(candidate, Path(makefile_dir) if makefile_dir else None)
         if observed[1:] != (fields["dr_hash"], fields["cdhash"]):
             raise InstallError("restored app identity mismatch")
+
+        def commit() -> None:
+            nonlocal committed
+            _verify_single_registration(installed, bundle_id)
+            committed = True
+
         _replace_verified(
             candidate,
-            install_dir / args.app_name,
-            lambda path: _verify_app(path, expected_identity=fields["tree_hash"]),
+            installed,
+            lambda path: _verify_app(
+                path,
+                expected_identity=fields["tree_hash"],
+                makefile_dir=Path(makefile_dir) if makefile_dir else None,
+            ),
+            commit,
         )
         print(f"✓ restored approved app archive {archive}")
     finally:
-        shutil.rmtree(parent, ignore_errors=True)
+        try:
+            shutil.rmtree(parent)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            if committed:
+                warnings.warn(f"rollback committed; temporary cleanup failed: {exc}")
+            else:
+                raise
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -341,12 +513,15 @@ def _parser() -> argparse.ArgumentParser:
     staged.add_argument("--baseline-dr-hash", default="")
     staged.add_argument("--baseline-cdhash", default="")
     staged.add_argument("--makefile-dir", required=True)
+    staged.add_argument("--bundle-id", required=True)
 
     restore = subparsers.add_parser("rollback")
     restore.add_argument("--app-name", required=True)
     restore.add_argument("--install-dir", required=True)
     restore.add_argument("--backup-dir", required=True)
     restore.add_argument("--record", required=True)
+    restore.add_argument("--makefile-dir", required=True)
+    restore.add_argument("--bundle-id", required=True)
     return parser
 
 

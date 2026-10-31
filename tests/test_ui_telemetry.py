@@ -7,6 +7,8 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -472,10 +474,160 @@ def test_cleanup_is_owner_checked_and_fail_open(tmp_path, monkeypatch):
 
     assert publisher.write_once(now=1001.0)
     monkeypatch.setattr(
-        Path, "unlink", lambda self: (_ for _ in ()).throw(OSError("busy"))
+        "onoats.ui_telemetry.os.unlink",
+        lambda path: (_ for _ in ()).throw(OSError("busy")),
     )
     assert not cleanup_snapshot(tmp_path, pid=4321, start_epoch=900.25)
     assert path.exists()
+
+
+@pytest.mark.parametrize("entry_kind", ["fifo", "directory", "symlink"])
+def test_cleanup_non_regular_entries_is_bounded_and_preserved(tmp_path, entry_kind):
+    """Cleanup must never perform a blocking pathname read.
+
+    Run the probe in a child so the regression fails quickly even when an
+    implementation accidentally opens a FIFO without ``O_NONBLOCK``.
+    """
+    path = _path(tmp_path)
+    path.parent.mkdir(parents=True)
+    if entry_kind == "fifo":
+        os.mkfifo(path)
+    elif entry_kind == "directory":
+        path.mkdir()
+    else:
+        target = tmp_path / "foreign.json"
+        target.write_text('{"pid":4321,"start_epoch":900.25}', encoding="utf-8")
+        path.symlink_to(target)
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from onoats.ui_telemetry import cleanup_snapshot; "
+                f"assert cleanup_snapshot(Path({str(tmp_path)!r}), "
+                "pid=4321, start_epoch=900.25) is False"
+            ),
+        ],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert path.lexists() if hasattr(path, "lexists") else os.path.lexists(path)
+
+
+def test_cleanup_uses_bounded_descriptor_read_and_nofollow(tmp_path, monkeypatch):
+    state = _state()
+    publisher = UITelemetryPublisher(tmp_path, state)
+    assert publisher.write_once(now=1000.0)
+
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def checked_open(path, flags, *args, **kwargs):
+        observed_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("onoats.ui_telemetry.os.open", checked_open)
+    assert cleanup_snapshot(tmp_path, pid=4321, start_epoch=900.25)
+    assert observed_flags
+    assert observed_flags[-1] & os.O_NONBLOCK
+    assert observed_flags[-1] & os.O_NOFOLLOW
+
+
+def test_publisher_cleanup_delegates_to_one_cleanup_primitive(tmp_path, monkeypatch):
+    state = _state()
+    publisher = UITelemetryPublisher(tmp_path, state)
+    calls = []
+
+    def cleanup(path, *, pid, start_epoch):
+        calls.append((Path(path), pid, start_epoch))
+        return True
+
+    monkeypatch.setattr("onoats.ui_telemetry._cleanup_owned_snapshot", cleanup)
+    assert publisher.cleanup() is True
+    assert calls == [(_path(tmp_path), 4321, 900.25)]
+
+
+def test_cleanup_preserves_same_path_inode_replacement(tmp_path, monkeypatch):
+    state = _state()
+    publisher = UITelemetryPublisher(tmp_path, state)
+    assert publisher.write_once(now=1000.0)
+    path = _path(tmp_path)
+    replacement = path.with_suffix(".replacement")
+    replacement.write_text(
+        json.dumps({"pid": 4321, "start_epoch": 900.25}), encoding="utf-8"
+    )
+    real_lstat = os.lstat
+    swapped = False
+
+    def replace_before_compare(candidate, *args, **kwargs):
+        nonlocal swapped
+        if Path(candidate) == path and not swapped:
+            swapped = True
+            os.replace(replacement, path)
+        return real_lstat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr("onoats.ui_telemetry.os.lstat", replace_before_compare)
+    assert cleanup_snapshot(tmp_path, pid=4321, start_epoch=900.25) is False
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "pid": 4321,
+        "start_epoch": 900.25,
+    }
+
+
+def test_cleanup_publication_at_quarantine_removal_boundary_survives(
+    tmp_path, monkeypatch
+):
+    """A publication racing the final quarantine unlink must remain public."""
+    state = _state()
+    publisher = UITelemetryPublisher(tmp_path, state)
+    assert publisher.write_once(now=1000.0)
+    path = _path(tmp_path)
+    replacement = path.with_suffix(".next")
+    replacement_payload = {"pid": 9876, "start_epoch": 1001.5, "generation": 2}
+    replacement.write_text(json.dumps(replacement_payload), encoding="utf-8")
+
+    real_unlink = os.unlink
+    removed: list[Path] = []
+    published = False
+
+    def publish_at_removal_boundary(candidate, *args, **kwargs):
+        nonlocal published
+        candidate_path = Path(candidate)
+        removed.append(candidate_path)
+        if candidate_path.name == "snapshot" and not published:
+            published = True
+            os.replace(replacement, path)
+        return real_unlink(candidate, *args, **kwargs)
+
+    monkeypatch.setattr("onoats.ui_telemetry.os.unlink", publish_at_removal_boundary)
+    assert cleanup_snapshot(tmp_path, pid=4321, start_epoch=900.25) is True
+
+    assert published, "test did not reach the quarantined-inode removal seam"
+    assert path not in removed, "cleanup unlinked the public publication path"
+    assert json.loads(path.read_text(encoding="utf-8")) == replacement_payload
+    assert not replacement.exists()
+    assert not list(path.parent.glob(".onoats-ui-cleanup-*"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"not-json", b"{}", b"x" * (64 * 1024 + 1)],
+    ids=["malformed", "missing-owner", "oversized"],
+)
+def test_cleanup_rejects_bad_or_oversized_regular_files_without_unlinking(
+    tmp_path, payload
+):
+    path = _path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    assert cleanup_snapshot(tmp_path, pid=4321, start_epoch=900.25) is False
+    assert path.read_bytes() == payload
 
 
 def test_status_schema_remains_separate():

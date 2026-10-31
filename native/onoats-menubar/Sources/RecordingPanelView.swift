@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The primary, fixed-width recording surface. RecorderModel remains the sole
@@ -29,11 +30,17 @@ struct RecordingPanelView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Image("OnoatsHeader", bundle: .main)
-                .resizable()
-                .scaledToFit()
-                .frame(height: 34)
-                .accessibilityLabel("Onoats")
+            OatsMarkView()
+                .frame(width: 28, height: 28)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Oats").font(.headline)
+                Text("Organized Transcript System")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Oats - Organized Transcript System")
             Spacer()
             Button(action: showSettings) {
                 Image(systemName: "gearshape")
@@ -113,7 +120,8 @@ struct RecordingPanelView: View {
             if let activity, model.telemetryAvailable {
                 ProgressView(value: activity.level, total: 1)
                     .progressViewStyle(.linear)
-                Text("Signal").font(.caption).foregroundStyle(.secondary)
+                Text(activity.level > 0 ? "Signal" : "Silent")
+                    .font(.caption).foregroundStyle(.secondary)
                     .frame(width: 76, alignment: .trailing)
             } else {
                 ProgressView(value: 0, total: 1)
@@ -215,9 +223,25 @@ struct RecordingPanelView: View {
     private var controls: some View {
         switch model.state {
         case .stopped, .failed:
-            Toggle("Seminar", isOn: $model.seminarMode)
-                .focused($focus, equals: .seminar)
-                .accessibilityHint("Applies to the next recording only")
+            HStack(spacing: 10) {
+                Image(systemName: "person.3.fill")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Seminar").font(.callout.weight(.semibold))
+                    Text("Applies to the next recording")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle(isOn: $model.seminarMode) { EmptyView() }
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .focused($focus, equals: .seminar)
+                    .accessibilityLabel("Seminar")
+                    .accessibilityHint("Applies to the next recording only")
+            }
+            .padding(10)
+            .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
             Button("Start Recording") { model.start() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -314,6 +338,34 @@ struct RecordingPanelView: View {
         case .failed: return .red
         case .recovering, .starting: return .orange
         case .unknown, .none: return .secondary
+        }
+    }
+}
+
+/// Crops the standalone grain-wave mark out of the canonical header export so
+/// transparent wordmark bounds never participate in panel layout.
+private struct OatsMarkView: View {
+    private static let mark: NSImage? = {
+        guard let source = NSImage(named: NSImage.Name("OnoatsHeader")),
+              let image = source.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else { return nil }
+        let side = image.height
+        guard let crop = image.cropping(to: CGRect(x: 0, y: 0, width: side, height: side))
+        else { return nil }
+        return NSImage(
+            cgImage: crop, size: NSSize(width: CGFloat(side), height: CGFloat(side)))
+    }()
+
+    @ViewBuilder
+    var body: some View {
+        if let mark = Self.mark {
+            Image(nsImage: mark)
+                .resizable()
+                .scaledToFit()
+        } else {
+            Image(systemName: "waveform")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
         }
     }
 }

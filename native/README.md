@@ -170,7 +170,11 @@ that surface:
   other line of `config.toml`, comments included, stays byte-identical.
 - **Diagnostics and logs:** every app-owned Start reserves one
   `~/Library/Logs/Onoats/onoats-bot-<spawnEpoch>.log` with exclusive creation;
-  recorder, Stop, and Flush writers append to it and the newest ten are kept.
+  the recorder and app-owned Flush helpers receive duplicates of that retained
+  append descriptor and the newest ten are kept. App-owned Stop terminates the
+  retained supervisor and does not spawn a Stop writer. The descriptor, not the
+  replaceable pathname, remains the output and diagnostic-read authority until
+  the recorder and every duplicate writer have exited.
   Open Log resolves the current app process's latest run first; Show Logs Folder
   always reveals the containing directory. External-session Stop and Flush
   output is not written to an app-owned run log, and no log tail is displayed
@@ -180,14 +184,46 @@ that surface:
   only the required native exports: header art, `.icns`, and state-specific
   monochrome template icons. `make app` starts from a clean bundle and copies
   each named resource explicitly; `make verify-resources` equality-checks that
-  allowlist before `make sign`. After the gauntlet, run `make app-tree-hash`
-  and smoke the already-signed staged bundle before installation. Then run
-  `make install-staged STAGED_APP_TREE_HASH=<app-tree-hash-output>` to install
-  an immutable verified snapshot without rebuilding or re-signing it. The
-  canonical identity includes paths, entry types, modes, file bytes, and
-  symlink targets. Do not fix
+  allowlist before `make sign`. After the gauntlet, run
+  `make -C native app-tree-hash`
+  and smoke the already-signed staged bundle before installation. For an
+  explicit clean install from the repository root, run:
+
+  ```sh
+  make -C native install-staged \
+    STAGED_APP_TREE_HASH=<app-tree-hash-output> \
+    ROLLBACK_BASELINE_APPROVED=0
+  ```
+
+  This installs an immutable verified snapshot without rebuilding or
+  re-signing it. The canonical identity
+  includes paths, entry types, executable modes, and file bytes. Private install
+  and rollback copies reject unsupported entry types and group/other-writable
+  modes, strip ACLs, retain code-signing metadata, and require every allowlisted
+  resource to be a regular non-symlink file. Do not fix
   or otherwise mutate the bundle after signing; any fix requires rebuilding,
   re-running the gauntlet, and signing again.
+
+Rollback-capable publication is a separate, fail-closed command. Before using
+it, verify and record the prior app's designated-requirement hash and cdhash,
+plus the prior CLI SHA, branch/detached state, exact `install-cli` command and
+`EXTRAS`, shim path, and checkout-owned import path. Then, from the repository
+root, run:
+
+```sh
+make -C native install-staged \
+  STAGED_APP_TREE_HASH=<smoked-app-tree-hash> \
+  ROLLBACK_BASELINE_APPROVED=1 \
+  ROLLBACK_BASELINE_DR_HASH=<verified-sha256> \
+  ROLLBACK_BASELINE_CDHASH=<verified-cdhash>
+```
+
+Only that approved mode publishes a rollback record. Restore it with
+`make -C native rollback`; rollback copies and extracts one immutable
+descriptor-backed archive snapshot and verifies it before atomically publishing
+the canonical `~/Applications/Onoats.app`. The current release is a clean-install
+run because its pre-change CLI baseline was incomplete, so it must use
+`ROLLBACK_BASELINE_APPROVED=0` and must not invoke rollback.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

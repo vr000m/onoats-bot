@@ -539,7 +539,7 @@ sequenceDiagram
 - [x] Phase 5: Native Resource Pipeline and Stateful Menu Icon
 - [x] Phase 6: Window-Style Recording Panel and In-Panel Settings
 - [x] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
-- [ ] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
+- [x] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
 
 ## Findings
 
@@ -609,6 +609,15 @@ sequenceDiagram
   test-matrix gaps. All recommended resolutions were incorporated before the
   marker refresh. Phase 8 now completes before the auto-chained gauntlet;
   accepted gauntlet fixes reopen the phase rather than creating a cycle.
+- 2026-10-31 — Phase 8 closed the four advisory findings without a contract
+  contradiction: telemetry cleanup remains descriptor-owned through removal,
+  installer uniqueness is global and failure-atomic, installed smoke rejects a
+  recorder crash, and the full recording test requires paced microphone audio
+  to produce a durable `source=me` utterance before graceful shutdown. The
+  focused gate passed 211 tests with 1 skip plus RecorderModelHarness; Ruff,
+  the 7,255-test full suite with 4 skips, review-marker verification, and the
+  native build passed. Post-gauntlet signing, installation, and installed-app
+  microphone smoke remain manual gates.
 
 ## Issues & Solutions
 
