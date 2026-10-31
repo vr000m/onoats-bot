@@ -2,6 +2,7 @@
 // authority; lifecycle status and UI telemetry only decorate that verdict.
 import AppKit
 import CoreAudio
+import Darwin
 import Foundation
 import SwiftUI
 
@@ -62,22 +63,52 @@ protocol SystemOps: AnyObject {
     func commandLine(_ pid: Int32) -> String?
     func readData(at url: URL) -> Data?
     func readText(at url: URL) -> String?
+    func readTail(at url: URL, maxBytes: Int) -> String?
     func write(_ data: Data, to url: URL) throws
+    func reserveFile(at url: URL) throws -> Bool
     func delete(at url: URL) throws
     func fileExists(at url: URL) -> Bool
     func isExecutable(at url: URL) -> Bool
+    func contentsOfDirectory(at url: URL) -> [URL]
+    func open(_ url: URL)
     func now() -> Date
     func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
         -> PollHandle
 }
 
+extension SystemOps {
+    func readTail(at url: URL, maxBytes: Int) -> String? {
+        guard maxBytes > 0, let data = readData(at: url) else { return nil }
+        return String(decoding: data.suffix(maxBytes), as: UTF8.self)
+    }
+    func contentsOfDirectory(at url: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])) ?? []
+    }
+    func reserveFile(at url: URL) throws -> Bool {
+        guard !fileExists(at: url) else { return false }
+        try write(Data(), to: url)
+        return true
+    }
+    func open(_ url: URL) { NSWorkspace.shared.open(url) }
+}
+
 private final class NativeProcessHandle: ProcessHandle {
     let process: Process
-    init(_ process: Process) { self.process = process }
+    private var output: FileHandle?
+    init(_ process: Process, output: FileHandle? = nil) {
+        self.process = process
+        self.output = output
+    }
     var pid: Int32 { process.processIdentifier }
     var isRunning: Bool { process.isRunning }
     var terminationStatus: Int32 { process.terminationStatus }
     func terminate() { process.terminate() }
+    func closeOutput() {
+        try? output?.close()
+        output = nil
+    }
 }
 
 private final class NativePollHandle: PollHandle {
@@ -93,32 +124,35 @@ final class NativeSystemOps: SystemOps {
         onExit: @escaping @MainActor (ProcessHandle) -> Void
     ) throws -> ProcessHandle {
         let process = Process()
-        let handle = NativeProcessHandle(process)
         process.executableURL = request.executable
         process.arguments = request.arguments
         process.environment = request.environment
+        var capturedOutput: FileHandle?
         if let log = request.appendOutputTo {
-            let manager = FileManager.default
-            try manager.createDirectory(
+            try FileManager.default.createDirectory(
                 at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if !manager.fileExists(atPath: log.path) {
-                guard manager.createFile(atPath: log.path, contents: nil) else {
-                    throw CocoaError(.fileWriteUnknown)
-                }
+            let descriptor = Darwin.open(
+                log.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            let output = try FileHandle(forWritingTo: log)
-            try output.seekToEnd()
+            let output = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+            capturedOutput = output
             process.standardOutput = output
             process.standardError = output
         }
+        let handle = NativeProcessHandle(process, output: capturedOutput)
         process.terminationHandler = { [weak handle] _ in
             guard let handle else { return }
+            handle.closeOutput()
             Task { @MainActor in onExit(handle) }
         }
         do {
             try process.run()
         } catch {
             process.terminationHandler = nil
+            handle.closeOutput()
             throw error
         }
         return handle
@@ -144,12 +178,45 @@ final class NativeSystemOps: SystemOps {
 
     func readData(at url: URL) -> Data? { try? Data(contentsOf: url) }
     func readText(at url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+    func readTail(at url: URL, maxBytes: Int) -> String? {
+        guard maxBytes > 0,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        do {
+            try handle.seek(toOffset: offset)
+            guard let data = try handle.read(upToCount: maxBytes) else { return nil }
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return nil
+        }
+    }
     func write(_ data: Data, to url: URL) throws { try data.write(to: url, options: .atomic) }
+    func reserveFile(at url: URL) throws -> Bool {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let descriptor = Darwin.open(
+            url.path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC,
+            S_IRUSR | S_IWUSR)
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+            return true
+        }
+        if errno == EEXIST { return false }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
     func delete(at url: URL) throws { try FileManager.default.removeItem(at: url) }
     func fileExists(at url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
     func isExecutable(at url: URL) -> Bool {
         FileManager.default.isExecutableFile(atPath: url.path)
     }
+    func contentsOfDirectory(at url: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])) ?? []
+    }
+    func open(_ url: URL) { NSWorkspace.shared.open(url) }
     func now() -> Date { Date() }
     func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
         -> PollHandle {
@@ -169,6 +236,11 @@ final class RecorderModel: ObservableObject {
     static let dataDirEnvironment = "ONOATS_DATA_DIR"
     static let dataDirArgument = "--data-dir"
     static let transcriptPreviewDefaultsKey = "showTranscriptPreview"
+    static let invalidCategoryErrorTag = "ONOATS-ERROR invalid-category"
+    static let runLogPrefix = "onoats-bot-"
+    static let runLogSuffix = ".log"
+    static let maxRunLogs = 10
+    static let categoryErrorTailBytes = 64 * 1024
 
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"
@@ -190,6 +262,10 @@ final class RecorderModel: ObservableObject {
     @Published var flushNote: String?
     @Published var stopRequested = false
     @Published private(set) var prestartDetail: String?
+    @Published private(set) var seminarConfigurationFailure = false
+    @Published private(set) var lastFailureWasAppOwned = false
+    @Published private(set) var mostRecentRunLogURL: URL?
+    @Published private(set) var mostRecentRunStartedAt: Date?
 
     @Published private(set) var meActivity: UiTelemetryActivity?
     @Published private(set) var themActivity: UiTelemetryActivity?
@@ -240,8 +316,19 @@ final class RecorderModel: ObservableObject {
     var cliAvailable: Bool { ops.isExecutable(at: URL(fileURLWithPath: cliPath)) }
     var capturerPath: String { Bundle.main.bundlePath + "/Contents/MacOS/onoats-capturer" }
     var dataDir: URL { nextDataDir }
-    private var logURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/Onoats/onoats-bot.log")
+    var logsDirectory: URL {
+        URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/Onoats", isDirectory: true)
+    }
+
+    var isOwnedSession: Bool {
+        if case .running(ours: true) = state { return true }
+        return proc != nil
+    }
+
+    var canOpenLogForCurrentSurface: Bool {
+        if isOwnedSession { return true }
+        if case .failed = state { return lastFailureWasAppOwned }
+        return false
     }
 
     static func resolveDataDir() -> URL {
@@ -372,6 +459,7 @@ final class RecorderModel: ObservableObject {
 
         if let handle = proc, handle.isRunning {
             if ownedPublication {
+                ownedRecorderPidWasPublished = true
                 prestartDetail = nil
                 if case .stopping = state {} else { state = .running(ours: true) }
             } else {
@@ -449,12 +537,29 @@ final class RecorderModel: ObservableObject {
         userRequestedStop = false
         flushNote = nil
         prestartDetail = nil
+        seminarConfigurationFailure = false
+        lastFailureWasAppOwned = false
+        ownedRecorderPidWasPublished = false
         setTelemetryAuthority(nil)
         let pinned = dataDirResolver()
         activeDataDir = pinned
         refreshDirectoryDisplays(configured: pinned)
         let attempt = ops.now()
         spawnedAt = attempt
+        let initialSpawnEpoch = Int64((attempt.timeIntervalSince1970 * 1000).rounded(.down))
+        let runLog: URL
+        do {
+            runLog = try reserveRunLog(startingAt: initialSpawnEpoch)
+        } catch {
+            spawnedAt = nil
+            activeDataDir = nil
+            activeDataDirDisplay = nil
+            lastFailureWasAppOwned = true
+            state = .failed(reason: "log-reservation-failed", detail: error.localizedDescription)
+            return
+        }
+        mostRecentRunLogURL = runLog
+        mostRecentRunStartedAt = attempt
         var environment = ProcessInfo.processInfo.environment
         environment["AUDIO_SOURCE"] = "socket"
         environment["ONOATS_CAPTURER_BIN"] = capturerPath
@@ -463,16 +568,19 @@ final class RecorderModel: ObservableObject {
         if seminarMode { p.arguments? += ["--category", Self.seminarCategory] }
         let request = ProcessRequest(
             executable: URL(fileURLWithPath: cliPath), arguments: p.arguments ?? ["bot"],
-            environment: environment, appendOutputTo: logURL)
+            environment: environment, appendOutputTo: runLog)
         do {
             let handle = try ops.spawn(request) { [weak self] handle in self?.handleExit(handle) }
             proc = handle
             state = .starting
+            pruneRunLogs()
         } catch {
             spawnedAt = nil
             activeDataDir = nil
             activeDataDirDisplay = nil
+            lastFailureWasAppOwned = true
             state = .failed(reason: "spawn-failed", detail: error.localizedDescription)
+            pruneRunLogs()
         }
     }
 
@@ -517,7 +625,7 @@ final class RecorderModel: ObservableObject {
     ) {
         let request = ProcessRequest(
             executable: URL(fileURLWithPath: cliPath), arguments: arguments,
-            environment: nil, appendOutputTo: logOwnedOutput ? logURL : nil)
+            environment: nil, appendOutputTo: logOwnedOutput ? mostRecentRunLogURL : nil)
         do {
             let handle = try ops.spawn(request) { [weak self] handle in
                 guard let self else { return }
@@ -551,9 +659,14 @@ final class RecorderModel: ObservableObject {
             var status = directory.flatMap { readStatus(under: $0) }
             if let value = status, let attempt = spawnedAt,
                value.start_time < attempt.timeIntervalSince1970 { status = nil }
+            let pidWasPublished = ownedRecorderPidWasPublished
+                || currentAttemptPublicationEvidence(handle: handle, directory: directory)
             state = .failed(
                 reason: status?.exit_reason ?? "exit code \(handle.terminationStatus)",
                 detail: status?.last_error)
+            lastFailureWasAppOwned = true
+            seminarConfigurationFailure = !pidWasPublished
+                && runLogTailContainsInvalidCategoryTag()
         }
         userRequestedStop = false
         seminarMode = false
@@ -562,6 +675,84 @@ final class RecorderModel: ObservableObject {
         activeDataDirDisplay = nil
         spawnedAt = nil
         refreshDirectoryDisplays(configured: dataDirResolver())
+    }
+
+    private var ownedRecorderPidWasPublished = false
+
+    private func currentAttemptPublicationEvidence(
+        handle: ProcessHandle, directory: URL?
+    ) -> Bool {
+        guard let directory, let attempt = spawnedAt,
+              let status = readStatus(under: directory)
+        else { return false }
+        return status.pid == handle.pid
+            && status.start_time >= attempt.timeIntervalSince1970
+            && !status.stt_label.isEmpty
+    }
+
+    private func reserveRunLog(startingAt initialEpoch: Int64) throws -> URL {
+        var epoch = initialEpoch
+        while true {
+            let candidate = logsDirectory.appendingPathComponent(
+                "\(Self.runLogPrefix)\(epoch)\(Self.runLogSuffix)")
+            if try ops.reserveFile(at: candidate) { return candidate }
+            guard epoch < Int64.max else { throw CocoaError(.fileWriteFileExists) }
+            epoch += 1
+        }
+    }
+
+    private func runLogEpoch(_ url: URL) -> Int64? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix(Self.runLogPrefix), name.hasSuffix(Self.runLogSuffix) else {
+            return nil
+        }
+        let start = name.index(name.startIndex, offsetBy: Self.runLogPrefix.count)
+        let end = name.index(name.endIndex, offsetBy: -Self.runLogSuffix.count)
+        return Int64(name[start..<end])
+    }
+
+    private func sortedRunLogsNewestFirst() -> [URL] {
+        ops.contentsOfDirectory(at: logsDirectory)
+            .compactMap { url -> (URL, Int64)? in
+                guard let epoch = runLogEpoch(url) else { return nil }
+                return (url, epoch)
+            }
+            .sorted {
+                if $0.1 != $1.1 { return $0.1 > $1.1 }
+                return $0.0.lastPathComponent > $1.0.lastPathComponent
+            }
+            .map(\.0)
+    }
+
+    private func pruneRunLogs() {
+        for url in sortedRunLogsNewestFirst().dropFirst(Self.maxRunLogs) {
+            try? ops.delete(at: url)
+        }
+    }
+
+    /// Resolves the one canonical Open Log target without opening it. When this
+    /// process has attempted a run, its in-memory path remains authoritative:
+    /// deletion falls back to the folder and never silently selects an older
+    /// run. A fresh launch may select the newest surviving run log.
+    func resolvedOpenLogURL() -> URL {
+        if let remembered = mostRecentRunLogURL {
+            return ops.fileExists(at: remembered) ? remembered : logsDirectory
+        }
+        return sortedRunLogsNewestFirst().first ?? logsDirectory
+    }
+
+    func openLog() {
+        ops.open(resolvedOpenLogURL())
+    }
+
+    func showLogsFolder() { ops.open(logsDirectory) }
+
+    private func runLogTailContainsInvalidCategoryTag() -> Bool {
+        guard let url = mostRecentRunLogURL,
+              let text = ops.readTail(at: url, maxBytes: Self.categoryErrorTailBytes) else {
+            return false
+        }
+        return text.components(separatedBy: .newlines).contains(Self.invalidCategoryErrorTag)
     }
 
     func setSTTService(_ service: String) {

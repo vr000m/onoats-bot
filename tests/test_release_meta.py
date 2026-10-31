@@ -22,6 +22,7 @@ from packaging.requirements import Requirement
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NATIVE_MAKEFILE = REPO_ROOT / "native" / "Makefile"
 MENUBAR_PLIST = REPO_ROOT / "native" / "onoats-menubar" / "Info.plist"
+RECORDER_HARNESS_SCRIPT = REPO_ROOT / "native" / "test_recorder_model.sh"
 
 NATIVE_RESOURCES = (
     "Onoats.icns",
@@ -200,6 +201,28 @@ def test_native_app_recreates_bundle_and_copies_each_resource_explicitly():
     assert not re.search(r"(?m)^\tcp\s+[^\n]*Resources/[^\s]*[*?]", app), (
         "resource assembly must not use a wildcard copy"
     )
+
+
+def test_native_build_and_model_harness_include_phase6_panel_sources():
+    """The app build picks up both panel destinations, while the model harness
+    remains an isolated model test and compiles every model dependency."""
+    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
+    assert (
+        "MENUBAR_SOURCES := $(wildcard $(MENUBAR_SRC_DIR)/Sources/*.swift)" in makefile
+    )
+    for name in ("RecordingPanelView.swift", "SettingsPanelView.swift"):
+        assert (REPO_ROOT / "native/onoats-menubar/Sources" / name).is_file(), name
+
+    harness = RECORDER_HARNESS_SCRIPT.read_text(encoding="utf-8")
+    for name in (
+        "AudioDevices.swift",
+        "ConfigStore.swift",
+        "LoginItemManager.swift",
+        "RecorderModel.swift",
+        "UiTelemetry.swift",
+    ):
+        assert name in harness
+    assert "CFFIXED_USER_HOME=" in harness and "HOME=" in harness
 
 
 def _run_resource_verifier(app: Path) -> subprocess.CompletedProcess[str]:

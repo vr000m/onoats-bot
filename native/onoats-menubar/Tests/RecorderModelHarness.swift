@@ -42,6 +42,9 @@ private final class FakeSystemOps: SystemOps {
     var processAliveCount = 0
     var commandLineCount = 0
     var telemetryReadCount = 0
+    var opened: [URL] = []
+    var deleted: [URL] = []
+    var tailReadLimits: [Int] = []
 
     func spawn(
         _ request: ProcessRequest,
@@ -49,6 +52,9 @@ private final class FakeSystemOps: SystemOps {
     ) throws -> ProcessHandle {
         if failSpawn { throw FakeSpawnError() }
         requests.append(request)
+        if let log = request.appendOutputTo, files[log.path] == nil {
+            files[log.path] = Data()
+        }
         let process = FakeProcess(pid: nextPid)
         nextPid += 1
         processes.append(process)
@@ -79,8 +85,23 @@ private final class FakeSystemOps: SystemOps {
         return files[url.path].flatMap { String(data: $0, encoding: .utf8) }
     }
     func write(_ data: Data, to url: URL) throws { files[url.path] = data }
-    func delete(at url: URL) throws { files[url.path] = nil }
+    func delete(at url: URL) throws {
+        deleted.append(url)
+        files[url.path] = nil
+    }
     func fileExists(at url: URL) -> Bool { files[url.path] != nil }
+    func contentsOfDirectory(at url: URL) -> [URL] {
+        files.keys.compactMap { path in
+            let candidate = URL(fileURLWithPath: path)
+            return candidate.deletingLastPathComponent().path == url.path ? candidate : nil
+        }
+    }
+    func readTail(at url: URL, maxBytes: Int) -> String? {
+        tailReadLimits.append(maxBytes)
+        guard let data = files[url.path] else { return nil }
+        return String(decoding: data.suffix(maxBytes), as: UTF8.self)
+    }
+    func open(_ url: URL) { opened.append(url) }
     func isExecutable(at url: URL) -> Bool { executable }
     func now() -> Date { nowValue }
     func schedule(
@@ -328,6 +349,8 @@ private func testExternalRoutingAndPidReuse(_ root: URL) throws {
     let model = makeModel(ops, suite: "onoats.harness.external", directory: choice)
     try require(model.state == .running(ours: false), "external PID was not discovered")
     try require(model.activeDataDir == directory, "external identity directory was not pinned")
+    try require(!model.canOpenLogForCurrentSurface,
+                "external session exposed an app-owned Open Log action")
 
     choice.url = next
     model.refresh()
@@ -353,6 +376,8 @@ private func testPrestartDetailBoundaries(_ root: URL) throws {
     let ops = FakeSystemOps()
     let model = makeModel(ops, suite: "onoats.harness.prestart", directory: choice)
     model.start()
+    try require(model.canOpenLogForCurrentSurface,
+                "app-owned starting surface did not expose its run log")
     let supervisor = ops.processes[0]
 
     try ops.putJSON(
@@ -452,10 +477,326 @@ private func testTelemetryNeverControlsLiveness(_ root: URL) throws {
     try require(model.categoryUnavailable, "external category did not degrade neutrally")
 }
 
+@MainActor
+private func testPanelTelemetryPresentationInputs(_ root: URL) throws {
+    let directory = root.appendingPathComponent("panel-telemetry")
+    let ops = FakeSystemOps()
+    let now = ops.nowValue.timeIntervalSince1970
+    putPid(ops, directory: directory, pid: 92, epoch: 50)
+    try ops.putJSON(status(pid: 92, epoch: 50), active(directory, "onoats.status.json"))
+    var snapshot = telemetry(pid: 92, epoch: 50, now: now)
+    var audio = snapshot["audio"] as! [String: [String: Any]]
+    audio["me"]?["observed_at"] =
+        now - UiTelemetryContract.audioObservationExpirySeconds - 0.001
+    snapshot["audio"] = audio
+    snapshot["stt"] = [
+        "me": ["state": "recovering", "detail": "reconnecting"],
+        "them": ["state": "ready", "detail": NSNull()],
+        "aggregate": "recovering",
+    ]
+    try ops.putJSON(snapshot, active(directory, "onoats.ui.json"))
+
+    let model = makeModel(
+        ops, suite: "onoats.harness.panel-telemetry", directory: DirectoryChoice(directory))
+    model.setTranscriptPreviewEnabled(true)
+    model.refreshTelemetry()
+    try require(model.meActivity == nil, "stale Me observation did not become No signal")
+    try require(model.themActivity?.level == 0.75, "fresh Them observation was lost")
+    try require(model.aggregateStt == .recovering, "aggregate STT state was lost")
+    try require(model.meStt?.detail == "reconnecting", "unhealthy branch detail was lost")
+    try require(model.themStt?.state == .ready, "healthy branch detail was corrupted")
+    try require(model.transcriptPreview?.source == "them", "preview source was lost")
+
+    ops.files[active(directory, "onoats.ui.json").path] = nil
+    model.refreshTelemetry()
+    try require(!model.telemetryAvailable, "missing external telemetry stayed available")
+    try require(model.audioSource == "socket", "status source disappeared with telemetry")
+    try require(model.categoryUnavailable, "missing external category was inferred")
+}
+
+@MainActor
+private func testOwnedSeminarBadgeSurvivesTelemetryLoss(_ root: URL) throws {
+    let directory = root.appendingPathComponent("owned-seminar")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.owned-seminar", directory: DirectoryChoice(directory))
+    model.seminarMode = true
+    model.start()
+    let process = ops.processes[0]
+    let epoch = ops.nowValue.timeIntervalSince1970
+    putPid(ops, directory: directory, pid: process.pid, epoch: epoch)
+    try ops.putJSON(status(pid: process.pid, epoch: epoch),
+                    active(directory, "onoats.status.json"))
+    model.refresh()
+    model.refreshTelemetry()
+    try require(model.state == .running(ours: true), "owned recorder was not claimed")
+    try require(!model.telemetryAvailable, "test unexpectedly had telemetry")
+    try require(model.categoryForDisplay == RecorderModel.seminarCategory,
+                "owned Seminar lock depended on telemetry")
+}
+
+@MainActor
+private func testMissingCliDisablesStart(_ root: URL) throws {
+    let ops = FakeSystemOps()
+    ops.executable = false
+    let model = makeModel(
+        ops, suite: "onoats.harness.missing-cli",
+        directory: DirectoryChoice(root.appendingPathComponent("missing-cli")))
+    try require(!model.cliAvailable, "unresolvable CLI was reported available")
+    model.start()
+    try require(ops.requests.isEmpty, "Start spawned an unresolvable CLI")
+    try require(model.state == .stopped, "missing CLI changed recorder state")
+}
+
+@MainActor
+private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
+    let directory = root.appendingPathComponent("logs-data")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.logs", directory: DirectoryChoice(directory))
+    let logs = root.standardizedFileURL.appendingPathComponent(
+        "Library/Logs/Onoats", isDirectory: true)
+    let unrelated = logs.appendingPathComponent("keep-me.txt")
+    ops.put("unrelated", unrelated)
+    var runLogs: [URL] = []
+
+    for index in 0..<11 {
+        ops.nowValue = Date(timeIntervalSince1970: 1_700_000_000 + Double(index))
+        model.start()
+        guard let log = ops.requests.last?.appendOutputTo else {
+            throw HarnessFailure(description: "owned Start did not capture a run log")
+        }
+        runLogs.append(log)
+        try require(log.lastPathComponent == "onoats-bot-\(1_700_000_000_000 + index * 1000).log",
+                    "run log name is not the Start-attempt epoch milliseconds")
+        model.flush()
+        try require(ops.requests.last?.appendOutputTo == log,
+                    "owned Flush did not append to the active run log")
+        ops.finish(ops.processes[ops.processes.count - 2], status: 0)
+    }
+
+    try require(!ops.fileExists(at: runLogs[0]), "11th run did not prune the oldest log")
+    try require(runLogs.dropFirst().allSatisfy { ops.fileExists(at: $0) },
+                "pruning removed one of the newest ten run logs")
+    try require(ops.fileExists(at: unrelated), "pruning deleted an unrelated file")
+    try require(ops.deleted == [runLogs[0]], "pruning touched more than the oldest run log")
+
+    // External commands are never appended to an app-owned run log.
+    let externalOps = FakeSystemOps()
+    putPid(externalOps, directory: directory, pid: 77, epoch: 10)
+    let external = makeModel(
+        externalOps, suite: "onoats.harness.logs-external",
+        directory: DirectoryChoice(directory))
+    external.flush()
+    try require(externalOps.requests.last?.appendOutputTo == nil,
+                "external Flush was written to an app-owned run log")
+    external.stopExternal()
+    try require(externalOps.requests.last?.appendOutputTo == nil,
+                "external Stop was written to an app-owned run log")
+}
+
+@MainActor
+private func testRunLogCollisionReservesFreshPath(_ root: URL) throws {
+    let directory = root.appendingPathComponent("collision-data")
+    let ops = FakeSystemOps()
+    ops.nowValue = Date(timeIntervalSince1970: 1_700_000_000)
+    let logs = root.standardizedFileURL.appendingPathComponent(
+        "Library/Logs/Onoats", isDirectory: true)
+    let stale = logs.appendingPathComponent("onoats-bot-1700000000000.log")
+    let expected = logs.appendingPathComponent("onoats-bot-1700000000001.log")
+    let staleContents = "stale\n\(RecorderModel.invalidCategoryErrorTag)\n"
+    ops.put(staleContents, stale)
+    let unrelated = logs.appendingPathComponent("onoats-bot-1700000000000.log.saved")
+    ops.put("keep", unrelated)
+
+    let model = makeModel(
+        ops, suite: "onoats.harness.log-collision", directory: DirectoryChoice(directory))
+    model.seminarMode = true
+    model.start()
+    let process = ops.processes[0]
+    guard let reserved = ops.requests[0].appendOutputTo else {
+        throw HarnessFailure(description: "colliding Start did not reserve a run log")
+    }
+    try require(reserved == expected,
+                "colliding Start reserved \(reserved.path), expected \(expected.path)")
+    try require(ops.readText(at: stale) == staleContents,
+                "colliding Start truncated or rewrote the stale run log")
+    try require(ops.fileExists(at: unrelated),
+                "collision handling touched a non-matching log-like file")
+
+    // The stale tag belongs to the previous run and must not classify this exit.
+    ops.finish(process, status: 2)
+    try require(!model.seminarConfigurationFailure,
+                "a stale colliding log classified the new Start failure")
+    try require(ops.fileExists(at: stale), "the stale collision file was deleted")
+    try require(ops.fileExists(at: unrelated), "pruning deleted a non-run-log file")
+}
+
+@MainActor
+private func testNativeAppendIsAtomicAcrossSeparateWriters(_ root: URL) throws {
+    let log = root.appendingPathComponent("atomic-append/onoats-bot-1.log")
+    let ops = NativeSystemOps()
+    let recorderLine = "RECORDER-COMPLETE-" + String(repeating: "r", count: 4096) + "\n"
+    let auxiliaryLine = "AUXILIARY-COMPLETE-" + String(repeating: "a", count: 4096) + "\n"
+    let harness = URL(fileURLWithPath: CommandLine.arguments[0])
+    let recorder = try ops.spawn(
+        ProcessRequest(
+            executable: harness,
+            arguments: ["--append-writer", "0.2", recorderLine],
+            environment: nil, appendOutputTo: log),
+        onExit: { _ in })
+    let auxiliary = try ops.spawn(
+        ProcessRequest(
+            executable: harness,
+            arguments: ["--append-writer", "0", auxiliaryLine],
+            environment: nil, appendOutputTo: log),
+        onExit: { _ in })
+
+    let deadline = Date().addingTimeInterval(3)
+    while (recorder.isRunning || auxiliary.isRunning) && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    try require(!recorder.isRunning && !auxiliary.isRunning,
+                "concurrent append regression exceeded its bounded deadline")
+    try require(recorder.terminationStatus == 0 && auxiliary.terminationStatus == 0,
+                "concurrent append fixture writer failed")
+    let contents = try String(contentsOf: log, encoding: .utf8)
+    try require(contents.components(separatedBy: recorderLine).count == 2,
+                "recorder output was overwritten or split by the auxiliary writer")
+    try require(contents.components(separatedBy: auxiliaryLine).count == 2,
+                "auxiliary output was overwritten or split by the recorder writer")
+    try require(contents.utf8.count == recorderLine.utf8.count + auxiliaryLine.utf8.count,
+                "concurrent writers left truncated or interleaved output")
+}
+
+@MainActor
+private func testOpenLogResolution(_ root: URL) throws {
+    let directory = root.appendingPathComponent("open-log-data")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.open-log", directory: DirectoryChoice(directory))
+    model.start()
+    let remembered = ops.requests[0].appendOutputTo!
+    let folder = remembered.deletingLastPathComponent()
+    ops.finish(ops.processes[0], status: 0)
+    model.openLog()
+    try require(ops.opened.last == remembered, "in-process Open Log lost its run path")
+
+    ops.files[remembered.path] = nil
+    let older = folder.appendingPathComponent("onoats-bot-100.log")
+    ops.put("old", older)
+    model.openLog()
+    try require(ops.opened.last == folder,
+                "missing in-memory run log scanned an older file instead of opening folder")
+
+    let newest = folder.appendingPathComponent("onoats-bot-999.log")
+    ops.put("new", newest)
+    let relaunched = makeModel(
+        ops, suite: "onoats.harness.open-log-relaunch", directory: DirectoryChoice(directory))
+    relaunched.openLog()
+    try require(ops.opened.last == newest, "fresh launch did not resolve newest surviving log")
+    relaunched.showLogsFolder()
+    try require(ops.opened.last == folder, "Show Logs Folder did not open canonical folder")
+}
+
+@MainActor
+private func invalidCategoryCase(
+    _ root: URL, suite: String, exit: Int32, contents: String,
+    publication: String? = nil, refreshAfterPublication: Bool = true,
+    removePidBeforeExit: Bool = false
+) throws -> (RecorderModel, FakeSystemOps) {
+    let directory = root.appendingPathComponent(suite)
+    let ops = FakeSystemOps()
+    let model = makeModel(ops, suite: suite, directory: DirectoryChoice(directory))
+    model.seminarMode = true
+    model.start()
+    let process = ops.processes[0]
+    guard let log = ops.requests[0].appendOutputTo else {
+        throw HarnessFailure(description: "invalid-category run has no log")
+    }
+    ops.put(contents, log)
+    if let publication {
+        let attempt = ops.nowValue.timeIntervalSince1970
+        let pid = publication == "foreign" ? process.pid + 1 : process.pid
+        let epoch = publication == "stale" ? attempt - 1 : attempt
+        putPid(ops, directory: directory, pid: pid, epoch: epoch)
+        try ops.putJSON(status(pid: pid, epoch: epoch),
+                        active(directory, "onoats.status.json"))
+        if refreshAfterPublication { model.refresh() }
+        if removePidBeforeExit { removePid(ops, directory: directory, pid: pid) }
+    }
+    ops.finish(process, status: exit)
+    return (model, ops)
+}
+
+@MainActor
+private func testInvalidCategoryStableTagMatrix(_ root: URL) throws {
+    let tag = RecorderModel.invalidCategoryErrorTag
+    let (matched, matchedOps) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-match", exit: 2,
+        contents: "prefix\n\(tag)\n")
+    try require(matched.seminarConfigurationFailure,
+                "tagged nonzero pre-publication exit was not classified")
+    try require(matched.canOpenLogForCurrentSurface,
+                "failed app-owned Start did not expose Open Log")
+    try require((1...65_536).contains(RecorderModel.categoryErrorTailBytes),
+                "log tail bound is missing or unreasonably large")
+    try require(matchedOps.tailReadLimits == [RecorderModel.categoryErrorTailBytes],
+                "failure did not read exactly one bounded log tail")
+
+    let (zero, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-zero", exit: 0, contents: tag)
+    try require(!zero.seminarConfigurationFailure, "zero exit matched invalid-category tag")
+
+    let (published, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-published", exit: 2,
+        contents: tag, publication: "current")
+    try require(!published.seminarConfigurationFailure,
+                "a run that published a recorder PID matched the pre-PID failure")
+
+    let (publishedThenExited, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-publish-exit-race", exit: 2,
+        contents: tag, publication: "current", refreshAfterPublication: false,
+        removePidBeforeExit: true)
+    try require(!publishedThenExited.seminarConfigurationFailure,
+                "recorder status was missed after teardown removed its PID before the exit callback")
+
+    let (stalePublication, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-stale-publication", exit: 2,
+        contents: tag, publication: "stale", refreshAfterPublication: false)
+    try require(stalePublication.seminarConfigurationFailure,
+                "stale publication suppressed a true pre-PID invalid-category failure")
+
+    let (foreignPublication, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-foreign-publication", exit: 2,
+        contents: tag, publication: "foreign", refreshAfterPublication: false)
+    try require(foreignPublication.seminarConfigurationFailure,
+                "foreign publication suppressed a true pre-PID invalid-category failure")
+
+    let (missing, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-missing", exit: 2,
+        contents: "--category must be one of: seminars")
+    try require(!missing.seminarConfigurationFailure,
+                "human prose was used as machine interface")
+
+    let (outsideTail, _) = try invalidCategoryCase(
+        root, suite: "onoats.harness.invalid-tag-old", exit: 2,
+        contents: tag + "\n" + String(repeating: "x", count: 70_000))
+    try require(!outsideTail.seminarConfigurationFailure,
+                "tag outside bounded tail was accepted")
+}
+
 @main
 struct RecorderModelHarness {
     @MainActor
     static func main() throws {
+        if CommandLine.arguments.count == 4,
+           CommandLine.arguments[1] == "--append-writer",
+           let delay = TimeInterval(CommandLine.arguments[2]) {
+            Thread.sleep(forTimeInterval: delay)
+            FileHandle.standardOutput.write(Data(CommandLine.arguments[3].utf8))
+            return
+        }
         guard CommandLine.arguments.count == 2 else {
             throw HarnessFailure(description: "usage: harness <isolated-home>")
         }
@@ -467,6 +808,14 @@ struct RecorderModelHarness {
         try testExternalRoutingAndPidReuse(root)
         try testPrestartDetailBoundaries(root)
         try testTelemetryNeverControlsLiveness(root)
+        try testPanelTelemetryPresentationInputs(root)
+        try testOwnedSeminarBadgeSurvivesTelemetryLoss(root)
+        try testMissingCliDisablesStart(root)
+        try testPerRunLogsPruningAndOwnedRouting(home)
+        try testNativeAppendIsAtomicAcrossSeparateWriters(home)
+        try testOpenLogResolution(home)
+        try testInvalidCategoryStableTagMatrix(root)
+        try testRunLogCollisionReservesFreshPath(home)
         try testPollingDiscipline(root)
         try testModelDeallocation(root)
         for suite in [
@@ -475,6 +824,16 @@ struct RecorderModelHarness {
             "onoats.harness.prestart-publication", "onoats.harness.telemetry",
             "onoats.harness.polling", "onoats.harness.deallocation-complete",
             "onoats.harness.deallocation-failed",
+            "onoats.harness.panel-telemetry", "onoats.harness.owned-seminar",
+            "onoats.harness.missing-cli", "onoats.harness.logs",
+            "onoats.harness.logs-external", "onoats.harness.open-log",
+            "onoats.harness.log-collision", "onoats.harness.open-log-relaunch",
+            "onoats.harness.invalid-tag-match",
+            "onoats.harness.invalid-tag-zero", "onoats.harness.invalid-tag-published",
+            "onoats.harness.invalid-tag-publish-exit-race",
+            "onoats.harness.invalid-tag-stale-publication",
+            "onoats.harness.invalid-tag-foreign-publication",
+            "onoats.harness.invalid-tag-missing", "onoats.harness.invalid-tag-old",
         ] { cleanupSuite(suite) }
         print("RecorderModelHarness: ok")
     }

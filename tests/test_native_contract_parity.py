@@ -43,6 +43,12 @@ FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.sw
 SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
 UI_TELEMETRY = REPO / "native" / "onoats-menubar" / "Sources" / "UiTelemetry.swift"
 MENU_BAR_APP = REPO / "native" / "onoats-menubar" / "Sources" / "OnoatsMenuBarApp.swift"
+RECORDING_PANEL = (
+    REPO / "native" / "onoats-menubar" / "Sources" / "RecordingPanelView.swift"
+)
+SETTINGS_PANEL = (
+    REPO / "native" / "onoats-menubar" / "Sources" / "SettingsPanelView.swift"
+)
 UI_FIXTURES = REPO / "tests" / "fixtures" / "ui_telemetry"
 
 
@@ -91,6 +97,43 @@ def test_status_file_relative_path_matches_swift():
         r'appendingPathComponent\("(\.active/onoats\.status\.json)"\)', RECORDER_MODEL
     )
     assert swift == python_rel
+
+
+def test_recorder_publication_status_is_distinct_from_prestart_status(
+    tmp_path: Path,
+):
+    from onoats.status import (
+        read_status,
+        write_prestart_failure,
+        write_prestart_waiting,
+        write_running,
+    )
+
+    write_prestart_waiting(tmp_path, audio_source="socket", note="waiting")
+    waiting = read_status(tmp_path)
+    assert waiting is not None and waiting.stt_label == ""
+
+    write_prestart_failure(
+        tmp_path,
+        audio_source="socket",
+        exit_reason="capturer-exited",
+        last_error="failed before recorder startup",
+    )
+    failure = read_status(tmp_path)
+    assert failure is not None and failure.stt_label == ""
+
+    write_running(
+        tmp_path,
+        pid=4242,
+        audio_source="socket",
+        stt_label="websocket",
+        start_time=100.0,
+    )
+    recorder = read_status(tmp_path)
+    assert recorder is not None and recorder.stt_label == "websocket"
+
+    swift = RECORDER_MODEL.read_text(encoding="utf-8")
+    assert "&& !status.stt_label.isEmpty" in swift
 
 
 def test_pid_marker_and_path_match_swift():
@@ -695,6 +738,16 @@ def test_swift_model_pins_data_directory_contract():
     )
 
 
+def test_invalid_category_machine_tag_matches_swift():
+    """The GUI may branch only on the CLI's stable tag, never its prose."""
+    from onoats.categories import INVALID_CATEGORY_ERROR_TAG
+
+    swift = _extract(
+        r'invalidCategoryErrorTag\s*(?::[^=]+)?=\s*"([^"]+)"', RECORDER_MODEL
+    )
+    assert swift == INVALID_CATEGORY_ERROR_TAG
+
+
 def test_swift_telemetry_consumer_has_no_network_probe():
     for path in (UI_TELEMETRY, RECORDER_MODEL):
         text = path.read_text(encoding="utf-8")
@@ -734,3 +787,154 @@ def test_menu_bar_uses_distinct_template_images_for_every_recorder_state():
     assert "OnoatsHeader" not in swift.split("MenuBarExtra", 1)[1].split("}", 1)[0], (
         "the full-colour header mark must not be used as the menu-bar glyph"
     )
+
+
+# --- window-style recording panel contracts (menu-bar Phase 6) ------------
+
+
+def _panel_sources() -> tuple[str, str, str]:
+    assert RECORDING_PANEL.is_file(), "RecordingPanelView.swift is missing"
+    assert SETTINGS_PANEL.is_file(), "SettingsPanelView.swift is missing"
+    return (
+        MENU_BAR_APP.read_text(encoding="utf-8"),
+        RECORDING_PANEL.read_text(encoding="utf-8"),
+        SETTINGS_PANEL.read_text(encoding="utf-8"),
+    )
+
+
+def test_menu_bar_opens_window_style_fixed_width_recording_panel():
+    app, recording, _ = _panel_sources()
+    assert ".menuBarExtraStyle(.window)" in app
+    assert re.search(r"ControlPanelRoot\s*\(", app)
+    assert re.search(r"RecordingPanelView\s*\(", app)
+    width = re.search(r"\.frame\s*\(\s*width:\s*(\d+(?:\.\d+)?)", recording)
+    assert width, "the main panel must declare a stable fixed width"
+    assert 280 <= float(width.group(1)) <= 480
+
+
+def test_recording_panel_keeps_primary_actions_and_live_distinctions_visible():
+    _, recording, _ = _panel_sources()
+    for label in (
+        "Start",
+        "Stop",
+        "Seminar",
+        "Flush",
+        "Me",
+        "Them",
+        "No signal",
+        "STT",
+        "Category unavailable",
+        "started outside the menu bar",
+        "Recording to:",
+        "Next recording:",
+    ):
+        assert label in recording, f"main panel lost {label!r}"
+
+    # Start/Stop are the one prominent, full-width action; Flush remains
+    # secondary. Enablement stays tied to the existing model authorities.
+    assert recording.count(".buttonStyle(.borderedProminent)") >= 1
+    assert ".frame(maxWidth: .infinity)" in recording
+    assert re.search(r"\.disabled\s*\(\s*!model\.cliAvailable\s*\)", recording)
+    assert re.search(r"\.disabled\s*\(\s*model\.stopRequested\s*\)", recording)
+    assert "model.categoryUnavailable" in recording
+    assert "model.activeDataDirDisplay" in recording
+    assert "model.nextDataDirDisplay" in recording
+    assert "model.aggregateStt" in recording
+    assert "model.meStt" in recording and "model.themStt" in recording
+    assert "model.transcriptPreview" in recording
+
+
+def test_settings_panel_preserves_every_existing_control_and_diagnostics():
+    app, _, settings = _panel_sources()
+    assert re.search(r"SettingsPanelView\s*\(", app)
+    for label in (
+        "Microphone",
+        "System output",
+        "Configured service",
+        "Open config.toml",
+        "Data Directory",
+        "transcript preview",
+        "Diagnostics",
+        "Open Log",
+        "Show Logs Folder",
+        "CLI",
+        "Active",
+        "Next recording",
+        "Quit Onoats",
+        "Stop & Quit Onoats",
+        "Changes apply on next Start",
+    ):
+        assert label in settings, f"settings panel lost {label!r}"
+
+    assert "model.openLog" in settings
+    assert "model.showLogsFolder" in settings
+    assert "model.openConfig" in settings
+    assert "model.chooseDataDir" in settings
+    assert "model.setTranscriptPreviewEnabled" in settings
+    assert "model.setSTTService" in settings
+
+    # Configuration shows the selected service only. Endpoint composition and
+    # resolution stay in config.toml/Python; the panel must not grow an editor.
+    forbidden = ("ws_socket", "ws_uri", "ws_host", "ws_port", "endpoint editor")
+    assert not any(value in settings for value in forbidden)
+
+
+def test_next_start_caption_is_scoped_to_deferred_configuration_controls():
+    _, _, settings = _panel_sources()
+    audio = settings.index('GroupBox("Audio")')
+    speech = settings.index('GroupBox("Speech to text")')
+    storage = settings.index('GroupBox("Storage and privacy")')
+    diagnostics = settings.index('Button("Diagnostics')
+
+    # Two call sites plus the shared caption declaration: STT and storage are
+    # deferred recorder configuration, while microphone and preview apply now.
+    assert settings.count("appliesNextStart") == 3
+    assert "appliesNextStart" not in settings[audio:speech]
+    assert settings[speech:storage].count("appliesNextStart") == 1
+    assert settings[storage:diagnostics].count("appliesNextStart") == 1
+    assert "Microphone changes update the macOS system default immediately" in settings
+    assert "Transcript preview visibility updates immediately" in settings
+
+
+def test_panel_keyboard_focus_and_icon_accessibility_contracts_are_explicit():
+    app, recording, settings = _panel_sources()
+    combined = app + recording + settings
+    assert ".onExitCommand" in app
+    assert ".focused(" in combined
+    assert "FocusState" in combined
+    assert ".defaultAction" in recording
+    assert re.search(r"\.accessibilityLabel\s*\(", combined)
+    assert re.search(r"\.help\s*\(", combined)
+    for action in ("Start", "Stop", "Seminar", "Flush", "Settings", "Back"):
+        assert action in combined, f"focusable action {action!r} is absent"
+
+
+def test_warning_region_is_bounded_and_panel_does_not_render_log_contents():
+    _, recording, settings = _panel_sources()
+    assert "hintCaptionLines" in recording
+    assert re.search(r"maxHeight\s*:\s*\d+", recording), (
+        "warning/failure text must have a bounded wrapping region"
+    )
+    assert re.search(r"\.fixedSize\s*\(\s*horizontal:\s*false", recording)
+
+    combined = recording + settings
+    forbidden = (
+        "String(contentsOf:",
+        "readToEnd",
+        "readDataToEndOfFile",
+        "TextEditor(",
+        "logTail",
+        "logContents",
+    )
+    assert not any(token in combined for token in forbidden), (
+        "the panel may open logs but must never read or render their contents"
+    )
+
+
+def test_warning_log_actions_preserve_owned_external_distinction():
+    _, recording, _ = _panel_sources()
+    assert "model.canOpenLogForCurrentSurface" in recording
+    assert "Log not captured (started outside the menu bar)" in recording
+    assert re.search(r"if\s+model\.canOpenLogForCurrentSurface", recording)
+    assert "model.seminarConfigurationFailure" in recording
+    assert "Seminar needs 'seminars' in config.toml [categories]" in recording

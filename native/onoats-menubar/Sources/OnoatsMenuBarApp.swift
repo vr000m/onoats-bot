@@ -58,11 +58,12 @@ struct OnoatsMenuBarApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(model: model, launch: launch)
+            ControlPanelRoot(model: model, launch: launch)
         } label: {
             Image(nsImage: menuImage)
                 .accessibilityLabel("Onoats")
         }
+        .menuBarExtraStyle(.window)
     }
 
     private var menuImageName: String {
@@ -96,6 +97,33 @@ struct OnoatsMenuBarApp: App {
         }
         image.isTemplate = true
         return image
+    }
+}
+
+private enum PanelDestination {
+    case recording
+    case settings
+}
+
+struct ControlPanelRoot: View {
+    @ObservedObject var model: RecorderModel
+    @ObservedObject var launch: LaunchState
+    @Environment(\.dismiss) private var dismiss
+    @State private var destination: PanelDestination = .recording
+
+    var body: some View {
+        Group {
+            switch destination {
+            case .recording:
+                RecordingPanelView(model: model, launch: launch) {
+                    destination = .settings
+                }
+            case .settings:
+                SettingsPanelView(model: model) { destination = .recording }
+            }
+        }
+        .frame(width: 360)
+        .onExitCommand { dismiss() }
     }
 }
 

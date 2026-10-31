@@ -486,7 +486,7 @@ sequenceDiagram
 - [x] Phase 3: Accepted Review Remediation for Completed Runtime Work
 - [x] Phase 4: Swift Telemetry Consumer
 - [x] Phase 5: Native Resource Pipeline and Stateful Menu Icon
-- [ ] Phase 6: Window-Style Recording Panel and In-Panel Settings
+- [x] Phase 6: Window-Style Recording Panel and In-Panel Settings
 - [ ] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
 
 ## Findings
@@ -523,6 +523,12 @@ sequenceDiagram
   bundle validation. Missing and unexpected resource probes both failed as
   required. Its one-shot reviewer found two rollback-boundary defects, both
   fixed before the phase boundary.
+- 2026-10-30 — Phase 6 replaced the flat menu with the window-style recording
+  panel, in-panel settings/diagnostics, per-run logs, and bounded stable-tag
+  diagnostics. The native harness, 75 focused tests, Ruff checks, and the
+  native build passed. Its one-shot reviewer found four lifecycle, logging,
+  append, and wording defects; all were fixed before the phase boundary. The
+  interaction, VoiceOver, and visual matrix remains a post-gauntlet manual gate.
 
 ## Issues & Solutions
 
@@ -547,6 +553,13 @@ sequenceDiagram
   staged installer now defaults to clean-install mode and clears stale approval;
   archive creation requires explicit expected requirement and cdhash evidence,
   while approved mode fails closed before removing the installed app.
+- A recorder can publish and tear down between menu polls; teardown removes the
+  PID file before process exit. Exit classification now accepts only matching
+  current-attempt, recorder-written status evidence, identified by the
+  non-empty STT label that distinguishes it from the pre-recorder sentinel.
+- Run logs are reserved with exclusive creation and all process writers use
+  kernel `O_APPEND`, preventing timestamp collisions, stale-tag reuse, and
+  separate recorder/Flush descriptors from overwriting one another.
 
 ## Final Results
 
