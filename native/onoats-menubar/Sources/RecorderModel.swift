@@ -67,7 +67,7 @@ protocol SystemOps: AnyObject {
     func readTail(at url: URL, maxBytes: Int) -> String?
     func write(_ data: Data, to url: URL) throws
     func reserveFile(at url: URL) throws -> Bool
-    func delete(at url: URL) throws
+    func deleteRegularFile(at url: URL) throws
     func fileExists(at url: URL) -> Bool
     func isRegularFile(at url: URL) -> Bool
     func isExecutable(at url: URL) -> Bool
@@ -185,9 +185,21 @@ final class NativeSystemOps: SystemOps {
     }
 
     func readData(at url: URL) -> Data? { try? Data(contentsOf: url) }
+    private func openRegularFile(at url: URL) -> FileHandle? {
+        let descriptor = Darwin.open(
+            url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { return nil }
+        var metadata = Darwin.stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG else {
+            Darwin.close(descriptor)
+            return nil
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
     func readData(at url: URL, maxBytes: Int) -> Data? {
         guard maxBytes > 0,
-              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+              let handle = openRegularFile(at: url) else { return nil }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd(), size <= UInt64(maxBytes) else { return nil }
         do {
@@ -200,7 +212,7 @@ final class NativeSystemOps: SystemOps {
     func readText(at url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
     func readTail(at url: URL, maxBytes: Int) -> String? {
         guard maxBytes > 0,
-              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+              let handle = openRegularFile(at: url) else { return nil }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd() else { return nil }
         let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
@@ -226,7 +238,20 @@ final class NativeSystemOps: SystemOps {
         if errno == EEXIST { return false }
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
-    func delete(at url: URL) throws {
+    func deleteRegularFile(at url: URL) throws {
+        guard let handle = openRegularFile(at: url) else {
+            throw POSIXError(.EINVAL)
+        }
+        defer { try? handle.close() }
+        var opened = Darwin.stat()
+        var current = Darwin.stat()
+        guard Darwin.fstat(handle.fileDescriptor, &opened) == 0,
+              Darwin.lstat(url.path, &current) == 0,
+              opened.st_dev == current.st_dev,
+              opened.st_ino == current.st_ino,
+              current.st_mode & S_IFMT == S_IFREG else {
+            throw POSIXError(.EINVAL)
+        }
         guard Darwin.unlink(url.path) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
@@ -296,6 +321,7 @@ final class RecorderModel: ObservableObject {
     @Published private(set) var seminarConfigurationFailure = false
     @Published private(set) var lastFailureWasAppOwned = false
     @Published private(set) var mostRecentRunLogURL: URL?
+    private var runLogReservationAttempted = false
     @Published private(set) var mostRecentRunStartedAt: Date?
 
     @Published private(set) var meActivity: UiTelemetryActivity?
@@ -579,6 +605,9 @@ final class RecorderModel: ObservableObject {
         refreshDirectoryDisplays(configured: pinned)
         let attempt = ops.now()
         spawnedAt = attempt
+        runLogReservationAttempted = true
+        mostRecentRunLogURL = nil
+        mostRecentRunStartedAt = nil
         let initialSpawnEpoch = Int64((attempt.timeIntervalSince1970 * 1000).rounded(.down))
         let runLog: URL
         do {
@@ -760,8 +789,15 @@ final class RecorderModel: ObservableObject {
     }
 
     private func pruneRunLogs() {
-        for url in sortedRunLogsNewestFirst().dropFirst(Self.maxRunLogs) {
-            try? ops.delete(at: url)
+        let active = mostRecentRunLogURL?.standardizedFileURL
+        var remainingHistorical = Self.maxRunLogs - (active == nil ? 0 : 1)
+        for url in sortedRunLogsNewestFirst() {
+            if url.standardizedFileURL == active { continue }
+            if remainingHistorical > 0 {
+                remainingHistorical -= 1
+            } else {
+                try? ops.deleteRegularFile(at: url)
+            }
         }
     }
 
@@ -773,6 +809,7 @@ final class RecorderModel: ObservableObject {
         if let remembered = mostRecentRunLogURL {
             return ops.isRegularFile(at: remembered) ? remembered : logsDirectory
         }
+        if runLogReservationAttempted { return logsDirectory }
         return sortedRunLogsNewestFirst().first ?? logsDirectory
     }
 
@@ -784,7 +821,6 @@ final class RecorderModel: ObservableObject {
 
     private func runLogTailContainsInvalidCategoryTag() -> Bool {
         guard let url = mostRecentRunLogURL,
-              ops.isRegularFile(at: url),
               let text = ops.readTail(at: url, maxBytes: Self.categoryErrorTailBytes) else {
             return false
         }

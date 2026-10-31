@@ -7,6 +7,7 @@ otherwise verbatim) and pyproject declares the matching PEP 639 SPDX string.
 
 import re
 import hashlib
+import importlib.util
 import os
 import plistlib
 import shutil
@@ -21,8 +22,16 @@ from packaging.requirements import Requirement
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NATIVE_MAKEFILE = REPO_ROOT / "native" / "Makefile"
+NATIVE_INSTALL_SCRIPT = REPO_ROOT / "native" / "install_staged.py"
 MENUBAR_PLIST = REPO_ROOT / "native" / "onoats-menubar" / "Info.plist"
 RECORDER_HARNESS_SCRIPT = REPO_ROOT / "native" / "test_recorder_model.sh"
+
+_INSTALL_SPEC = importlib.util.spec_from_file_location(
+    "onoats_native_install_staged", NATIVE_INSTALL_SCRIPT
+)
+assert _INSTALL_SPEC is not None and _INSTALL_SPEC.loader is not None
+INSTALL_STAGED = importlib.util.module_from_spec(_INSTALL_SPEC)
+_INSTALL_SPEC.loader.exec_module(INSTALL_STAGED)
 
 NATIVE_RESOURCES = (
     "Onoats.icns",
@@ -301,13 +310,123 @@ def _copy_file_without_flags(source: str, destination: str) -> str:
 
 
 def _app_tree_hash(app: Path) -> str:
-    rows = []
-    for path in sorted(
-        candidate for candidate in app.rglob("*") if candidate.is_file()
-    ):
-        relative = f"./{path.relative_to(app)}"
-        rows.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}\n")
-    return hashlib.sha256("".join(rows).encode()).hexdigest()
+    return INSTALL_STAGED.app_identity(app)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["file-bytes", "file-mode", "directory-mode", "entry-type", "symlink-target"],
+)
+def test_app_identity_covers_complete_bundle_state_space(tmp_path: Path, mutation: str):
+    baseline = tmp_path / "baseline.app"
+    (baseline / "Contents/MacOS").mkdir(parents=True)
+    executable = baseline / "Contents/MacOS/Onoats"
+    executable.write_bytes(b"signed executable")
+    executable.chmod(0o755)
+    (baseline / "target-a").write_text("a", encoding="utf-8")
+    (baseline / "target-b").write_text("b", encoding="utf-8")
+    (baseline / "link").symlink_to("target-a")
+    candidate = tmp_path / "candidate.app"
+    shutil.copytree(baseline, candidate, symlinks=True)
+    assert _app_tree_hash(candidate) == _app_tree_hash(baseline)
+
+    if mutation == "file-bytes":
+        (candidate / "Contents/MacOS/Onoats").write_bytes(b"mutated")
+    elif mutation == "file-mode":
+        (candidate / "Contents/MacOS/Onoats").chmod(0o644)
+    elif mutation == "directory-mode":
+        (candidate / "Contents").chmod(0o700)
+    elif mutation == "entry-type":
+        path = candidate / "target-a"
+        path.unlink()
+        path.mkdir()
+    else:
+        link = candidate / "link"
+        link.unlink()
+        link.symlink_to("target-b")
+
+    assert _app_tree_hash(candidate) != _app_tree_hash(baseline)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("post_verify_succeeds", [False, True])
+@pytest.mark.parametrize("commit_succeeds", [False, True])
+def test_verified_replacement_is_failure_atomic_over_full_state_space(
+    tmp_path: Path,
+    monkeypatch,
+    existing: bool,
+    post_verify_succeeds: bool,
+    commit_succeeds: bool,
+):
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate.app"
+    candidate.mkdir()
+    (candidate / "identity").write_text("new", encoding="utf-8")
+    if existing:
+        installed.mkdir()
+        (installed / "identity").write_text("old", encoding="utf-8")
+
+    def exchange(left: Path, right: Path) -> None:
+        temporary = tmp_path / "exchange"
+        left.rename(temporary)
+        right.rename(left)
+        temporary.rename(right)
+
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", exchange)
+
+    def verify(path: Path) -> None:
+        assert (path / "identity").read_text(encoding="utf-8") == "new"
+        if not post_verify_succeeds:
+            raise INSTALL_STAGED.InstallError("injected post-publish failure")
+
+    def commit() -> None:
+        if not commit_succeeds:
+            raise INSTALL_STAGED.InstallError("injected record commit failure")
+
+    if post_verify_succeeds and commit_succeeds:
+        INSTALL_STAGED._replace_verified(candidate, installed, verify, commit)
+        assert (installed / "identity").read_text(encoding="utf-8") == "new"
+        assert not candidate.exists()
+    else:
+        with pytest.raises(INSTALL_STAGED.InstallError):
+            INSTALL_STAGED._replace_verified(candidate, installed, verify, commit)
+        if existing:
+            assert (installed / "identity").read_text(encoding="utf-8") == "old"
+        else:
+            assert not installed.exists()
+        assert (candidate / "identity").read_text(encoding="utf-8") == "new"
+
+
+def test_same_second_archive_allocation_never_overwrites_an_approved_archive(
+    tmp_path: Path, monkeypatch
+):
+    installed = tmp_path / "Onoats.app"
+    installed.mkdir()
+    backup_dir = tmp_path / "backups"
+    identity = ("1" * 64, "2" * 64, "3" * 40)
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_app", lambda _path: identity)
+    monkeypatch.setattr(
+        INSTALL_STAGED.time, "strftime", lambda *_args: "20260101T000000Z"
+    )
+
+    def fake_run(*argv: str, cwd=None):
+        if argv[1:5] == ("-c", "-k", "--keepParent", str(installed)):
+            Path(argv[5]).write_bytes(f"archive:{Path(argv[5]).name}".encode())
+        elif argv[1:4] == ("-x", "-k", argv[3]):
+            (Path(argv[4]) / installed.name).mkdir()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
+    first, first_path = INSTALL_STAGED._archive_baseline(
+        installed, backup_dir, identity[1], identity[2]
+    )
+    first_bytes = first_path.read_bytes()
+    second, second_path = INSTALL_STAGED._archive_baseline(
+        installed, backup_dir, identity[1], identity[2]
+    )
+    assert first["archive"] != second["archive"]
+    assert first_path.read_bytes() == first_bytes
+    assert second_path.is_file()
 
 
 def _run_install_staged(
@@ -354,6 +473,7 @@ def staged_install_workflow(tmp_path: Path) -> Path:
     if missing:
         pytest.skip(f"native install tools unavailable: {', '.join(missing)}")
     shutil.copy2(NATIVE_MAKEFILE, tmp_path / "Makefile")
+    shutil.copy2(NATIVE_INSTALL_SCRIPT, tmp_path / "install_staged.py")
     _make_adhoc_app(tmp_path / "Onoats.app")
     (tmp_path / "installed").mkdir()
     return tmp_path
@@ -395,17 +515,14 @@ def test_resource_verification_precedes_codesigning():
 
 
 def test_designated_requirement_extraction_is_path_independent_and_fail_closed():
-    makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
-    assert re.search(r"\^designated => ", makefile), (
+    installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert 'line.startswith("designated => ")' in installer, (
         "codesign output must be reduced to the designated requirement line"
     )
-    assert re.search(r"(?:!=|-(?:eq|ne))\s*1|count\s*==\s*1", makefile), (
+    assert "len(lines) != 1" in installer, (
         "designated-requirement extraction must reject zero or multiple matches"
     )
-    assert not re.search(
-        r"printf\s+'%s(?:\\n)?'\s+\"\$\$dr_output\"\s*\|\s*shasum",
-        makefile,
-    ), "the full path-bearing codesign stderr must never be hashed"
+    assert "hashlib.sha256(requirement.encode())" in installer
 
 
 def test_adhoc_designated_requirement_normalizes_across_bundle_paths(tmp_path: Path):
@@ -463,30 +580,14 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
     ):
         assert re.search(rf"(?m)^{variable}\s*\?=", makefile)
         assert f"$({variable})" in body
-    assert "ditto -c -k --keepParent" in body
-    assert "app-backups" in body and "Onoats-" in body and ".zip" in body
-    assert re.search(r"sha(?:sum|256sum)\b[^\n]*256|shasum\s+-a\s+256", body)
-    assert "mktemp -d" in body
-    assert "ditto -x -k" in body
-
-    remove = body.find('rm -rf "$$installed"')
-    copy = body.find('ditto "$$staged" "$$installed"')
-    assert -1 not in (remove, copy) and remove < copy
-    for evidence in (
-        "codesign --verify --deep --strict",
-        "codesign -dr -",
-        "cdhash",
-    ):
-        position = body.find(evidence)
-        assert position != -1 and position < remove, (
-            f"installed baseline {evidence!r} verification must precede removal"
-        )
-
-    # The approved archive path and its digest must be persisted together for
-    # rollback, rather than rediscovered later from a directory glob.
-    before_remove = body[:remove]
-    assert re.search(r"(?:printf|echo)[^\n]*(?:archive|ARCHIVE)", before_remove)
-    assert re.search(r"(?:printf|echo)[^\n]*(?:hash|HASH|sha)", before_remove)
+    assert "$(INSTALL_STAGED_SCRIPT) install" in body
+    installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert '"ditto", "-c", "-k", "--keepParent"' in installer
+    assert "tempfile.mkstemp(" in installer and 'suffix=".zip"' in installer
+    assert "_verify_app(candidate" in installer
+    assert "_replace_verified(candidate, installed, verify, commit)" in installer
+    assert "_write_record(record, record_fields)" in installer
+    assert "commit()" in installer
 
 
 def test_install_staged_binds_install_to_pre_smoke_tree_digest(
@@ -505,7 +606,7 @@ def test_install_staged_binds_install_to_pre_smoke_tree_digest(
     result = _run_install_staged(work, staged_app_tree_hash=expected)
 
     assert result.returncode != 0
-    assert "differs from the bytes that passed smoke" in result.stdout + result.stderr
+    assert "canonical approved identity" in result.stdout + result.stderr
     assert installed.stat().st_ino == inode_before
 
 
@@ -661,15 +762,14 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
     _, install_body = _make_target(makefile, "install-staged")
     _, body = _make_target(makefile, "rollback")
-    assert "app-backups" in body
-    assert re.search(r"sha(?:sum|256sum)\b[^\n]*256|shasum\s+-a\s+256", body)
-    assert "ditto -x -k" in body
-    assert "codesign --verify --deep --strict" in body
-    assert "codesign -dr -" in body
-    assert "cdhash" in body
-    assert not re.search(r"app-backups/[^\n]*[*?]", body), (
-        "rollback must not select an archive by glob"
-    )
+    assert "$(INSTALL_STAGED_SCRIPT) rollback" in body
+    installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert "_read_record(Path(args.record), backup_dir)" in installer
+    assert '"ditto", "-x", "-k"' in installer
+    assert '_verify_app(candidate, expected_identity=fields["tree_hash"])' in installer
+    assert "_replace_verified(" in installer
+    assert 'archive = Path(fields["archive"])' in installer
+    assert "archive.relative_to(backup_dir)" in installer
     approval_vars = set(
         re.findall(r"\$\(([A-Z_]*(?:APPROV|MANIFEST|RECORD)[A-Z_]*)\)", install_body)
     ) & set(re.findall(r"\$\(([A-Z_]*(?:APPROV|MANIFEST|RECORD)[A-Z_]*)\)", body))
@@ -678,14 +778,12 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
         "rollback may not accept an arbitrary archive path"
     )
 
-    remove = body.find('rm -rf "$$installed"')
-    unpack = body.find("ditto -x -k")
-    assert -1 not in (remove, unpack) and remove < unpack
-    assert body.find("codesign --verify --deep --strict", unpack) > unpack
-    assert body.find("codesign -dr -", unpack) > unpack
-    assert body.find("cdhash", unpack) > unpack
-    assert 'rm -rf "$$installed"' in body
-    assert 'ditto -x -k "$$archive" "$(INSTALL_DIR)"' in body
+    unpack = installer.index('_run("ditto", "-x", "-k", str(archive), str(parent))')
+    verify = installer.index(
+        '_verify_app(candidate, expected_identity=fields["tree_hash"])', unpack
+    )
+    replace = installer.index("_replace_verified(", verify)
+    assert unpack < verify < replace
 
 
 def test_existing_install_and_setup_contracts_are_unchanged():

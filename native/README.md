@@ -180,10 +180,12 @@ that surface:
   only the required native exports: header art, `.icns`, and state-specific
   monochrome template icons. `make app` starts from a clean bundle and copies
   each named resource explicitly; `make verify-resources` equality-checks that
-  allowlist before `make sign`. After the gauntlet, hash and smoke the
-  already-signed staged bundle before installation. Then run
-  `make install-staged STAGED_APP_TREE_HASH=<pre-smoke-tree-sha256>` to install
-  those exact verified bytes without rebuilding or re-signing them. Do not fix
+  allowlist before `make sign`. After the gauntlet, run `make app-tree-hash`
+  and smoke the already-signed staged bundle before installation. Then run
+  `make install-staged STAGED_APP_TREE_HASH=<app-tree-hash-output>` to install
+  an immutable verified snapshot without rebuilding or re-signing it. The
+  canonical identity includes paths, entry types, modes, file bytes, and
+  symlink targets. Do not fix
   or otherwise mutate the bundle after signing; any fix requires rebuilding,
   re-running the gauntlet, and signing again.
 

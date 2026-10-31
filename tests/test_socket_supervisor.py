@@ -2588,6 +2588,70 @@ def test_late_force_exit_interrupts_normal_telemetry_wait_promptly():
     assert pending_tasks == []
 
 
+def test_cancellation_resistant_telemetry_cannot_block_shutdown_finalization(
+    tmp_path, monkeypatch
+):
+    """A publisher that swallows cancellation cannot strand status or PID cleanup."""
+    import asyncio
+
+    from onoats import dual
+
+    events: list[str] = []
+
+    class ResistantPublisher:
+        def __init__(self):
+            self.release = asyncio.Event()
+            self.task = asyncio.create_task(
+                self._run(), name="test-cancellation-resistant-telemetry"
+            )
+
+        async def _run(self):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                events.append("cancel-swallowed")
+                await self.release.wait()
+
+        def request_stop(self):
+            events.append("stop-requested")
+            return self.task
+
+        def cleanup(self):
+            events.append("telemetry-cleanup")
+
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(dual, "_restore_terminal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    async def scenario():
+        publisher = ResistantPublisher()
+        started = asyncio.get_running_loop().time()
+        await dual._stop_telemetry_publisher(
+            publisher, force_exit_event=asyncio.Event()
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        dual._finalize_shutdown_status(
+            tmp_path,
+            tmp_path / ".active" / "onoats.pid",
+            ended_by_error=False,
+            telemetry_cleanup=publisher.cleanup,
+        )
+        publisher.release.set()
+        await publisher.task
+        return elapsed
+
+    elapsed = asyncio.run(scenario())
+
+    assert elapsed < 0.75
+    assert events.index("cancel-swallowed") < events.index("stopped")
+    assert events.index("stopped") < events.index("telemetry-cleanup")
+    assert events.index("telemetry-cleanup") < events.index("pid-removed")
+
+
 def test_run_shutdown_uses_bounded_telemetry_stop_before_finalization():
     """Pin the helper into the real nested shutdown path, not only unit tests."""
     import inspect

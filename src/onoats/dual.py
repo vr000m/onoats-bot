@@ -157,7 +157,7 @@ async def _shutdown_stt_service(stt_service, label: str) -> None:
 
 
 async def _stop_telemetry_publisher(publisher, *, force_exit_event) -> None:
-    """Bound shutdown of the publisher's one concrete background task."""
+    """Bound both graceful and cancellation waits for the publisher task."""
 
     def _consume_task_result(task: asyncio.Task) -> None:
         try:
@@ -188,8 +188,12 @@ async def _stop_telemetry_publisher(publisher, *, force_exit_event) -> None:
             return
 
         publisher_task.cancel()
-        await asyncio.gather(publisher_task, return_exceptions=True)
-        if force_waiter not in done:
+        cancelled, _still_pending = await asyncio.wait({publisher_task}, timeout=0.1)
+        if publisher_task in cancelled:
+            _consume_task_result(publisher_task)
+        else:
+            publisher_task.add_done_callback(_consume_task_result)
+        if force_waiter not in done or publisher_task not in cancelled:
             logger.warning(
                 "UI telemetry publisher did not stop within the shutdown bound"
             )

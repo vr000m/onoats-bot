@@ -80,9 +80,10 @@ ROLLBACK_BASELINE_CDHASH ?=
 # Exact bundle digest recorded immediately before staged smoke. Installation
 # fails closed if any staged byte changes after that smoke.
 STAGED_APP_TREE_HASH ?=
+INSTALL_STAGED_SCRIPT := $(CURDIR)/install_staged.py
 
 .PHONY: build app verify-resources sign dr cdhash rebuild print-bin clean \
-	check-identity cert install-cli install install-staged rollback setup \
+	check-identity cert install-cli install app-tree-hash install-staged rollback setup \
 	sign-cli setup-cli
 
 build: $(BUILD)/onoats-capturer $(BUILD)/Onoats
@@ -189,105 +190,28 @@ install: sign install-cli
 	ditto $(APP) $(INSTALL_DIR)/$(APP)
 	@echo "✓ installed $(INSTALL_DIR)/$(APP)"
 
-# Install exactly the already-signed staged bytes. The default is deliberately
-# a clean install, even when an app already exists. A rollback archive is made
-# only when the operator explicitly approves a complete baseline and supplies
-# its expected designated-requirement hash and cdhash.
-# No build/sign prerequisite is intentional: post-gauntlet smoke and install
-# must operate on the same bytes.
-install-staged:
-	@set -eu; \
-	staged="$(APP)"; installed="$(INSTALL_DIR)/$(APP)"; \
-	backup_dir="$(HOME)/Library/Application Support/Onoats/app-backups"; record="$(ROLLBACK_RECORD)"; \
-	extract_dr() { \
-	  dr_output=$$(codesign -dr - "$$1" 2>&1) || { echo "✗ cannot read designated requirement: $$1" >&2; return 1; }; \
-	  dr_count=$$(printf '%s\n' "$$dr_output" | awk '/^designated => / || /^# designated => / { count += 1 } END { print count + 0 }'); \
-	  [ "$$dr_count" -eq 1 ] || { echo "✗ expected exactly one designated requirement: $$1" >&2; return 1; }; \
-	  printf '%s\n' "$$dr_output" | sed -n -e 's/^designated => //p' -e 's/^# designated => //p'; \
-	}; \
-	[ -d "$$staged" ] || { echo "✗ staged app missing: $$staged"; exit 1; }; \
-	staged_tree_hash=$$(cd "$$staged" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
-	expected_staged_tree_hash="$(STAGED_APP_TREE_HASH)"; \
-	[ "$${#expected_staged_tree_hash}" -eq 64 ] || { echo "✗ STAGED_APP_TREE_HASH must be the 64-character digest recorded before smoke"; exit 1; }; \
-	case "$$expected_staged_tree_hash" in *[!0-9A-Fa-f]*) echo "✗ STAGED_APP_TREE_HASH must be hexadecimal"; exit 1;; esac; \
-	[ "$$staged_tree_hash" = "$$expected_staged_tree_hash" ] || { echo "✗ staged app differs from the bytes that passed smoke"; exit 1; }; \
-	$(MAKE) -s verify-resources APP="$$staged"; \
-	codesign --verify --deep --strict "$$staged"; \
-	staged_dr=$$(extract_dr "$$staged"); \
-	staged_dr_hash=$$(printf '%s' "$$staged_dr" | shasum -a 256 | awk '{print $$1}'); \
-	mkdir -p "$(INSTALL_DIR)" "$$backup_dir"; \
-	if [ "$(ROLLBACK_BASELINE_APPROVED)" = "1" ]; then \
-	  expected_dr_hash="$(ROLLBACK_BASELINE_DR_HASH)"; expected_cdhash="$(ROLLBACK_BASELINE_CDHASH)"; \
-	  [ -n "$$expected_dr_hash" ] && [ -n "$$expected_cdhash" ] || { echo "✗ approved rollback requires ROLLBACK_BASELINE_DR_HASH and ROLLBACK_BASELINE_CDHASH"; exit 1; }; \
-	  [ "$${#expected_dr_hash}" -eq 64 ] || { echo "✗ invalid rollback baseline designated-requirement hash"; exit 1; }; \
-	  case "$$expected_dr_hash$$expected_cdhash" in *[!0-9A-Fa-f]*) echo "✗ rollback baseline identity must be hexadecimal"; exit 1;; esac; \
-	  [ -d "$$installed" ] || { echo "✗ approved rollback baseline app is missing: $$installed"; exit 1; }; \
-	  codesign --verify --deep --strict "$$installed"; \
-	  baseline_dr=$$(extract_dr "$$installed"); \
-	  baseline_dr_hash=$$(printf '%s' "$$baseline_dr" | shasum -a 256 | awk '{print $$1}'); \
-	  [ "$$baseline_dr_hash" = "$$expected_dr_hash" ] || { echo "✗ installed baseline designated requirement differs from approved evidence"; exit 1; }; \
-	  [ "$$baseline_dr_hash" = "$$staged_dr_hash" ] || { echo "✗ installed baseline designated requirement differs from staged app"; exit 1; }; \
-	  baseline_cdhash=$$(codesign -dvvv "$$installed" 2>&1 | awk -F= 'tolower($$1)=="cdhash" {print $$2; exit}'); \
-	  [ -n "$$baseline_cdhash" ] || { echo "✗ installed baseline has no cdhash"; exit 1; }; \
-	  [ "$$baseline_cdhash" = "$$expected_cdhash" ] || { echo "✗ installed baseline cdhash differs from approved evidence"; exit 1; }; \
-	  timestamp=$$(date -u +%Y%m%dT%H%M%SZ); \
-	  archive="$$backup_dir/Onoats-$$timestamp.zip"; \
-	  ditto -c -k --keepParent "$$installed" "$$archive"; \
-	  archive_hash=$$(shasum -a 256 "$$archive" | awk '{print $$1}'); \
-	  verify_dir=$$(mktemp -d); \
-	  trap 'rm -rf "$$verify_dir"' EXIT; \
-	  ditto -x -k "$$archive" "$$verify_dir"; \
-	  extracted="$$verify_dir/$(APP)"; \
-	  codesign --verify --deep --strict "$$extracted"; \
-	  extracted_dr=$$(extract_dr "$$extracted"); \
-	  extracted_dr_hash=$$(printf '%s' "$$extracted_dr" | shasum -a 256 | awk '{print $$1}'); \
-	  extracted_cdhash=$$(codesign -dvvv "$$extracted" 2>&1 | awk -F= 'tolower($$1)=="cdhash" {print $$2; exit}'); \
-	  [ "$$extracted_dr_hash" = "$$baseline_dr_hash" ] && [ "$$extracted_cdhash" = "$$baseline_cdhash" ] || { echo "✗ rollback archive identity mismatch"; exit 1; }; \
-	  printf 'archive=%s\nhash=%s\ndr_hash=%s\ncdhash=%s\n' "$$archive" "$$archive_hash" "$$baseline_dr_hash" "$$baseline_cdhash" > "$$record"; \
-	  echo "✓ approved rollback archive $$archive (sha256 $$archive_hash)"; \
-	else \
-	  [ "$(ROLLBACK_BASELINE_APPROVED)" = "0" ] || { echo "✗ ROLLBACK_BASELINE_APPROVED must be 0 or 1"; exit 1; }; \
-	  echo "ℹ rollback baseline not explicitly approved; proceeding as a clean install"; \
-	fi; \
-	rm -rf "$$installed"; \
-	ditto "$$staged" "$$installed"; \
-	codesign --verify --deep --strict "$$installed"; \
-	installed_tree_hash=$$(cd "$$installed" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
-	[ "$$installed_tree_hash" = "$$staged_tree_hash" ] || { echo "✗ installed app differs from staged bytes"; exit 1; }; \
-	if [ "$(ROLLBACK_BASELINE_APPROVED)" = "0" ]; then rm -f "$$record"; fi; \
-	echo "✓ installed exact staged app at $$installed"
+# Canonical producer for the identity token recorded before staged smoke. It
+# covers bundle paths, entry types, modes, file bytes, and symlink targets.
+app-tree-hash:
+	@python3 $(INSTALL_STAGED_SCRIPT) identity "$(APP)"
 
-# Restore only the archive and identity persisted by install-staged. The
-# archive is re-hashed and preflighted before the installed app is removed,
-# then the restored tree is verified again after extraction.
+# Install exactly one immutable private snapshot of the already-signed staged
+# bytes. The verified snapshot is atomically exchanged with the installed app;
+# the staged path is never read again after snapshot verification.
+install-staged:
+	@python3 $(INSTALL_STAGED_SCRIPT) install \
+		--app "$(APP)" --install-dir "$(INSTALL_DIR)" --backup-dir "$(BACKUP_DIR)" \
+		--record "$(ROLLBACK_RECORD)" --expected-identity "$(STAGED_APP_TREE_HASH)" \
+		--approved "$(ROLLBACK_BASELINE_APPROVED)" \
+		--baseline-dr-hash "$(ROLLBACK_BASELINE_DR_HASH)" \
+		--baseline-cdhash "$(ROLLBACK_BASELINE_CDHASH)" --makefile-dir "$(CURDIR)"
+
+# Restore only a private, fully verified extraction of the recorded archive.
+# Atomic exchange keeps the current app installed on every validation failure.
 rollback:
-	@set -eu; \
-	record="$(ROLLBACK_RECORD)"; backup_dir="$(HOME)/Library/Application Support/Onoats/app-backups"; \
-	[ -f "$$record" ] || { echo "✗ no approved rollback record in $$backup_dir"; exit 1; }; \
-	archive=$$(awk -F= '$$1=="archive" {sub(/^archive=/, ""); print; exit}' "$$record"); \
-	expected_hash=$$(awk -F= '$$1=="hash" {print $$2; exit}' "$$record"); \
-	expected_dr_hash=$$(awk -F= '$$1=="dr_hash" {print $$2; exit}' "$$record"); \
-	expected_cdhash=$$(awk -F= '$$1=="cdhash" {print $$2; exit}' "$$record"); \
-	case "$$archive" in "$$backup_dir"/Onoats-*.zip) ;; *) echo "✗ invalid recorded archive path"; exit 1;; esac; \
-	[ -f "$$archive" ] || { echo "✗ approved archive missing"; exit 1; }; \
-	actual_hash=$$(shasum -a 256 "$$archive" | awk '{print $$1}'); \
-	[ "$$actual_hash" = "$$expected_hash" ] || { echo "✗ approved archive hash mismatch"; exit 1; }; \
-	installed="$(INSTALL_DIR)/$(APP)"; \
-	rm -rf "$$installed"; \
-	ditto -x -k "$$archive" "$(INSTALL_DIR)"; \
-	restored="$$installed"; \
-	extract_dr() { \
-	  dr_output=$$(codesign -dr - "$$1" 2>&1) || { echo "✗ cannot read designated requirement: $$1" >&2; return 1; }; \
-	  dr_count=$$(printf '%s\n' "$$dr_output" | awk '/^designated => / || /^# designated => / { count += 1 } END { print count + 0 }'); \
-	  [ "$$dr_count" -eq 1 ] || { echo "✗ expected exactly one designated requirement: $$1" >&2; return 1; }; \
-	  printf '%s\n' "$$dr_output" | sed -n -e 's/^designated => //p' -e 's/^# designated => //p'; \
-	}; \
-	codesign --verify --deep --strict "$$restored"; \
-	restored_dr=$$(extract_dr "$$restored"); \
-	restored_dr_hash=$$(printf '%s' "$$restored_dr" | shasum -a 256 | awk '{print $$1}'); \
-	restored_cdhash=$$(codesign -dvvv "$$restored" 2>&1 | awk -F= 'tolower($$1)=="cdhash" {print $$2; exit}'); \
-	[ "$$restored_dr_hash" = "$$expected_dr_hash" ] && [ "$$restored_cdhash" = "$$expected_cdhash" ] || { echo "✗ restored app identity mismatch"; exit 1; }; \
-	echo "✓ restored approved app archive $$archive"
+	@python3 $(INSTALL_STAGED_SCRIPT) rollback --app-name "$(APP)" \
+		--install-dir "$(INSTALL_DIR)" --backup-dir "$(BACKUP_DIR)" \
+		--record "$(ROLLBACK_RECORD)"
 
 # Fresh-clone bootstrap. cert is idempotent (make_cert.sh exits 0 — and never
 # regenerates — when the identity exists). init runs only on a missing

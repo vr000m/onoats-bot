@@ -47,6 +47,7 @@ private final class FakeSystemOps: SystemOps {
     var opened: [URL] = []
     var deleted: [URL] = []
     var tailReadLimits: [Int] = []
+    var failReservation = false
 
     func spawn(
         _ request: ProcessRequest,
@@ -92,9 +93,16 @@ private final class FakeSystemOps: SystemOps {
         return files[url.path].flatMap { String(data: $0, encoding: .utf8) }
     }
     func write(_ data: Data, to url: URL) throws { files[url.path] = data }
-    func delete(at url: URL) throws {
+    func deleteRegularFile(at url: URL) throws {
+        guard isRegularFile(at: url) else { throw FakeSpawnError() }
         deleted.append(url)
         files[url.path] = nil
+    }
+    func reserveFile(at url: URL) throws -> Bool {
+        if failReservation { throw FakeSpawnError() }
+        guard files[url.path] == nil else { return false }
+        files[url.path] = Data()
+        return true
     }
     func fileExists(at url: URL) -> Bool { files[url.path] != nil }
     func isRegularFile(at url: URL) -> Bool {
@@ -619,6 +627,77 @@ private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
 }
 
 @MainActor
+private func testActiveRunLogSurvivesClockRollback(_ root: URL) throws {
+    let directory = root.appendingPathComponent("clock-rollback-data")
+    let ops = FakeSystemOps()
+    let logs = root.standardizedFileURL.appendingPathComponent(
+        "Library/Logs/Onoats", isDirectory: true)
+    for index in 0..<10 {
+        ops.put("future", logs.appendingPathComponent("onoats-bot-\(9_000 + index).log"))
+    }
+    ops.nowValue = Date(timeIntervalSince1970: 1)
+    let model = makeModel(
+        ops, suite: "onoats.harness.clock-rollback", directory: DirectoryChoice(directory))
+    model.start()
+    let active = ops.requests[0].appendOutputTo!
+    try require(ops.fileExists(at: active),
+                "wall-clock rollback allowed pruning to unlink the active run log")
+    try require(ops.deleted.count == 1 && ops.deleted[0] != active,
+                "active-log retention did not prune exactly one historical log")
+}
+
+@MainActor
+private func testReservationFailureClearsPriorRunAuthority(_ root: URL) throws {
+    let directory = root.appendingPathComponent("reservation-failure-data")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.reservation-failure",
+        directory: DirectoryChoice(directory))
+    model.start()
+    let oldLog = ops.requests[0].appendOutputTo!
+    ops.finish(ops.processes[0], status: 0)
+    ops.failReservation = true
+    model.start()
+    try require(model.mostRecentRunLogURL == nil,
+                "failed reservation retained the prior run as current authority")
+    model.openLog()
+    try require(ops.opened.last == oldLog.deletingLastPathComponent(),
+                "failed reservation opened the previous run instead of the log folder")
+}
+
+@MainActor
+private func testNativeBoundedReadStateSpace(_ root: URL) throws {
+    let ops = NativeSystemOps()
+    let directory = root.appendingPathComponent("bounded-read")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let regular = directory.appendingPathComponent("regular")
+    try Data("abcdef".utf8).write(to: regular)
+    try require(ops.readData(at: regular, maxBytes: 6) == Data("abcdef".utf8),
+                "bounded reader rejected an in-limit regular file")
+    try require(ops.readData(at: regular, maxBytes: 5) == nil,
+                "bounded reader accepted an oversized regular file")
+    try require(ops.readTail(at: regular, maxBytes: 3) == "def",
+                "tail reader did not read from its validated descriptor")
+
+    let symlink = directory.appendingPathComponent("symlink")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: regular)
+    try require(ops.readData(at: symlink, maxBytes: 32) == nil,
+                "bounded reader followed a symbolic link")
+
+    let fifo = directory.appendingPathComponent("fifo")
+    guard Darwin.mkfifo(fifo.path, S_IRUSR | S_IWUSR) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let started = Date()
+    try require(ops.readData(at: fifo, maxBytes: 32) == nil,
+                "bounded reader accepted a FIFO")
+    try require(Date().timeIntervalSince(started) < 0.5,
+                "bounded reader blocked while opening a FIFO")
+    try require(ops.readData(at: directory, maxBytes: 32) == nil,
+                "bounded reader accepted a directory")
+}
+
+@MainActor
 private func testRunLogCollisionReservesFreshPath(_ root: URL) throws {
     let directory = root.appendingPathComponent("collision-data")
     let ops = FakeSystemOps()
@@ -840,6 +919,9 @@ struct RecorderModelHarness {
         try testOwnedSeminarBadgeSurvivesTelemetryLoss(root)
         try testMissingCliDisablesStart(root)
         try testPerRunLogsPruningAndOwnedRouting(home)
+        try testActiveRunLogSurvivesClockRollback(home)
+        try testReservationFailureClearsPriorRunAuthority(home)
+        try testNativeBoundedReadStateSpace(home)
         try testNativeAppendIsAtomicAcrossSeparateWriters(home)
         try testOpenLogResolution(home)
         try testInvalidCategoryStableTagMatrix(root)
@@ -854,6 +936,7 @@ struct RecorderModelHarness {
             "onoats.harness.deallocation-failed",
             "onoats.harness.panel-telemetry", "onoats.harness.owned-seminar",
             "onoats.harness.missing-cli", "onoats.harness.logs",
+            "onoats.harness.clock-rollback", "onoats.harness.reservation-failure",
             "onoats.harness.logs-external", "onoats.harness.open-log",
             "onoats.harness.log-collision", "onoats.harness.open-log-relaunch",
             "onoats.harness.invalid-tag-match",
