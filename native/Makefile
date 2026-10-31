@@ -77,6 +77,9 @@ ROLLBACK_RECORD := $(BACKUP_DIR)/approved-rollback.txt
 ROLLBACK_BASELINE_APPROVED ?= 0
 ROLLBACK_BASELINE_DR_HASH ?=
 ROLLBACK_BASELINE_CDHASH ?=
+# Exact bundle digest recorded immediately before staged smoke. Installation
+# fails closed if any staged byte changes after that smoke.
+STAGED_APP_TREE_HASH ?=
 
 .PHONY: build app verify-resources sign dr cdhash rebuild print-bin clean \
 	check-identity cert install-cli install install-staged rollback setup \
@@ -202,13 +205,16 @@ install-staged:
 	  [ "$$dr_count" -eq 1 ] || { echo "✗ expected exactly one designated requirement: $$1" >&2; return 1; }; \
 	  printf '%s\n' "$$dr_output" | sed -n -e 's/^designated => //p' -e 's/^# designated => //p'; \
 	}; \
-	rm -f "$$record"; \
 	[ -d "$$staged" ] || { echo "✗ staged app missing: $$staged"; exit 1; }; \
+	staged_tree_hash=$$(cd "$$staged" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
+	expected_staged_tree_hash="$(STAGED_APP_TREE_HASH)"; \
+	[ "$${#expected_staged_tree_hash}" -eq 64 ] || { echo "✗ STAGED_APP_TREE_HASH must be the 64-character digest recorded before smoke"; exit 1; }; \
+	case "$$expected_staged_tree_hash" in *[!0-9A-Fa-f]*) echo "✗ STAGED_APP_TREE_HASH must be hexadecimal"; exit 1;; esac; \
+	[ "$$staged_tree_hash" = "$$expected_staged_tree_hash" ] || { echo "✗ staged app differs from the bytes that passed smoke"; exit 1; }; \
 	$(MAKE) -s verify-resources APP="$$staged"; \
 	codesign --verify --deep --strict "$$staged"; \
 	staged_dr=$$(extract_dr "$$staged"); \
 	staged_dr_hash=$$(printf '%s' "$$staged_dr" | shasum -a 256 | awk '{print $$1}'); \
-	staged_tree_hash=$$(cd "$$staged" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
 	mkdir -p "$(INSTALL_DIR)" "$$backup_dir"; \
 	if [ "$(ROLLBACK_BASELINE_APPROVED)" = "1" ]; then \
 	  expected_dr_hash="$(ROLLBACK_BASELINE_DR_HASH)"; expected_cdhash="$(ROLLBACK_BASELINE_CDHASH)"; \
@@ -243,11 +249,12 @@ install-staged:
 	  [ "$(ROLLBACK_BASELINE_APPROVED)" = "0" ] || { echo "✗ ROLLBACK_BASELINE_APPROVED must be 0 or 1"; exit 1; }; \
 	  echo "ℹ rollback baseline not explicitly approved; proceeding as a clean install"; \
 	fi; \
-	rm -rf $(INSTALL_DIR)/$(APP); \
-	ditto $(APP) $(INSTALL_DIR)/$(APP); \
+	rm -rf "$$installed"; \
+	ditto "$$staged" "$$installed"; \
 	codesign --verify --deep --strict "$$installed"; \
 	installed_tree_hash=$$(cd "$$installed" && find . -type f | LC_ALL=C sort | while IFS= read -r file; do file_hash=$$(shasum -a 256 "$$file" | awk '{print $$1}'); printf '%s  %s\n' "$$file_hash" "$$file"; done | shasum -a 256 | awk '{print $$1}'); \
 	[ "$$installed_tree_hash" = "$$staged_tree_hash" ] || { echo "✗ installed app differs from staged bytes"; exit 1; }; \
+	if [ "$(ROLLBACK_BASELINE_APPROVED)" = "0" ]; then rm -f "$$record"; fi; \
 	echo "✓ installed exact staged app at $$installed"
 
 # Restore only the archive and identity persisted by install-staged. The
@@ -265,9 +272,10 @@ rollback:
 	[ -f "$$archive" ] || { echo "✗ approved archive missing"; exit 1; }; \
 	actual_hash=$$(shasum -a 256 "$$archive" | awk '{print $$1}'); \
 	[ "$$actual_hash" = "$$expected_hash" ] || { echo "✗ approved archive hash mismatch"; exit 1; }; \
-	rm -rf $(INSTALL_DIR)/$(APP); \
+	installed="$(INSTALL_DIR)/$(APP)"; \
+	rm -rf "$$installed"; \
 	ditto -x -k "$$archive" "$(INSTALL_DIR)"; \
-	restored="$(INSTALL_DIR)/$(APP)"; \
+	restored="$$installed"; \
 	extract_dr() { \
 	  dr_output=$$(codesign -dr - "$$1" 2>&1) || { echo "✗ cannot read designated requirement: $$1" >&2; return 1; }; \
 	  dr_count=$$(printf '%s\n' "$$dr_output" | awk '/^designated => / || /^# designated => / { count += 1 } END { print count + 0 }'); \

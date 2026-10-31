@@ -29,6 +29,7 @@ private struct FakeSpawnError: Error {}
 private final class FakeSystemOps: SystemOps {
     var nowValue = Date(timeIntervalSince1970: 1_700_000_000)
     var files: [String: Data] = [:]
+    var nonRegularFiles: Set<String> = []
     var alive: Set<Int32> = []
     var commands: [Int32: String] = [:]
     var executable = true
@@ -42,6 +43,7 @@ private final class FakeSystemOps: SystemOps {
     var processAliveCount = 0
     var commandLineCount = 0
     var telemetryReadCount = 0
+    var boundedReadLimits: [Int] = []
     var opened: [URL] = []
     var deleted: [URL] = []
     var tailReadLimits: [Int] = []
@@ -80,6 +82,11 @@ private final class FakeSystemOps: SystemOps {
         if url.lastPathComponent == UiTelemetryContract.fileName { telemetryReadCount += 1 }
         return files[url.path]
     }
+    func readData(at url: URL, maxBytes: Int) -> Data? {
+        boundedReadLimits.append(maxBytes)
+        guard let data = readData(at: url), data.count <= maxBytes else { return nil }
+        return data
+    }
     func readText(at url: URL) -> String? {
         readTextCount += 1
         return files[url.path].flatMap { String(data: $0, encoding: .utf8) }
@@ -90,6 +97,9 @@ private final class FakeSystemOps: SystemOps {
         files[url.path] = nil
     }
     func fileExists(at url: URL) -> Bool { files[url.path] != nil }
+    func isRegularFile(at url: URL) -> Bool {
+        files[url.path] != nil && !nonRegularFiles.contains(url.path)
+    }
     func contentsOfDirectory(at url: URL) -> [URL] {
         files.keys.compactMap { path in
             let candidate = URL(fileURLWithPath: path)
@@ -467,6 +477,15 @@ private func testTelemetryNeverControlsLiveness(_ root: URL) throws {
     try require(model.aggregateStt == .ready, "STT aggregate did not decode")
     try require(model.transcriptPreview == nil, "preview default was not off")
     try require(model.categoryForDisplay == "seminars", "external category was not decoded")
+    try require(ops.boundedReadLimits.last == RecorderModel.telemetryMaxBytes,
+                "telemetry polling did not use the bounded reader")
+
+    ops.files[active(directory, "onoats.ui.json").path] = Data(
+        repeating: 0x7b, count: RecorderModel.telemetryMaxBytes + 1)
+    model.refreshTelemetry()
+    try require(!model.telemetryAvailable, "oversized telemetry was accepted")
+    try require(ops.boundedReadLimits.last == RecorderModel.telemetryMaxBytes,
+                "oversized telemetry bypassed the bounded reader")
 
     ops.files[active(directory, "onoats.ui.json").path] = nil
     model.refreshTelemetry()
@@ -558,6 +577,9 @@ private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
         "Library/Logs/Onoats", isDirectory: true)
     let unrelated = logs.appendingPathComponent("keep-me.txt")
     ops.put("unrelated", unrelated)
+    let unsafe = logs.appendingPathComponent("onoats-bot-9999999999999.log")
+    ops.put("unsafe", unsafe)
+    ops.nonRegularFiles.insert(unsafe.path)
     var runLogs: [URL] = []
 
     for index in 0..<11 {
@@ -579,6 +601,7 @@ private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
     try require(runLogs.dropFirst().allSatisfy { ops.fileExists(at: $0) },
                 "pruning removed one of the newest ten run logs")
     try require(ops.fileExists(at: unrelated), "pruning deleted an unrelated file")
+    try require(ops.fileExists(at: unsafe), "pruning deleted a non-regular matching entry")
     try require(ops.deleted == [runLogs[0]], "pruning touched more than the oldest run log")
 
     // External commands are never appended to an app-owned run log.
@@ -691,10 +714,15 @@ private func testOpenLogResolution(_ root: URL) throws {
 
     let newest = folder.appendingPathComponent("onoats-bot-999.log")
     ops.put("new", newest)
+    let unsafeNewest = folder.appendingPathComponent("onoats-bot-1000.log")
+    ops.put("unsafe", unsafeNewest)
+    ops.nonRegularFiles.insert(unsafeNewest.path)
     let relaunched = makeModel(
         ops, suite: "onoats.harness.open-log-relaunch", directory: DirectoryChoice(directory))
     relaunched.openLog()
     try require(ops.opened.last == newest, "fresh launch did not resolve newest surviving log")
+    try require(ops.opened.last != unsafeNewest,
+                "fresh launch opened a non-regular matching entry")
     relaunched.showLogsFolder()
     try require(ops.opened.last == folder, "Show Logs Folder did not open canonical folder")
 }

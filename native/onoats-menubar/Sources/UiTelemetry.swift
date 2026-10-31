@@ -44,6 +44,13 @@ struct UiTelemetryTranscript: Equatable {
     let speakerLabel: String?
 }
 
+func transcriptDisplayLabel(source: String?, speakerLabel: String?) -> String {
+    if let speakerLabel, !speakerLabel.isEmpty { return speakerLabel }
+    if source == "me" { return "Me" }
+    if source == "them" { return "Them" }
+    return "Transcript"
+}
+
 struct UiTelemetrySnapshot: Equatable {
     let pid: Int32
     let startEpoch: Double

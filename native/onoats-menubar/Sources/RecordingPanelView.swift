@@ -151,8 +151,9 @@ struct RecordingPanelView: View {
     @ViewBuilder
     private var transcriptRow: some View {
         if model.transcriptPreviewEnabled, let preview = model.transcriptPreview {
-            let source = preview.source == "me" ? "Me" : preview.source == "them" ? "Them" : "Transcript"
-            Text("\(source)\(preview.speakerLabel.map { " (\($0))" } ?? ""): \(preview.text)")
+            let label = transcriptDisplayLabel(
+                source: preview.source, speakerLabel: preview.speakerLabel)
+            Text("\(label): \(preview.text)")
                 .font(.caption)
                 .lineLimit(1)
                 .truncationMode(.tail)

@@ -300,20 +300,35 @@ def _copy_file_without_flags(source: str, destination: str) -> str:
     return destination
 
 
+def _app_tree_hash(app: Path) -> str:
+    rows = []
+    for path in sorted(
+        candidate for candidate in app.rglob("*") if candidate.is_file()
+    ):
+        relative = f"./{path.relative_to(app)}"
+        rows.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}\n")
+    return hashlib.sha256("".join(rows).encode()).hexdigest()
+
+
 def _run_install_staged(
     work: Path,
     *,
     approved: bool = False,
     designated_requirement_sha256: str | None = None,
     cdhash: str | None = None,
+    staged_app_tree_hash: str | None = None,
+    install_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    staged_app_tree_hash = staged_app_tree_hash or _app_tree_hash(work / "Onoats.app")
+    install_dir = install_dir or work / "installed"
     command = [
         "make",
         "-s",
         "install-staged",
         "APP=Onoats.app",
-        f"INSTALL_DIR={work / 'installed'}",
+        f"INSTALL_DIR={install_dir}",
         f"ROLLBACK_BASELINE_APPROVED={int(approved)}",
+        f"STAGED_APP_TREE_HASH={staged_app_tree_hash}",
     ]
     if designated_requirement_sha256 is not None:
         command.append(f"ROLLBACK_BASELINE_DR_HASH={designated_requirement_sha256}")
@@ -444,6 +459,7 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
         "ROLLBACK_BASELINE_APPROVED",
         "ROLLBACK_BASELINE_DR_HASH",
         "ROLLBACK_BASELINE_CDHASH",
+        "STAGED_APP_TREE_HASH",
     ):
         assert re.search(rf"(?m)^{variable}\s*\?=", makefile)
         assert f"$({variable})" in body
@@ -453,8 +469,8 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
     assert "mktemp -d" in body
     assert "ditto -x -k" in body
 
-    remove = body.find("rm -rf $(INSTALL_DIR)/$(APP)")
-    copy = body.find("ditto $(APP) $(INSTALL_DIR)/$(APP)")
+    remove = body.find('rm -rf "$$installed"')
+    copy = body.find('ditto "$$staged" "$$installed"')
     assert -1 not in (remove, copy) and remove < copy
     for evidence in (
         "codesign --verify --deep --strict",
@@ -471,6 +487,54 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
     before_remove = body[:remove]
     assert re.search(r"(?:printf|echo)[^\n]*(?:archive|ARCHIVE)", before_remove)
     assert re.search(r"(?:printf|echo)[^\n]*(?:hash|HASH|sha)", before_remove)
+
+
+def test_install_staged_binds_install_to_pre_smoke_tree_digest(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    installed = work / "installed" / "Onoats.app"
+    shutil.copytree(
+        work / "Onoats.app", installed, copy_function=_copy_file_without_flags
+    )
+    inode_before = installed.stat().st_ino
+    expected = _app_tree_hash(work / "Onoats.app")
+    resource = work / "Onoats.app/Contents/Resources/OnoatsHeader.png"
+    resource.write_bytes(resource.read_bytes() + b"changed-after-smoke")
+
+    result = _run_install_staged(work, staged_app_tree_hash=expected)
+
+    assert result.returncode != 0
+    assert "differs from the bytes that passed smoke" in result.stdout + result.stderr
+    assert installed.stat().st_ino == inode_before
+
+
+def test_install_staged_preserves_rollback_record_until_successful_install(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    backup_dir.mkdir(parents=True)
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text("existing verified rollback\n", encoding="utf-8")
+
+    result = _run_install_staged(work, staged_app_tree_hash="0" * 64)
+
+    assert result.returncode != 0
+    assert record.read_text(encoding="utf-8") == "existing verified rollback\n"
+
+
+def test_install_staged_quotes_paths_with_spaces_and_glob_characters(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    install_dir = work / "installed target [literal]"
+    install_dir.mkdir()
+
+    result = _run_install_staged(work, install_dir=install_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (install_dir / "Onoats.app").is_dir()
 
 
 def test_clean_install_ignores_invalid_existing_app_and_clears_stale_approval(
@@ -614,12 +678,14 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
         "rollback may not accept an arbitrary archive path"
     )
 
-    remove = body.find("rm -rf $(INSTALL_DIR)/$(APP)")
+    remove = body.find('rm -rf "$$installed"')
     unpack = body.find("ditto -x -k")
     assert -1 not in (remove, unpack) and remove < unpack
     assert body.find("codesign --verify --deep --strict", unpack) > unpack
     assert body.find("codesign -dr -", unpack) > unpack
     assert body.find("cdhash", unpack) > unpack
+    assert 'rm -rf "$$installed"' in body
+    assert 'ditto -x -k "$$archive" "$(INSTALL_DIR)"' in body
 
 
 def test_existing_install_and_setup_contracts_are_unchanged():

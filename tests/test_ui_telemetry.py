@@ -183,6 +183,18 @@ def test_stt_details_and_transcript_are_unicode_codepoint_bounded():
     assert snapshot["transcript"]["speaker_label"] == "S12"
 
 
+@pytest.mark.parametrize("scalar_count", [1, DETAIL_LIMIT, DETAIL_LIMIT + 1, 1024])
+def test_locked_category_producer_is_consumer_bounded(scalar_count):
+    motif = "e\u0301🙂👩\u200d💻"
+    value = (motif * ((scalar_count // len(motif)) + 1))[:scalar_count]
+    state = UITelemetryState(4321, 900.25, locked_category=value)
+
+    published = state.snapshot()["locked_category"]
+
+    assert published == value[:DETAIL_LIMIT]
+    assert 0 < len(published) <= DETAIL_LIMIT
+
+
 def test_snapshot_shape_carries_one_owner_epoch_and_consistent_aggregate():
     state = _state()
     state.set_stt_state("me", "ready")

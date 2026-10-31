@@ -182,9 +182,10 @@ that surface:
   each named resource explicitly; `make verify-resources` equality-checks that
   allowlist before `make sign`. After the gauntlet, hash and smoke the
   already-signed staged bundle before installation. Then run
-  `make install-staged` to install those exact verified bytes without rebuilding
-  or re-signing them. Do not fix or otherwise mutate the bundle after signing;
-  any fix requires rebuilding, re-running the gauntlet, and signing again.
+  `make install-staged STAGED_APP_TREE_HASH=<pre-smoke-tree-sha256>` to install
+  those exact verified bytes without rebuilding or re-signing them. Do not fix
+  or otherwise mutate the bundle after signing; any fix requires rebuilding,
+  re-running the gauntlet, and signing again.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

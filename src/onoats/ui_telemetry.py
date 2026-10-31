@@ -70,7 +70,7 @@ class UITelemetryState:
     ) -> None:
         self.pid = int(pid)
         self.start_epoch = float(start_epoch)
-        self.locked_category = locked_category
+        self.locked_category = _cap(locked_category, DETAIL_LIMIT)
         self._clock = clock
         self._monotonic_clock = monotonic_clock
         self._audio: dict[str, dict[str, float] | None] = {

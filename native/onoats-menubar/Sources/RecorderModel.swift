@@ -62,12 +62,14 @@ protocol SystemOps: AnyObject {
     func processIsAlive(_ pid: Int32) -> Bool
     func commandLine(_ pid: Int32) -> String?
     func readData(at url: URL) -> Data?
+    func readData(at url: URL, maxBytes: Int) -> Data?
     func readText(at url: URL) -> String?
     func readTail(at url: URL, maxBytes: Int) -> String?
     func write(_ data: Data, to url: URL) throws
     func reserveFile(at url: URL) throws -> Bool
     func delete(at url: URL) throws
     func fileExists(at url: URL) -> Bool
+    func isRegularFile(at url: URL) -> Bool
     func isExecutable(at url: URL) -> Bool
     func contentsOfDirectory(at url: URL) -> [URL]
     func open(_ url: URL)
@@ -77,6 +79,12 @@ protocol SystemOps: AnyObject {
 }
 
 extension SystemOps {
+    func readData(at url: URL, maxBytes: Int) -> Data? {
+        guard maxBytes > 0, let data = readData(at: url), data.count <= maxBytes else {
+            return nil
+        }
+        return data
+    }
     func readTail(at url: URL, maxBytes: Int) -> String? {
         guard maxBytes > 0, let data = readData(at: url) else { return nil }
         return String(decoding: data.suffix(maxBytes), as: UTF8.self)
@@ -177,6 +185,18 @@ final class NativeSystemOps: SystemOps {
     }
 
     func readData(at url: URL) -> Data? { try? Data(contentsOf: url) }
+    func readData(at url: URL, maxBytes: Int) -> Data? {
+        guard maxBytes > 0,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(), size <= UInt64(maxBytes) else { return nil }
+        do {
+            try handle.seek(toOffset: 0)
+            return try handle.read(upToCount: maxBytes)
+        } catch {
+            return nil
+        }
+    }
     func readText(at url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
     func readTail(at url: URL, maxBytes: Int) -> String? {
         guard maxBytes > 0,
@@ -206,8 +226,18 @@ final class NativeSystemOps: SystemOps {
         if errno == EEXIST { return false }
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
-    func delete(at url: URL) throws { try FileManager.default.removeItem(at: url) }
+    func delete(at url: URL) throws {
+        guard Darwin.unlink(url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
     func fileExists(at url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+    func isRegularFile(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [
+            .isRegularFileKey, .isSymbolicLinkKey,
+        ]) else { return false }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
     func isExecutable(at url: URL) -> Bool {
         FileManager.default.isExecutableFile(atPath: url.path)
     }
@@ -241,6 +271,7 @@ final class RecorderModel: ObservableObject {
     static let runLogSuffix = ".log"
     static let maxRunLogs = 10
     static let categoryErrorTailBytes = 64 * 1024
+    static let telemetryMaxBytes = 64 * 1024
 
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"
@@ -496,8 +527,10 @@ final class RecorderModel: ObservableObject {
     /// Four-hertz display poll. This method deliberately never assigns state.
     func refreshTelemetry() {
         guard let authority = telemetryAuthority,
-              let data = ops.readData(at: authority.directory.appendingPathComponent(
-                ".active/\(UiTelemetryContract.fileName)")),
+              let data = ops.readData(
+                at: authority.directory.appendingPathComponent(
+                    ".active/\(UiTelemetryContract.fileName)"),
+                maxBytes: Self.telemetryMaxBytes),
               let snapshot = UiTelemetryDecoder.decode(
                 data, expectedPid: authority.pid, expectedStartEpoch: authority.startEpoch,
                 now: ops.now())
@@ -714,7 +747,9 @@ final class RecorderModel: ObservableObject {
     private func sortedRunLogsNewestFirst() -> [URL] {
         ops.contentsOfDirectory(at: logsDirectory)
             .compactMap { url -> (URL, Int64)? in
-                guard let epoch = runLogEpoch(url) else { return nil }
+                guard ops.isRegularFile(at: url), let epoch = runLogEpoch(url) else {
+                    return nil
+                }
                 return (url, epoch)
             }
             .sorted {
@@ -736,7 +771,7 @@ final class RecorderModel: ObservableObject {
     /// run. A fresh launch may select the newest surviving run log.
     func resolvedOpenLogURL() -> URL {
         if let remembered = mostRecentRunLogURL {
-            return ops.fileExists(at: remembered) ? remembered : logsDirectory
+            return ops.isRegularFile(at: remembered) ? remembered : logsDirectory
         }
         return sortedRunLogsNewestFirst().first ?? logsDirectory
     }
@@ -749,6 +784,7 @@ final class RecorderModel: ObservableObject {
 
     private func runLogTailContainsInvalidCategoryTag() -> Bool {
         guard let url = mostRecentRunLogURL,
+              ops.isRegularFile(at: url),
               let text = ops.readTail(at: url, maxBytes: Self.categoryErrorTailBytes) else {
             return false
         }

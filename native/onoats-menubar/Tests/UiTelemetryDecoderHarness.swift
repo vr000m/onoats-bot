@@ -184,6 +184,24 @@ private func runAllAggregatePairs() throws {
     }
 }
 
+private func runTranscriptDisplayLabels() throws {
+    let cases: [(String?, String?, String)] = [
+        ("me", nil, "Me"),
+        ("them", nil, "Them"),
+        (nil, nil, "Transcript"),
+        ("other", nil, "Transcript"),
+        ("me", "Me", "Me"),
+        ("them", "Them", "Them"),
+        ("them", "Them (S2)", "Them (S2)"),
+        (nil, "Them (S9)", "Them (S9)"),
+    ]
+    for (source, speakerLabel, expected) in cases {
+        try require(
+            transcriptDisplayLabel(source: source, speakerLabel: speakerLabel) == expected,
+            "display label mismatch for source=\(source ?? "nil") label=\(speakerLabel ?? "nil")")
+    }
+}
+
 @main
 struct UiTelemetryDecoderHarness {
     static func main() throws {
@@ -196,6 +214,7 @@ struct UiTelemetryDecoderHarness {
         try runStringBoundaries(root)
         try runLevelVerdicts(root)
         try runAllAggregatePairs()
+        try runTranscriptDisplayLabels()
         print("UiTelemetryDecoderHarness: ok")
     }
 }
