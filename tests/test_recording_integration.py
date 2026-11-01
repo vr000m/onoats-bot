@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import struct
 import tempfile
+from types import SimpleNamespace
 import wave
 
 import pytest
@@ -205,9 +206,86 @@ def test_installed_smoke_finds_exact_app_executable_when_path_contains_spaces(
     monkeypatch.setattr(
         SMOKE,
         "_processes",
-        lambda: {4321: (1, f"{executable} --launch-argument")},
+        lambda: {
+            4321: SMOKE.ProcessRow(
+                1, 4321, "Sat Nov  1 10:00:00 2026", f"{executable} --launch-argument"
+            )
+        },
     )
     assert SMOKE._one_app_pid(app) == 4321
+
+
+def test_installed_smoke_refuses_preexisting_app_before_open(tmp_path, monkeypatch):
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: 777)
+    opened = []
+    monkeypatch.setattr(
+        SMOKE.subprocess, "run", lambda *args, **kwargs: opened.append(args)
+    )
+    with pytest.raises(SMOKE.SmokeFailure, match="already running"):
+        SMOKE.run(SimpleNamespace(app=app, data_dir=tmp_path / "data"))
+    assert opened == []
+
+
+def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monkeypatch):
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    recorder = SMOKE.RecorderIdentity(4321, 900.25, "/onoats bot", "rec-start", 4321)
+    results = {
+        "signed app launch": 1234,
+        "app-owned recorder identity": recorder,
+        "fresh non-zero Me activity": True,
+        "graceful app-owned stop": True,
+        "durable Me utterance": True,
+    }
+    cleaned = []
+    monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
+    monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        SMOKE,
+        "wait_for",
+        lambda stage, _timeout, _probe: results[stage],
+    )
+    monkeypatch.setattr(
+        SMOKE,
+        "_processes",
+        lambda: {
+            1234: SMOKE.ProcessRow(1, 1234, "app-start", str(executable.resolve()))
+        },
+    )
+    monkeypatch.setattr(SMOKE, "_owned_descendant_groups", lambda *_args: ())
+    monkeypatch.setattr(
+        SMOKE, "_cleanup_after_failure", lambda *args, **kwargs: cleaned.append(kwargs)
+    )
+    SMOKE.run(
+        SimpleNamespace(
+            app=app,
+            data_dir=tmp_path / "data",
+            app_timeout=1,
+            recording_timeout=1,
+            activity_timeout=1,
+            stop_timeout=1,
+            transcript_timeout=1,
+            me_floor=0.01,
+        )
+    )
+    assert cleaned == [
+        {
+            "app_pid": 1234,
+            "app_process_start": "app-start",
+            "recorder": recorder,
+            "status_path": tmp_path / "data/.active/onoats.status.json",
+            "pid_path": tmp_path / "data/.active/onoats.pid",
+            "groups": (),
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -227,9 +305,16 @@ def test_installed_smoke_failure_cleanup_signals_only_verified_owned_identities(
     app_pid, recorder_pid = 1234, 4321
     expected_recorder_command = "/opt/onoats/bin/onoats bot"
     processes = {
-        app_pid: (1, executable if app_matches else "/tmp/foreign-app"),
-        recorder_pid: (
+        app_pid: SMOKE.ProcessRow(
+            1,
             app_pid,
+            "app-start",
+            executable if app_matches else "/tmp/foreign-app",
+        ),
+        recorder_pid: SMOKE.ProcessRow(
+            app_pid,
+            recorder_pid,
+            "recorder-start",
             expected_recorder_command if recorder_matches else "/tmp/foreign-recorder",
         ),
     }
@@ -260,7 +345,12 @@ def test_installed_smoke_cleanup_attempts_app_after_recorder_signal_failure(
     executable = str((app / "Contents/MacOS/Onoats").resolve())
     app_pid, recorder_pid = 1234, 4321
     command = "/opt/onoats/bin/onoats bot"
-    processes = {app_pid: (1, executable), recorder_pid: (app_pid, command)}
+    processes = {
+        app_pid: SMOKE.ProcessRow(1, app_pid, "app-start", executable),
+        recorder_pid: SMOKE.ProcessRow(
+            app_pid, recorder_pid, "recorder-start", command
+        ),
+    }
     attempted: list[int] = []
 
     def kill(pid: int, _sig: signal.Signals) -> None:
@@ -281,6 +371,23 @@ def test_installed_smoke_cleanup_attempts_app_after_recorder_signal_failure(
             timeout=0.01,
         )
     assert attempted == [recorder_pid, app_pid]
+
+
+def test_installed_smoke_group_cleanup_survives_reaped_leader_and_rejects_reuse(
+    monkeypatch,
+):
+    member = SMOKE.ProcessIdentity(5002, 5001, "member-start", "/capturer/helper")
+    group = SMOKE.OwnedProcessGroup(5001, (member,))
+    processes = {5002: SMOKE.ProcessRow(1, 5001, "member-start", "/capturer/helper")}
+    signalled = []
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(processes))
+    monkeypatch.setattr(
+        SMOKE.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
+    )
+    assert SMOKE._signal_owned_group(group, signal.SIGKILL) is True
+    processes[5002] = SMOKE.ProcessRow(1, 5001, "reused-start", "/capturer/helper")
+    assert SMOKE._signal_owned_group(group, signal.SIGKILL) is False
+    assert signalled == [(5001, signal.SIGKILL)]
 
 
 def test_installed_smoke_requires_new_canonical_me_without_exposing_text(

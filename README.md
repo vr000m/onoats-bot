@@ -180,7 +180,9 @@ less-frequent settings and diagnostics without leaving the panel.
   recorder identity, liveness, warnings, and failures. A separate display-only
   telemetry snapshot supplies fresh Me/Them levels, per-branch STT health, the
   locked category, and (when enabled) a bounded latest-transcript preview.
-  `No signal` means that branch has not published a fresh audio observation;
+  `Signal` means the branch has a fresh positive audio level, `Silent` means
+  its fresh level is zero, and `No signal` means that branch has not published
+  a fresh audio observation;
   `Unavailable` means telemetry is missing, stale, malformed, unsupported, or
   belongs to another run. STT is ready only when both websocket branches report
   ready; whisper and deepgram show neutral `status not reported`. Telemetry

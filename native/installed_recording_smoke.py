@@ -25,6 +25,27 @@ class RecorderIdentity(NamedTuple):
     pid: int
     start_epoch: float
     command: str
+    process_start: str = ""
+    pgid: int = 0
+
+
+class ProcessRow(NamedTuple):
+    parent: int
+    pgid: int
+    start: str
+    command: str
+
+
+class ProcessIdentity(NamedTuple):
+    pid: int
+    pgid: int
+    start: str
+    command: str
+
+
+class OwnedProcessGroup(NamedTuple):
+    pgid: int
+    members: tuple[ProcessIdentity, ...]
 
 
 def wait_for(
@@ -54,19 +75,26 @@ def _json(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
-def _processes() -> dict[int, tuple[int, str]]:
+def _processes() -> dict[int, ProcessRow]:
     result = subprocess.run(
-        ["/bin/ps", "-axo", "pid=,ppid=,command="],
+        ["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,command="],
         capture_output=True,
         text=True,
         timeout=5,
         check=True,
     )
-    found: dict[int, tuple[int, str]] = {}
+    found: dict[int, ProcessRow] = {}
     for line in result.stdout.splitlines():
-        fields = line.strip().split(None, 2)
-        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
-            found[int(fields[0])] = (int(fields[1]), fields[2])
+        fields = line.strip().split(None, 8)
+        if (
+            len(fields) == 9
+            and fields[0].isdigit()
+            and fields[1].isdigit()
+            and fields[2].isdigit()
+        ):
+            found[int(fields[0])] = ProcessRow(
+                int(fields[1]), int(fields[2]), " ".join(fields[3:8]), fields[8]
+            )
     return found
 
 
@@ -74,8 +102,8 @@ def _one_app_pid(app: Path) -> int | None:
     executable = str((app / "Contents/MacOS/Onoats").resolve())
     matches = [
         pid
-        for pid, (_parent, command) in _processes().items()
-        if command == executable or command.startswith(f"{executable} ")
+        for pid, row in _processes().items()
+        if row.command == executable or row.command.startswith(f"{executable} ")
     ]
     if len(matches) > 1:
         raise SmokeFailure("app identity failed: multiple matching Onoats processes")
@@ -110,7 +138,8 @@ def _recording_identity(
         raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
     if not _pid_file_matches(pid_path, pid=recorder_pid, start_epoch=epoch):
         return None
-    return RecorderIdentity(recorder_pid, epoch, processes[recorder_pid][1])
+    row = processes[recorder_pid]
+    return RecorderIdentity(recorder_pid, epoch, row.command, row.start, row.pgid)
 
 
 def _wait_pid_gone(pid: int, timeout: float) -> bool:
@@ -127,32 +156,89 @@ def _recorder_process_matches(identity: RecorderIdentity, *, app_pid: int) -> bo
     row = processes.get(identity.pid)
     return (
         row is not None
-        and row[1] == identity.command
+        and row.command == identity.command
+        and (not identity.process_start or row.start == identity.process_start)
+        and (not identity.pgid or row.pgid == identity.pgid)
         and _descends_from(identity.pid, app_pid, processes)
     )
 
 
-def _app_process_matches(app: Path, app_pid: int) -> bool:
+def _app_process_matches(app: Path, app_pid: int, *, process_start: str = "") -> bool:
     executable = str((app / "Contents/MacOS/Onoats").resolve())
     row = _processes().get(app_pid)
-    return row is not None and (
-        row[1] == executable or row[1].startswith(f"{executable} ")
+    return (
+        row is not None
+        and (not process_start or row.start == process_start)
+        and (row.command == executable or row.command.startswith(f"{executable} "))
     )
+
+
+def _identity_matches(identity: ProcessIdentity) -> bool:
+    row = _processes().get(identity.pid)
+    return row is not None and (
+        row.pgid == identity.pgid
+        and row.start == identity.start
+        and row.command == identity.command
+    )
+
+
+def _owned_descendant_groups(
+    app_pid: int, recorder_pid: int
+) -> tuple[OwnedProcessGroup, ...]:
+    """Snapshot smoke-owned descendant groups while their ancestry is provable."""
+    processes = _processes()
+    app_row = processes.get(app_pid)
+    grouped: dict[int, list[ProcessIdentity]] = {}
+    for pid, row in processes.items():
+        if not _descends_from(pid, recorder_pid, processes):
+            continue
+        if app_row is not None and row.pgid == app_row.pgid:
+            continue
+        grouped.setdefault(row.pgid, []).append(
+            ProcessIdentity(pid, row.pgid, row.start, row.command)
+        )
+    return tuple(
+        OwnedProcessGroup(pgid, tuple(members))
+        for pgid, members in sorted(grouped.items())
+    )
+
+
+def _signal_owned_group(group: OwnedProcessGroup, sig: signal.Signals) -> bool:
+    """Signal a captured group only while at least one exact member survives."""
+    if not any(_identity_matches(member) for member in group.members):
+        return False
+    os.killpg(group.pgid, sig)
+    return True
+
+
+def _cleanup_groups(groups: tuple[OwnedProcessGroup, ...], timeout: float) -> None:
+    for group in groups:
+        if _signal_owned_group(group, signal.SIGTERM):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and any(
+                _identity_matches(member) for member in group.members
+            ):
+                time.sleep(0.1)
+            _signal_owned_group(group, signal.SIGKILL)
 
 
 def _cleanup_after_failure(
     app: Path,
     *,
     app_pid: int | None,
+    app_process_start: str = "",
     recorder: RecorderIdentity | None,
     status_path: Path,
     pid_path: Path,
+    groups: tuple[OwnedProcessGroup, ...] = (),
     timeout: float = 5.0,
 ) -> None:
     """Boundedly stop only identities proven to belong to this smoke run."""
-    if app_pid is None:
-        app_pid = _one_app_pid(app)
-    if app_pid is None or not _app_process_matches(app, app_pid):
+    # Never discover ownership during cleanup: only a PID captured after the
+    # preflight-empty launch boundary belongs to this smoke run.
+    if app_pid is None or not _app_process_matches(
+        app, app_pid, process_start=app_process_start
+    ):
         return
     if recorder is None:
         try:
@@ -168,15 +254,17 @@ def _cleanup_after_failure(
             if not _wait_pid_gone(recorder.pid, timeout) and _recorder_process_matches(
                 recorder, app_pid=app_pid
             ):
+                _cleanup_groups(groups, timeout)
                 os.kill(recorder.pid, signal.SIGKILL)
                 _wait_pid_gone(recorder.pid, timeout)
+        _cleanup_groups(groups, timeout)
     except BaseException as exc:
         failures.append(exc)
     try:
-        if _app_process_matches(app, app_pid):
+        if _app_process_matches(app, app_pid, process_start=app_process_start):
             os.kill(app_pid, signal.SIGTERM)
             if not _wait_pid_gone(app_pid, timeout) and _app_process_matches(
-                app, app_pid
+                app, app_pid, process_start=app_process_start
             ):
                 os.kill(app_pid, signal.SIGKILL)
                 _wait_pid_gone(app_pid, timeout)
@@ -187,9 +275,7 @@ def _cleanup_after_failure(
         raise SmokeFailure(f"bounded cleanup encountered errors: {details}")
 
 
-def _descends_from(
-    pid: int, ancestor: int, processes: dict[int, tuple[int, str]]
-) -> bool:
+def _descends_from(pid: int, ancestor: int, processes: dict[int, ProcessRow]) -> bool:
     seen: set[int] = set()
     current = pid
     while current > 1 and current not in seen:
@@ -199,7 +285,7 @@ def _descends_from(
         row = processes.get(current)
         if row is None:
             return False
-        current = row[0]
+        current = row.parent
     return False
 
 
@@ -289,12 +375,22 @@ def run(args: argparse.Namespace) -> None:
     app = Path(args.app).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser().resolve()
     _verify_signed_app(app)
+    executable = (app / "Contents/MacOS/Onoats").resolve()
+    verified_executable = executable.stat()
+    preexisting = _one_app_pid(app)
+    if preexisting is not None:
+        raise SmokeFailure(
+            f"app preflight failed: Onoats is already running (pid {preexisting})"
+        )
     before = _session_snapshot(data_dir)
     status_path = data_dir / ".active/onoats.status.json"
     pid_path = data_dir / ".active/onoats.pid"
     telemetry_path = data_dir / ".active/onoats.ui.json"
     app_pid: int | None = None
+    app_process_start = ""
     recorder: RecorderIdentity | None = None
+    groups: tuple[OwnedProcessGroup, ...] = ()
+    primary_error: BaseException | None = None
     try:
         subprocess.run(["/usr/bin/open", str(app)], check=True, timeout=10)
         print("Open the Onoats panel, press Start, and speak into the microphone.")
@@ -302,12 +398,23 @@ def run(args: argparse.Namespace) -> None:
         app_pid = wait_for(
             "signed app launch", args.app_timeout, lambda: _one_app_pid(app)
         )
+        app_row = _processes().get(app_pid)
+        if app_row is None:
+            raise SmokeFailure("app launch failed: new process vanished")
+        app_process_start = app_row.start
+        current_executable = executable.stat()
+        if (verified_executable.st_dev, verified_executable.st_ino) != (
+            current_executable.st_dev,
+            current_executable.st_ino,
+        ):
+            raise SmokeFailure("app launch failed: verified executable was replaced")
         recorder = wait_for(
             "app-owned recorder identity",
             args.recording_timeout,
             lambda: _recording_identity(status_path, pid_path, app_pid=app_pid),
         )
         recorder_pid, epoch = recorder.pid, recorder.start_epoch
+        groups = _owned_descendant_groups(app_pid, recorder_pid)
 
         def nonzero_me() -> bool | None:
             telemetry = _json(telemetry_path)
@@ -357,21 +464,27 @@ def run(args: argparse.Namespace) -> None:
         print(
             "Installed recording smoke passed: app-owned Me activity and durable utterance."
         )
-    except BaseException:
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
         try:
             _cleanup_after_failure(
                 app,
                 app_pid=app_pid,
+                app_process_start=app_process_start,
                 recorder=recorder,
                 status_path=status_path,
                 pid_path=pid_path,
+                groups=groups,
             )
         except BaseException as cleanup_error:
             print(
                 f"installed recording smoke cleanup failed: {cleanup_error}",
                 file=sys.stderr,
             )
-        raise
+            if primary_error is None:
+                raise
 
 
 def _parser() -> argparse.ArgumentParser:

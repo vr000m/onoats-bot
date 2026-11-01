@@ -1117,6 +1117,8 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     _, install_body = _make_target(makefile, "install-staged")
     _, body = _make_target(makefile, "rollback")
     assert "$(INSTALL_STAGED_SCRIPT) rollback" in body
+    assert '--app-name "$(APP_NAME)"' in body
+    assert "APP_NAME := $(notdir $(APP))" in makefile
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "_read_record(Path(args.record), backup_dir)" in installer
     assert '"ditto", "-x", "-k"' in installer

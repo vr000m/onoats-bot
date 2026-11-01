@@ -801,6 +801,46 @@ async def test_frame_larger_than_byte_cap_is_dropped_not_spun(path):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "policy", [BackpressurePolicy.DROP_NEWEST, BackpressurePolicy.DROP_OLDEST]
+)
+async def test_level_observer_sees_only_frames_handed_to_pipeline(path, policy):
+    observed: list[float] = []
+    transport = _make_transport(
+        path,
+        max_buffered_frames=1,
+        backpressure_policy=policy,
+        on_level=observed.append,
+    )
+    quiet = InputAudioRawFrame(
+        audio=pcm_from_samples([0]), sample_rate=16000, num_channels=1
+    )
+    loud = InputAudioRawFrame(
+        audio=pcm_from_samples([32767]), sample_rate=16000, num_channels=1
+    )
+    await transport._stage_frame(quiet)
+    await transport._stage_frame(loud)
+    assert observed == [], "staging or eviction refreshed display-only telemetry"
+
+    delivered = asyncio.Event()
+
+    async def capture(_frame):
+        delivered.set()
+
+    transport.push_audio_frame = capture  # type: ignore[method-assign]
+    transport._audio_in_queue = asyncio.Queue()
+    pump = asyncio.create_task(transport._pump_loop())
+    await asyncio.wait_for(delivered.wait(), timeout=WAIT_TIMEOUT)
+    pump.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pump
+    if policy is BackpressurePolicy.DROP_NEWEST:
+        assert observed == [0.0]
+    else:
+        assert observed[0] > 0.99
+
+
+@pytest.mark.anyio
 async def test_block_backpressure_bounded_put_raises_on_consumer_stall(path):
     """BLOCK must not park the reader forever on a stalled consumer.
 

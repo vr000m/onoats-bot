@@ -26,6 +26,7 @@ from onoats.ui_telemetry import (
     UI_TELEMETRY_SCHEMA_VERSION,
     UITelemetryPublisher,
     UITelemetryState,
+    _restore_quarantined,
     aggregate_stt_state,
     cleanup_snapshot,
     read_snapshot,
@@ -578,6 +579,31 @@ def test_cleanup_preserves_same_path_inode_replacement(tmp_path, monkeypatch):
         "pid": 4321,
         "start_epoch": 900.25,
     }
+
+
+def test_restore_quarantined_directory_uses_atomic_noreplace_rename(tmp_path):
+    quarantined = tmp_path / "quarantine" / "snapshot"
+    quarantined.mkdir(parents=True)
+    (quarantined / "sentinel").write_text("foreign", encoding="utf-8")
+    public = tmp_path / "onoats.ui.json"
+    _restore_quarantined(quarantined, public)
+    assert public.is_dir()
+    assert (public / "sentinel").read_text(encoding="utf-8") == "foreign"
+    assert not quarantined.exists()
+
+
+def test_cleanup_fails_open_before_move_without_atomic_noreplace(tmp_path, monkeypatch):
+    state = _state()
+    publisher = UITelemetryPublisher(tmp_path, state)
+    assert publisher.write_once(now=1000.0)
+    path = _path(tmp_path)
+    before = path.read_bytes()
+    monkeypatch.setattr(
+        "onoats.ui_telemetry._rename_noreplace_available", lambda: False
+    )
+    assert cleanup_snapshot(tmp_path, pid=4321, start_epoch=900.25) is False
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob(".onoats-ui-cleanup-*"))
 
 
 def test_cleanup_publication_at_quarantine_removal_boundary_survives(

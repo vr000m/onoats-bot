@@ -9,6 +9,8 @@ liveness authority -- the PID and lifecycle status files retain that role.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import json
 import logging
 import math
@@ -34,6 +36,8 @@ DETAIL_LIMIT = 256
 LEVEL_MIN = 0.0
 LEVEL_MAX = 1.0
 MAX_SNAPSHOT_BYTES = 64 * 1024
+_AT_FDCWD = -2
+_RENAME_EXCL = 0x00000004
 
 STT_STATES = frozenset({"failed", "recovering", "starting", "unknown", "ready"})
 STT_PRECEDENCE = ("failed", "recovering", "starting", "unknown", "ready")
@@ -434,6 +438,8 @@ def _cleanup_owned_snapshot(path: Path, *, pid: int, start_epoch: float) -> bool
             descriptor, opened, pid=pid, start_epoch=start_epoch
         ):
             return False
+        if not _rename_noreplace_available():
+            return False
 
         # This is advisory only: the subsequent rename and quarantine inode
         # check, not this pathname observation, decide what may be removed.
@@ -501,13 +507,53 @@ def _descriptor_has_owner(
 def _restore_quarantined(quarantined: Path, public_path: Path) -> None:
     """Restore a moved replacement without overwriting a newer publication."""
     try:
-        os.link(quarantined, public_path, follow_symlinks=False)
+        _rename_noreplace(quarantined, public_path)
     except FileExistsError:
         # A newer public-path replacement wins; preserve the moved entry in its
         # private quarantine rather than deleting either replacement.
         return
-    except OSError:
-        # The raced entry may not be linkable (for example a directory).  Keep
-        # it quarantined; cleanup is best-effort and must not destroy it.
+    except (NotImplementedError, OSError):
+        # Cleanup is fail-open if the platform cannot provide an atomic
+        # no-replace rename.  Never emulate it with a racy exists+rename pair.
         return
-    os.unlink(quarantined)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename any entry type without replacing ``destination``.
+
+    macOS exposes this contract as ``renameatx_np(RENAME_EXCL)``.  Keeping the
+    operation in one syscall is essential: a pathname check followed by plain
+    rename could overwrite a publisher that wins the intervening race.
+    """
+    renameatx_np = _rename_noreplace_symbol()
+    if renameatx_np is None:
+        raise NotImplementedError("atomic no-replace rename is unavailable")
+    renameatx_np.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameatx_np.restype = ctypes.c_int
+    result = renameatx_np(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_EXCL,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), destination)
+    raise OSError(error, os.strerror(error), source)
+
+
+def _rename_noreplace_symbol() -> Any | None:
+    return getattr(ctypes.CDLL(None, use_errno=True), "renameatx_np", None)
+
+
+def _rename_noreplace_available() -> bool:
+    return _rename_noreplace_symbol() is not None

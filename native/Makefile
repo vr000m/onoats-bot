@@ -54,6 +54,7 @@ RESOURCE_NAMES  := Onoats.icns \
 
 BUILD := build
 APP   := Onoats.app
+APP_NAME := $(notdir $(APP))
 # Phase 5b bundle shape: the menu-bar app is the main executable
 # (CFBundleExecutable=Onoats); the capturer is embedded alongside it. One
 # bundle id => one TCC identity; the DR is unchanged by the restructure
@@ -215,7 +216,7 @@ install-staged:
 # Restore only a private, fully verified extraction of the recorded archive.
 # Atomic exchange keeps the current app installed on every validation failure.
 rollback:
-	@python3 $(INSTALL_STAGED_SCRIPT) rollback --app-name "$(APP)" \
+	@python3 $(INSTALL_STAGED_SCRIPT) rollback --app-name "$(APP_NAME)" \
 		--install-dir "$(INSTALL_DIR)" --backup-dir "$(BACKUP_DIR)" \
 		--record "$(ROLLBACK_RECORD)" --makefile-dir "$(CURDIR)" \
 		--bundle-id "$(BUNDLE_ID)"

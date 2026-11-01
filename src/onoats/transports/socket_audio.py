@@ -439,7 +439,6 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                         f"capturer closed socket {self._socket_path!r} (EOF); ending branch"
                     )
                     return
-                self._observe_level(frame.audio)
                 await self._stage_frame(frame)
         except asyncio.CancelledError:
             raise
@@ -743,6 +742,10 @@ class UnixSocketAudioInputTransport(BaseInputTransport):
                 frame = await self._stage.get()
                 self._staged_bytes -= len(frame.audio)
                 self._room_freed.set()
+                # Observe only at the handoff that VAD/STT will consume.  A
+                # staged frame may still be evicted by DROP_OLDEST, and a
+                # DROP_NEWEST frame never reaches this boundary.
+                self._observe_level(frame.audio)
                 await self.push_audio_frame(frame)
         except asyncio.CancelledError:
             raise
