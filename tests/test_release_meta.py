@@ -461,6 +461,68 @@ def test_launchservices_uniqueness_rejects_any_second_registered_bundle(
         INSTALL_STAGED._verify_single_registration(installed, "net.varunsingh.onoats")
 
 
+@pytest.mark.parametrize(
+    ("initial", "should_fail"),
+    [
+        ("none", False),
+        ("staged", False),
+        ("installed-and-staged", False),
+        ("foreign-and-staged", True),
+    ],
+)
+def test_installer_clears_only_verified_staged_registration_then_fails_closed(
+    tmp_path, monkeypatch, initial, should_fail
+):
+    staged = (tmp_path / "smoke output" / "Onoats.app").resolve()
+    installed = (tmp_path / "Applications" / "Onoats.app").resolve()
+    foreign = (tmp_path / "Elsewhere" / "Onoats.app").resolve()
+    registrations = {
+        "none": set(),
+        "staged": {staged},
+        "installed-and-staged": {installed, staged},
+        "foreign-and-staged": {foreign, staged},
+    }[initial]
+    verified: list[Path] = []
+    unregistered: list[Path] = []
+
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_launchservices_paths", lambda _bundle_id: registrations
+    )
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_app",
+        lambda app, **_kwargs: verified.append(app) or ("1" * 64, "2" * 64, "3" * 40),
+    )
+
+    def fake_run(*argv: str, cwd=None):
+        assert argv[:2] == (str(INSTALL_STAGED.LSREGISTER), "-u")
+        target = Path(argv[2]).resolve()
+        registrations.remove(target)
+        unregistered.append(target)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
+    INSTALL_STAGED._clear_verified_staged_registration(
+        staged,
+        installed,
+        "net.varunsingh.onoats",
+        "1" * 64,
+        tmp_path,
+    )
+    if should_fail:
+        with pytest.raises(
+            INSTALL_STAGED.InstallError, match="duplicate LaunchServices"
+        ):
+            INSTALL_STAGED._verify_single_registration(
+                installed, "net.varunsingh.onoats"
+            )
+    else:
+        INSTALL_STAGED._verify_single_registration(installed, "net.varunsingh.onoats")
+    assert unregistered == ([staged] if "staged" in initial else [])
+    assert verified == ([staged] if "staged" in initial else [])
+    assert foreign in registrations if should_fail else foreign not in registrations
+
+
 def test_post_publication_launchservices_failure_restores_prior_app_before_commit(
     tmp_path, monkeypatch
 ):
@@ -1129,6 +1191,69 @@ def test_rollback_extracts_one_private_archive_snapshot_not_replaced_path(
         )
     )
     assert len(extraction_sources) == 1
+
+
+def test_rollback_uses_recorded_identity_not_current_resource_manifest(
+    tmp_path, monkeypatch
+):
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    archive = backup_dir / "Onoats-approved.zip"
+    payload = b"older-release-archive"
+    archive.write_bytes(payload)
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text(
+        "\n".join(
+            (
+                f"archive={archive}",
+                f"hash={hashlib.sha256(payload).hexdigest()}",
+                f"tree_hash={'1' * 64}",
+                f"dr_hash={'2' * 64}",
+                f"cdhash={'3' * 40}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    install_dir = tmp_path / "Applications"
+    verify_kwargs: list[dict[str, object]] = []
+
+    def fake_run(*argv: str, cwd=None):
+        if len(argv) >= 5 and argv[1:3] == ("-x", "-k"):
+            (Path(argv[4]) / "Onoats.app").mkdir()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def verify(_app, **kwargs):
+        verify_kwargs.append(kwargs)
+        return "1" * 64, "2" * 64, "3" * 40
+
+    def replace(candidate, installed, verify_published, commit):
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        candidate.rename(installed)
+        verify_published(installed)
+        commit()
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_app", verify)
+    monkeypatch.setattr(INSTALL_STAGED, "_replace_verified", replace)
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_single_registration", lambda *_: None)
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_resources",
+        lambda *_: (_ for _ in ()).throw(AssertionError("current manifest used")),
+    )
+    INSTALL_STAGED.rollback(
+        argparse.Namespace(
+            install_dir=str(install_dir),
+            backup_dir=str(backup_dir),
+            record=str(record),
+            app_name="Onoats.app",
+            makefile_dir=str(tmp_path / "current-release"),
+            bundle_id="net.varunsingh.onoats",
+        )
+    )
+    assert len(verify_kwargs) == 2
+    assert all("makefile_dir" not in kwargs for kwargs in verify_kwargs)
 
 
 def test_existing_install_and_setup_contracts_are_unchanged():

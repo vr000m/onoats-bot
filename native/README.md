@@ -221,7 +221,10 @@ make -C native install-staged \
 Only that approved mode publishes a rollback record. Restore it with
 `make -C native rollback`; rollback copies and extracts one immutable
 descriptor-backed archive snapshot and verifies it before atomically publishing
-the canonical `~/Applications/Onoats.app`. The current release is a clean-install
+the canonical `~/Applications/Onoats.app`. Restore verification uses the
+archive's recorded tree hash, designated-requirement hash, cdhash, and archive
+hash rather than the current checkout's resource allowlist, so an approved older
+bundle remains restorable after the allowlist changes. The current release is a clean-install
 run because its pre-change CLI baseline was incomplete, so it must use
 `ROLLBACK_BASELINE_APPROVED=0` and must not invoke rollback.
 

@@ -18,6 +18,10 @@ import warnings
 
 IDENTITY_VERSION = b"onoats-app-identity-v1\0"
 RENAME_SWAP = 0x00000002
+LSREGISTER = Path(
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+    "LaunchServices.framework/Support/lsregister"
+)
 
 
 class InstallError(RuntimeError):
@@ -222,13 +226,9 @@ def _launchservices_paths(bundle_id: str) -> set[Path]:
     """Return registered paths for a bundle id when LaunchServices is present."""
     if os.uname().sysname != "Darwin":
         return set()
-    tool = Path(
-        "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
-        "LaunchServices.framework/Support/lsregister"
-    )
-    if not tool.is_file():
+    if not LSREGISTER.is_file():
         raise InstallError("LaunchServices registration tool is unavailable")
-    output = _run(str(tool), "-dump").stdout
+    output = _run(str(LSREGISTER), "-dump").stdout
     paths: set[Path] = set()
     record: dict[str, list[str]] = {}
 
@@ -271,6 +271,31 @@ def _verify_single_registration(installed: Path, bundle_id: str) -> None:
     if unexpected:
         rendered = ", ".join(str(path) for path in sorted(unexpected, key=str))
         raise InstallError(f"duplicate LaunchServices bundle registration: {rendered}")
+
+
+def _clear_verified_staged_registration(
+    staged: Path,
+    installed: Path,
+    bundle_id: str,
+    expected_identity: str,
+    makefile_dir: Path,
+) -> None:
+    """Remove only the exact approved staged bundle from LaunchServices."""
+    staged = staged.resolve()
+    installed = installed.resolve()
+    if staged == installed:
+        raise InstallError("staged app and install destination must be distinct")
+    registered = _launchservices_paths(bundle_id)
+    if staged not in registered:
+        return
+    _verify_app(
+        staged,
+        expected_identity=expected_identity,
+        makefile_dir=makefile_dir,
+    )
+    _run(str(LSREGISTER), "-u", str(staged))
+    if staged in _launchservices_paths(bundle_id):
+        raise InstallError("staged LaunchServices registration could not be removed")
 
 
 def _write_record(record: Path, fields: dict[str, str]) -> None:
@@ -375,6 +400,13 @@ def install(args: argparse.Namespace) -> None:
         raise InstallError("ROLLBACK_BASELINE_APPROVED must be 0 or 1")
 
     install_dir.mkdir(parents=True, exist_ok=True)
+    _clear_verified_staged_registration(
+        staged,
+        installed,
+        args.bundle_id,
+        expected,
+        Path(args.makefile_dir),
+    )
     _verify_single_registration(installed, args.bundle_id)
     parent, candidate = _copy_snapshot(staged, install_dir, staged.name)
     archive: Path | None = None
@@ -453,7 +485,6 @@ def rollback(args: argparse.Namespace) -> None:
     install_dir.mkdir(parents=True, exist_ok=True)
     installed = install_dir / args.app_name
     bundle_id = getattr(args, "bundle_id", "net.varunsingh.onoats")
-    makefile_dir = getattr(args, "makefile_dir", None)
     _verify_single_registration(installed, bundle_id)
     parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
     candidate = parent / "candidate"
@@ -465,7 +496,6 @@ def rollback(args: argparse.Namespace) -> None:
         _normalise_private_tree(extracted)
         os.rename(extracted, candidate)
         observed = _verify_app(candidate, expected_identity=fields["tree_hash"])
-        _verify_resources(candidate, Path(makefile_dir) if makefile_dir else None)
         if observed[1:] != (fields["dr_hash"], fields["cdhash"]):
             raise InstallError("restored app identity mismatch")
 
@@ -480,7 +510,6 @@ def rollback(args: argparse.Namespace) -> None:
             lambda path: _verify_app(
                 path,
                 expected_identity=fields["tree_hash"],
-                makefile_dir=Path(makefile_dir) if makefile_dir else None,
             ),
             commit,
         )

@@ -762,6 +762,9 @@ def test_menu_bar_uses_distinct_template_images_for_every_recorder_state():
     colour for template images, and light/dark menu bars need the same mapping.
     """
     swift = MENU_BAR_APP.read_text(encoding="utf-8")
+    switch_start = swift.index("private var menuImageName")
+    switch_end = swift.index("private var menuImage: NSImage", switch_start)
+    menu_image_switch = swift[switch_start:switch_end]
     expected = {
         "Idle": "OnoatsMenuBarTemplateIdle",
         "Recording": "OnoatsMenuBarTemplateRecording",
@@ -783,7 +786,7 @@ def test_menu_bar_uses_distinct_template_images_for_every_recorder_state():
     # (starting/stopping), and failed rather than selecting one colour asset
     # and attempting to tint it at runtime.
     for case in ("stopped", "starting", "running", "stopping", "failed"):
-        assert re.search(rf"case\s+\.{case}\b", swift), case
+        assert re.search(rf"case\s+[^:\n]*\.{case}\b", menu_image_switch), case
     assert "OnoatsHeader" not in swift.split("MenuBarExtra", 1)[1].split("}", 1)[0], (
         "the full-colour header mark must not be used as the menu-bar glyph"
     )

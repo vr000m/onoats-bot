@@ -5,18 +5,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
-from typing import TypeVar
+from typing import NamedTuple, TypeVar
 
 T = TypeVar("T")
 
 
 class SmokeFailure(RuntimeError):
     """One stage of the installed recording proof failed."""
+
+
+class RecorderIdentity(NamedTuple):
+    pid: int
+    start_epoch: float
+    command: str
 
 
 def wait_for(
@@ -67,11 +75,116 @@ def _one_app_pid(app: Path) -> int | None:
     matches = [
         pid
         for pid, (_parent, command) in _processes().items()
-        if command.split(None, 1)[0] == executable
+        if command == executable or command.startswith(f"{executable} ")
     ]
     if len(matches) > 1:
         raise SmokeFailure("app identity failed: multiple matching Onoats processes")
     return matches[0] if matches else None
+
+
+def _pid_file_matches(pid_path: Path, *, pid: int, start_epoch: float) -> bool:
+    try:
+        fields = pid_path.read_text(encoding="utf-8").splitlines()
+        return (
+            len(fields) >= 4
+            and int(fields[0]) == pid
+            and float(fields[3]) == start_epoch
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _recording_identity(
+    status_path: Path, pid_path: Path, *, app_pid: int
+) -> RecorderIdentity | None:
+    status = _json(status_path)
+    if not status or status.get("running") is not True:
+        return None
+    try:
+        recorder_pid = int(status["pid"])
+        epoch = float(status["start_time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    processes = _processes()
+    if not _descends_from(recorder_pid, app_pid, processes):
+        raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
+    if not _pid_file_matches(pid_path, pid=recorder_pid, start_epoch=epoch):
+        return None
+    return RecorderIdentity(recorder_pid, epoch, processes[recorder_pid][1])
+
+
+def _wait_pid_gone(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid not in _processes():
+            return True
+        time.sleep(0.1)
+    return pid not in _processes()
+
+
+def _recorder_process_matches(identity: RecorderIdentity, *, app_pid: int) -> bool:
+    processes = _processes()
+    row = processes.get(identity.pid)
+    return (
+        row is not None
+        and row[1] == identity.command
+        and _descends_from(identity.pid, app_pid, processes)
+    )
+
+
+def _app_process_matches(app: Path, app_pid: int) -> bool:
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    row = _processes().get(app_pid)
+    return row is not None and (
+        row[1] == executable or row[1].startswith(f"{executable} ")
+    )
+
+
+def _cleanup_after_failure(
+    app: Path,
+    *,
+    app_pid: int | None,
+    recorder: RecorderIdentity | None,
+    status_path: Path,
+    pid_path: Path,
+    timeout: float = 5.0,
+) -> None:
+    """Boundedly stop only identities proven to belong to this smoke run."""
+    if app_pid is None:
+        app_pid = _one_app_pid(app)
+    if app_pid is None or not _app_process_matches(app, app_pid):
+        return
+    if recorder is None:
+        try:
+            recorder = _recording_identity(status_path, pid_path, app_pid=app_pid)
+        except (SmokeFailure, OSError, subprocess.SubprocessError, ValueError):
+            recorder = None
+    failures: list[BaseException] = []
+    try:
+        if recorder is not None and _recorder_process_matches(
+            recorder, app_pid=app_pid
+        ):
+            os.kill(recorder.pid, signal.SIGTERM)
+            if not _wait_pid_gone(recorder.pid, timeout) and _recorder_process_matches(
+                recorder, app_pid=app_pid
+            ):
+                os.kill(recorder.pid, signal.SIGKILL)
+                _wait_pid_gone(recorder.pid, timeout)
+    except BaseException as exc:
+        failures.append(exc)
+    try:
+        if _app_process_matches(app, app_pid):
+            os.kill(app_pid, signal.SIGTERM)
+            if not _wait_pid_gone(app_pid, timeout) and _app_process_matches(
+                app, app_pid
+            ):
+                os.kill(app_pid, signal.SIGKILL)
+                _wait_pid_gone(app_pid, timeout)
+    except BaseException as exc:
+        failures.append(exc)
+    if failures:
+        details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
+        raise SmokeFailure(f"bounded cleanup encountered errors: {details}")
 
 
 def _descends_from(
@@ -177,86 +290,88 @@ def run(args: argparse.Namespace) -> None:
     data_dir = Path(args.data_dir).expanduser().resolve()
     _verify_signed_app(app)
     before = _session_snapshot(data_dir)
-    subprocess.run(["/usr/bin/open", str(app)], check=True, timeout=10)
-    print("Open the Onoats panel, press Start, and speak into the microphone.")
-
-    app_pid = wait_for("signed app launch", args.app_timeout, lambda: _one_app_pid(app))
     status_path = data_dir / ".active/onoats.status.json"
     pid_path = data_dir / ".active/onoats.pid"
     telemetry_path = data_dir / ".active/onoats.ui.json"
+    app_pid: int | None = None
+    recorder: RecorderIdentity | None = None
+    try:
+        subprocess.run(["/usr/bin/open", str(app)], check=True, timeout=10)
+        print("Open the Onoats panel, press Start, and speak into the microphone.")
 
-    def recording_identity() -> tuple[int, float] | None:
-        status = _json(status_path)
-        if not status or status.get("running") is not True:
-            return None
+        app_pid = wait_for(
+            "signed app launch", args.app_timeout, lambda: _one_app_pid(app)
+        )
+        recorder = wait_for(
+            "app-owned recorder identity",
+            args.recording_timeout,
+            lambda: _recording_identity(status_path, pid_path, app_pid=app_pid),
+        )
+        recorder_pid, epoch = recorder.pid, recorder.start_epoch
+
+        def nonzero_me() -> bool | None:
+            telemetry = _json(telemetry_path)
+            if not telemetry:
+                return None
+            now = time.time()
+            if (
+                telemetry.get("pid") != recorder_pid
+                or telemetry.get("start_epoch") != epoch
+            ):
+                raise SmokeFailure(
+                    "telemetry ownership failed: stale or external session"
+                )
+            audio = telemetry.get("audio")
+            me = audio.get("me") if isinstance(audio, dict) else None
+            if not isinstance(me, dict):
+                return None
+            try:
+                level = float(me["level"])
+                observed_at = float(me["observed_at"])
+                updated_at = float(telemetry["updated_at"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if now - updated_at > 5 or now - observed_at > 1:
+                return None
+            return True if level > args.me_floor else None
+
+        wait_for("fresh non-zero Me activity", args.activity_timeout, nonzero_me)
+        print("Non-zero Me activity confirmed. Press Stop in the Onoats panel.")
+
+        wait_for(
+            "graceful app-owned stop",
+            args.stop_timeout,
+            lambda: (
+                _graceful_stop_evidence(
+                    status_path, recorder_pid=recorder_pid, start_epoch=epoch
+                )
+                if not pid_path.exists()
+                else None
+            ),
+        )
+        wait_for(
+            "durable Me utterance",
+            args.transcript_timeout,
+            lambda: _new_me_utterance(data_dir, before),
+        )
+        print(
+            "Installed recording smoke passed: app-owned Me activity and durable utterance."
+        )
+    except BaseException:
         try:
-            recorder_pid = int(status["pid"])
-            epoch = float(status["start_time"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        processes = _processes()
-        if not _descends_from(recorder_pid, app_pid, processes):
-            raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
-        try:
-            pid_fields = pid_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return None
-        if len(pid_fields) < 4 or int(pid_fields[0]) != recorder_pid:
-            return None
-        if float(pid_fields[3]) != epoch:
-            return None
-        return recorder_pid, epoch
-
-    recorder_pid, epoch = wait_for(
-        "app-owned recorder identity", args.recording_timeout, recording_identity
-    )
-
-    def nonzero_me() -> bool | None:
-        telemetry = _json(telemetry_path)
-        if not telemetry:
-            return None
-        now = time.time()
-        if (
-            telemetry.get("pid") != recorder_pid
-            or telemetry.get("start_epoch") != epoch
-        ):
-            raise SmokeFailure("telemetry ownership failed: stale or external session")
-        audio = telemetry.get("audio")
-        me = audio.get("me") if isinstance(audio, dict) else None
-        if not isinstance(me, dict):
-            return None
-        try:
-            level = float(me["level"])
-            observed_at = float(me["observed_at"])
-            updated_at = float(telemetry["updated_at"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        if now - updated_at > 5 or now - observed_at > 1:
-            return None
-        return True if level > args.me_floor else None
-
-    wait_for("fresh non-zero Me activity", args.activity_timeout, nonzero_me)
-    print("Non-zero Me activity confirmed. Press Stop in the Onoats panel.")
-
-    wait_for(
-        "graceful app-owned stop",
-        args.stop_timeout,
-        lambda: (
-            _graceful_stop_evidence(
-                status_path, recorder_pid=recorder_pid, start_epoch=epoch
+            _cleanup_after_failure(
+                app,
+                app_pid=app_pid,
+                recorder=recorder,
+                status_path=status_path,
+                pid_path=pid_path,
             )
-            if not pid_path.exists()
-            else None
-        ),
-    )
-    wait_for(
-        "durable Me utterance",
-        args.transcript_timeout,
-        lambda: _new_me_utterance(data_dir, before),
-    )
-    print(
-        "Installed recording smoke passed: app-owned Me activity and durable utterance."
-    )
+        except BaseException as cleanup_error:
+            print(
+                f"installed recording smoke cleanup failed: {cleanup_error}",
+                file=sys.stderr,
+            )
+        raise
 
 
 def _parser() -> argparse.ArgumentParser:

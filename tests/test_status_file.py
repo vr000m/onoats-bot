@@ -1299,23 +1299,27 @@ def test_swift_menu_bar_shares_one_hint_splitter_across_every_hint():
     convention is what failed: the second producer inherited the wrong
     behaviour by default, and nothing said so.
     """
-    swift = (
-        Path(__file__).resolve().parents[1]
-        / "native"
-        / "onoats-menubar"
-        / "Sources"
-        / "OnoatsMenuBarApp.swift"
+    sources = (
+        Path(__file__).resolve().parents[1] / "native" / "onoats-menubar" / "Sources"
     )
-    source = swift.read_text(encoding="utf-8")
-    assert "func hintCaptionLines(" in source, (
+    app_source = (sources / "OnoatsMenuBarApp.swift").read_text(encoding="utf-8")
+    panel_source = (sources / "RecordingPanelView.swift").read_text(encoding="utf-8")
+    assert "func hintCaptionLines(" in app_source, (
         "the shared hint splitter is gone — each hint call site is free to "
         "invent its own rendering again."
     )
+    assert "struct MenuContent" not in app_source, (
+        "the unreachable legacy menu can mask drift in the active recording panel"
+    )
     # No hint may be rendered as a bare, unsplit menu item.
-    for field in ("model.warning", "model.flushNote", "launch.loginItemHint"):
-        assert f'Text("⚠ \\({field}' not in source, field
-    for binding in ("warning", "note", "hint"):
-        assert f"hintLines({binding})" in source, binding
+    for field, binding in (
+        ("model.warning", "warning"),
+        ("model.flushNote", "note"),
+        ("launch.loginItemHint", "hint"),
+    ):
+        assert f'Text("⚠ \\({field}' not in panel_source, field
+        assert f"values.append({binding})" in panel_source, field
+    assert "hintCaptionLines(warning)" in panel_source
 
 
 def test_read_status_survives_a_non_utf8_status_file(tmp_path: Path):

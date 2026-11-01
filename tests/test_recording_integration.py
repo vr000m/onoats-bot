@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import struct
 import tempfile
 import wave
@@ -194,6 +195,92 @@ def test_installed_smoke_every_wait_has_stage_specific_timeout(stage):
             clock=lambda: next(ticks),
             sleep=lambda _delay: None,
         )
+
+
+def test_installed_smoke_finds_exact_app_executable_when_path_contains_spaces(
+    tmp_path, monkeypatch
+):
+    app = tmp_path / "Build Output" / "Onoats.app"
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    monkeypatch.setattr(
+        SMOKE,
+        "_processes",
+        lambda: {4321: (1, f"{executable} --launch-argument")},
+    )
+    assert SMOKE._one_app_pid(app) == 4321
+
+
+@pytest.mark.parametrize(
+    ("app_matches", "recorder_matches", "expected"),
+    [
+        (True, True, [(4321, signal.SIGTERM), (1234, signal.SIGTERM)]),
+        (True, False, [(1234, signal.SIGTERM)]),
+        (False, True, []),
+    ],
+    ids=["owned-recorder-and-app", "foreign-recorder", "foreign-app-root"],
+)
+def test_installed_smoke_failure_cleanup_signals_only_verified_owned_identities(
+    tmp_path, monkeypatch, app_matches, recorder_matches, expected
+):
+    app = tmp_path / "Build Output" / "Onoats.app"
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    app_pid, recorder_pid = 1234, 4321
+    expected_recorder_command = "/opt/onoats/bin/onoats bot"
+    processes = {
+        app_pid: (1, executable if app_matches else "/tmp/foreign-app"),
+        recorder_pid: (
+            app_pid,
+            expected_recorder_command if recorder_matches else "/tmp/foreign-recorder",
+        ),
+    }
+    signalled: list[tuple[int, signal.Signals]] = []
+
+    def kill(pid: int, sig: signal.Signals) -> None:
+        signalled.append((pid, sig))
+        processes.pop(pid, None)
+
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(processes))
+    monkeypatch.setattr(SMOKE.os, "kill", kill)
+    identity = SMOKE.RecorderIdentity(recorder_pid, 900.25, expected_recorder_command)
+    SMOKE._cleanup_after_failure(
+        app,
+        app_pid=app_pid,
+        recorder=identity,
+        status_path=tmp_path / "status.json",
+        pid_path=tmp_path / "pid",
+        timeout=0.01,
+    )
+    assert signalled == expected
+
+
+def test_installed_smoke_cleanup_attempts_app_after_recorder_signal_failure(
+    tmp_path, monkeypatch
+):
+    app = tmp_path / "Onoats.app"
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    app_pid, recorder_pid = 1234, 4321
+    command = "/opt/onoats/bin/onoats bot"
+    processes = {app_pid: (1, executable), recorder_pid: (app_pid, command)}
+    attempted: list[int] = []
+
+    def kill(pid: int, _sig: signal.Signals) -> None:
+        attempted.append(pid)
+        if pid == recorder_pid:
+            raise PermissionError("injected recorder cleanup failure")
+        processes.pop(pid, None)
+
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(processes))
+    monkeypatch.setattr(SMOKE.os, "kill", kill)
+    with pytest.raises(SMOKE.SmokeFailure, match="injected recorder cleanup failure"):
+        SMOKE._cleanup_after_failure(
+            app,
+            app_pid=app_pid,
+            recorder=SMOKE.RecorderIdentity(recorder_pid, 900.25, command),
+            status_path=tmp_path / "status.json",
+            pid_path=tmp_path / "pid",
+            timeout=0.01,
+        )
+    assert attempted == [recorder_pid, app_pid]
 
 
 def test_installed_smoke_requires_new_canonical_me_without_exposing_text(
