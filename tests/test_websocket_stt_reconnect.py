@@ -378,6 +378,49 @@ def test_lost_established_connection_fires_recovering_once(monkeypatch):
     assert events == ["ready", "recovering"]
 
 
+@pytest.mark.parametrize("ending", ["eof", "error", "session.closed"])
+@pytest.mark.parametrize("ownership", ["current", "superseded", "draining", "closing"])
+@pytest.mark.parametrize("was_connected", [False, True])
+def test_reader_exit_revokes_only_current_established_readiness(
+    ending, ownership, was_connected
+):
+    """All remote endings revoke ready once; detached readers never mutate health."""
+    callbacks = []
+    svc = _make_service(on_recovering=lambda: callbacks.append("recovering"))
+
+    class EndingClient(_FakeClient):
+        async def events(self):
+            if ending == "error":
+                raise OSError("remote connection lost")
+            if ending == "session.closed":
+                yield {"type": P.EVT_SESSION_CLOSED}
+
+    async def _run():
+        client = EndingClient()
+        svc._client = client
+        if ownership in {"draining", "closing"}:
+            svc._detach_client(draining=ownership == "draining")
+        elif ownership == "superseded":
+            svc._client = _FakeClient()
+        # For detached readers this can also represent a newer live connection;
+        # their exit must preserve its state regardless of its readiness.
+        svc._connected = was_connected
+        svc._ui_state = "ready" if was_connected else "starting"
+        owner = svc._client
+        await svc._read_events(client)
+        # Re-entering teardown cannot publish a second revocation.
+        await svc._read_events(client)
+        assert svc._client is owner
+
+    asyncio.run(_run())
+    revoked = ownership == "current" and was_connected
+    assert callbacks == (["recovering"] if revoked else [])
+    assert svc._connected is (was_connected and ownership != "current")
+    assert svc._ui_state == (
+        "recovering" if revoked else "ready" if was_connected else "starting"
+    )
+
+
 def test_decode_timeout_publishes_recovering_until_next_confirmed_handshake(
     monkeypatch,
 ):

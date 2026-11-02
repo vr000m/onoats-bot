@@ -737,6 +737,26 @@ sequenceDiagram
   macro plugin after redirecting its module cache. Parent validation reruns these
   full gates outside the sandbox. Sibling-plan review found no superseded decision.
 
+### Review gauntlet round 2 remediation (2026-11-02)
+
+- Remote `session.closed` now revokes STT readiness just like EOF or a reader
+  error. Root cause: the recovery callback lived inside the abnormal-close
+  logging branch, although an orderly remote close also ends the handshake.
+- The reader's current-client and prior-connected guards own the transition;
+  local drain/close detaches the client before awaiting teardown. A 24-case
+  matrix covers three remote endings, current/superseded/draining/closing
+  ownership, and both connected states, including repeated teardown. Restoring
+  the old transition fails exactly the established current `session.closed`
+  case; restoring the fix passes all 24 cases. The reconnect suite passes 71.
+- Callback and teardown call-site audit found no additional transition owner
+  requiring changes. Sibling plans retain their historical decisions. Native
+  code and contracts are unchanged; no native build is required for this fix.
+- `just ci` has no justfile. Format, lint, and review-marker checks pass.
+- Full sandbox suite: 7369 passed, 51 failed, 9 errors, 3 skipped; socket/ps
+  restrictions and unavailable Metal prevent a green broad gate here. Combined
+  reconnect/config/telemetry run: 181 passed, 2 Metal-dependent failures. Parent
+  validation must rerun the broad gate outside the sandbox.
+
 ## Final Results
 
 ### Summary

@@ -1063,6 +1063,10 @@ class WebSocketSTTService(SegmentedSTTService):
                     logger.warning(
                         f"{self.name}: connection lost (no session.closed received)"
                     )
+                if was_connected:
+                    # Any remote ending revokes the live handshake, including
+                    # session.closed. Local shutdown detaches ownership first,
+                    # so its draining/closing reader never publishes recovery.
                     self._fire_ui_callback("recovering")
                 # If the socket closed while a decode was in flight, fail
                 # fast instead of letting run_stt hit its 90 s timeout.
