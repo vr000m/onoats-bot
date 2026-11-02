@@ -525,6 +525,45 @@ def _run_socket_supervisor(rest: list[str]) -> int:
 
 
 async def _supervise_socket_session(rest: list[str]) -> int:
+    """Own startup signals until the recorder installs its drain handlers."""
+    import asyncio
+    import signal
+    import threading
+
+    from onoats import runtime
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    requested = False
+    previous = {}
+
+    def stop_startup():
+        nonlocal requested
+        if not requested:
+            requested = True
+            runtime._mark_graceful_shutdown_requested()
+            task.cancel()
+
+    if (
+        sys.platform != "win32"
+        and threading.current_thread() is threading.main_thread()
+    ):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.getsignal(sig)
+            loop.add_signal_handler(sig, stop_startup)
+    try:
+        return await _supervise_socket_session_inner(rest)
+    except asyncio.CancelledError:
+        if not requested:
+            raise
+        return 0  # inner finally has reaped the entire capturer group
+    finally:
+        for sig, handler in previous.items():
+            loop.remove_signal_handler(sig)
+            signal.signal(sig, handler)
+
+
+async def _supervise_socket_session_inner(rest: list[str]) -> int:
     """Mint sockets + nonce, spawn the capturer, run the recorder, tear down.
 
     Runs the recorder and a capturer-exit watcher concurrently in one event
@@ -646,37 +685,46 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             f"(mic={mic_sock}, system={system_sock}, nonce={nonce[:8]}…)"
         )
         try:
-            capturer_proc = await asyncio.create_subprocess_exec(
-                capturer_bin,
-                "--mic-socket",
-                mic_sock,
-                "--system-socket",
-                system_sock,
-                "--nonce",
-                nonce,
-                env=capturer_env,
-                # Phase 4: pipe stderr through the supervisor instead of
-                # inheriting the fd. The always-drain reader task below tees
-                # every line to our own stderr (so the menu bar's log redirect
-                # is unchanged) and parses ONOATS-EVENT lines into the status
-                # file. Process.wait() is deadlock-prone with a PIPE only if
-                # nothing drains it — the reader starts before any wait.
-                stderr=asyncio.subprocess.PIPE,
-                # Spawn the capturer in its OWN session/process group
-                # (start_new_session=True is the portable subprocess spelling of
-                # setsid). On POSIX a terminal Ctrl+C/SIGTERM is delivered to the
-                # whole foreground process group, so without this it would hit
-                # BOTH onoats and the capturer. Terminal signals must NOT reach
-                # the capturer: the supervisor owns capturer teardown explicitly
-                # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the
-                # whole process group) AFTER the recorder finishes. This
-                # isolation is what keeps a terminal Ctrl+C from killing the
-                # capturer out from under the recorder (which would be
-                # mis-classified as capturer-death, rc=1). The capturer can still
-                # exit first on a graceful stop by seeing its sockets closed; that
-                # rc=0 case is handled in _run_recorder_with_capturer.
-                start_new_session=True,
+            spawn_task = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    capturer_bin,
+                    "--mic-socket",
+                    mic_sock,
+                    "--system-socket",
+                    system_sock,
+                    "--nonce",
+                    nonce,
+                    env=capturer_env,
+                    # Phase 4: pipe stderr through the supervisor instead of
+                    # inheriting the fd. The always-drain reader task below tees
+                    # every line to our own stderr (so the menu bar's log redirect
+                    # is unchanged) and parses ONOATS-EVENT lines into the status
+                    # file. Process.wait() is deadlock-prone with a PIPE only if
+                    # nothing drains it — the reader starts before any wait.
+                    stderr=asyncio.subprocess.PIPE,
+                    # Spawn the capturer in its OWN session/process group
+                    # (start_new_session=True is the portable subprocess spelling of
+                    # setsid). On POSIX a terminal Ctrl+C/SIGTERM is delivered to the
+                    # whole foreground process group, so without this it would hit
+                    # BOTH onoats and the capturer. Terminal signals must NOT reach
+                    # the capturer: the supervisor owns capturer teardown explicitly
+                    # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the
+                    # whole process group) AFTER the recorder finishes. This
+                    # isolation is what keeps a terminal Ctrl+C from killing the
+                    # capturer out from under the recorder (which would be
+                    # mis-classified as capturer-death, rc=1). The capturer can still
+                    # exit first on a graceful stop by seeing its sockets closed; that
+                    # rc=0 case is handled in _run_recorder_with_capturer.
+                    start_new_session=True,
+                )
             )
+            try:
+                capturer_proc = await asyncio.shield(spawn_task)
+            except asyncio.CancelledError:
+                # Cancellation during OS spawn must not lose the child handle.
+                # Reap via the same authoritative finally as every later stop.
+                capturer_proc = await spawn_task
+                raise
         except OSError as exc:
             # Missing binary / permission denied launching it — fail loud.
             logger.error(
@@ -1095,6 +1143,16 @@ async def _run_recorder_with_capturer(
             last_error="capturer exited mid-session; partial recording rotated to pending/",
         )
         return 1
+    except asyncio.CancelledError:
+        # Startup signals cancel the supervisor before the recorder has its
+        # own drain handlers. Retire the preflight/recorder task before the
+        # outer finally tears down capture; do not leave it running orphaned.
+        recorder_task.cancel()
+        capturer_task.cancel()
+        await asyncio.wait(
+            {recorder_task, capturer_task}, timeout=_RECORDER_DRAIN_GRACE_SEC
+        )
+        raise
     finally:
         if device_flush_task is not None:
             device_flush_task.cancel()

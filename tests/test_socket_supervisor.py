@@ -2844,3 +2844,70 @@ def test_diarization_flag_off_never_preflights(
 
     assert "preflight" not in calls
     assert "spawn" in calls
+
+
+@pytest.mark.parametrize("stage", ["spawn", "sockets", "preflight", "running"])
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
+def test_supervisor_stop_owns_capturer_through_startup_and_running(
+    sup_env, monkeypatch, set_capturer_behaviour, stage, stop_signal
+):
+    """Both startup cancellation and recorder drain reap the isolated child."""
+    from onoats import runtime
+
+    set_capturer_behaviour("hang")
+    children = []
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        real_add = loop.add_signal_handler
+        handlers = {}
+
+        def add(sig, callback, *args):
+            handlers[sig] = lambda: callback(*args)
+            real_add(sig, callback, *args)
+
+        monkeypatch.setattr(loop, "add_signal_handler", add)
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def spawn(*args, **kwargs):
+            assert stop_signal in handlers, "capturer spawned before signal ownership"
+            child = await real_spawn(*args, **kwargs)
+            children.append(child)
+            if stage == "spawn":
+                assert stop_signal in handlers, "startup signal has no owner"
+                handlers[stop_signal]()
+            return child
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+        async def sockets(*args, **kwargs):
+            if stage == "sockets":
+                assert stop_signal in handlers, "socket-wait signal has no owner"
+                handlers[stop_signal]()
+                await asyncio.sleep(0)
+            return True  # lifecycle seam; no socket data is needed by this recorder
+
+        monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+
+        async def recorder(**kwargs):
+            if stage == "preflight":
+                assert stop_signal in handlers, "preflight signal has no owner"
+                handlers[stop_signal]()
+                await asyncio.sleep(0)
+            elif stage == "running":
+                shutdown = asyncio.Event()
+                runtime._install_signal_handlers(
+                    shutdown, asyncio.Event(), None, None, loop
+                )
+                handlers[stop_signal]()
+                await asyncio.wait_for(shutdown.wait(), timeout=1)
+                assert runtime.graceful_shutdown_requested()
+
+        monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+        result = await asyncio.wait_for(
+            cli._supervise_socket_session([]), timeout=SUP_TIMEOUT
+        )
+        assert result == 0
+        assert children and all(child.returncode is not None for child in children)
+
+    asyncio.run(run())

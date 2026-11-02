@@ -122,12 +122,14 @@ protocol SystemOps: AnyObject {
     func isExecutable(at url: URL) -> Bool
     func contentsOfDirectory(at url: URL) -> [URL]
     func open(_ url: URL)
+    func terminateApplication()
     func now() -> Date
     func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
         -> PollHandle
 }
 
 extension SystemOps {
+    func terminateApplication() { NSApp.terminate(nil) }
     func readData(at url: URL, maxBytes: Int) -> Data? {
         guard maxBytes > 0, let data = readData(at: url), data.count <= maxBytes else {
             return nil
@@ -467,6 +469,8 @@ final class RecorderModel: ObservableObject {
     private let dataDirResolver: () -> URL
     private var proc: ProcessHandle?
     private var auxiliary: [ObjectIdentifier: ProcessHandle] = [:]
+    private var quitRequestedAt: Date?
+    private var quitPoll: PollHandle?
     private var userRequestedStop = false
     private var spawnedAt: Date?
     private var statusPoll: PollHandle?
@@ -535,6 +539,7 @@ final class RecorderModel: ObservableObject {
     deinit {
         statusPoll?.cancel()
         telemetryPoll?.cancel()
+        quitPoll?.cancel()
     }
 
     private func displayPath(_ url: URL) -> String {
@@ -779,8 +784,30 @@ final class RecorderModel: ObservableObject {
     }
 
     func quitApp() {
-        if let handle = proc, handle.isRunning { handle.terminate() }
-        NSApp.terminate(nil)
+        guard quitRequestedAt == nil else { return }
+        quitRequestedAt = ops.now()
+        if let handle = proc, handle.isRunning, !userRequestedStop { stop() }
+        finishQuitIfReady()
+        guard quitRequestedAt != nil else { return }
+        quitPoll = ops.schedule(every: 0.25) { [weak self] in self?.finishQuitIfReady() }
+    }
+
+    private func finishQuitIfReady() {
+        guard let requested = quitRequestedAt else { return }
+        // Only retained children are ours. An external recorder keeps running.
+        if proc?.isRunning != true && !auxiliary.values.contains(where: { $0.isRunning }) {
+            quitPoll?.cancel()
+            quitPoll = nil
+            quitRequestedAt = nil
+            ops.terminateApplication()
+        } else if ops.now().timeIntervalSince(requested) >= 15 {
+            // Killing the supervisor would bypass its capturer-group teardown.
+            // Keep the app/handles alive and surface a bounded failure instead.
+            quitPoll?.cancel()
+            quitPoll = nil
+            quitRequestedAt = nil
+            flushNote = "Quit timed out waiting for recorder cleanup. Check the run log and retry."
+        }
     }
 
     func flush() {
@@ -817,6 +844,7 @@ final class RecorderModel: ObservableObject {
             let handle = try ops.spawn(request) { [weak self] handle in
                 guard let self else { return }
                 self.auxiliary[ObjectIdentifier(handle)] = nil
+                defer { self.finishQuitIfReady() }
                 self.releaseRunLogSinkIfIdle()
                 if handle.terminationStatus != 0 {
                     if clearExternalStopOnFailure { self.clearExternalStopRequest() }
@@ -838,6 +866,7 @@ final class RecorderModel: ObservableObject {
 
     private func handleExit(_ handle: ProcessHandle) {
         guard let owned = proc, owned === handle else { return }
+        defer { finishQuitIfReady() }
         let directory = activeDataDir
         let knownEpoch = telemetryAuthority?.startEpoch
         prestartDetail = nil

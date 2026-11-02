@@ -48,6 +48,9 @@ private final class FakeSystemOps: SystemOps {
     var deleted: [URL] = []
     var tailReadLimits: [Int] = []
     var failReservation = false
+    var applicationTerminations = 0
+    var pollActions: [@MainActor () -> Void] = []
+    func terminateApplication() { applicationTerminations += 1 }
 
     func spawn(
         _ request: ProcessRequest,
@@ -126,6 +129,7 @@ private final class FakeSystemOps: SystemOps {
         every interval: TimeInterval, _ action: @escaping @MainActor () -> Void
     ) -> PollHandle {
         scheduledIntervals.append(interval)
+        pollActions.append(action)
         return FakePoll()
     }
 
@@ -216,6 +220,66 @@ private func makeModel(
 @MainActor
 private func cleanupSuite(_ suite: String) {
     UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+}
+
+@MainActor
+private func testQuitOwnershipMatrix(_ root: URL) throws {
+    for mode in ["stopped", "failed", "starting", "running", "stopping", "external"] {
+        for withAuxiliary in [false, true] {
+            let suite = "onoats.harness.quit.\(mode).\(withAuxiliary)"
+            defer { cleanupSuite(suite) }
+            let ops = FakeSystemOps()
+            let directory = DirectoryChoice(root.appendingPathComponent(suite))
+            let model = makeModel(ops, suite: suite, directory: directory)
+            var owned: FakeProcess?
+            if ["starting", "running", "stopping"].contains(mode) {
+                model.start()
+                owned = ops.processes[0]
+                if mode != "starting" {
+                    putPid(ops, directory: directory.url, pid: owned!.pid,
+                           epoch: ops.nowValue.timeIntervalSince1970)
+                    model.refresh()
+                }
+                if mode == "stopping" { model.stop() }
+            } else if mode == "failed" {
+                ops.failSpawn = true
+                model.start()
+                ops.failSpawn = false
+            } else if mode == "external" {
+                putPid(ops, directory: directory.url, pid: 777,
+                       epoch: ops.nowValue.timeIntervalSince1970)
+                model.refresh()
+            }
+            var auxiliary: FakeProcess?
+            if withAuxiliary && model.activeDataDir != nil {
+                model.flush()
+                auxiliary = ops.processes.last
+            }
+            model.quitApp()
+            model.quitApp() // pending Quit must be idempotent
+            if let owned {
+                try require(owned.terminateCount == 1, "Quit duplicated or missed owned stop: \(mode)")
+                try require(ops.applicationTerminations == 0, "Quit abandoned owned process: \(mode)")
+                ops.finish(owned, status: 0)
+            }
+            if let auxiliary {
+                try require(ops.applicationTerminations == 0, "Quit abandoned auxiliary: \(mode)")
+                ops.finish(auxiliary, status: 0)
+            }
+            try require(ops.applicationTerminations >= 1, "Quit never completed: \(mode)")
+        }
+    }
+    let suite = "onoats.harness.quit.timeout"
+    defer { cleanupSuite(suite) }
+    let ops = FakeSystemOps()
+    let model = makeModel(ops, suite: suite, directory: DirectoryChoice(root))
+    model.start()
+    model.quitApp()
+    ops.nowValue = ops.nowValue.addingTimeInterval(15)
+    for action in ops.pollActions { action() }
+    try require(ops.applicationTerminations == 0, "timeout abandoned supervisor")
+    try require(model.flushNote?.contains("Quit timed out") == true, "timeout not surfaced")
+    try require(ops.processes[0].terminateCount == 1, "timeout sent unsafe extra signal")
 }
 
 @MainActor
@@ -1085,6 +1149,7 @@ struct RecorderModelHarness {
         try testStartAuxiliaryStateSpace(root)
         try testExitDiagnosticIdentityStateSpace(root)
         try testPruningQuarantineStateSpace(root)
+        try testQuitOwnershipMatrix(root)
         try testDirectoryAuthority(root)
         try testStartPublicationAssociation(root)
         try testExternalRoutingAndPidReuse(root)
