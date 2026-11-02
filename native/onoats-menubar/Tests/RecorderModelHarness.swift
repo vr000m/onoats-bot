@@ -177,7 +177,8 @@ private func status(
 
 private func telemetry(pid: Int32, epoch: Double, now: Double) -> [String: Any] {
     [
-        "schema": 1,
+        "schema": 2,
+        "transcript_run_id": "0123456789abcdef0123456789abcdef",
         "pid": pid,
         "start_epoch": epoch,
         "updated_at": now,
@@ -259,6 +260,7 @@ private func testDirectoryAuthority(_ root: URL) throws {
     try require(model.activeDataDir == nil, "old run retained directory after exit")
     try require(model.nextDataDir == new, "exit did not adopt next-run directory")
 
+    try require(!model.canStart, "Start enabled while old Flush retains the sink")
     model.start()
     try require(ops.requests.count == 2,
                 "next Start raced the still-running owned Flush writer")
@@ -574,6 +576,7 @@ private func testMissingCliDisablesStart(_ root: URL) throws {
         ops, suite: "onoats.harness.missing-cli",
         directory: DirectoryChoice(root.appendingPathComponent("missing-cli")))
     try require(!model.cliAvailable, "unresolvable CLI was reported available")
+    try require(!model.canStart, "Start availability ignored missing CLI")
     model.start()
     try require(ops.requests.isEmpty, "Start spawned an unresolvable CLI")
     try require(model.state == .stopped, "missing CLI changed recorder state")
@@ -652,10 +655,12 @@ private func testRunLogOwnerOutlivesOverlappingFlush(_ root: URL) throws {
                 "owned recorder and Flush did not share one retained sink")
 
     ops.finish(recorder, status: 0)
+    try require(!model.canStart, "Start enabled while old Flush retains the sink")
     model.start()
     try require(ops.requests.count == 2,
                 "a new run started while the prior Flush still owned a log duplicate")
     ops.finish(flush, status: 0)
+    try require(model.canStart, "Start stayed disabled after auxiliary cleanup")
     model.start()
     try require(ops.requests.count == 3,
                 "run-log owner was not released after the final child exited")
@@ -952,6 +957,114 @@ private func testInvalidCategoryStableTagMatrix(_ root: URL) throws {
                 "tag outside bounded tail was accepted")
 }
 
+@MainActor
+private func testStartAuxiliaryStateSpace(_ root: URL) throws {
+    for count in 0...2 {
+        for exitStatus: Int32 in [0, 1] {
+            let ops = FakeSystemOps()
+            let model = makeModel(ops, suite: "onoats.harness.start-auxiliary",
+                                  directory: DirectoryChoice(root))
+            try require(model.canStart, "idle model disabled Start")
+            model.start()
+            let recorder = ops.processes[0]
+            for _ in 0..<count { model.flush() }
+            try require(!model.canStart, "live recorder enabled Start")
+            ops.finish(recorder, status: exitStatus)
+            try require(model.canStart == (count == 0), "exit ignored auxiliary ownership")
+            for index in 0..<count {
+                ops.finish(ops.processes[index + 1], status: 0)
+                try require(model.canStart == (index == count - 1),
+                            "Start availability disagrees with remaining auxiliary count")
+            }
+            model.start()
+            try require(ops.requests.count == count + 2, "enabled Start did not spawn")
+        }
+    }
+    cleanupSuite("onoats.harness.start-auxiliary")
+}
+
+@MainActor
+private func testExitDiagnosticIdentityStateSpace(_ root: URL) throws {
+    for published in [false, true] {
+      for matchingPid in [false, true] {
+        for offset in [-1.0, 0.0, 1.0] {
+            let ops = FakeSystemOps()
+            let model = makeModel(ops, suite: "onoats.harness.exit-identity",
+                                  directory: DirectoryChoice(root))
+            model.start()
+            let handle = ops.processes[0]
+            let epoch = ops.nowValue.timeIntervalSince1970
+            if published {
+                putPid(ops, directory: root, pid: handle.pid, epoch: epoch)
+                model.refresh()
+            }
+            var record = status(pid: matchingPid ? handle.pid : handle.pid + 1,
+                                epoch: epoch + offset)
+            record["exit_reason"] = "owned-diagnostic"
+            record["last_error"] = "owned-detail"
+            try ops.putJSON(record, active(root, "onoats.status.json"))
+            ops.finish(handle, status: 1)
+            let accepted = matchingPid && (published ? offset == 0 : offset >= 0)
+            try require(model.state == .failed(
+                reason: accepted ? "owned-diagnostic" : "exit code 1",
+                detail: accepted ? "owned-detail" : nil),
+                "exit diagnostic identity matrix failed")
+        }
+      }
+    }
+    cleanupSuite("onoats.harness.exit-identity")
+}
+
+@MainActor
+private func testPruningQuarantineStateSpace(_ root: URL) throws {
+    for replacement in ["unchanged", "regular", "symlink", "missing", "occupied", "recreated"] {
+        let ops = NativeSystemOps()
+        let directory = root.appendingPathComponent("prune-" + replacement)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("log")
+        let original = directory.appendingPathComponent("original")
+        let target = directory.appendingPathComponent("target")
+        try Data("old".utf8).write(to: path)
+        try Data("target".utf8).write(to: target)
+        ops.beforeLogQuarantine = { url in
+            guard replacement != "unchanged" && replacement != "recreated" else { return }
+            try! FileManager.default.moveItem(at: url, to: original)
+            if replacement == "regular" || replacement == "occupied" {
+                try! Data("replacement".utf8).write(to: url)
+            } else if replacement == "symlink" {
+                try! FileManager.default.createSymbolicLink(at: url, withDestinationURL: target)
+            }
+        }
+        if replacement == "occupied" || replacement == "recreated" {
+            ops.afterLogQuarantine = { url in
+                try! Data("arrival".utf8).write(to: url)
+            }
+        }
+        let deleted: Bool
+        do {
+            try ops.deleteRegularFile(at: path)
+            deleted = true
+        } catch { deleted = false }
+        try require(deleted == (replacement == "unchanged" || replacement == "recreated"),
+                    "pruning deletion disagreed with descriptor identity")
+        if replacement == "regular" || replacement == "occupied" || replacement == "recreated" {
+            let contents = try String(contentsOf: path, encoding: .utf8)
+            try require(contents == (replacement == "regular" ? "replacement" : "arrival"),
+                        "pruning deleted replacement")
+        }
+        if replacement == "occupied" {
+            let candidates = try FileManager.default.contentsOfDirectory(at: directory,
+                includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasPrefix(".onoats-prune-") }
+            try require(candidates.count == 1, "raced candidate was lost instead of retained")
+            let preserved = try String(contentsOf: candidates[0].appendingPathComponent("candidate"), encoding: .utf8)
+            try require(preserved == "replacement", "quarantined replacement was destroyed")
+        }
+        let targetContents = try String(contentsOf: target, encoding: .utf8)
+        try require(targetContents == "target",
+                    "pruning touched symlink target")
+    }
+}
+
 @main
 struct RecorderModelHarness {
     @MainActor
@@ -969,6 +1082,9 @@ struct RecorderModelHarness {
         let home = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let root = home.appendingPathComponent("data")
+        try testStartAuxiliaryStateSpace(root)
+        try testExitDiagnosticIdentityStateSpace(root)
+        try testPruningQuarantineStateSpace(root)
         try testDirectoryAuthority(root)
         try testStartPublicationAssociation(root)
         try testExternalRoutingAndPidReuse(root)

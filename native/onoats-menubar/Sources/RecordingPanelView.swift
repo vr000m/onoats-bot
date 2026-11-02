@@ -248,8 +248,9 @@ struct RecordingPanelView: View {
                 .frame(maxWidth: .infinity)
                 .focused($focus, equals: .primary)
                 .keyboardShortcut(.defaultAction)
-                .disabled(!model.cliAvailable)
-                .help(model.cliAvailable ? "Start recording" : "CLI unavailable; see Settings, Diagnostics")
+                .disabled(!model.canStart)
+                .help(!model.cliAvailable ? "CLI unavailable; see Settings, Diagnostics"
+                      : model.canStart ? "Start recording" : "Finishing previous recording")
         case .running(let ours):
             Button("Stop Recording") {
                 if ours { model.stop() } else { model.stopExternal() }

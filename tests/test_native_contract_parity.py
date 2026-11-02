@@ -850,7 +850,7 @@ def test_recording_panel_keeps_primary_actions_and_live_distinctions_visible():
     # secondary. Enablement stays tied to the existing model authorities.
     assert recording.count(".buttonStyle(.borderedProminent)") >= 1
     assert ".frame(maxWidth: .infinity)" in recording
-    assert re.search(r"\.disabled\s*\(\s*!model\.cliAvailable\s*\)", recording)
+    assert re.search(r"\.disabled\s*\(\s*!model\.canStart\s*\)", recording)
     assert re.search(r"\.disabled\s*\(\s*model\.stopRequested\s*\)", recording)
     assert "model.categoryUnavailable" in recording
     assert "model.activeDataDirDisplay" in recording

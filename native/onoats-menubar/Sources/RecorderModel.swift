@@ -342,23 +342,36 @@ final class NativeSystemOps: SystemOps {
         if errno == EEXIST { return nil }
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
+    // Test seam at the pathname replacement boundary, before atomic quarantine.
+    var beforeLogQuarantine: ((URL) -> Void)?
+    var afterLogQuarantine: ((URL) -> Void)?
     func deleteRegularFile(at url: URL) throws {
-        guard let handle = openRegularFile(at: url) else {
-            throw POSIXError(.EINVAL)
-        }
+        guard let handle = openRegularFile(at: url) else { throw POSIXError(.EINVAL) }
         defer { try? handle.close() }
         var opened = Darwin.stat()
-        var current = Darwin.stat()
-        guard Darwin.fstat(handle.fileDescriptor, &opened) == 0,
-              Darwin.lstat(url.path, &current) == 0,
-              opened.st_dev == current.st_dev,
-              opened.st_ino == current.st_ino,
-              current.st_mode & S_IFMT == S_IFREG else {
+        guard Darwin.fstat(handle.fileDescriptor, &opened) == 0 else {
             throw POSIXError(.EINVAL)
         }
-        guard Darwin.unlink(url.path) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        let quarantine = url.deletingLastPathComponent().appendingPathComponent(
+            ".onoats-prune-\(UUID().uuidString)", isDirectory: true)
+        guard Darwin.mkdir(quarantine.path, S_IRWXU) == 0 else {
+            throw POSIXError(.EIO)
         }
+        defer { _ = Darwin.rmdir(quarantine.path) }
+        let moved = quarantine.appendingPathComponent("candidate")
+        beforeLogQuarantine?(url)
+        guard Darwin.rename(url.path, moved.path) == 0 else { throw POSIXError(.EIO) }
+        afterLogQuarantine?(url)
+        var current = Darwin.stat()
+        guard Darwin.lstat(moved.path, &current) == 0,
+              opened.st_dev == current.st_dev, opened.st_ino == current.st_ino,
+              current.st_mode & S_IFMT == S_IFREG else {
+            // Never replace a new arrival while restoring a raced candidate.
+            // If occupied, retain the candidate in quarantine rather than lose it.
+            _ = Darwin.renamex_np(moved.path, url.path, UInt32(RENAME_EXCL))
+            throw POSIXError(.EINVAL)
+        }
+        guard Darwin.unlink(moved.path) == 0 else { throw POSIXError(.EIO) }
     }
     func fileExists(at url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
     func isRegularFile(at url: URL) -> Bool {
@@ -425,7 +438,7 @@ final class RecorderModel: ObservableObject {
     @Published private(set) var seminarConfigurationFailure = false
     @Published private(set) var lastFailureWasAppOwned = false
     @Published private(set) var mostRecentRunLogURL: URL?
-    private var mostRecentRunLogSink: RunLogSink?
+    @Published private var mostRecentRunLogSink: RunLogSink?
     private var runLogFinishing = false
     private var runLogReservationAttempted = false
     @Published private(set) var mostRecentRunStartedAt: Date?
@@ -697,8 +710,10 @@ final class RecorderModel: ObservableObject {
         if enabled { refreshTelemetry() } else { transcriptPreview = nil }
     }
 
+    var canStart: Bool { proc == nil && mostRecentRunLogSink == nil && cliAvailable }
+
     func start() {
-        guard proc == nil, mostRecentRunLogSink == nil, cliAvailable else { return }
+        guard canStart else { return }
         userRequestedStop = false
         flushNote = nil
         prestartDetail = nil
@@ -824,14 +839,20 @@ final class RecorderModel: ObservableObject {
     private func handleExit(_ handle: ProcessHandle) {
         guard let owned = proc, owned === handle else { return }
         let directory = activeDataDir
+        let knownEpoch = telemetryAuthority?.startEpoch
         prestartDetail = nil
         setTelemetryAuthority(nil)
         if userRequestedStop || handle.terminationStatus == 0 {
             state = .stopped
         } else {
             var status = directory.flatMap { readStatus(under: $0) }
-            if let value = status, let attempt = spawnedAt,
-               value.start_time < attempt.timeIntervalSince1970 { status = nil }
+            if let value = status {
+                if value.pid != handle.pid || spawnedAt == nil
+                    || value.start_time < spawnedAt!.timeIntervalSince1970
+                    || (knownEpoch != nil && value.start_time != knownEpoch!) {
+                    status = nil
+                }
+            }
             let pidWasPublished = ownedRecorderPidWasPublished
                 || currentAttemptPublicationEvidence(handle: handle, directory: directory)
             state = .failed(
