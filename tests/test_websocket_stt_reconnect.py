@@ -1716,3 +1716,42 @@ def test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled(
     assert client.session_closed is False, "no graceful session.close"
     assert client.closed is True
     assert svc._client is None and svc._connected is False
+
+
+@pytest.mark.parametrize("ending", [None, P.EVT_SESSION_CLOSED, "eof"])
+@pytest.mark.parametrize("kickstart_pending", [False, True])
+def test_negotiation_preserves_newer_reader_revocation(
+    monkeypatch, ending, kickstart_pending
+):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    events = []
+    recovered = []
+    svc = _make_service(
+        on_ready=lambda: events.append("ready"),
+        on_recovering=lambda: events.append("recovering"),
+        on_recovery=lambda message: recovered.append(message),
+    )
+    svc._kickstart_awaiting_connect = kickstart_pending
+    svc._kickstart_awaiting_connect_until = float("inf")
+
+    async def update(client, **kwargs):
+        await client._events.put({"type": P.EVT_SESSION_UPDATED})
+        if ending is not None:
+            await client._events.put(None if ending == "eof" else {"type": ending})
+
+    monkeypatch.setattr(_FakeClient, "update_session", update)
+
+    async def run():
+        if ending is None:
+            await svc._ensure_connected()
+            assert events == ["ready"]
+            assert len(recovered) == int(kickstart_pending)
+        else:
+            with pytest.raises(ConnectionError, match="ended during negotiation"):
+                await svc._ensure_connected()
+            assert "ready" not in events
+            assert not recovered
+            assert not svc._connected
+        await svc.cancel(None)
+
+    asyncio.run(run())

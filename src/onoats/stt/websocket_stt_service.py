@@ -624,6 +624,16 @@ class WebSocketSTTService(SegmentedSTTService):
                     # `except BaseException`.
                     await self._discard_stale()
                     raise
+                # The reader can consume session.updated AND a subsequent
+                # close before this task resumes. The acknowledgement alone
+                # cannot grant readiness after that newer revocation.
+                if (
+                    self._client is not client
+                    or not self._connected
+                    or self._reader_task is None
+                    or self._reader_task.done()
+                ):
+                    raise ConnectionError("STT session ended during negotiation")
                 # Backend identity from server.hello — surfaces an operational
                 # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
                 # and is stashed on the instance so callers (banner, metrics,
