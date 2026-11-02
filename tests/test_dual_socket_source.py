@@ -47,6 +47,7 @@ Interface (verified against the landed Phase-2 implementation):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from pathlib import Path
 
@@ -757,6 +758,24 @@ def test_single_input_logs_ignored_warning_once(monkeypatch, tmp_path):
 
 class _Stop(Exception):
     """Sentinel raised by the builder spies to cut run_onoats_dual short."""
+
+
+def test_socket_telemetry_uses_the_exact_transcript_buffer_run_id():
+    """One recorder-minted token must attest telemetry and every JSONL header."""
+    import onoats.dual as dual_mod
+
+    source = inspect.getsource(dual_mod.run_onoats_dual)
+    buffer_pos = source.index("TranscriptBuffer(")
+    telemetry_pos = source.index("UITelemetryState(")
+
+    assert buffer_pos < telemetry_pos, (
+        "TranscriptBuffer must mint the run id before schema-v2 telemetry is built"
+    )
+    telemetry_call = source[telemetry_pos : source.index(")", telemetry_pos) + 1]
+    assert "transcript_buffer.run_id" in telemetry_call
+    assert source.count("transcript_buffer.run_id") == 1, (
+        "dual must wire the buffer-owned id directly, not mint or transform another id"
+    )
 
 
 def _dual_spies(monkeypatch, tmp_path, *, preflight_raises: bool):

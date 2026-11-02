@@ -645,6 +645,14 @@ def test_ui_telemetry_contract_matches_swift():
     assert precedence, "UiTelemetry.swift missing sttPrecedence literal"
     assert tuple(re.findall(r'"([^"]+)"', precedence.group(1))) == py.STT_PRECEDENCE
 
+    assert py.UI_TELEMETRY_SCHEMA_VERSION == 2
+    assert re.search(r"let\s+transcriptRunID:\s*String", swift)
+    required = re.search(
+        r'required:\s*\[([^\]]*"transcript_run_id"[^\]]*)\]', swift, re.DOTALL
+    )
+    assert required, "schema-v2 transcript_run_id must be a required exact-shape key"
+    assert re.search(r"let\s+transcript_run_id:\s*String", swift)
+
 
 def test_ui_telemetry_shared_decoder_vectors_match_python_contract(tmp_path: Path):
     """Keep native fixtures live against the producer-side tolerant reader."""
@@ -706,7 +714,12 @@ def test_level_verdict_vectors_match_python_producer():
 
     cases = json.loads((UI_FIXTURES / "level_verdicts.json").read_text())
     for case in cases:
-        state = UITelemetryState(4242, 1.0, clock=lambda: 2.0)
+        state = UITelemetryState(
+            4242,
+            1.0,
+            transcript_run_id="0123456789abcdef0123456789abcdef",
+            clock=lambda: 2.0,
+        )
         accepted = state.observe_level("me", float(case["input"]))
         assert accepted is case["accepted"], case["input"]
         if accepted:

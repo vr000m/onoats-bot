@@ -2674,6 +2674,7 @@ def test_pid_status_and_telemetry_share_the_caller_minted_epoch(tmp_path):
 
     data_dir = tmp_path / "data"
     start_epoch = 1_793_000_000.125
+    transcript_run_id = "0123456789abcdef0123456789abcdef"
     pid_path = runtime._write_pid_file(data_dir, start_epoch=start_epoch)
     assert runtime._write_status_running(
         data_dir,
@@ -2682,15 +2683,18 @@ def test_pid_status_and_telemetry_share_the_caller_minted_epoch(tmp_path):
         start_epoch=start_epoch,
     )
     publisher = UITelemetryPublisher(
-        data_dir, UITelemetryState(os.getpid(), start_epoch)
+        data_dir,
+        UITelemetryState(os.getpid(), start_epoch, transcript_run_id=transcript_run_id),
     )
     assert publisher.write_once(now=start_epoch + 0.25)
 
     pid_epoch = float(pid_path.read_text(encoding="utf-8").splitlines()[3])
     status_epoch = status_file.read_status(data_dir).start_time
-    telemetry_epoch = json.loads(
+    telemetry = json.loads(
         (data_dir / ".active" / "onoats.ui.json").read_text(encoding="utf-8")
-    )["start_epoch"]
+    )
+    assert telemetry["transcript_run_id"] == transcript_run_id
+    telemetry_epoch = telemetry["start_epoch"]
     assert pid_epoch == status_epoch == telemetry_epoch == start_epoch
 
 

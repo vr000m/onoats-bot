@@ -581,9 +581,15 @@ sequenceDiagram
 - [x] Phase 6: Window-Style Recording Panel and In-Panel Settings
 - [x] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
 - [x] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
-- [ ] Phase 9: Run-Bound Recording Proof and Captured-Identity Teardown
+- [x] Phase 9: Run-Bound Recording Proof and Captured-Identity Teardown
 
 ## Findings
+
+- 2026-11-02 — Phase 9 completed the recorder-attested schema-v2 run-ID flow,
+  descriptor-bound JSONL proof, kernel-birth process identity, and captured
+  teardown matrix. The canonical focused gate passed 226 tests with one opt-in
+  skip plus the Swift decoder harness; full validation passed 7,348 tests with
+  four opt-in skips, Ruff, review-marker validation, and the native build.
 
 - 2026-11-02 — Phase 9 review (`20261101T195750Z-phase9-amendment`) produced
   11 unique findings and two reported contradictions. All were accepted and

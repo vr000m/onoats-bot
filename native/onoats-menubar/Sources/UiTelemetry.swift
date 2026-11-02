@@ -6,7 +6,7 @@
 import Foundation
 
 enum UiTelemetryContract {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
     static let fileName = "onoats.ui.json"
     static let maxWriteHz = 4.0
     static let heartbeatSeconds = 2.0
@@ -20,6 +20,7 @@ enum UiTelemetryContract {
     static let levelMinimum = levelMin
     static let levelMaximum = levelMax
     static let seminarCategory = "seminars"
+    static let transcriptRunIDPattern = "^[0-9a-f]{32}$"
     static let sttStates = ["failed", "recovering", "starting", "unknown", "ready"]
     static let sttPrecedence = ["failed", "recovering", "starting", "unknown", "ready"]
 }
@@ -54,6 +55,7 @@ func transcriptDisplayLabel(source: String?, speakerLabel: String?) -> String {
 struct UiTelemetrySnapshot: Equatable {
     let pid: Int32
     let startEpoch: Double
+    let transcriptRunID: String
     let updatedAt: Date
     /// nil means that branch has no observation or its observation is stale.
     let me: UiTelemetryActivity?
@@ -92,6 +94,7 @@ enum UiTelemetryDecoder {
         let schema: Int
         let pid: Int32
         let start_epoch: Double
+        let transcript_run_id: String
         let updated_at: Double
         let audio: [String: WireAudio?]
         let stt: WireStt
@@ -101,6 +104,14 @@ enum UiTelemetryDecoder {
 
     private static func scalars(_ value: String) -> Int {
         value.unicodeScalars.count
+    }
+
+    private static func validTranscriptRunID(_ value: String) -> Bool {
+        guard value.unicodeScalars.count == 32 else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            (scalar.value >= 48 && scalar.value <= 57)
+                || (scalar.value >= 97 && scalar.value <= 102)
+        }
     }
 
     private static func exactKeys(
@@ -115,7 +126,10 @@ enum UiTelemetryDecoder {
         guard let root = try? JSONSerialization.jsonObject(with: data),
               exactKeys(
                 root,
-                required: ["schema", "pid", "start_epoch", "updated_at", "audio", "stt"],
+                required: [
+                    "schema", "pid", "start_epoch", "transcript_run_id",
+                    "updated_at", "audio", "stt",
+                ],
                 optional: ["transcript", "locked_category"]
               ),
               let dictionary = root as? [String: Any],
@@ -167,6 +181,7 @@ enum UiTelemetryDecoder {
               wire.pid == expectedPid,
               wire.start_epoch.isFinite,
               wire.start_epoch == expectedStartEpoch,
+              validTranscriptRunID(wire.transcript_run_id),
               wire.updated_at.isFinite
         else { return nil }
 
@@ -240,6 +255,7 @@ enum UiTelemetryDecoder {
         return UiTelemetrySnapshot(
             pid: wire.pid,
             startEpoch: wire.start_epoch,
+            transcriptRunID: wire.transcript_run_id,
             updatedAt: Date(timeIntervalSince1970: wire.updated_at),
             me: activity(wire.audio["me"] ?? nil),
             them: activity(wire.audio["them"] ?? nil),

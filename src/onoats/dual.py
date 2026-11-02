@@ -507,15 +507,41 @@ async def run_onoats_dual(
     audio_source = cfg.audio_source
     start_epoch = _mint_start_epoch()
 
+    # Mint the durable transcript identity before display telemetry so the
+    # schema-v2 snapshot can attest the exact run written into every JSONL
+    # session header. The callback resolves ``telemetry_state`` at delivery
+    # time, after socket-mode state has been constructed below.
+    telemetry_state = None
+
+    def _publish_transcript(
+        text: str, source: str | None, speaker_label: str | None
+    ) -> None:
+        if telemetry_state is not None:
+            telemetry_state.set_transcript(text, source, speaker_label)
+
+    transcript_buffer = TranscriptBuffer(
+        track_vad_gaps=True,
+        use_frame_source=True,
+        locked_category=locked_category,
+        # Provenance for the session_meta header: what the run was configured
+        # with. A runtime degrade does not change it; per-utterance `speakers`
+        # is the truth about whether a line was labelled.
+        diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
+        on_transcript=_publish_transcript if audio_source == "socket" else None,
+    )
+
     # Display-only state exists before transports/services so every callback has
     # a target, but no publisher (and therefore no file) exists until PID and
     # running status publication both succeed below.
-    telemetry_state = None
     if audio_source == "socket":
         from onoats.ui_telemetry import UITelemetryState
 
+        recorder_pid = os.getpid()
         telemetry_state = UITelemetryState(
-            os.getpid(), start_epoch, locked_category=locked_category
+            recorder_pid,
+            start_epoch,
+            transcript_buffer.run_id,
+            locked_category=locked_category,
         )
         initial_stt_state = "starting" if cfg.stt_service == "websocket" else "unknown"
         telemetry_state.set_stt_state("me", initial_stt_state)
@@ -571,22 +597,6 @@ async def run_onoats_dual(
     # overlapping speech won't produce spurious silence_gap entries.
     # Enabling this restores Segmenter's ability to split short sessions
     # (segmenter fast-skips no-gap buffers with <=10 utterances).
-    transcript_buffer = TranscriptBuffer(
-        track_vad_gaps=True,
-        use_frame_source=True,
-        locked_category=locked_category,
-        # Provenance for the session_meta header: what the run was configured
-        # with. A runtime degrade does not change it; per-utterance `speakers`
-        # is the truth about whether a line was labelled.
-        diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
-        on_transcript=(
-            lambda text, source, speaker_label: telemetry_state.set_transcript(
-                text, source, speaker_label
-            )
-        )
-        if telemetry_state is not None
-        else None,
-    )
     flush_lock = asyncio.Lock()
 
     async def _rotate_flush(reason: str, *, continue_session: bool) -> None:

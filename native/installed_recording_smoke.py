@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import math
 import os
 from pathlib import Path
+import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -15,18 +19,28 @@ from collections.abc import Callable
 from typing import NamedTuple, TypeVar
 
 T = TypeVar("T")
+_PROC_PIDTBSDINFO = 3
+_MAXCOMLEN = 16
+_TRANSCRIPT_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+JSONL_LINE_LIMIT = 1024 * 1024
 
 
 class SmokeFailure(RuntimeError):
     """One stage of the installed recording proof failed."""
 
 
+class ProcessBirth(NamedTuple):
+    seconds: int
+    microseconds: int
+
+
 class RecorderIdentity(NamedTuple):
     pid: int
     start_epoch: float
     command: str
-    process_start: str = ""
-    pgid: int = 0
+    process_start: str
+    pgid: int
+    process_birth: ProcessBirth
 
 
 class ProcessRow(NamedTuple):
@@ -41,11 +55,61 @@ class ProcessIdentity(NamedTuple):
     pgid: int
     start: str
     command: str
+    process_birth: ProcessBirth
 
 
 class OwnedProcessGroup(NamedTuple):
     pgid: int
     members: tuple[ProcessIdentity, ...]
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * _MAXCOMLEN),
+        ("pbi_name", ctypes.c_char * (_MAXCOMLEN * 2)),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _process_birth(pid: int) -> ProcessBirth | None:
+    """Read the kernel process generation used as signalling authority."""
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    proc_pidinfo = libproc.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    info = _ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    if proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) != size:
+        return None
+    return ProcessBirth(int(info.pbi_start_tvsec), int(info.pbi_start_tvusec))
 
 
 def wait_for(
@@ -69,7 +133,10 @@ def wait_for(
 
 def _json(path: Path) -> dict[str, object] | None:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
@@ -133,44 +200,70 @@ def _recording_identity(
         epoch = float(status["start_time"])
     except (KeyError, TypeError, ValueError):
         return None
+    if not math.isfinite(epoch):
+        return None
+    initial = _processes()
+    initial_chain = _ancestry_chain(recorder_pid, app_pid, initial)
+    if initial_chain is None:
+        raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
+    births_before = {pid: _process_birth(pid) for pid in initial_chain}
+    if any(birth is None for birth in births_before.values()):
+        return None
     processes = _processes()
+    current_chain = _ancestry_chain(recorder_pid, app_pid, processes)
+    if current_chain != initial_chain:
+        return None
+    births_after = {pid: _process_birth(pid) for pid in current_chain}
+    if births_after != births_before:
+        return None
     if not _descends_from(recorder_pid, app_pid, processes):
         raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
     if not _pid_file_matches(pid_path, pid=recorder_pid, start_epoch=epoch):
         return None
     row = processes[recorder_pid]
-    return RecorderIdentity(recorder_pid, epoch, row.command, row.start, row.pgid)
+    birth = births_after[recorder_pid]
+    assert birth is not None
+    return RecorderIdentity(
+        recorder_pid, epoch, row.command, row.start, row.pgid, birth
+    )
 
 
-def _wait_pid_gone(pid: int, timeout: float) -> bool:
+def _wait_identity_gone(identity: ProcessIdentity, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if pid not in _processes():
+        if not _identity_matches(identity):
             return True
         time.sleep(0.1)
-    return pid not in _processes()
+    return not _identity_matches(identity)
 
 
-def _recorder_process_matches(identity: RecorderIdentity, *, app_pid: int) -> bool:
-    processes = _processes()
-    row = processes.get(identity.pid)
-    return (
-        row is not None
-        and row.command == identity.command
-        and (not identity.process_start or row.start == identity.process_start)
-        and (not identity.pgid or row.pgid == identity.pgid)
-        and _descends_from(identity.pid, app_pid, processes)
+def _recorder_process_identity(identity: RecorderIdentity) -> ProcessIdentity:
+    return ProcessIdentity(
+        identity.pid,
+        identity.pgid,
+        identity.process_start,
+        identity.command,
+        identity.process_birth,
     )
 
 
-def _app_process_matches(app: Path, app_pid: int, *, process_start: str = "") -> bool:
+def _app_process_matches(app: Path, identity: ProcessIdentity) -> bool:
     executable = str((app / "Contents/MacOS/Onoats").resolve())
-    row = _processes().get(app_pid)
     return (
-        row is not None
-        and (not process_start or row.start == process_start)
-        and (row.command == executable or row.command.startswith(f"{executable} "))
-    )
+        identity.command == executable or identity.command.startswith(f"{executable} ")
+    ) and _identity_matches(identity)
+
+
+def _capture_process_identity(pid: int) -> ProcessIdentity | None:
+    """Capture command/topology between two matching kernel-birth reads."""
+    birth_before = _process_birth(pid)
+    if birth_before is None:
+        return None
+    row = _processes().get(pid)
+    birth_after = _process_birth(pid)
+    if row is None or birth_after != birth_before:
+        return None
+    return ProcessIdentity(pid, row.pgid, row.start, row.command, birth_after)
 
 
 def _identity_matches(identity: ProcessIdentity) -> bool:
@@ -179,14 +272,40 @@ def _identity_matches(identity: ProcessIdentity) -> bool:
         row.pgid == identity.pgid
         and row.start == identity.start
         and row.command == identity.command
+        and _process_birth(identity.pid) == identity.process_birth
     )
+
+
+def _signal_identity(identity: ProcessIdentity, sig: signal.Signals) -> bool:
+    """Signal only an exact captured process generation."""
+    if not _identity_matches(identity):
+        return False
+    os.kill(identity.pid, sig)
+    return True
+
+
+def _signal_app(app: Path, identity: ProcessIdentity, sig: signal.Signals) -> bool:
+    """Signal only the exact captured app generation at its verified path."""
+    if not _app_process_matches(app, identity):
+        return False
+    os.kill(identity.pid, sig)
+    return True
 
 
 def _owned_descendant_groups(
     app_pid: int, recorder_pid: int
 ) -> tuple[OwnedProcessGroup, ...]:
     """Snapshot smoke-owned descendant groups while their ancestry is provable."""
+    initial = _processes()
+    initial_pids = _capture_related_pids(initial, app_pid, recorder_pid)
+    births_before = {pid: _process_birth(pid) for pid in initial_pids}
+    if any(birth is None for birth in births_before.values()):
+        raise SmokeFailure("process capture failed: generation unavailable")
     processes = _processes()
+    current_pids = _capture_related_pids(processes, app_pid, recorder_pid)
+    births_after = {pid: _process_birth(pid) for pid in current_pids}
+    if current_pids != initial_pids or births_after != births_before:
+        raise SmokeFailure("process capture failed: generation changed during snapshot")
     app_row = processes.get(app_pid)
     grouped: dict[int, list[ProcessIdentity]] = {}
     for pid, row in processes.items():
@@ -194,8 +313,10 @@ def _owned_descendant_groups(
             continue
         if app_row is not None and row.pgid == app_row.pgid:
             continue
+        birth = births_after[pid]
+        assert birth is not None
         grouped.setdefault(row.pgid, []).append(
-            ProcessIdentity(pid, row.pgid, row.start, row.command)
+            ProcessIdentity(pid, row.pgid, row.start, row.command, birth)
         )
     return tuple(
         OwnedProcessGroup(pgid, tuple(members))
@@ -225,51 +346,48 @@ def _cleanup_groups(groups: tuple[OwnedProcessGroup, ...], timeout: float) -> No
 def _cleanup_after_failure(
     app: Path,
     *,
-    app_pid: int | None,
-    app_process_start: str = "",
-    recorder: RecorderIdentity | None,
-    status_path: Path,
-    pid_path: Path,
+    app_identity: ProcessIdentity | None,
+    recorder: RecorderIdentity | None = None,
+    status_path: Path | None = None,
+    pid_path: Path | None = None,
     groups: tuple[OwnedProcessGroup, ...] = (),
     timeout: float = 5.0,
 ) -> None:
     """Boundedly stop only identities proven to belong to this smoke run."""
-    # Never discover ownership during cleanup: only a PID captured after the
-    # preflight-empty launch boundary belongs to this smoke run.
-    if app_pid is None or not _app_process_matches(
-        app, app_pid, process_start=app_process_start
-    ):
-        return
-    if recorder is None:
-        try:
-            recorder = _recording_identity(status_path, pid_path, app_pid=app_pid)
-        except (SmokeFailure, OSError, subprocess.SubprocessError, ValueError):
-            recorder = None
+    # Ancestry is a discovery gate only. Once captured, each identity remains
+    # independently eligible for cleanup even if its ancestor exits first.
     failures: list[BaseException] = []
-    try:
-        if recorder is not None and _recorder_process_matches(
-            recorder, app_pid=app_pid
-        ):
-            os.kill(recorder.pid, signal.SIGTERM)
-            if not _wait_pid_gone(recorder.pid, timeout) and _recorder_process_matches(
-                recorder, app_pid=app_pid
-            ):
-                _cleanup_groups(groups, timeout)
-                os.kill(recorder.pid, signal.SIGKILL)
-                _wait_pid_gone(recorder.pid, timeout)
-        _cleanup_groups(groups, timeout)
-    except BaseException as exc:
-        failures.append(exc)
-    try:
-        if _app_process_matches(app, app_pid, process_start=app_process_start):
-            os.kill(app_pid, signal.SIGTERM)
-            if not _wait_pid_gone(app_pid, timeout) and _app_process_matches(
-                app, app_pid, process_start=app_process_start
-            ):
-                os.kill(app_pid, signal.SIGKILL)
-                _wait_pid_gone(app_pid, timeout)
-    except BaseException as exc:
-        failures.append(exc)
+    if recorder is not None:
+        recorder_identity = _recorder_process_identity(recorder)
+        try:
+            if _signal_identity(recorder_identity, signal.SIGTERM):
+                if not _wait_identity_gone(recorder_identity, timeout):
+                    _signal_identity(recorder_identity, signal.SIGKILL)
+                    _wait_identity_gone(recorder_identity, timeout)
+        except BaseException as exc:
+            failures.append(exc)
+
+    for group in groups:
+        try:
+            if _signal_owned_group(group, signal.SIGTERM):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline and any(
+                    _identity_matches(member) for member in group.members
+                ):
+                    time.sleep(0.1)
+                _signal_owned_group(group, signal.SIGKILL)
+        except BaseException as exc:
+            failures.append(exc)
+
+    if app_identity is not None:
+        try:
+            if _signal_app(app, app_identity, signal.SIGTERM):
+                if not _wait_identity_gone(app_identity, timeout):
+                    _signal_app(app, app_identity, signal.SIGKILL)
+                    _wait_identity_gone(app_identity, timeout)
+        except BaseException as exc:
+            failures.append(exc)
+
     if failures:
         details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
         raise SmokeFailure(f"bounded cleanup encountered errors: {details}")
@@ -289,47 +407,123 @@ def _descends_from(pid: int, ancestor: int, processes: dict[int, ProcessRow]) ->
     return False
 
 
-def _session_snapshot(data_dir: Path) -> dict[Path, tuple[int, int]]:
-    snapshots: dict[Path, tuple[int, int]] = {}
-    for path in data_dir.rglob("*.jsonl") if data_dir.exists() else ():
-        try:
-            info = path.stat()
-        except OSError:
-            continue
-        if path.is_file() and not path.is_symlink():
-            snapshots[path.resolve()] = (info.st_ino, info.st_size)
-    return snapshots
+def _ancestry_chain(
+    pid: int, ancestor: int, processes: dict[int, ProcessRow]
+) -> frozenset[int] | None:
+    chain: set[int] = set()
+    current = pid
+    while current > 1 and current not in chain:
+        chain.add(current)
+        if current == ancestor:
+            return frozenset(chain)
+        row = processes.get(current)
+        if row is None:
+            return None
+        current = row.parent
+    return None
 
 
-def _new_me_utterance(
-    data_dir: Path, before: dict[Path, tuple[int, int]]
-) -> bool | None:
+def _capture_related_pids(
+    processes: dict[int, ProcessRow], app_pid: int, recorder_pid: int
+) -> frozenset[int]:
+    ancestry = _ancestry_chain(recorder_pid, app_pid, processes)
+    if ancestry is None:
+        raise SmokeFailure("process capture failed: recorder ancestry changed")
+    descendants = {
+        pid for pid in processes if _descends_from(pid, recorder_pid, processes)
+    }
+    return ancestry | descendants
+
+
+def _bounded_jsonl_lines(path: Path):
+    """Open once, no-follow, then yield JSON objects from one regular-file fd."""
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SmokeFailure("transcript proof failed: unsafe JSONL candidate")
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        with handle:
+            while True:
+                raw = handle.readline(JSONL_LINE_LIMIT + 2)
+                if not raw:
+                    return
+                content = raw[:-1] if raw.endswith(b"\n") else raw
+                if len(content) > JSONL_LINE_LIMIT:
+                    raise SmokeFailure(
+                        "transcript proof failed: JSONL line limit exceeded"
+                    )
+                try:
+                    yield json.loads(content)
+                except (UnicodeDecodeError, ValueError):
+                    yield None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _header_run_id(path: Path) -> str | None:
+    try:
+        first = next(_bounded_jsonl_lines(path), None)
+    except OSError:
+        return None
+    if not isinstance(first, dict) or first.get("type") != "session_meta":
+        return None
+    run_id = first.get("run_id")
+    if not isinstance(run_id, str) or _TRANSCRIPT_RUN_ID_RE.fullmatch(run_id) is None:
+        return None
+    return run_id
+
+
+def _attested_file_has_me(path: Path, transcript_run_id: str) -> bool:
+    """Validate header and utterances through the same opened descriptor."""
+    lines = _bounded_jsonl_lines(path)
+    first = next(lines, None)
+    if not isinstance(first, dict) or first.get("type") != "session_meta":
+        return False
+    if first.get("run_id") != transcript_run_id:
+        return False
+    for entry in lines:
+        if (
+            isinstance(entry, dict)
+            and entry.get("type") == "utterance"
+            and entry.get("source") == "me"
+            and isinstance(entry.get("text"), str)
+            and bool(entry["text"].strip())
+        ):
+            return True
+    return False
+
+
+def _prelaunch_run_ids(data_dir: Path) -> set[str]:
+    """Classify every existing transcript before launch as defence in depth."""
+    run_ids: set[str] = set()
     for path in data_dir.rglob("*.jsonl") if data_dir.exists() else ():
         try:
-            resolved = path.resolve()
-            info = path.stat()
-            old = before.get(resolved)
-            if old == (info.st_ino, info.st_size):
-                continue
-            offset = old[1] if old and old[0] == info.st_ino else 0
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                payload = handle.read()
-        except OSError:
-            continue
-        for raw in payload.splitlines():
-            try:
-                entry = json.loads(raw)
-            except ValueError:
-                continue
-            if (
-                isinstance(entry, dict)
-                and entry.get("type") == "utterance"
-                and entry.get("source") == "me"
-                and isinstance(entry.get("text"), str)
-                and bool(entry["text"].strip())
-            ):
+            run_id = _header_run_id(path)
+        except (OSError, SmokeFailure) as exc:
+            raise SmokeFailure(
+                "transcript pre-launch failed: unsafe JSONL candidate"
+            ) from exc
+        if run_id is None:
+            raise SmokeFailure(
+                "transcript pre-launch failed: unclassifiable JSONL candidate"
+            )
+        run_ids.add(run_id)
+    return run_ids
+
+
+def _new_me_utterance(data_dir: Path, transcript_run_id: str) -> bool | None:
+    """Accept only a canonical Me utterance from the telemetry-attested run."""
+    for path in data_dir.rglob("*.jsonl") if data_dir.exists() else ():
+        try:
+            if _attested_file_has_me(path, transcript_run_id):
                 return True
+        except OSError:
+            continue
     return None
 
 
@@ -372,6 +566,8 @@ def _verify_signed_app(app: Path) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.me_floor) or not 0.0 <= args.me_floor <= 1.0:
+        raise SmokeFailure("--me-floor must be finite and inside [0.0, 1.0]")
     app = Path(args.app).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser().resolve()
     _verify_signed_app(app)
@@ -382,12 +578,12 @@ def run(args: argparse.Namespace) -> None:
         raise SmokeFailure(
             f"app preflight failed: Onoats is already running (pid {preexisting})"
         )
-    before = _session_snapshot(data_dir)
+    prelaunch_run_ids = _prelaunch_run_ids(data_dir)
     status_path = data_dir / ".active/onoats.status.json"
     pid_path = data_dir / ".active/onoats.pid"
     telemetry_path = data_dir / ".active/onoats.ui.json"
     app_pid: int | None = None
-    app_process_start = ""
+    app_identity: ProcessIdentity | None = None
     recorder: RecorderIdentity | None = None
     groups: tuple[OwnedProcessGroup, ...] = ()
     primary_error: BaseException | None = None
@@ -398,10 +594,9 @@ def run(args: argparse.Namespace) -> None:
         app_pid = wait_for(
             "signed app launch", args.app_timeout, lambda: _one_app_pid(app)
         )
-        app_row = _processes().get(app_pid)
-        if app_row is None:
+        app_identity = _capture_process_identity(app_pid)
+        if app_identity is None:
             raise SmokeFailure("app launch failed: new process vanished")
-        app_process_start = app_row.start
         current_executable = executable.stat()
         if (verified_executable.st_dev, verified_executable.st_ino) != (
             current_executable.st_dev,
@@ -416,7 +611,7 @@ def run(args: argparse.Namespace) -> None:
         recorder_pid, epoch = recorder.pid, recorder.start_epoch
         groups = _owned_descendant_groups(app_pid, recorder_pid)
 
-        def nonzero_me() -> bool | None:
+        def nonzero_me() -> str | None:
             telemetry = _json(telemetry_path)
             if not telemetry:
                 return None
@@ -428,6 +623,18 @@ def run(args: argparse.Namespace) -> None:
                 raise SmokeFailure(
                     "telemetry ownership failed: stale or external session"
                 )
+            if telemetry.get("schema") != 2:
+                return None
+            transcript_run_id = telemetry.get("transcript_run_id")
+            if (
+                not isinstance(transcript_run_id, str)
+                or _TRANSCRIPT_RUN_ID_RE.fullmatch(transcript_run_id) is None
+            ):
+                return None
+            if transcript_run_id in prelaunch_run_ids:
+                raise SmokeFailure(
+                    "transcript attestation failed: recorder reused a pre-launch run id"
+                )
             audio = telemetry.get("audio")
             me = audio.get("me") if isinstance(audio, dict) else None
             if not isinstance(me, dict):
@@ -438,11 +645,26 @@ def run(args: argparse.Namespace) -> None:
                 updated_at = float(telemetry["updated_at"])
             except (KeyError, TypeError, ValueError):
                 return None
-            if now - updated_at > 5 or now - observed_at > 1:
+            if (
+                not all(
+                    math.isfinite(value) for value in (level, observed_at, updated_at)
+                )
+                or not 0.0 <= level <= 1.0
+            ):
                 return None
-            return True if level > args.me_floor else None
+            snapshot_age = now - updated_at
+            observation_age = now - observed_at
+            if (
+                not 0.0 <= snapshot_age <= 5.0
+                or not 0.0 <= observation_age <= 1.0
+                or observed_at > updated_at
+            ):
+                return None
+            return transcript_run_id if level > args.me_floor else None
 
-        wait_for("fresh non-zero Me activity", args.activity_timeout, nonzero_me)
+        transcript_run_id = wait_for(
+            "fresh non-zero Me activity", args.activity_timeout, nonzero_me
+        )
         print("Non-zero Me activity confirmed. Press Stop in the Onoats panel.")
 
         wait_for(
@@ -459,7 +681,7 @@ def run(args: argparse.Namespace) -> None:
         wait_for(
             "durable Me utterance",
             args.transcript_timeout,
-            lambda: _new_me_utterance(data_dir, before),
+            lambda: _new_me_utterance(data_dir, transcript_run_id),
         )
         print(
             "Installed recording smoke passed: app-owned Me activity and durable utterance."
@@ -469,15 +691,14 @@ def run(args: argparse.Namespace) -> None:
         raise
     finally:
         try:
-            _cleanup_after_failure(
-                app,
-                app_pid=app_pid,
-                app_process_start=app_process_start,
-                recorder=recorder,
-                status_path=status_path,
-                pid_path=pid_path,
-                groups=groups,
-            )
+            cleanup_kwargs = {
+                "app_identity": app_identity,
+                "recorder": recorder,
+                "status_path": status_path,
+                "pid_path": pid_path,
+                "groups": groups,
+            }
+            _cleanup_after_failure(app, **cleanup_kwargs)
         except BaseException as cleanup_error:
             print(
                 f"installed recording smoke cleanup failed: {cleanup_error}",

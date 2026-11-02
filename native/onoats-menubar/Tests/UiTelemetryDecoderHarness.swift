@@ -28,9 +28,10 @@ private func baseSnapshot(
     let meStt: [String: Any] = ["state": "ready", "detail": detailValue]
     let themStt: [String: Any] = ["state": "ready", "detail": NSNull()]
     var root: [String: Any] = [
-        "schema": 1,
+        "schema": 2,
         "pid": 4242,
         "start_epoch": 1_699_999_900.0,
+        "transcript_run_id": "0123456789abcdef0123456789abcdef",
         "updated_at": 1_700_000_000.0,
         "audio": ["me": NSNull(), "them": NSNull()],
         "stt": [
@@ -94,6 +95,11 @@ private func runDecoderCases(_ root: URL) throws {
         if name == "level-boundaries", let decoded {
             try require(decoded.me?.level == 0.0, "negative zero was not canonicalised")
             try require(decoded.them?.level == 1.0, "inclusive upper bound rejected")
+        }
+        if name == "valid", let decoded {
+            try require(
+                decoded.transcriptRunID == "0123456789abcdef0123456789abcdef",
+                "schema-v2 transcript run id was not decoded")
         }
     }
 }

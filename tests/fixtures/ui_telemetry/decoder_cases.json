@@ -7,7 +7,8 @@
     "owner_alive": true,
     "accepted": true,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1699999999.75,
@@ -32,7 +33,7 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 2,
+      "schema": 1,
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -52,7 +53,8 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4243,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -72,7 +74,8 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999901.0,
       "updated_at": 1700000000.0,
@@ -92,7 +95,8 @@
     "owner_alive": false,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -112,7 +116,8 @@
     "owner_alive": true,
     "accepted": true,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1699999995.0,
@@ -132,7 +137,8 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1699999994.999,
@@ -152,7 +158,8 @@
     "owner_alive": true,
     "accepted": true,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000005.0,
@@ -172,7 +179,8 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000005.001,
@@ -194,7 +202,8 @@
     "expected_me_signal": false,
     "expected_them_signal": true,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -217,7 +226,8 @@
     "owner_alive": true,
     "accepted": true,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -240,7 +250,8 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -263,7 +274,8 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
@@ -283,13 +295,55 @@
     "owner_alive": true,
     "accepted": false,
     "snapshot": {
-      "schema": 1,
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
       "pid": 4242,
       "start_epoch": 1699999900.0,
       "updated_at": 1700000000.0,
       "audio": {"me": null, "them": null},
       "stt": {
         "me": {"state": "green", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "missing-transcript-run-id",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "invalid-transcript-run-id",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "ABCDEF0123456789ABCDEF0123456789",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
         "them": {"state": "ready", "detail": null},
         "aggregate": "ready"
       }

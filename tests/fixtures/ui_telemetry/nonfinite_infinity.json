@@ -1,1 +1,1 @@
-{"schema":1,"pid":4242,"start_epoch":1699999900.0,"updated_at":1700000000.0,"audio":{"me":{"level":Infinity,"observed_at":1700000000.0},"them":null},"stt":{"me":{"state":"ready","detail":null},"them":{"state":"ready","detail":null},"aggregate":"ready"}}
+{"schema":2,"transcript_run_id":"0123456789abcdef0123456789abcdef","pid":4242,"start_epoch":1699999900.0,"updated_at":1700000000.0,"audio":{"me":{"level":Infinity,"observed_at":1700000000.0},"them":null},"stt":{"me":{"state":"ready","detail":null},"them":{"state":"ready","detail":null},"aggregate":"ready"}}

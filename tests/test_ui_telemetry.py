@@ -32,6 +32,8 @@ from onoats.ui_telemetry import (
     read_snapshot,
 )
 
+RUN_ID = "0123456789abcdef0123456789abcdef"
+
 
 class FakeClock:
     def __init__(self, now: float = 1000.0):
@@ -79,6 +81,7 @@ def _state(
     return UITelemetryState(
         pid=4321,
         start_epoch=900.25,
+        transcript_run_id=RUN_ID,
         locked_category=SEMINAR_CATEGORY,
         clock=clock,
         monotonic_clock=monotonic_clock,
@@ -90,7 +93,7 @@ def _path(data_dir: Path) -> Path:
 
 
 def test_contract_constants_are_independent_and_bounded():
-    assert UI_TELEMETRY_SCHEMA_VERSION == 1
+    assert UI_TELEMETRY_SCHEMA_VERSION == 2
     assert UI_TELEMETRY_FILENAME == "onoats.ui.json"
     assert UI_TELEMETRY_MODE == 0o600
     assert MAX_WRITE_HZ == 4
@@ -190,7 +193,9 @@ def test_stt_details_and_transcript_are_unicode_codepoint_bounded():
 def test_locked_category_producer_is_consumer_bounded(scalar_count):
     motif = "e\u0301🙂👩\u200d💻"
     value = (motif * ((scalar_count // len(motif)) + 1))[:scalar_count]
-    state = UITelemetryState(4321, 900.25, locked_category=value)
+    state = UITelemetryState(
+        4321, 900.25, transcript_run_id=RUN_ID, locked_category=value
+    )
 
     published = state.snapshot()["locked_category"]
 
@@ -205,9 +210,10 @@ def test_snapshot_shape_carries_one_owner_epoch_and_consistent_aggregate():
     snapshot = state.snapshot(now=1001.0)
 
     assert snapshot == {
-        "schema": 1,
+        "schema": 2,
         "pid": 4321,
         "start_epoch": 900.25,
+        "transcript_run_id": RUN_ID,
         "updated_at": 1001.0,
         "audio": {"me": None, "them": None},
         "stt": {
@@ -217,6 +223,31 @@ def test_snapshot_shape_carries_one_owner_epoch_and_consistent_aggregate():
         },
         "locked_category": "seminars",
     }
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "",
+        "0" * 31,
+        "0" * 33,
+        "G" * 32,
+        "ABCDEF0123456789ABCDEF0123456789",
+        "01234567-89ab-cdef-0123-456789abcdef",
+    ],
+)
+def test_transcript_run_id_is_required_and_strictly_lower_hex(run_id):
+    with pytest.raises((TypeError, ValueError)):
+        UITelemetryState(4321, 900.25, transcript_run_id=run_id)
+
+
+def test_schema_v2_snapshot_requires_recorder_attested_transcript_run_id(tmp_path):
+    path = tmp_path / "snapshot.json"
+    snapshot = _state().snapshot()
+    snapshot.pop("transcript_run_id")
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    assert read_snapshot(path, pid=4321, start_epoch=900.25, now=1000.0) is None
 
 
 def test_write_once_is_atomic_owner_only_and_strict_json(tmp_path, monkeypatch):
@@ -435,7 +466,7 @@ def test_read_snapshot_rejects_stale_foreign_schema_and_bad_aggregate(tmp_path):
     assert read_snapshot(path, pid=4321, start_epoch=900.25, now=1005.001) is None
 
     raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["schema"] = 2
+    raw["schema"] = 1
     path.write_text(json.dumps(raw), encoding="utf-8")
     assert read_snapshot(path, pid=4321, start_epoch=900.25, now=1000.0) is None
 
@@ -660,4 +691,9 @@ def test_status_schema_remains_separate():
     from onoats.status import STATUS_SCHEMA_VERSION
 
     assert STATUS_SCHEMA_VERSION == 2
-    assert STATUS_SCHEMA_VERSION != UI_TELEMETRY_SCHEMA_VERSION
+    assert UI_TELEMETRY_SCHEMA_VERSION == 2
+    repo = Path(__file__).parents[1]
+    telemetry_source = (repo / "src/onoats/ui_telemetry.py").read_text()
+    status_source = (repo / "src/onoats/status.py").read_text()
+    assert "STATUS_SCHEMA_VERSION" not in telemetry_source
+    assert "UI_TELEMETRY_SCHEMA_VERSION" not in status_source

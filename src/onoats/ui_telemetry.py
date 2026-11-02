@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import stat
 import tempfile
 import time
@@ -22,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-UI_TELEMETRY_SCHEMA_VERSION = 1
+UI_TELEMETRY_SCHEMA_VERSION = 2
 UI_TELEMETRY_FILENAME = "onoats.ui.json"
 UI_TELEMETRY_MODE = 0o600
 MAX_WRITE_HZ = 4.0
@@ -35,6 +36,7 @@ TRANSCRIPT_LIMIT = 240
 DETAIL_LIMIT = 256
 LEVEL_MIN = 0.0
 LEVEL_MAX = 1.0
+TRANSCRIPT_RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
 MAX_SNAPSHOT_BYTES = 64 * 1024
 _AT_FDCWD = -2
 _RENAME_EXCL = 0x00000004
@@ -44,6 +46,7 @@ STT_PRECEDENCE = ("failed", "recovering", "starting", "unknown", "ready")
 BRANCHES = ("me", "them")
 
 _LOG = logging.getLogger(__name__)
+_TRANSCRIPT_RUN_ID_RE = re.compile(TRANSCRIPT_RUN_ID_PATTERN)
 
 
 def aggregate_stt_state(me: str, them: str) -> str:
@@ -69,6 +72,7 @@ class UITelemetryState:
         self,
         pid: int,
         start_epoch: float,
+        transcript_run_id: str,
         locked_category: str | None = None,
         *,
         clock: Callable[[], float] = time.time,
@@ -76,6 +80,9 @@ class UITelemetryState:
     ) -> None:
         self.pid = int(pid)
         self.start_epoch = float(start_epoch)
+        if _TRANSCRIPT_RUN_ID_RE.fullmatch(transcript_run_id) is None:
+            raise ValueError("invalid transcript run id")
+        self.transcript_run_id = transcript_run_id
         self.locked_category = _cap(locked_category, DETAIL_LIMIT)
         self._clock = clock
         self._monotonic_clock = monotonic_clock
@@ -169,6 +176,7 @@ class UITelemetryState:
             "schema": UI_TELEMETRY_SCHEMA_VERSION,
             "pid": self.pid,
             "start_epoch": self.start_epoch,
+            "transcript_run_id": self.transcript_run_id,
             "updated_at": now,
             "audio": {
                 branch: (dict(value) if value is not None else None)
@@ -343,7 +351,7 @@ def read_snapshot(
     start_epoch: float,
     now: float | None = None,
 ) -> dict[str, Any] | None:
-    """Read only a fresh schema-v1 snapshot belonging to the requested run."""
+    """Read only a fresh schema-v2 snapshot belonging to the requested run."""
     try:
         record = json.loads(
             Path(path).read_text(encoding="utf-8"),
@@ -357,6 +365,8 @@ def read_snapshot(
             or record.get("schema") != UI_TELEMETRY_SCHEMA_VERSION
             or record.get("pid") != pid
             or record.get("start_epoch") != start_epoch
+            or not isinstance(record.get("transcript_run_id"), str)
+            or _TRANSCRIPT_RUN_ID_RE.fullmatch(record["transcript_run_id"]) is None
             or not isinstance(record.get("updated_at"), (int, float))
             or not math.isfinite(float(record["updated_at"]))
             or current - float(record["updated_at"]) > SNAPSHOT_EXPIRY_SECONDS
