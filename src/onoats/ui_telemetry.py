@@ -2,7 +2,8 @@
 
 This module is deliberately a stdlib-only leaf.  Producers mutate
 ``UITelemetryState`` in memory; the single ``UITelemetryPublisher`` task owns
-coalesced filesystem writes.  Nothing consuming this file may use it as a
+coalesced snapshots and one dedicated daemon worker owns filesystem I/O.
+Nothing consuming this file may use it as a
 liveness authority -- the PID and lifecycle status files retain that role.
 """
 
@@ -15,9 +16,11 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import stat
 import tempfile
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -196,7 +199,7 @@ class UITelemetryState:
 
 
 class UITelemetryPublisher:
-    """One bounded task that coalesces state changes and heartbeat writes."""
+    """One coalescing task and one daemon I/O worker; no queued update backlog."""
 
     def __init__(
         self,
@@ -220,6 +223,10 @@ class UITelemetryPublisher:
         self._written_revision = -1
         self._write_failed = False
         self._cleanup_failed = False
+        self._worker: threading.Thread | None = None
+        self._jobs: queue.Queue = queue.Queue(maxsize=1)
+        self._worker_stop = threading.Event()
+        self._cleanup_requested = threading.Event()
 
     def _notify(self) -> None:
         self._wake.set()
@@ -235,6 +242,47 @@ class UITelemetryPublisher:
         self._wake.set()
         return self._task
 
+    def _worker_main(self, loop: asyncio.AbstractEventLoop) -> None:
+        # Dedicated daemon: a wedged filesystem cannot hold asyncio.run's
+        # default-executor shutdown hostage. At most one job is in flight.
+        try:
+            while not self._worker_stop.is_set():
+                job = self._jobs.get()
+                if job is None:
+                    break
+                snapshot, future = job
+                result = self._write_snapshot(snapshot)
+
+                def complete(future=future, result=result):
+                    if not future.done():
+                        future.set_result(result)
+
+                try:
+                    loop.call_soon_threadsafe(complete)
+                except RuntimeError:  # loop already closed after bounded stop
+                    break
+        finally:
+            self._cleanup_requested.wait()
+            self._cleanup_sync()
+
+    def _start_worker(self) -> None:
+        if self._worker is None:
+            self._worker = threading.Thread(
+                target=self._worker_main,
+                args=(asyncio.get_running_loop(),),
+                name="ui-telemetry-io",
+                daemon=True,
+            )
+            self._worker.start()
+
+    async def _publish(self, now: float) -> bool:
+        # Snapshot/revision reads belong to the event loop, never the worker.
+        snapshot = self.state.snapshot(now)
+        self._start_worker()
+        future = asyncio.get_running_loop().create_future()
+        self._jobs.put_nowait((snapshot, future))
+        return await future
+
     async def run(self) -> None:
         self.state.set_notifier(self._notify)
         self._wake.set()
@@ -246,7 +294,11 @@ class UITelemetryPublisher:
                 heartbeat_due = elapsed >= HEARTBEAT_SECONDS
                 rate_ready = elapsed >= 1.0 / MAX_WRITE_HZ
                 if rate_ready and (changed or heartbeat_due):
-                    self.write_once(self._clock(), monotonic_now=monotonic_now)
+                    revision = self.state.revision
+                    succeeded = await self._publish(self._clock())
+                    self._last_write_monotonic = monotonic_now
+                    if succeeded:
+                        self._written_revision = revision
                     continue
 
                 wait_for = max(0.0, 1.0 / MAX_WRITE_HZ - elapsed)
@@ -266,6 +318,11 @@ class UITelemetryPublisher:
                     await asyncio.gather(wake_task, sleep_task, return_exceptions=True)
         finally:
             self.state.set_notifier(None)
+            self._worker_stop.set()
+            try:
+                self._jobs.put_nowait(None)
+            except queue.Full:
+                pass  # in-flight worker observes the stop before another job
 
     def write_once(
         self,
@@ -278,14 +335,18 @@ class UITelemetryPublisher:
         monotonic_now = (
             self._monotonic_clock() if monotonic_now is None else float(monotonic_now)
         )
+        succeeded = self._write_snapshot(self.state.snapshot(now))
+        self._last_write_monotonic = monotonic_now
+        if succeeded:
+            self._written_revision = self.state.revision
+        return succeeded
+
+    def _write_snapshot(self, snapshot: dict[str, Any]) -> bool:
         tmp: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
-                self.state.snapshot(now),
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
+                snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")
             )
             fd, tmp = tempfile.mkstemp(
                 dir=self.path.parent, prefix=".onoats-ui-", suffix=".tmp"
@@ -298,14 +359,11 @@ class UITelemetryPublisher:
             if self._write_failed:
                 _LOG.warning("UI telemetry writes recovered")
                 self._write_failed = False
-            self._last_write_monotonic = monotonic_now
-            self._written_revision = self.state.revision
             return True
         except Exception as exc:
             if not self._write_failed:
                 _LOG.warning("Could not write UI telemetry: %s", exc)
                 self._write_failed = True
-            self._last_write_monotonic = monotonic_now
             return False
         finally:
             if tmp is not None:
@@ -323,8 +381,25 @@ class UITelemetryPublisher:
         except TimeoutError:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self.cleanup()
 
     def cleanup(self) -> bool:
+        if self._task is not None:
+            # Started publishers clean up on their sole I/O worker, including
+            # after a write that completes later than the shutdown deadline.
+            self.request_stop()
+            self._cleanup_requested.set()
+            self._worker_stop.set()
+            try:
+                self._jobs.put_nowait(None)
+            except queue.Full:
+                pass
+            self._start_worker()
+            return False
+        return self._cleanup_sync()
+
+    def _cleanup_sync(self) -> bool:
         try:
             removed = _cleanup_owned_snapshot(
                 self.path, pid=self.state.pid, start_epoch=self.state.start_epoch

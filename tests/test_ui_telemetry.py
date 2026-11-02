@@ -68,8 +68,7 @@ class ControlledSleep:
 
 
 async def _settle() -> None:
-    for _ in range(6):
-        await asyncio.sleep(0)
+    await asyncio.sleep(0.02)
 
 
 def _state(
@@ -304,15 +303,15 @@ def test_real_publisher_task_coalesces_at_four_hz_and_stops_bounded(tmp_path):
             sleep=sleep,
         )
         writes: list[tuple[float, float]] = []
-        real_write_once = publisher.write_once
+        real_write_once = publisher._write_snapshot
 
-        def record_write(now=None, *, monotonic_now=None):
-            result = real_write_once(now, monotonic_now=monotonic_now)
+        def record_write(snapshot):
+            result = real_write_once(snapshot)
             if result:
-                writes.append((float(now), float(monotonic_now)))
+                writes.append((snapshot["updated_at"], monotonic()))
             return result
 
-        publisher.write_once = record_write
+        publisher._write_snapshot = record_write
         task = publisher.start()
         await _settle()
         assert writes == [(1000.0, 0.0)]
@@ -697,3 +696,145 @@ def test_status_schema_remains_separate():
     status_source = (repo / "src/onoats/status.py").read_text()
     assert "STATUS_SCHEMA_VERSION" not in telemetry_source
     assert "UI_TELEMETRY_SCHEMA_VERSION" not in status_source
+
+
+@pytest.mark.parametrize("operation", ["mkdir", "replace", "cleanup"])
+def test_publisher_blocked_filesystem_never_blocks_loop_or_shutdown(
+    tmp_path, monkeypatch, operation
+):
+    import threading
+    import time
+
+    async def run():
+        state = _state()
+        publisher = UITelemetryPublisher(tmp_path, state)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        worker_ids = []
+        original = (
+            publisher._cleanup_sync
+            if operation == "cleanup"
+            else Path.mkdir
+            if operation == "mkdir"
+            else os.replace
+        )
+
+        def blocked(*args, **kwargs):
+            worker_ids.append(threading.get_ident())
+            calls.append(1)
+            entered.set()
+            release.wait(0.3)  # bounded even when the off-loop mutation fails
+            return original(*args, **kwargs)
+
+        if operation == "cleanup":
+            monkeypatch.setattr(publisher, "_cleanup_sync", blocked)
+        elif operation == "mkdir":
+            monkeypatch.setattr(Path, "mkdir", blocked)
+        else:
+            monkeypatch.setattr("onoats.ui_telemetry.os.replace", blocked)
+        main_thread = threading.get_ident()
+        publisher.start()
+        begin = time.monotonic()
+        if operation == "cleanup":
+            await _settle()
+            publisher.request_stop()
+            publisher.cleanup()
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        assert time.monotonic() - begin < 0.2
+        assert worker_ids == [worker_ids[0]] and worker_ids[0] != main_thread
+        for index in range(200):
+            state.set_transcript(str(index), "me")
+        assert publisher._jobs.qsize() <= 1
+        begin = time.monotonic()
+        await publisher.stop(timeout=0.01)
+        publisher.cleanup()
+        assert time.monotonic() - begin < 0.1
+        release.set()
+        for _ in range(100):
+            if not publisher._worker.is_alive():
+                break
+            await asyncio.sleep(0.005)
+        assert not publisher._worker.is_alive()
+        assert not _path(tmp_path).exists()  # no late snapshot resurrected
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("source", ["me", "them"])
+@pytest.mark.parametrize("producer", ["audio", "stt", "transcript"])
+def test_worker_coalesces_inflight_updates_to_latest_snapshot(
+    tmp_path, monkeypatch, source, producer
+):
+    import threading
+
+    async def run():
+        state = _state()
+        publisher = UITelemetryPublisher(tmp_path, state, clock=lambda: 1000.0)
+        entered = threading.Event()
+        release = threading.Event()
+        snapshots = []
+        original = publisher._write_snapshot
+
+        def write(snapshot):
+            snapshots.append(snapshot)
+            if len(snapshots) == 1:
+                entered.set()
+                release.wait(1)
+            return original(snapshot)
+
+        monkeypatch.setattr(publisher, "_write_snapshot", write)
+        publisher.start()
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        for index in range(100):
+            if producer == "audio":
+                state.observe_level(source, index / 100)
+            elif producer == "stt":
+                state.set_stt_state(source, "ready" if index == 99 else "recovering")
+            else:
+                state.set_transcript(str(index), source)
+        latest = state.snapshot(1000.0)
+        assert len(snapshots) == 1
+        release.set()
+        for _ in range(200):
+            if len(snapshots) >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert len(snapshots) == 2
+        assert snapshots[-1] == latest
+        assert snapshots[0] != latest
+        await publisher.stop()
+
+    asyncio.run(run())
+
+
+def test_cleanup_before_first_publisher_turn_is_off_loop(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    async def run():
+        publisher = UITelemetryPublisher(tmp_path, _state())
+        task = publisher.start()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        threads = []
+        release = threading.Event()
+
+        def cleanup():
+            threads.append(threading.get_ident())
+            release.wait(0.3)
+            return False
+
+        monkeypatch.setattr(publisher, "_cleanup_sync", cleanup)
+        before = time.monotonic()
+        publisher.cleanup()
+        assert time.monotonic() - before < 0.1
+        while not threads:
+            await asyncio.sleep(0.001)
+        assert threads[0] != threading.get_ident()
+        release.set()
+
+    asyncio.run(run())
