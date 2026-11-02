@@ -23,6 +23,7 @@ _PROC_PIDTBSDINFO = 3
 _MAXCOMLEN = 16
 _TRANSCRIPT_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 JSONL_LINE_LIMIT = 1024 * 1024
+CONTROL_FILE_LIMIT = 64 * 1024
 
 
 class SmokeFailure(RuntimeError):
@@ -131,10 +132,46 @@ def wait_for(
         sleep(min(0.2, remaining))
 
 
+def _control_text(path: Path) -> str | None:
+    """Read one bounded, regular, no-follow control-file descriptor."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > CONTROL_FILE_LIMIT
+            ):
+                return None
+            data = os.read(fd, CONTROL_FILE_LIMIT + 1)
+            if len(data) > CONTROL_FILE_LIMIT:
+                return None
+            return data.decode("utf-8")
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeError):
+        return None
+
+
+def _process_executable(pid: int) -> str | None:
+    """Kernel executable path; argv text is never app authentication."""
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidpath = libproc.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        if proc_pidpath(pid, buffer, len(buffer)) <= 0:
+            return None
+        return os.fsdecode(buffer.value)
+    except OSError:
+        return None
+
+
 def _json(path: Path) -> dict[str, object] | None:
     try:
         value = json.loads(
-            path.read_text(encoding="utf-8"),
+            _control_text(path) or "",
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
         )
     except (OSError, ValueError):
@@ -167,21 +204,22 @@ def _processes() -> dict[int, ProcessRow]:
 
 def _one_app_pid(app: Path) -> int | None:
     executable = str((app / "Contents/MacOS/Onoats").resolve())
-    matches = [
-        pid
-        for pid, row in _processes().items()
-        if row.command == executable or row.command.startswith(f"{executable} ")
-    ]
+    matches = [pid for pid in _processes() if _process_executable(pid) == executable]
     if len(matches) > 1:
         raise SmokeFailure("app identity failed: multiple matching Onoats processes")
     return matches[0] if matches else None
 
 
-def _pid_file_matches(pid_path: Path, *, pid: int, start_epoch: float) -> bool:
+def _pid_file_matches(
+    pid_path: Path, *, pid: int, start_epoch: float, command: str
+) -> bool:
     try:
-        fields = pid_path.read_text(encoding="utf-8").splitlines()
+        fields = (_control_text(pid_path) or "").splitlines()
         return (
             len(fields) >= 4
+            and fields[1].strip() == "onoats-bot"
+            and bool(command.strip())
+            and fields[2].strip() == command.strip()
             and int(fields[0]) == pid
             and float(fields[3]) == start_epoch
         )
@@ -218,7 +256,12 @@ def _recording_identity(
         return None
     if not _descends_from(recorder_pid, app_pid, processes):
         raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
-    if not _pid_file_matches(pid_path, pid=recorder_pid, start_epoch=epoch):
+    if not _pid_file_matches(
+        pid_path,
+        pid=recorder_pid,
+        start_epoch=epoch,
+        command=processes[recorder_pid].command,
+    ):
         return None
     row = processes[recorder_pid]
     birth = births_after[recorder_pid]
@@ -249,9 +292,9 @@ def _recorder_process_identity(identity: RecorderIdentity) -> ProcessIdentity:
 
 def _app_process_matches(app: Path, identity: ProcessIdentity) -> bool:
     executable = str((app / "Contents/MacOS/Onoats").resolve())
-    return (
-        identity.command == executable or identity.command.startswith(f"{executable} ")
-    ) and _identity_matches(identity)
+    return (_process_executable(identity.pid) == executable) and _identity_matches(
+        identity
+    )
 
 
 def _capture_process_identity(pid: int) -> ProcessIdentity | None:

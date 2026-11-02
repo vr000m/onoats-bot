@@ -711,6 +711,32 @@ sequenceDiagram
   kernel `O_APPEND`, preventing timestamp collisions, stale-tag reuse, and
   separate recorder/Flush descriptors from overwriting one another.
 
+### Review gauntlet round 1 remediation (2026-11-02)
+
+- Exit diagnostics now require the owned PID and the published epoch, or the
+  existing current-attempt epoch bound before publication. Start enablement and
+  its action share the retained recorder/log-sink lifetime gate, including Flush.
+- Pruning first moves a candidate into a private same-directory quarantine and
+  verifies the moved inode against the opened descriptor. A replacement is
+  restored without overwriting a new arrival; an occupied restoration retains
+  the candidate in quarantine rather than deleting it.
+- Installed-smoke control reads share a 64 KiB, nonblocking, no-follow regular
+  descriptor reader. Recorder discovery also verifies the identity marker and
+  live command fingerprint; app discovery and cleanup use kernel executable
+  paths (`proc_pidpath`) alongside captured process generations.
+- Matrix regressions cover publication/PID/epoch, pruning replacements and
+  restoration collisions, auxiliary lifetimes, control-file kinds, PID identity,
+  and kernel-path/argv combinations. All six mechanism mutations failed their
+  new tests and were restored; the smoke suite (142 tests), both native harnesses,
+  lint/format and review markers pass. The model harness's pre-existing schema-1
+  telemetry fixture failure was reproduced from pre-fix HEAD in isolation, then
+  updated to schema 2 with its required run ID. Panel parity now pins `canStart`.
+- `just ci` has no justfile. The sandbox full suite produced 7344 passes,
+  52 failures and 9 errors (socket/ps/Metal restrictions plus the now-corrected
+  panel parity assertion); the full native build reached a sandbox-denied Swift
+  macro plugin after redirecting its module cache. Parent validation reruns these
+  full gates outside the sandbox. Sibling-plan review found no superseded decision.
+
 ## Final Results
 
 ### Summary

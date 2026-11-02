@@ -236,6 +236,7 @@ def test_installed_smoke_finds_exact_app_executable_when_path_contains_spaces(
 ):
     app = tmp_path / "Build Output" / "Onoats.app"
     executable = str((app / "Contents/MacOS/Onoats").resolve())
+    monkeypatch.setattr(SMOKE, "_process_executable", lambda _pid: executable)
     monkeypatch.setattr(
         SMOKE,
         "_processes",
@@ -393,6 +394,7 @@ def test_installed_smoke_failure_cleanup_signals_only_verified_owned_identities(
 ):
     app = tmp_path / "Build Output" / "Onoats.app"
     executable = str((app / "Contents/MacOS/Onoats").resolve())
+    monkeypatch.setattr(SMOKE, "_process_executable", lambda _pid: executable)
     app_pid, recorder_pid = 1234, 4321
     expected_recorder_command = "/opt/onoats/bin/onoats bot"
     processes = {
@@ -445,6 +447,7 @@ def test_installed_smoke_cleanup_attempts_app_after_recorder_signal_failure(
 ):
     app = tmp_path / "Onoats.app"
     executable = str((app / "Contents/MacOS/Onoats").resolve())
+    monkeypatch.setattr(SMOKE, "_process_executable", lambda _pid: executable)
     app_pid, recorder_pid = 1234, 4321
     command = "/opt/onoats/bin/onoats bot"
     processes = {
@@ -522,6 +525,7 @@ def test_installed_smoke_captured_identity_cleanup_whole_state_space(
     """Captured ownership survives app exit; kernel generation gates signals."""
     app = tmp_path / "Onoats.app"
     executable = str((app / "Contents/MacOS/Onoats").resolve())
+    monkeypatch.setattr(SMOKE, "_process_executable", lambda _pid: executable)
     app_birth = _birth(10, 100)
     recorder_birth = _birth(20, 200)
     member_birth = _birth(30, 300)
@@ -618,6 +622,7 @@ def test_installed_smoke_cleanup_attempts_recorder_groups_and_app_independently(
 ):
     app = tmp_path / "Onoats.app"
     executable = str((app / "Contents/MacOS/Onoats").resolve())
+    monkeypatch.setattr(SMOKE, "_process_executable", lambda _pid: executable)
     app_birth = _birth(10, 10)
     recorder_birth = _birth(20, 20)
     member_birth = _birth(30, 30)
@@ -1155,3 +1160,97 @@ def test_live_variant_reuses_fixture_through_full_supervisor_path(
     assert any(entry.get("source") == "me" for entry in _utterances(data_dir)), (
         "real websocket full path produced no durable source=me utterance"
     )
+
+
+@pytest.mark.parametrize("reader", ["json", "pid"])
+@pytest.mark.parametrize(
+    "kind",
+    ["regular", "oversized", "fifo", "symlink", "directory", "missing", "invalid_utf8"],
+)
+def test_smoke_control_descriptor_state_space(tmp_path, reader, kind):
+    path = tmp_path / "control"
+    content = (
+        b'{"ok":true}' if reader == "json" else b"4321\nonoats-bot\ncommand\n900.25\n"
+    )
+    if kind == "regular":
+        path.write_bytes(content)
+    elif kind == "oversized":
+        path.write_bytes(b"x" * (SMOKE.CONTROL_FILE_LIMIT + 1))
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.write_bytes(content)
+        path.symlink_to(target)
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "invalid_utf8":
+        path.write_bytes(b"\xff")
+
+    # Alarm makes an unsafe FIFO regression fail rather than hang the suite.
+    def expired(*_args):
+        raise AssertionError("control read blocked")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 0.5)
+    try:
+        result = (
+            SMOKE._json(path)
+            if reader == "json"
+            else SMOKE._pid_file_matches(
+                path, pid=4321, start_epoch=900.25, command="command"
+            )
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert bool(result) is (kind == "regular")
+
+
+@pytest.mark.parametrize("marker", ["onoats-bot", "foreign", ""])
+@pytest.mark.parametrize("command", ["command", "foreign", ""])
+@pytest.mark.parametrize("pid", [4321, 9999])
+@pytest.mark.parametrize("epoch", [900.25, 901.25])
+def test_smoke_pid_identity_state_space(tmp_path, marker, command, pid, epoch):
+    path = tmp_path / "pid"
+    path.write_text(f"4321\n{marker}\ncommand\n900.25\n")
+    assert SMOKE._pid_file_matches(
+        path, pid=pid, start_epoch=epoch, command=command
+    ) is (
+        marker == "onoats-bot"
+        and command == "command"
+        and pid == 4321
+        and epoch == 900.25
+    )
+
+
+@pytest.mark.parametrize("kernel", ["matching", "foreign", "missing"])
+@pytest.mark.parametrize("argv", ["matching", "foreign"])
+def test_smoke_kernel_app_identity_state_space(tmp_path, monkeypatch, kernel, argv):
+    app = tmp_path / "Onoats.app"
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    command = executable if argv == "matching" else "/foreign"
+    monkeypatch.setattr(
+        SMOKE,
+        "_processes",
+        lambda: {1234: SMOKE.ProcessRow(1, 1234, "app-start", command)},
+    )
+    monkeypatch.setattr(SMOKE, "_process_birth", lambda _pid: _birth(10, 20))
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_executable",
+        lambda _pid: (
+            executable
+            if kernel == "matching"
+            else "/foreign"
+            if kernel == "foreign"
+            else None
+        ),
+    )
+    assert SMOKE._one_app_pid(app) == (1234 if kernel == "matching" else None)
+    calls = []
+    monkeypatch.setattr(SMOKE.os, "kill", lambda *args: calls.append(args))
+    assert SMOKE._signal_app(
+        app, _app_identity(app, command=command), signal.SIGTERM
+    ) is (kernel == "matching")
+    assert bool(calls) is (kernel == "matching")
