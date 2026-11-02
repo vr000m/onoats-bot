@@ -91,6 +91,12 @@ registry dep, not a git pin).
   `ONOATS-EVENT waiting-for-permission`; if the base socket wait expires with
   that event seen, the supervisor extends the wait once (+120 s) and surfaces
   the pending prompt in the status file.
+- **Startup signals are owned before spawn.** Until the recorder installs its
+  normal drain handlers, SIGINT/SIGTERM cancel startup through the supervisor's
+  authoritative `finally`. Cancellation during spawn first retains the child
+  handle, so the capturer group is still reaped. The app waits for owned child
+  exit on Quit; its bounded timeout keeps the app alive with an error rather
+  than killing the supervisor before capturer cleanup.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →
   transport `expected_nonce`. A capturer presenting a missing/stale nonce on the
   supervisor's paths is rejected at handshake. Ungated (None) when socket mode is
@@ -466,7 +472,10 @@ its scope; this list is a pointer, not the contract itself.
   contract and its in-memory state/publisher. Telemetry is fail-open: producer,
   persistence, and cleanup failures may degrade the menu-bar panel but must not
   affect capture, STT, transcript persistence, or shutdown. Exactly one bounded
-  publisher task owns filesystem writes for a run; callbacks update memory only.
+  publisher task coalesces immutable snapshots into one dedicated daemon I/O
+  worker for a run; callbacks update memory only. Filesystem writes and cleanup
+  never execute on the recorder event loop, and shutdown never joins a stalled
+  I/O thread. The one-slot queue prevents an update backlog.
   Audio levels must be finite and inside `[0.0, 1.0]`; invalid values are rejected
   without advancing the branch observation time, never clamped.
 

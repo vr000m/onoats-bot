@@ -757,6 +757,34 @@ sequenceDiagram
   reconnect/config/telemetry run: 181 passed, 2 Metal-dependent failures. Parent
   validation must rerun the broad gate outside the sandbox.
 
+### 2026-11-02: Gauntlet round 3 lifecycle and telemetry corrections
+
+- Readiness requires the exact negotiated client, a connected state, and a live
+  reader after the acknowledgement wait. A newer remote-close revocation cannot
+  be overwritten by readiness or kickstart-recovery callbacks.
+- Quit retains owned recorder/auxiliary handles until exit. The 15-second error
+  fallback leaves the app alive rather than bypassing supervisor teardown.
+  Early supervisor signal ownership covers spawn, socket/permission waiting,
+  and preflight; running handlers retain their existing drain semantics.
+- The publisher now captures immutable snapshots on the loop and awaits one
+  dedicated daemon I/O worker through a one-slot queue. New observations coalesce
+  in memory. The shutdown cleanup callback requests worker-owned cleanup only
+  after stopped status; a late write is followed by owner-checked cleanup.
+  A blocked filesystem cannot block the recorder loop or executor shutdown.
+- These changes refine the existing fail-open and ownership contracts without
+  changing schemas, process ownership, external-session signalling, or STT
+  reconnect policy. Sibling-plan audit found no superseded historical decision.
+- Restored focused gates: 147 Python tests and the RecorderModel native harness
+  pass. Four mutations fail as expected: removed readiness gate (4 cells),
+  synchronous telemetry writes (3 cells), removed startup signal owner (8 cells),
+  and immediate Quit termination (native startup-ownership assertion).
+- Format, lint, review-marker and whitespace gates pass; `just ci` has no
+  justfile. Full sandbox suite: 7393 passed, 51 failed, 9 errors, 3 skipped;
+  AF_UNIX/ps restrictions and unavailable Metal still block broad validation.
+  Production native compilation is blocked by the sandboxed Swift macro plugin;
+  the isolated model harness compiles and passes. Parent must repeat those
+  environment-blocked gates outside the sandbox.
+
 ## Final Results
 
 ### Summary

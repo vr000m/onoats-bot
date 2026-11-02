@@ -130,6 +130,10 @@ that surface:
   capturer directly. A verified external session routes Stop through the
   identity-checked CLI path; Flush uses the same identity gate with its own
   signal.
+- Quit requests the same owned graceful stop during startup and recording,
+  then waits for the recorder and any in-flight Flush/Stop helper to exit.
+  A 15-second timeout keeps the app open with a cleanup error and retained
+  process handles. Quitting an external session leaves its recorder running.
 - The Settings "Mic (me)" picker sets the macOS **default input device** because the
   capturer binds the system default at start — the only selection that
   actually applies. Named device+STT profiles are a follow-up (need capturer
@@ -141,7 +145,9 @@ that surface:
   branch/aggregate STT state, locked category, and the optional bounded
   transcript preview. The consumer rejects stale ownership, freshness, schema,
   numeric, and aggregate mismatches; missing telemetry degrades the panel and
-  never changes recorder liveness or success.
+  never changes recorder liveness or success. Snapshot writes and cleanup use
+  one daemon I/O worker with bounded coalescing, so a slow data volume cannot
+  block capture or app-requested recorder shutdown.
 - Data dir resolves from `~/.config/onoats/config.toml` `[storage].data_dir`,
   else `~/.local/share/onoats` (a GUI app sees no shell env, so
   `ONOATS_DATA_DIR`/XDG exports don't apply here). The model snapshots this path
