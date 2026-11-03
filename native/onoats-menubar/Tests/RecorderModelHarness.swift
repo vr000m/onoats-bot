@@ -252,8 +252,9 @@ private func testQuitOwnershipMatrix(_ root: URL) throws {
             }
             var auxiliary: FakeProcess?
             if withAuxiliary && model.activeDataDir != nil {
+                let processCount = ops.processes.count
                 model.flush()
-                auxiliary = ops.processes.last
+                if ops.processes.count > processCount { auxiliary = ops.processes.last }
             }
             model.quitApp()
             model.quitApp() // pending Quit must be idempotent
@@ -304,11 +305,19 @@ private func testDirectoryAuthority(_ root: URL) throws {
     try require(model.activeDataDir == old, "mid-run config retargeted active reads")
     try require(model.nextDataDir == new, "next recording directory did not update")
 
+    let owned = ops.processes[0]
+    putPid(
+        ops, directory: old, pid: owned.pid,
+        epoch: ops.nowValue.timeIntervalSince1970)
+    model.refresh()
     model.flush()
-    try require(ops.requests.last?.arguments == ["flush", "--data-dir", old.path],
+    try require(ops.requests.last?.arguments == [
+        "flush", "--data-dir", old.path,
+        "--expected-pid", String(owned.pid),
+        "--expected-start-epoch", String(ops.nowValue.timeIntervalSince1970),
+    ],
                 "Flush did not use the active directory")
 
-    let owned = ops.processes[0]
     model.stop()
     try require(owned.terminateCount == 1, "owned Stop did not terminate retained handle")
     try require(model.state == .stopping, "owned Stop did not enter draining state")
@@ -443,7 +452,10 @@ private func testExternalRoutingAndPidReuse(_ root: URL) throws {
     choice.url = next
     model.refresh()
     model.stopExternal()
-    try require(ops.requests.last?.arguments == ["stop", "--data-dir", directory.path],
+    try require(ops.requests.last?.arguments == [
+        "stop", "--data-dir", directory.path,
+        "--expected-pid", "77", "--expected-start-epoch", "10.0",
+    ],
                 "external Stop used next-session directory")
     try require(model.stopRequested, "external Stop did not guard duplicate requests")
 
@@ -453,7 +465,10 @@ private func testExternalRoutingAndPidReuse(_ root: URL) throws {
     try require(model.state == .running(ours: false), "PID reuse changed liveness")
 
     model.flush()
-    try require(ops.requests.last?.arguments == ["flush", "--data-dir", directory.path],
+    try require(ops.requests.last?.arguments == [
+        "flush", "--data-dir", directory.path,
+        "--expected-pid", "77", "--expected-start-epoch", "11.0",
+    ],
                 "external Flush used next-session directory")
 }
 
@@ -670,10 +685,14 @@ private func testPerRunLogsPruningAndOwnedRouting(_ root: URL) throws {
         runLogs.append(log)
         try require(log.lastPathComponent == "onoats-bot-\(1_700_000_000_000 + index * 1000).log",
                     "run log name is not the Start-attempt epoch milliseconds")
+        let recorder = ops.processes.last!
+        putPid(
+            ops, directory: directory, pid: recorder.pid,
+            epoch: ops.nowValue.timeIntervalSince1970)
+        model.refresh()
         model.flush()
         try require(ops.requests.last?.appendOutputTo == log,
                     "owned Flush did not append to the active run log")
-        let recorder = ops.processes[ops.processes.count - 2]
         let flush = ops.processes[ops.processes.count - 1]
         ops.finish(recorder, status: 0)
         ops.finish(flush, status: 0)
@@ -708,8 +727,12 @@ private func testRunLogOwnerOutlivesOverlappingFlush(_ root: URL) throws {
         ops, suite: "onoats.harness.owner-lifetime",
         directory: DirectoryChoice(directory))
     model.start()
-    model.flush()
     let recorder = ops.processes[0]
+    putPid(
+        ops, directory: directory, pid: recorder.pid,
+        epoch: ops.nowValue.timeIntervalSince1970)
+    model.refresh()
+    model.flush()
     let flush = ops.processes[1]
     guard let recorderSink = ops.requests[0].outputSink,
           let flushSink = ops.requests[1].outputSink else {
@@ -1031,6 +1054,10 @@ private func testStartAuxiliaryStateSpace(_ root: URL) throws {
             try require(model.canStart, "idle model disabled Start")
             model.start()
             let recorder = ops.processes[0]
+            putPid(
+                ops, directory: root, pid: recorder.pid,
+                epoch: ops.nowValue.timeIntervalSince1970)
+            model.refresh()
             for _ in 0..<count { model.flush() }
             try require(!model.canStart, "live recorder enabled Start")
             ops.finish(recorder, status: exitStatus)

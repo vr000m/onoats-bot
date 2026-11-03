@@ -563,6 +563,41 @@ def test_stop_and_flush_send_distinct_signals(
     assert reject_sig not in sent, f"{command} must NOT send {reject_sig!r}"
 
 
+@pytest.mark.parametrize("command", ["flush", "stop"])
+@pytest.mark.parametrize(
+    ("identity", "signals"),
+    [("absent", True), ("matching", True), ("successor", False)],
+)
+def test_signal_commands_cover_captured_identity_state_space(
+    command, identity, signals, monkeypatch, _isolate_env
+):
+    """A captured UI action can signal only the exact recorder generation."""
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n10.0\n", encoding="utf-8")
+    delivered = []
+
+    def fake_kill(pid, sig):
+        if sig != 0:
+            delivered.append((pid, sig))
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr(
+        "onoats._vendor.pid._live_ps_cmdline", lambda _pid: "onoats bot"
+    )
+    argv = [command]
+    if identity != "absent":
+        argv += [
+            "--expected-pid",
+            "9001",
+            "--expected-start-epoch",
+            "10.0" if identity == "matching" else "9.0",
+        ]
+
+    assert cli.main(argv) == (0 if signals else 1)
+    assert bool(delivered) is signals
+
+
 def test_stop_no_pid_file(_isolate_env):
     assert cli.main(["stop"]) == 1
 

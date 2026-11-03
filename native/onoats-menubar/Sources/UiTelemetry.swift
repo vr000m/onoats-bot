@@ -209,8 +209,7 @@ enum UiTelemetryDecoder {
                   value.level.isFinite,
                   value.level >= UiTelemetryContract.levelMin,
                   value.level <= UiTelemetryContract.levelMax,
-                  value.observed_at.isFinite,
-                  value.observed_at <= wire.updated_at
+                  value.observed_at.isFinite
             else { return nil }
             let age = nowEpoch - value.observed_at
             guard age >= 0,
@@ -223,15 +222,17 @@ enum UiTelemetryDecoder {
             )
         }
 
-        // Invalid numeric observations reject the whole snapshot.  Missing or
-        // old observations are the only cases that become a per-branch nil.
+        // Invalid numeric observations reject the whole snapshot. Missing,
+        // old, or future observations become per-branch nil. A future branch
+        // timestamp can be a valid pre-rollback observation retained across a
+        // heartbeat after the wall clock moved backwards; it must not hide STT,
+        // category, or transcript state from the otherwise-current snapshot.
         for value in [wire.audio["me"] ?? nil, wire.audio["them"] ?? nil] {
             if let value,
                (!value.level.isFinite
                 || value.level < UiTelemetryContract.levelMin
                 || value.level > UiTelemetryContract.levelMax
-                || !value.observed_at.isFinite
-                || value.observed_at > wire.updated_at) {
+                || !value.observed_at.isFinite) {
                 return nil
             }
         }

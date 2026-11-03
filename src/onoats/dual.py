@@ -520,6 +520,7 @@ async def run_onoats_dual(
             telemetry_state.set_transcript(text, source, speaker_label)
 
     transcript_buffer = TranscriptBuffer(
+        data_dir=data_dir,
         track_vad_gaps=True,
         use_frame_source=True,
         locked_category=locked_category,

@@ -741,14 +741,13 @@ def test_swift_model_pins_data_directory_contract():
     assert argument == "--data-dir"
     assert cli.count('"--data-dir"') >= 2
     assert "environment[Self.dataDirEnvironment]" in swift
-    assert re.search(
-        r'arguments:\s*\["stop",\s*"--data-dir",\s*directory\.path\]',
-        swift,
-    )
-    assert re.search(
-        r'arguments:\s*\["flush",\s*"--data-dir",\s*directory\.path\]',
-        swift,
-    )
+    for command in ("stop", "flush"):
+        assert re.search(
+            rf'"{command}",\s*"--data-dir",\s*directory\.path,\s*'
+            r'"--expected-pid",\s*String\([^)]*\.pid\),\s*'
+            r'"--expected-start-epoch",\s*String\([^)]*\.startEpoch\)',
+            swift,
+        )
 
 
 def test_invalid_category_machine_tag_matches_swift():

@@ -20,6 +20,7 @@ or importing pyaudio / pipecat / MLX. This keeps the import-guard clean: a bare
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -1316,7 +1317,23 @@ def _cmd_flush(rest: list[str]) -> int:
         default=None,
         help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
     )
+    parser.add_argument(
+        "--expected-pid", type=int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--expected-start-epoch", type=float, default=None, help=argparse.SUPPRESS
+    )
     args = parser.parse_args(rest)
+    if (args.expected_pid is None) != (args.expected_start_epoch is None):
+        parser.error(
+            "--expected-pid and --expected-start-epoch must be supplied together"
+        )
+    if args.expected_pid is not None and (
+        args.expected_pid <= 0
+        or not math.isfinite(args.expected_start_epoch)
+        or args.expected_start_epoch <= 0
+    ):
+        parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
     from onoats._vendor.pid import read_pid_record, resolve_flush_target
@@ -1325,6 +1342,17 @@ def _cmd_flush(rest: list[str]) -> int:
     # Capture the pid the file records BEFORE resolving, so stale cleanup can
     # compare-and-unlink (never delete a newer recorder's freshly-written file).
     prior_rec = read_pid_record(pid_path)
+    if args.expected_pid is not None and (
+        prior_rec is None
+        or prior_rec.pid != args.expected_pid
+        or prior_rec.start_epoch != args.expected_start_epoch
+    ):
+        print(
+            "onoats flush: requested recorder identity is no longer active "
+            f"(pid file {pid_path})",
+            file=sys.stderr,
+        )
+        return 1
     target = resolve_flush_target(pid_path)
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so
@@ -1375,7 +1403,23 @@ def _cmd_stop(rest: list[str]) -> int:
         default=None,
         help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
     )
+    parser.add_argument(
+        "--expected-pid", type=int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--expected-start-epoch", type=float, default=None, help=argparse.SUPPRESS
+    )
     args = parser.parse_args(rest)
+    if (args.expected_pid is None) != (args.expected_start_epoch is None):
+        parser.error(
+            "--expected-pid and --expected-start-epoch must be supplied together"
+        )
+    if args.expected_pid is not None and (
+        args.expected_pid <= 0
+        or not math.isfinite(args.expected_start_epoch)
+        or args.expected_start_epoch <= 0
+    ):
+        parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
     from onoats._vendor.pid import read_pid_record, resolve_flush_target
@@ -1384,6 +1428,17 @@ def _cmd_stop(rest: list[str]) -> int:
     # Capture the pid the file records BEFORE resolving, so stale cleanup can
     # compare-and-unlink (never delete a newer recorder's freshly-written file).
     prior_rec = read_pid_record(pid_path)
+    if args.expected_pid is not None and (
+        prior_rec is None
+        or prior_rec.pid != args.expected_pid
+        or prior_rec.start_epoch != args.expected_start_epoch
+    ):
+        print(
+            "onoats stop: requested recorder identity is no longer active "
+            f"(pid file {pid_path})",
+            file=sys.stderr,
+        )
+        return 1
     target = resolve_flush_target(pid_path)
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so

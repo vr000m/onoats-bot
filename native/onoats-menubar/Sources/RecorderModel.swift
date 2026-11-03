@@ -816,20 +816,36 @@ final class RecorderModel: ObservableObject {
             flushNote = "Flush failed: no active recorder directory"
             return
         }
+        guard let target = readPid(under: directory), target.startEpoch > 0 else {
+            flushNote = "Flush failed: recorder identity is unavailable"
+            return
+        }
         spawnAuxiliary(
-            arguments: ["flush", "--data-dir", directory.path],
+            arguments: [
+                "flush", "--data-dir", directory.path,
+                "--expected-pid", String(target.pid),
+                "--expected-start-epoch", String(target.startEpoch),
+            ],
             logOwnedOutput: proc?.isRunning == true, failureAction: "Flush")
     }
 
     func stopExternal() {
         guard proc == nil, let directory = activeDataDir else { return }
-        stopRequested = true
         let stopping = readPid(under: directory)
-        stopRequestedForPid = stopping?.pid
-        stopRequestedForStartEpoch = stopping?.startEpoch
+        guard let stopping, stopping.startEpoch > 0 else {
+            flushNote = "Stop failed: recorder identity is unavailable"
+            return
+        }
+        stopRequested = true
+        stopRequestedForPid = stopping.pid
+        stopRequestedForStartEpoch = stopping.startEpoch
         flushNote = nil
         spawnAuxiliary(
-            arguments: ["stop", "--data-dir", directory.path],
+            arguments: [
+                "stop", "--data-dir", directory.path,
+                "--expected-pid", String(stopping.pid),
+                "--expected-start-epoch", String(stopping.startEpoch),
+            ],
             logOwnedOutput: false, failureAction: "Stop", clearExternalStopOnFailure: true)
     }
 

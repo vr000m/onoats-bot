@@ -96,6 +96,11 @@ private func runDecoderCases(_ root: URL) throws {
             try require(decoded.me?.level == 0.0, "negative zero was not canonicalised")
             try require(decoded.them?.level == 1.0, "inclusive upper bound rejected")
         }
+        if name == "rollback-future-me", let decoded {
+            try require(decoded.me == nil, "pre-rollback Me observation must expire")
+            try require(decoded.aggregateStt == .ready, "clock rollback hid STT state")
+            try require(decoded.lockedCategory == "seminars", "clock rollback hid category")
+        }
         if name == "valid", let decoded {
             try require(
                 decoded.transcriptRunID == "0123456789abcdef0123456789abcdef",

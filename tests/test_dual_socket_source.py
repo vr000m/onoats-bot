@@ -771,11 +771,45 @@ def test_socket_telemetry_uses_the_exact_transcript_buffer_run_id():
     assert buffer_pos < telemetry_pos, (
         "TranscriptBuffer must mint the run id before schema-v2 telemetry is built"
     )
+    assert "TranscriptBuffer(\n        data_dir=data_dir," in source
     telemetry_call = source[telemetry_pos : source.index(")", telemetry_pos) + 1]
     assert "transcript_buffer.run_id" in telemetry_call
     assert source.count("transcript_buffer.run_id") == 1, (
         "dual must wire the buffer-owned id directly, not mint or transform another id"
     )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_transcript_storage_uses_the_resolved_session_data_dir(
+    explicit, tmp_path, monkeypatch
+):
+    """Explicit and environment-resolved sessions give storage one authority."""
+    import onoats.dual as dual_mod
+    import onoats.processors.transcript_buffer as buffer_mod
+
+    selected = tmp_path / ("explicit" if explicit else "environment")
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "environment"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    captured = []
+
+    class FakeBuffer:
+        run_id = "0123456789abcdef0123456789abcdef"
+
+        def __init__(self, **kwargs):
+            captured.append(kwargs["data_dir"])
+
+    monkeypatch.setattr(buffer_mod, "TranscriptBuffer", FakeBuffer)
+    monkeypatch.setattr(dual_mod, "_acquire_instance_lock", lambda *_args: None)
+
+    def stop_before_capture(*_args, **_kwargs):
+        raise _Stop
+
+    monkeypatch.setattr(dual_mod, "_build_socket_transports", stop_before_capture)
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=selected if explicit else None))
+
+    assert captured == [selected]
 
 
 def _dual_spies(monkeypatch, tmp_path, *, preflight_raises: bool):

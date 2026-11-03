@@ -329,6 +329,31 @@
     }
   },
   {
+    "name": "rollback-future-me",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {
+        "me": {"level": 0.5, "observed_at": 1700003600.0},
+        "them": null
+      },
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      },
+      "locked_category": "seminars"
+    }
+  },
+  {
     "name": "invalid-transcript-run-id",
     "now": 1700000000.0,
     "owner_pid": 4242,

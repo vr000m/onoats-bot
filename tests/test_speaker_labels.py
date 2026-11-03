@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import textwrap
 
+import pytest
+
 from onoats.config import OnoatsConfig, load_config
 
 
@@ -182,6 +184,33 @@ def test_raising_transcript_preview_callback_does_not_lose_durable_utterance(tmp
     assert any(entry.get("text") == "must persist" for entry in entries)
 
 
+@pytest.mark.parametrize(("persisted", "preview_count"), [(True, 1), (False, 0)])
+def test_transcript_preview_publication_tracks_jsonl_write_result(
+    tmp_path, monkeypatch, persisted, preview_count
+):
+    """Display state mirrors exactly the utterances accepted by persistence."""
+    from pipecat.frames.frames import TranscriptionFrame
+
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    observed = []
+    buf = TranscriptBuffer(
+        data_dir=tmp_path, on_transcript=lambda *args: observed.append(args)
+    )
+
+    async def controlled_write(_entry):
+        return persisted
+
+    monkeypatch.setattr(buf, "_write_entry", controlled_write)
+    asyncio.run(
+        buf._handle_transcription(
+            TranscriptionFrame(text="not durable", user_id="me", timestamp="t")
+        )
+    )
+
+    assert len(observed) == preview_count
+
+
 def test_raising_preview_label_composition_does_not_lose_durable_utterance(
     tmp_path, monkeypatch
 ):
@@ -224,8 +253,6 @@ def test_raising_preview_label_composition_does_not_lose_durable_utterance(
 
 import asyncio  # noqa: E402
 import json  # noqa: E402
-
-import pytest  # noqa: E402
 
 EXPECTED_KEYS = {
     "time",

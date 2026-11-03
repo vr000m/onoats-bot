@@ -374,9 +374,10 @@ class TranscriptBuffer(FrameProcessor):
             )
             self._buffer.append(entry)
             idx = len(self._buffer) - 1
-            if await self._write_entry(entry):
+            persisted = await self._write_entry(entry)
+            if persisted:
                 self._persisted_indices.add(idx)
-        if self._on_transcript is not None:
+        if persisted and self._on_transcript is not None:
             try:
                 speaker_label = None
                 if source:
