@@ -156,6 +156,8 @@ def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_pa
     _write_launch_agent(plist, label)
     calls: list[list[str]] = []
     envs: list[dict[str, str]] = []
+    consumed: list[bytes] = []
+    expected = plist.read_bytes()
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
@@ -164,6 +166,11 @@ def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_pa
             return subprocess.CompletedProcess(
                 argv, 113, "", f'Could not find service "{label}"'
             )
+        if argv[1] == "bootstrap":
+            plist.write_bytes(plistlib.dumps({"Label": "attacker.replacement"}))
+            (fd,) = kwargs["pass_fds"]
+            os.lseek(fd, 0, os.SEEK_SET)
+            consumed.append(os.read(fd, launchd._LAUNCH_AGENT_PLIST_MAX_BYTES + 1))
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
@@ -172,10 +179,10 @@ def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_pa
     monkeypatch.setenv("STT_WS_TOKEN", "must-not-reach-launchctl")
 
     assert launchd.kickstart_stt_server(label) is True
-    assert calls == [
-        ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
-        ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist)],
-    ]
+    assert calls[0] == ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"]
+    assert calls[1][:3] == ["/bin/launchctl", "bootstrap", f"gui/{uid}"]
+    assert calls[1][3].startswith("/dev/fd/")
+    assert consumed == [expected]
     assert all("STT_WS_TOKEN" not in env for env in envs)
 
 
@@ -227,15 +234,17 @@ def test_kickstart_refuses_wrong_owner_or_oversized_launch_agent(monkeypatch, tm
             st_size=info.st_size,
             st_dev=info.st_dev,
             st_ino=info.st_ino,
+            st_mtime_ns=info.st_mtime_ns,
+            st_ctime_ns=info.st_ctime_ns,
         )
 
     monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
     monkeypatch.setattr(launchd.os, "fstat", wrong_owner)
-    assert launchd._validated_launch_agent_path(label, uid) is None
+    assert launchd._validated_launch_agent_bytes(label, uid) is None
 
     monkeypatch.setattr(launchd.os, "fstat", real_fstat)
     plist.write_bytes(b"x" * (launchd._LAUNCH_AGENT_PLIST_MAX_BYTES + 1))
-    assert launchd._validated_launch_agent_path(label, uid) is None
+    assert launchd._validated_launch_agent_bytes(label, uid) is None
 
 
 def test_bootstrap_race_accepts_job_loaded_by_another_process(monkeypatch, tmp_path):

@@ -78,6 +78,7 @@ import plistlib
 import pwd
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -172,8 +173,8 @@ def _launch_agent_path(label: str, uid: int) -> Path:
     return home / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
-def _validated_launch_agent_path(label: str, uid: int) -> Path | None:
-    """Validate the fixed user LaunchAgents plist without following links."""
+def _validated_launch_agent_bytes(label: str, uid: int) -> bytes | None:
+    """Read and validate the fixed LaunchAgent into one bounded byte snapshot."""
     path = _launch_agent_path(label, uid)
     flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
@@ -210,16 +211,88 @@ def _validated_launch_agent_path(label: str, uid: int) -> Path | None:
         if payload.get("RunAtLoad") is not True:
             raise ValueError("plist must set RunAtLoad=true")
 
+        after = os.fstat(fd)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ):
+            raise ValueError("plist changed during validation")
         current = os.stat(path, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
             raise ValueError("plist pathname changed during validation")
-        return path
+        return data
     except (OSError, ValueError, plistlib.InvalidFileException) as exc:
         logger.warning(f"STT: launch agent {path} is not safe to bootstrap: {exc}")
         return None
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def _immutable_launch_agent_snapshot(data: bytes) -> int:
+    """Return a read-only fd for an unlinked private copy of ``data``.
+
+    ``launchctl`` receives ``/dev/fd/<fd>`` while the descriptor is inherited.
+    The source LaunchAgent pathname and the temporary pathname are therefore
+    outside the consume step: the child can only read the exact validated bytes.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="onoats-launch-agent-"))
+    os.chmod(directory, 0o700)
+    path = directory / "validated.plist"
+    write_fd: int | None = None
+    read_fd: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        write_fd = os.open(path, flags, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(write_fd, view)
+            if written <= 0:
+                raise OSError("short write while snapshotting launch agent")
+            view = view[written:]
+        os.fsync(write_fd)
+        os.fchmod(write_fd, 0o400)
+        os.close(write_fd)
+        write_fd = None
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        read_fd = os.open(path, flags)
+        if os.fstat(read_fd).st_size != len(data):
+            raise OSError("launch agent snapshot size changed")
+        copied = os.read(read_fd, len(data) + 1)
+        if copied != data:
+            raise OSError("launch agent snapshot bytes changed")
+        os.lseek(read_fd, 0, os.SEEK_SET)
+
+        path.unlink()
+        directory.rmdir()
+        return read_fd
+    except Exception:
+        if read_fd is not None:
+            os.close(read_fd)
+        raise
+    finally:
+        if write_fd is not None:
+            os.close(write_fd)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _looks_unloaded(result: subprocess.CompletedProcess[str]) -> bool:
@@ -229,19 +302,24 @@ def _looks_unloaded(result: subprocess.CompletedProcess[str]) -> bool:
 
 def _bootstrap_stt_server(label: str, uid: int, env: dict[str, str]) -> bool:
     """Bootstrap one explicitly configured, fixed-path user LaunchAgent."""
-    path = _validated_launch_agent_path(label, uid)
-    if path is None:
+    data = _validated_launch_agent_bytes(label, uid)
+    if data is None:
         return False
 
     domain = f"gui/{uid}"
-    result = subprocess.run(
-        [_LAUNCHCTL, "bootstrap", domain, str(path)],
-        capture_output=True,
-        text=True,
-        timeout=_KICKSTART_TIMEOUT_SEC,
-        check=False,
-        env=env,
-    )
+    snapshot_fd = _immutable_launch_agent_snapshot(data)
+    try:
+        result = subprocess.run(
+            [_LAUNCHCTL, "bootstrap", domain, f"/dev/fd/{snapshot_fd}"],
+            capture_output=True,
+            text=True,
+            timeout=_KICKSTART_TIMEOUT_SEC,
+            check=False,
+            env=env,
+            pass_fds=(snapshot_fd,),
+        )
+    finally:
+        os.close(snapshot_fd)
     if result.returncode == 0:
         logger.info(f"STT: bootstrapped unloaded launch agent {label!r}")
         return True
