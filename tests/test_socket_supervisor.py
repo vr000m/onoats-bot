@@ -2175,9 +2175,11 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
     from onoats import status as status_file
 
     data_dir, _ = sup_env
-    # Leave enough room for the Python fixture to start and announce the
-    # pending prompt; the 2.5s bind delay still forces the extension branch.
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 2.0)
+    # Leave enough room for a cold Python fixture to start and announce the
+    # pending prompt under full-suite load; the later bind still forces the
+    # extension branch while staying below the production 10s base budget.
+    fixture_base_wait = 8.0
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", fixture_base_wait)
     monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", float(SUP_TIMEOUT))
     set_capturer_behaviour(
         "stream",
@@ -2185,7 +2187,7 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
             "ONOATS-EVENT waiting-for-permission branch=system "
             "hint=tap creation pending the TCC prompt"
         ],
-        bind_delay=2.5,  # > the 2.0s base budget: without the extension this
+        bind_delay=fixture_base_wait + 0.5,  # without the extension this
         # run is a capturer-start-timeout
     )
 
