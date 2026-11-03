@@ -33,6 +33,7 @@ _SMOKE_SPEC.loader.exec_module(SMOKE)
 
 RUN_ID = "0123456789abcdef0123456789abcdef"
 OLD_RUN_ID = "fedcba9876543210fedcba9876543210"
+_FIXTURE_SOCKET_WAIT_SEC = 8.0
 
 
 def _birth(sec: int, usec: int):
@@ -176,7 +177,12 @@ def test_full_supervisor_socket_pipeline_requires_durable_me_speech(
     monkeypatch.setenv("ONOATS_DIARIZATION", "0")
     socket_dirs_before = set(Path("/tmp").glob("onoats-sock-*"))
     monkeypatch.setattr(tempfile, "tempdir", "/tmp")
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 2.0)
+    # A freshly-created executable can spend several seconds in macOS's first
+    # execution checks before Python binds either socket. Keep this fixture
+    # bounded below production's 10-second fail-loud budget without making the
+    # result depend on whether this is the first generated child in the run.
+    assert _FIXTURE_SOCKET_WAIT_SEC < cli._SOCKET_WAIT_TIMEOUT_SEC
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", _FIXTURE_SOCKET_WAIT_SEC)
     monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 3.0)
 
     import onoats.dual as dual
@@ -1137,7 +1143,7 @@ def test_live_variant_reuses_fixture_through_full_supervisor_path(
     monkeypatch.setenv("STT_SERVICE", "websocket")
     monkeypatch.setenv("ONOATS_DIARIZATION", "0")
     monkeypatch.setattr(tempfile, "tempdir", "/tmp")
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 3.0)
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", _FIXTURE_SOCKET_WAIT_SEC)
     monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 120.0)
 
     from onoats.config import load_config
