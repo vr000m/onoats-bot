@@ -146,6 +146,11 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
   terminate an unrelated process. A differential test asserts `stop` sends
   SIGTERM-not-SIGUSR1 and `flush` sends SIGUSR1-not-SIGTERM, so a copy-paste
   signal swap fails.
+- **A captured UI action is generation-bound.** The menu bar passes the pid and
+  start epoch it observed as `--expected-pid` / `--expected-start-epoch`; both
+  signal commands reject the action if the pid file now names another
+  generation. Direct CLI calls without those optional arguments still target
+  the currently verified recorder in the selected data directory.
 - **`stop` is a near-clone of `flush`, not a refactor.** Drift is pinned by tests
   rather than a shared helper, keeping the shipped `flush` path untouched.
 - Both return on **signal delivery**, not confirmed exit — a consumer must derive
@@ -241,7 +246,9 @@ server is unreachable, onoats asks `launchd` to start or restart the *managed*
 job. A loaded job is kickstarted. An unloaded job may be bootstrapped only from
 the matching `~/Library/LaunchAgents/<label>.plist`, after a bounded no-follow
 read confirms a regular user-owned file, safe write permissions, and an exact
-`Label`, with `RunAtLoad=true`. Successful bootstrap is the launch request; do
+`Label`, with `RunAtLoad=true`. Bootstrap consumes an unlinked descriptor-backed
+snapshot of those validated bytes, never the mutable LaunchAgents pathname.
+Successful bootstrap is the launch request; do
 not immediately kickstart the already-booting job. No port inference or
 arbitrary plist path is allowed. These
 invariants are load-bearing — breaking any of them silently degrades the

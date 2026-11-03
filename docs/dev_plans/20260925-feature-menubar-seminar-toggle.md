@@ -58,3 +58,10 @@ The diagnostic reproduced the stall on 2026-09-25 21:31: `WARNING mic: bind stil
   category now has a specific failed-Start explanation with Open Config and Open
   Log actions. See `20261028-feature-menubar-control-panel.md`; the original
   implementation and diagnostic history above remain unchanged.
+
+- **2026-11-04 correction — recorder logs are per-run.**
+  The fixed `~/Library/Logs/Onoats/onoats-bot.log` diagnostic path above is
+  retired. App-owned runs now write `onoats-bot-<spawnEpoch>.log`; use the
+  control panel's Open Log action for the current app-owned run, or Show Logs
+  Folder to inspect retained historic runs. The original stall evidence remains
+  a historic record of the 2026-09-25 investigation.
