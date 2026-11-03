@@ -240,7 +240,14 @@ not upscale those native raster files.
   over the config.toml value), the `launchctl` label to kickstart when the
   websocket STT server is unreachable at startup or drops mid-session;
   absent by default, in which case self-healing is skipped and today's
-  plain-failure behavior is unchanged; must match
+  plain-failure behavior is unchanged. A configured label also authorises
+  Onoats to bootstrap an unloaded matching user launch agent at
+  `~/Library/LaunchAgents/<launchd_label>.plist`; the plist must be a regular,
+  user-owned file, must not be group/world-writable, and its `Label` must match.
+  It must also set `RunAtLoad=true`, so a successful bootstrap is the bounded
+  launch request and Onoats does not restart a server that is already booting.
+  Onoats never infers a launch agent from the endpoint port and never accepts an
+  arbitrary plist path. The label must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` — any other value is logged and treated
   as absent; `diarization` — true/false, default off, overridable via the
   `ONOATS_DIARIZATION` env var, see

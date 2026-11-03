@@ -237,7 +237,13 @@ teardown: a spawned child PID is gone after stop). The supervisor's tests in
 ## STT self-healing (`launchctl kickstart`) invariants
 
 `[stt].launchd_label` (absent by default) turns on self-healing: when the STT
-server is unreachable, onoats asks `launchd` to restart the *managed* job. These
+server is unreachable, onoats asks `launchd` to start or restart the *managed*
+job. A loaded job is kickstarted. An unloaded job may be bootstrapped only from
+the matching `~/Library/LaunchAgents/<label>.plist`, after a bounded no-follow
+read confirms a regular user-owned file, safe write permissions, and an exact
+`Label`, with `RunAtLoad=true`. Successful bootstrap is the launch request; do
+not immediately kickstart the already-booting job. No port inference or
+arbitrary plist path is allowed. These
 invariants are load-bearing — breaking any of them silently degrades the
 feature rather than failing a test you'd notice:
 

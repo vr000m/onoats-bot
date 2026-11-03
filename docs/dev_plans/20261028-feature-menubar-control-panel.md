@@ -785,6 +785,21 @@ sequenceDiagram
   the isolated model harness compiles and passes. Parent must repeat those
   environment-blocked gates outside the sandbox.
 
+### 2026-11-03: Unloaded STT launch-agent recovery
+
+- Installed testing showed the configured websocket endpoint could remain
+  unreachable when its launch-agent plist existed but the job was unloaded.
+  The existing self-healing path only kickstarted already-loaded jobs.
+- A configured `launchd_label` now also authorises one fixed bootstrap target:
+  `~/Library/LaunchAgents/<label>.plist`. Onoats rejects symlinks, non-regular or
+  oversized files, wrong ownership, group/world-writable files, mismatched
+  labels, and plists without `RunAtLoad=true`; it never infers authority from a
+  port or accepts an arbitrary path. Bootstrap uses the existing bounded,
+  secret-free `launchctl` subprocess policy and tolerates a concurrent loader.
+- The live configured job was booted out and recovered through the production
+  helper. Launchd reported it running and TCP port 9865 was reachable after the
+  bootstrap. Focused recovery/config/preflight coverage passed (160 tests).
+
 ## Final Results
 
 ### Summary
