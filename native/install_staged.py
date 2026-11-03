@@ -22,6 +22,10 @@ LSREGISTER = Path(
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
     "LaunchServices.framework/Support/lsregister"
 )
+CHMOD = "/bin/chmod"
+CODESIGN = "/usr/bin/codesign"
+DITTO = "/usr/bin/ditto"
+MAKE = "/usr/bin/make"
 
 
 class InstallError(RuntimeError):
@@ -77,7 +81,7 @@ def _normalise_private_tree(app: Path) -> None:
             raise InstallError(f"copied entry is writable beyond owner: {path}")
     if os.uname().sysname == "Darwin":
         result = subprocess.run(
-            ("chmod", "-RN", str(app)), capture_output=True, text=True
+            (CHMOD, "-RN", str(app)), capture_output=True, text=True
         )
         if result.returncode:
             raise InstallError(f"could not strip copied ACL metadata: {result.stderr}")
@@ -92,7 +96,7 @@ def _run(*argv: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str
 
 
 def _designated_requirement(app: Path) -> str:
-    result = _run("codesign", "-dr", "-", str(app))
+    result = _run(CODESIGN, "-dr", "-", str(app))
     lines = []
     for line in (result.stdout + result.stderr).splitlines():
         if line.startswith("designated => "):
@@ -105,7 +109,7 @@ def _designated_requirement(app: Path) -> str:
 
 
 def _cdhash(app: Path) -> str:
-    result = _run("codesign", "-dvvv", str(app))
+    result = _run(CODESIGN, "-dvvv", str(app))
     for line in (result.stdout + result.stderr).splitlines():
         key, separator, value = line.partition("=")
         if separator and key.lower() == "cdhash" and value:
@@ -123,15 +127,15 @@ def _verify_app(
     if expected_identity is not None and identity != expected_identity.lower():
         raise InstallError("app differs from the canonical approved identity")
     if makefile_dir is not None:
-        _run("make", "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
-    _run("codesign", "--verify", "--deep", "--strict", str(app))
+        _run(MAKE, "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
+    _run(CODESIGN, "--verify", "--deep", "--strict", str(app))
     requirement = _designated_requirement(app)
     return identity, hashlib.sha256(requirement.encode()).hexdigest(), _cdhash(app)
 
 
 def _verify_resources(app: Path, makefile_dir: Path | None) -> None:
     if makefile_dir is not None:
-        _run("make", "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
+        _run(MAKE, "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
 
 
 def _remove_path(path: Path) -> None:
@@ -187,7 +191,7 @@ def _copy_snapshot(source: Path, install_dir: Path, app_name: str) -> tuple[Path
     # second LaunchServices-discoverable bundle while cleanup is pending.
     candidate = parent / "candidate"
     try:
-        _run("ditto", str(source), str(candidate))
+        _run(DITTO, str(source), str(candidate))
         _normalise_private_tree(candidate)
     except Exception:
         shutil.rmtree(parent, ignore_errors=True)
@@ -358,10 +362,10 @@ def _archive_baseline(
     os.close(descriptor)
     archive = Path(archive_name)
     try:
-        _run("ditto", "-c", "-k", "--keepParent", str(installed), str(archive))
+        _run(DITTO, "-c", "-k", "--keepParent", str(installed), str(archive))
         archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
         with tempfile.TemporaryDirectory(prefix="onoats-archive-verify-") as directory:
-            _run("ditto", "-x", "-k", str(archive), directory)
+            _run(DITTO, "-x", "-k", str(archive), directory)
             extracted = Path(directory) / installed.name
             _normalise_private_tree(extracted)
             extracted_tree, extracted_dr, extracted_cdhash = _verify_app(extracted)
@@ -491,7 +495,7 @@ def rollback(args: argparse.Namespace) -> None:
     committed = False
     try:
         archive = _copy_archive_snapshot(archive, parent, fields["hash"])
-        _run("ditto", "-x", "-k", str(archive), str(parent))
+        _run(DITTO, "-x", "-k", str(archive), str(parent))
         extracted = parent / args.app_name
         _normalise_private_tree(extracted)
         os.rename(extracted, candidate)

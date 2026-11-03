@@ -868,6 +868,30 @@ def test_resource_verification_precedes_codesigning():
     )
 
 
+def test_staged_installer_never_resolves_trust_executables_through_path():
+    """All install trust/copy tools have fixed platform-owned authority."""
+    source = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert INSTALL_STAGED.CHMOD == "/bin/chmod"
+    assert INSTALL_STAGED.CODESIGN == "/usr/bin/codesign"
+    assert INSTALL_STAGED.DITTO == "/usr/bin/ditto"
+    assert INSTALL_STAGED.MAKE == "/usr/bin/make"
+    assert '_run("' not in source
+    assert '(CHMOD, "-RN"' in source
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("CHMOD", "/bin/chmod"),
+        ("CODESIGN", "/usr/bin/codesign"),
+        ("DITTO", "/usr/bin/ditto"),
+        ("MAKE", "/usr/bin/make"),
+    ],
+)
+def test_staged_installer_executable_authority_table(name, expected):
+    assert getattr(INSTALL_STAGED, name) == expected
+
+
 def test_designated_requirement_extraction_is_path_independent_and_fail_closed():
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert 'line.startswith("designated => ")' in installer, (
@@ -936,7 +960,7 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
         assert f"$({variable})" in body
     assert "$(INSTALL_STAGED_SCRIPT) install" in body
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
-    assert '"ditto", "-c", "-k", "--keepParent"' in installer
+    assert '_run(DITTO, "-c", "-k", "--keepParent"' in installer
     assert "tempfile.mkstemp(" in installer and 'suffix=".zip"' in installer
     assert "_verify_app(candidate" in installer
     assert "_replace_verified(candidate, installed, verify, commit)" in installer
@@ -1121,7 +1145,7 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     assert "APP_NAME := $(notdir $(APP))" in makefile
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "_read_record(Path(args.record), backup_dir)" in installer
-    assert '"ditto", "-x", "-k"' in installer
+    assert '_run(DITTO, "-x", "-k"' in installer
     assert '_verify_app(candidate, expected_identity=fields["tree_hash"])' in installer
     assert "_replace_verified(" in installer
     assert 'archive = Path(fields["archive"])' in installer
@@ -1134,7 +1158,7 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
         "rollback may not accept an arbitrary archive path"
     )
 
-    unpack = installer.index('_run("ditto", "-x", "-k", str(archive), str(parent))')
+    unpack = installer.index('_run(DITTO, "-x", "-k", str(archive), str(parent))')
     verify = installer.index(
         '_verify_app(candidate, expected_identity=fields["tree_hash"])', unpack
     )
