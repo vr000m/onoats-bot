@@ -192,7 +192,17 @@ that surface:
   each named resource explicitly; `make verify-resources` equality-checks that
   allowlist before `make sign`. After the gauntlet, run
   `make -C native app-tree-hash`
-  and smoke the already-signed staged bundle before installation. For an
+  and smoke the already-signed staged bundle before installation:
+
+  ```sh
+  SMOKE_DATA_DIR="$(mktemp -d)"
+  trap 'rm -rf "$SMOKE_DATA_DIR"' EXIT
+  python3 native/installed_recording_smoke.py \
+    --app native/Onoats.app --data-dir "$SMOKE_DATA_DIR"
+  ```
+
+  The smoke is interactive: speak when prompted. It passes only after fresh Me
+  telemetry and a durable Me utterance from the attested recorder run. For an
   explicit clean install from the repository root, run:
 
   ```sh
@@ -253,12 +263,13 @@ AUDIO_SOURCE=socket ONOATS_CAPTURER_BIN="$(make -s print-bin)" onoats bot
 Design notes baked into the capturer (each learned the hard way — see the dev
 plan `## Findings` for the evidence):
 
-- **Startup order is load-bearing:** mic TCC grant → system-tap preflight
-  (emit `waiting-for-permission`, start the tap/aggregate/IOProc chain — the
-  TCC-prompting call, before any socket exists) → create both sockets →
-  accept both → write both handshakes → attach the system writer + start the
-  mic engine (strictly after the tap; pre-socket system frames are dropped as
-  pre-session audio).
+- **Startup order is load-bearing:** mic TCC grant → emit
+  `waiting-for-permission` → start the mic engine → start the
+  system-tap/aggregate/IOProc chain (the system-audio TCC-prompting call) →
+  create both sockets → accept both → write both handshakes → attach both
+  writers. Starting the mic before creating the process tap avoids a known
+  `AudioDeviceStart` stall; pre-socket frames from either branch are dropped as
+  pre-session audio.
 - **Copy-only IOProc.** Doing AVAudioConverter work in the Core Audio realtime
   callback makes the HAL silently stop calling it after ~5 cycles. The IOProc
   memcpys into a bounded queue; a worker thread resamples and chunks.

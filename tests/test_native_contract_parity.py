@@ -622,6 +622,7 @@ def test_ui_telemetry_contract_matches_swift():
         "audioObservationRefreshSeconds": py.AUDIO_OBSERVATION_REFRESH_SECONDS,
         "transcriptLimit": py.TRANSCRIPT_LIMIT,
         "detailLimit": py.DETAIL_LIMIT,
+        "maxSnapshotBytes": py.MAX_SNAPSHOT_BYTES,
         "levelMin": py.LEVEL_MIN,
         "levelMax": py.LEVEL_MAX,
     }
@@ -652,6 +653,12 @@ def test_ui_telemetry_contract_matches_swift():
     )
     assert required, "schema-v2 transcript_run_id must be a required exact-shape key"
     assert re.search(r"let\s+transcript_run_id:\s*String", swift)
+    run_id_pattern = re.search(
+        r'(?:static\s+)?let\s+transcriptRunIDPattern\s*(?::[^=]+)?=\s*"([^"]+)"',
+        swift,
+    )
+    assert run_id_pattern, "UiTelemetry.swift missing transcriptRunIDPattern"
+    assert run_id_pattern.group(1) == py.TRANSCRIPT_RUN_ID_PATTERN
 
 
 def test_ui_telemetry_shared_decoder_vectors_match_python_contract(tmp_path: Path):

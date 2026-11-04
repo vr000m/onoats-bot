@@ -15,6 +15,7 @@ enum UiTelemetryContract {
     static let audioObservationRefreshSeconds = 0.5
     static let transcriptLimit = 240
     static let detailLimit = 256
+    static let maxSnapshotBytes = 65536
     static let levelMin = 0.0
     static let levelMax = 1.0
     static let levelMinimum = levelMin
