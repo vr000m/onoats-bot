@@ -107,11 +107,8 @@ Other subcommands:
 
 ```bash
 onoats bot-single   # legacy mic-only recorder
-onoats flush        # tell the running recorder to rotate its buffer now
-onoats stop         # stop the running recorder gracefully: SIGTERM → drain +
-                    # final flush, then EXIT (unlike flush, which keeps
-                    # recording). Identity-checked like flush, so it only ever
-                    # signals the verified recorder — never a recycled pid
+onoats flush        # generation-authenticated continuation rotation
+onoats stop         # generation-authenticated graceful drain + final flush
 onoats devices      # list audio input/output devices (PortAudio's view; under
                     # the socket path it adds a note — the native capturer binds
                     # the system default input / default-output tap instead)
@@ -159,6 +156,11 @@ less-frequent settings and diagnostics without leaving the panel.
   the current buffer into the queue mid-session. App-owned Stop terminates the
   retained supervisor; a verified external session uses the identity-checked
   `onoats stop` path instead.
+- External Stop and Flush use a recorder-owned Unix control socket, never a
+  normal-path PID signal. Each request includes the complete PID/start-epoch
+  generation and is accepted only from the same macOS uid; missing or legacy
+  recorder endpoints fail closed. Direct SIGUSR1/SIGTERM remain compatibility
+  inputs for terminal and service-manager control.
 - **Seminar** — before Start, the toggle adds `--category seminars` to that next
   recording only (other categories are classified downstream). It becomes a
   read-only lock badge during the app-owned session and resets when the session

@@ -626,7 +626,7 @@ sequenceDiagram
 - [x] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
 - [x] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
 - [x] Phase 9: Run-Bound Recording Proof and Captured-Identity Teardown
-- [ ] Phase 10: Recorder-Owned Control Channel and Boundary Hardening
+- [x] Phase 10: Recorder-Owned Control Channel and Boundary Hardening
 
 ## Findings
 

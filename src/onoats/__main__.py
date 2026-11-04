@@ -69,14 +69,18 @@ from onoats.runtime import (  # noqa: E402
     RecorderAlreadyRunningError,
     SttPreflightError,
     _acquire_instance_lock,
+    _build_pid_record,
     _create_stt_service,
     _install_signal_handlers,
+    _mark_graceful_shutdown_requested,
     _mint_start_epoch,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
     _topic_pipeline_tasks,
     _write_pid_file,
+    _write_status_running,
+    _write_status_stopped,
     flush_and_rotate,
     run_crash_recovery,
     stop_pipeline_for_shutdown,
@@ -309,7 +313,39 @@ async def run_onoats(
     # the PID file is visible.)
     # ----------------------------------------------------------------
     start_epoch = _mint_start_epoch()
-    pid_path = _write_pid_file(data_dir, start_epoch=start_epoch)
+    from onoats.control_socket import ControlServer
+
+    pid_record = _build_pid_record(start_epoch=start_epoch)
+
+    async def _control_flush() -> None:
+        await _flush_continuation("Control socket flush")
+
+    def _control_stop() -> None:
+        _mark_graceful_shutdown_requested()
+        shutdown_event.set()
+
+    control_server = ControlServer(
+        data_dir,
+        pid_record,
+        on_flush=_control_flush,
+        on_stop=_control_stop,
+    )
+    await control_server.start()
+    try:
+        pid_path = _write_pid_file(data_dir, start_epoch=start_epoch, record=pid_record)
+    except BaseException:
+        await control_server.close()
+        raise
+    status_published = _write_status_running(
+        data_dir,
+        audio_source="portaudio",
+        stt_label=stt_banner(),
+        start_epoch=start_epoch,
+    )
+    if not status_published:
+        await control_server.close()
+        _remove_pid_file(pid_path, owner_record=pid_record)
+        raise RuntimeError("could not publish recorder running status")
 
     _shutdown_started = False
     _shutdown_complete = asyncio.Event()
@@ -427,8 +463,10 @@ async def run_onoats(
         await runner.run(task)
     finally:
         await _on_shutdown()
+        await control_server.close()
+        _write_status_stopped(data_dir, exit_reason="graceful")
         _restore_terminal(_old_terminal_settings)
-        _remove_pid_file(pid_path, owner_pid=os.getpid())
+        _remove_pid_file(pid_path, owner_record=pid_record)
         # The single-instance lock is held for the process lifetime; the kernel
         # releases it on exit (see runtime._release_instance_lock).
 

@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +38,7 @@ from loguru import logger
 
 PID_FILENAME = "onoats.pid"
 PID_MARKER = "onoats-bot"
+PID_MAX_BYTES = 65536
 
 
 @dataclass(frozen=True)
@@ -60,13 +63,11 @@ class PidRecord:
     start_epoch: float = 0.0
 
 
-def _parse_pid_file(pid_path: Path) -> PidRecord | None:
-    if not pid_path.exists():
-        return None
+def _parse_pid_text(text: str, *, source: Path) -> PidRecord | None:
     try:
-        lines = pid_path.read_text(encoding="utf-8").strip().splitlines()
+        lines = text.strip().splitlines()
         if len(lines) < 2 or lines[1].strip() != PID_MARKER:
-            logger.warning(f"PID file {pid_path} missing identity marker — ignoring")
+            logger.warning(f"PID file {source} missing identity marker — ignoring")
             return None
         pid = int(lines[0].strip())
         # Line 3 (index 2) is the cmdline fingerprint. ``.strip()`` on the
@@ -84,6 +85,15 @@ def _parse_pid_file(pid_path: Path) -> PidRecord | None:
         return None
 
 
+def _parse_pid_file(pid_path: Path) -> PidRecord | None:
+    if not pid_path.exists():
+        return None
+    try:
+        return _parse_pid_text(pid_path.read_text(encoding="utf-8"), source=pid_path)
+    except (UnicodeError, OSError):
+        return None
+
+
 def read_pid_file(pid_path: Path) -> int | None:
     """Read and validate a PID file. Returns the PID if valid, None otherwise."""
     rec = _parse_pid_file(pid_path)
@@ -96,6 +106,75 @@ def read_pid_record(pid_path: Path) -> PidRecord | None:
     Use this when you need pid-recycling protection.
     """
     return _parse_pid_file(pid_path)
+
+
+def compare_and_unlink_pid_record(pid_path: Path, expected: PidRecord) -> bool:
+    """Unlink only when the complete current record still equals ``expected``.
+
+    This is the sole stale/teardown cleanup primitive.  Comparing only the PID
+    would let an old generation delete a same-PID successor's authoritative
+    record.  Unreadable, malformed, absent, foreign, or replaced records are
+    preserved (and report ``False``).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(pid_path, flags)
+    except OSError:
+        return False
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > PID_MAX_BYTES:
+            return False
+        data = os.read(descriptor, PID_MAX_BYTES + 1)
+        if len(data) > PID_MAX_BYTES:
+            return False
+        try:
+            record = _parse_pid_text(data.decode("utf-8"), source=pid_path)
+        except UnicodeError:
+            return False
+        if record != expected:
+            return False
+        opened_identity = (opened.st_dev, opened.st_ino)
+    finally:
+        os.close(descriptor)
+
+    try:
+        quarantine_dir = Path(
+            tempfile.mkdtemp(prefix=".onoats-pid-quarantine-", dir=pid_path.parent)
+        )
+    except OSError:
+        return False
+    quarantine_path = quarantine_dir / pid_path.name
+    try:
+        os.rename(pid_path, quarantine_path)
+    except OSError:
+        try:
+            quarantine_dir.rmdir()
+        except OSError:
+            pass
+        return False
+
+    try:
+        moved = quarantine_path.lstat()
+        if (moved.st_dev, moved.st_ino) != opened_identity:
+            # A successor won the open-to-rename race. Restore it atomically
+            # without replacing any newer entry that reached the public name.
+            try:
+                os.link(quarantine_path, pid_path, follow_symlinks=False)
+            except OSError:
+                return False
+            # Keep the quarantine link as preservation authority: another
+            # actor may replace the just-restored public name immediately.
+            return False
+        quarantine_path.unlink()
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            quarantine_dir.rmdir()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

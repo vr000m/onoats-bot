@@ -108,11 +108,14 @@ enum UiTelemetryDecoder {
     }
 
     private static func validTranscriptRunID(_ value: String) -> Bool {
-        guard value.unicodeScalars.count == 32 else { return false }
-        return value.unicodeScalars.allSatisfy { scalar in
-            (scalar.value >= 48 && scalar.value <= 57)
-                || (scalar.value >= 97 && scalar.value <= 102)
+        guard let expression = try? NSRegularExpression(
+            pattern: UiTelemetryContract.transcriptRunIDPattern
+        ) else { return false }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = expression.firstMatch(in: value, range: range) else {
+            return false
         }
+        return match.range == range
     }
 
     private static func exactKeys(

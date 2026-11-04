@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import re
 import json
+import shutil
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -687,6 +690,51 @@ def test_ui_telemetry_shared_decoder_vectors_match_python_contract(tmp_path: Pat
             read_snapshot(path, pid=4242, start_epoch=1699999900.0, now=1700000000.0)
             is None
         )
+
+
+def test_swift_decoder_validation_consumes_the_parity_checked_run_id_pattern(
+    tmp_path: Path,
+):
+    """Mutating only the shared pattern must change decoder acceptance.
+
+    A source-presence assertion cannot detect a decoder that keeps an unused
+    parity constant beside a hand-written duplicate grammar.
+    """
+    if sys.platform != "darwin" or not shutil.which("swiftc"):
+        pytest.skip("Swift mutation harness requires macOS swiftc")
+    source = UI_TELEMETRY.read_text(encoding="utf-8")
+    needle = 'transcriptRunIDPattern = "^[0-9a-f]{32}$"'
+    assert source.count(needle) == 1
+    mutated = source.replace(needle, 'transcriptRunIDPattern = "^[A-F]{32}$"', 1)
+    mutated_source = tmp_path / "UiTelemetry.swift"
+    mutated_source.write_text(mutated, encoding="utf-8")
+    binary = tmp_path / "ui-telemetry-mutated"
+    compile_result = subprocess.run(
+        [
+            "swiftc",
+            "-parse-as-library",
+            "-module-cache-path",
+            str(tmp_path / "module-cache"),
+            str(mutated_source),
+            str(REPO / "native/onoats-menubar/Tests/UiTelemetryDecoderHarness.swift"),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert compile_result.returncode == 0, compile_result.stderr
+    mutation_result = subprocess.run(
+        [str(binary), str(UI_FIXTURES)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert mutation_result.returncode != 0, (
+        "decoder ignored the mutated transcriptRunIDPattern and kept accepting "
+        "the original lowercase grammar"
+    )
 
 
 def test_ui_telemetry_string_boundary_vectors_cover_unicode_scalars():

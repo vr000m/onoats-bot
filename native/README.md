@@ -206,9 +206,9 @@ that surface:
   explicit clean install from the repository root, run:
 
   ```sh
-  make -C native install-staged \
-    STAGED_APP_TREE_HASH=<app-tree-hash-output> \
-    ROLLBACK_BASELINE_APPROVED=0
+  ONOATS_INSTALL_EXPECTED_IDENTITY=<app-tree-hash-output> \
+    ONOATS_INSTALL_ROLLBACK_APPROVED=0 \
+    make -C native install-staged
   ```
 
   This installs an immutable verified snapshot without rebuilding or
@@ -227,11 +227,11 @@ plus the prior CLI SHA, branch/detached state, exact `install-cli` command and
 root, run:
 
 ```sh
-make -C native install-staged \
-  STAGED_APP_TREE_HASH=<smoked-app-tree-hash> \
-  ROLLBACK_BASELINE_APPROVED=1 \
-  ROLLBACK_BASELINE_DR_HASH=<verified-sha256> \
-  ROLLBACK_BASELINE_CDHASH=<verified-cdhash>
+ONOATS_INSTALL_EXPECTED_IDENTITY=<smoked-app-tree-hash> \
+  ONOATS_INSTALL_ROLLBACK_APPROVED=1 \
+  ONOATS_INSTALL_BASELINE_DR_HASH=<verified-sha256> \
+  ONOATS_INSTALL_BASELINE_CDHASH=<verified-cdhash> \
+  make -C native install-staged
 ```
 
 Only that approved mode publishes a rollback record. Restore it with
@@ -242,7 +242,18 @@ archive's recorded tree hash, designated-requirement hash, cdhash, and archive
 hash rather than the current checkout's resource allowlist, so an approved older
 bundle remains restorable after the allowlist changes. The current release is a clean-install
 run because its pre-change CLI baseline was incomplete, so it must use
-`ROLLBACK_BASELINE_APPROVED=0` and must not invoke rollback.
+`ONOATS_INSTALL_ROLLBACK_APPROVED=0` and must not invoke rollback.
+
+All staged-installer operator input is environment-only data read directly by
+`install_staged.py`: `ONOATS_INSTALL_APP`, `ONOATS_INSTALL_DIR`,
+`ONOATS_INSTALL_BACKUP_DIR`, `ONOATS_INSTALL_ROLLBACK_RECORD`,
+`ONOATS_INSTALL_EXPECTED_IDENTITY`, `ONOATS_INSTALL_ROLLBACK_APPROVED`,
+`ONOATS_INSTALL_BASELINE_DR_HASH`, `ONOATS_INSTALL_BASELINE_CDHASH`, and
+`ONOATS_INSTALL_BUNDLE_ID`.
+Python owns defaults and derives the app name. The former Make-variable names
+are rejected for `app-tree-hash`, `install-staged`, and `rollback`; staged
+inputs must use the `NAME=value make ...` environment-prefix form shown above.
+Their values are never expanded by Make.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

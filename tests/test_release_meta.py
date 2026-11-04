@@ -770,22 +770,22 @@ def _run_install_staged(
 ) -> subprocess.CompletedProcess[str]:
     staged_app_tree_hash = staged_app_tree_hash or _app_tree_hash(work / "Onoats.app")
     install_dir = install_dir or work / "installed"
-    command = [
-        "make",
-        "-s",
-        "install-staged",
-        "APP=Onoats.app",
-        "BUNDLE_ID=net.varunsingh.onoats.install-test",
-        f"INSTALL_DIR={install_dir}",
-        f"ROLLBACK_BASELINE_APPROVED={int(approved)}",
-        f"STAGED_APP_TREE_HASH={staged_app_tree_hash}",
-    ]
-    if designated_requirement_sha256 is not None:
-        command.append(f"ROLLBACK_BASELINE_DR_HASH={designated_requirement_sha256}")
-    if cdhash is not None:
-        command.append(f"ROLLBACK_BASELINE_CDHASH={cdhash}")
+    command = ["make", "-s", "install-staged"]
     env = os.environ.copy()
     env["HOME"] = str(work / "home")
+    env.update(
+        {
+            "ONOATS_INSTALL_APP": str(work / "Onoats.app"),
+            "ONOATS_INSTALL_DIR": str(install_dir),
+            "ONOATS_INSTALL_BACKUP_DIR": str(work / "backups"),
+            "ONOATS_INSTALL_ROLLBACK_RECORD": str(work / "approved-rollback.txt"),
+            "ONOATS_INSTALL_EXPECTED_IDENTITY": staged_app_tree_hash,
+            "ONOATS_INSTALL_ROLLBACK_APPROVED": str(int(approved)),
+            "ONOATS_INSTALL_BASELINE_DR_HASH": designated_requirement_sha256 or "",
+            "ONOATS_INSTALL_BASELINE_CDHASH": cdhash or "",
+            "ONOATS_INSTALL_BUNDLE_ID": "net.varunsingh.onoats.install-test",
+        }
+    )
     return subprocess.run(
         command,
         cwd=work,
@@ -950,29 +950,22 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
     assert prerequisites == "", (
         "install-staged must not rebuild or re-sign staged bytes"
     )
-    for variable in (
-        "ROLLBACK_BASELINE_APPROVED",
-        "ROLLBACK_BASELINE_DR_HASH",
-        "ROLLBACK_BASELINE_CDHASH",
-        "STAGED_APP_TREE_HASH",
-    ):
-        assert re.search(rf"(?m)^{variable}\s*\?=", makefile)
     recipe = next(line.strip() for line in body.splitlines() if line.startswith("\t"))
-    assert recipe == "@python3 install_staged.py make-install"
+    assert recipe == "@python3 install_staged.py env-install"
     assert "$(" not in recipe, "operator values must never become shell source"
-    for exported in (
-        "ONOATS_MAKE_APP",
-        "ONOATS_MAKE_INSTALL_DIR",
-        "ONOATS_MAKE_ROLLBACK_RECORD",
-        "ONOATS_MAKE_STAGED_APP_TREE_HASH",
-        "ONOATS_MAKE_ROLLBACK_BASELINE_APPROVED",
-        "ONOATS_MAKE_ROLLBACK_BASELINE_DR_HASH",
-        "ONOATS_MAKE_ROLLBACK_BASELINE_CDHASH",
-        "ONOATS_MAKEFILE_DIR",
-        "ONOATS_MAKE_BUNDLE_ID",
-    ):
-        assert re.search(rf"(?m)^export {exported}\s*:=", makefile)
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    for variable in (
+        "ONOATS_INSTALL_APP",
+        "ONOATS_INSTALL_DIR",
+        "ONOATS_INSTALL_BACKUP_DIR",
+        "ONOATS_INSTALL_ROLLBACK_RECORD",
+        "ONOATS_INSTALL_EXPECTED_IDENTITY",
+        "ONOATS_INSTALL_ROLLBACK_APPROVED",
+        "ONOATS_INSTALL_BASELINE_DR_HASH",
+        "ONOATS_INSTALL_BASELINE_CDHASH",
+    ):
+        assert f'"{variable}"' in installer
+        assert variable not in recipe
     assert '_run(DITTO, "-c", "-k", "--keepParent"' in installer
     assert "tempfile.mkstemp(" in installer and 'suffix=".zip"' in installer
     assert "_verify_app(candidate" in installer
@@ -982,33 +975,31 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
 
 
 def test_staged_make_recipes_treat_hostile_paths_as_data(tmp_path: Path):
-    """Make-expanded checkout/install values never become shell program text."""
+    """Environment-only operator bytes reach Python without Make evaluation."""
     hostile = tmp_path / "checkout `touch CHECKOUT_PWNED` $(touch ALSO_PWNED)"
     hostile.mkdir()
     shutil.copy2(NATIVE_MAKEFILE, hostile / "Makefile")
     (hostile / "install_staged.py").write_text(
         "import os, pathlib, sys\n"
         "pathlib.Path('captured.txt').write_text("
-        "sys.argv[1] + '\\n' + os.environ['ONOATS_MAKE_APP'] + '\\n' + "
-        "os.environ['ONOATS_MAKE_INSTALL_DIR'], encoding='utf-8')\n",
+        "sys.argv[1] + '\\n' + os.environ['ONOATS_INSTALL_APP'] + '\\n' + "
+        "os.environ['ONOATS_INSTALL_DIR'], encoding='utf-8')\n",
         encoding="utf-8",
     )
-    hostile_app = "Onoats`touch APP_PWNED`.app"
-    hostile_install = str(tmp_path / "Install; touch INSTALL_PWNED; #")
+    hostile_app = "Onoats$(touch APP_PWNED)`touch ALSO_APP_PWNED`.app"
+    hostile_install = str(tmp_path / "Install; touch INSTALL_PWNED; # space")
     for target, subcommand in (
         ("app-tree-hash", "make-identity"),
         ("install-staged", "make-install"),
         ("rollback", "make-rollback"),
     ):
+        env = os.environ.copy()
+        env["ONOATS_INSTALL_APP"] = hostile_app
+        env["ONOATS_INSTALL_DIR"] = hostile_install
         result = subprocess.run(
-            [
-                "make",
-                "-s",
-                target,
-                f"APP={hostile_app}",
-                f"INSTALL_DIR={hostile_install}",
-            ],
+            ["make", "-s", target],
             cwd=hostile,
+            env=env,
             capture_output=True,
             text=True,
             timeout=15,
@@ -1018,13 +1009,127 @@ def test_staged_make_recipes_treat_hostile_paths_as_data(tmp_path: Path):
             "CHECKOUT_PWNED",
             "ALSO_PWNED",
             "APP_PWNED",
+            "ALSO_APP_PWNED",
             "INSTALL_PWNED",
         ):
             assert not (hostile / marker).exists()
             assert not (tmp_path / marker).exists()
         assert (hostile / "captured.txt").read_text(encoding="utf-8") == (
-            f"{subcommand}\n{hostile_app}\n{hostile_install}"
+            f"{subcommand.replace('make-', 'env-')}\n{hostile_app}\n{hostile_install}"
         )
+
+
+STAGED_INSTALL_ENV_INPUTS = (
+    "ONOATS_INSTALL_APP",
+    "ONOATS_INSTALL_DIR",
+    "ONOATS_INSTALL_BACKUP_DIR",
+    "ONOATS_INSTALL_ROLLBACK_RECORD",
+    "ONOATS_INSTALL_EXPECTED_IDENTITY",
+    "ONOATS_INSTALL_ROLLBACK_APPROVED",
+    "ONOATS_INSTALL_BASELINE_DR_HASH",
+    "ONOATS_INSTALL_BASELINE_CDHASH",
+    "ONOATS_INSTALL_BUNDLE_ID",
+)
+
+
+@pytest.mark.parametrize("variable", STAGED_INSTALL_ENV_INPUTS)
+def test_every_staged_installer_input_rejects_make_command_line_evaluation(
+    tmp_path: Path, variable: str
+):
+    """Make command-line variables are program text, never installer data."""
+    shutil.copy2(NATIVE_MAKEFILE, tmp_path / "Makefile")
+    (tmp_path / "install_staged.py").write_text(
+        "from pathlib import Path\nPath('PYTHON_STARTED').write_text('bad')\n",
+        encoding="utf-8",
+    )
+    sentinel = tmp_path / "installed-sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "make",
+            "-s",
+            "install-staged",
+            f"{variable}=$(shell touch MAKE_EVALUATED)",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode != 0
+    assert not (tmp_path / "PYTHON_STARTED").exists()
+    assert not (tmp_path / "MAKE_EVALUATED").exists()
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.parametrize("variable", STAGED_INSTALL_ENV_INPUTS)
+def test_every_staged_installer_input_accepts_literal_environment_prefix_bytes(
+    tmp_path: Path, variable: str
+):
+    """A true environment-prefix assignment bypasses Make evaluation."""
+    shutil.copy2(NATIVE_MAKEFILE, tmp_path / "Makefile")
+    (tmp_path / "install_staged.py").write_text(
+        "import os, pathlib\n"
+        "name = os.environ['CAPTURE_NAME']\n"
+        "pathlib.Path('captured.txt').write_text(os.environ[name], encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    hostile = "$(shell touch ENVIRONMENT_EVALUATED)"
+    env = os.environ.copy()
+    env.update({"CAPTURE_NAME": variable, variable: hostile})
+
+    result = subprocess.run(
+        ["make", "-s", "install-staged"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "captured.txt").read_text(encoding="utf-8") == hostile
+    assert not (tmp_path / "ENVIRONMENT_EVALUATED").exists()
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        "APP",
+        "APP_NAME",
+        "INSTALL_DIR",
+        "BACKUP_DIR",
+        "ROLLBACK_RECORD",
+        "STAGED_APP_TREE_HASH",
+        "ROLLBACK_BASELINE_APPROVED",
+        "ROLLBACK_BASELINE_DR_HASH",
+        "ROLLBACK_BASELINE_CDHASH",
+        "BUNDLE_ID",
+    ],
+)
+def test_every_legacy_staged_installer_override_fails_before_python_or_mutation(
+    tmp_path: Path, legacy: str
+):
+    shutil.copy2(NATIVE_MAKEFILE, tmp_path / "Makefile")
+    (tmp_path / "install_staged.py").write_text(
+        "from pathlib import Path\nPath('PYTHON_STARTED').write_text('bad')\n",
+        encoding="utf-8",
+    )
+    sentinel = tmp_path / "installed-sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    result = subprocess.run(
+        ["make", "-s", "install-staged", f"{legacy}=$(shell touch MAKE_EVALUATED)"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / "PYTHON_STARTED").exists()
+    assert not (tmp_path / "MAKE_EVALUATED").exists()
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_install_staged_binds_install_to_pre_smoke_tree_digest(
@@ -1051,7 +1156,7 @@ def test_install_staged_preserves_rollback_record_until_successful_install(
     staged_install_workflow: Path,
 ):
     work = staged_install_workflow
-    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    backup_dir = work / "backups"
     backup_dir.mkdir(parents=True)
     record = backup_dir / "approved-rollback.txt"
     record.write_text("existing verified rollback\n", encoding="utf-8")
@@ -1082,9 +1187,9 @@ def test_clean_install_ignores_invalid_existing_app_and_clears_stale_approval(
     installed = work / "installed" / "Onoats.app"
     installed.mkdir()
     (installed / "invalid-baseline").write_text("not signed", encoding="utf-8")
-    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    backup_dir = work / "backups"
     backup_dir.mkdir(parents=True)
-    record = backup_dir / "approved-rollback.txt"
+    record = work / "approved-rollback.txt"
     record.write_text("stale approval", encoding="utf-8")
 
     result = _run_install_staged(work)
@@ -1107,7 +1212,7 @@ def test_clean_install_does_not_archive_an_unapproved_valid_app(
 
     result = _run_install_staged(work)
     assert result.returncode == 0, result.stdout + result.stderr
-    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    backup_dir = work / "backups"
     assert not list(backup_dir.glob("Onoats-*.zip"))
     assert not (backup_dir / "approved-rollback.txt").exists()
 
@@ -1185,10 +1290,10 @@ def test_complete_explicit_approval_creates_verified_rollback_record(
         cdhash=evidence["cdhash"],
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    backup_dir = work / "home" / "Library/Application Support/Onoats/app-backups"
+    backup_dir = work / "backups"
     archives = list(backup_dir.glob("Onoats-*.zip"))
     assert len(archives) == 1
-    record = backup_dir / "approved-rollback.txt"
+    record = work / "approved-rollback.txt"
     assert record.is_file()
     record_text = record.read_text(encoding="utf-8")
     assert str(archives[0]) in record_text
@@ -1200,9 +1305,8 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     _make_target(makefile, "install-staged")
     _, body = _make_target(makefile, "rollback")
     recipe = next(line.strip() for line in body.splitlines() if line.startswith("\t"))
-    assert recipe == "@python3 install_staged.py make-rollback"
+    assert recipe == "@python3 install_staged.py env-rollback"
     assert "$(" not in recipe, "operator values must never become shell source"
-    assert "APP_NAME := $(notdir $(APP))" in makefile
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "_read_record(Path(args.record), backup_dir)" in installer
     assert '_run(DITTO, "-x", "-k"' in installer
@@ -1210,8 +1314,8 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     assert "_replace_verified(" in installer
     assert 'archive = Path(fields["archive"])' in installer
     assert "archive.relative_to(backup_dir)" in installer
-    assert "ONOATS_MAKE_ROLLBACK_RECORD" in makefile
-    assert '_make_value("ONOATS_MAKE_ROLLBACK_RECORD")' in installer
+    assert "ONOATS_INSTALL_ROLLBACK_RECORD" not in recipe
+    assert '_env_value(\n        "ONOATS_INSTALL_ROLLBACK_RECORD"' in installer
 
     unpack = installer.index('_run(DITTO, "-x", "-k", str(archive), str(parent))')
     verify = installer.index(

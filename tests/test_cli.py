@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import signal
-
 import pytest
 
 from onoats import cli
@@ -369,27 +367,36 @@ def test_status_socket_hides_portaudio_config_lines(capsys, _isolate_env, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_flush_sends_sigusr1(monkeypatch, _isolate_env):
-    """Happy path: live process cmdline matches the stored fingerprint."""
+def test_flush_sends_generation_to_control_channel_without_signal(
+    monkeypatch, _isolate_env
+):
+    """Happy path: verified generation is delivered as a Flush request."""
     pid_path = cli._pid_path(_isolate_env)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n10.0\n", encoding="utf-8")
 
-    sent = {}
+    sent = []
 
     def fake_kill(pid, sig):
-        # sig 0 is the liveness probe; record only the real signal.
-        if sig != 0:
-            sent["pid"] = pid
-            sent["sig"] = sig
+        assert sig == 0, "normal CLI Flush must never signal the recorder"
+
+    def fake_control(data_dir, record, command):
+        from onoats.control_socket import ControlResponse
+
+        sent.append((data_dir, record, command))
+        return ControlResponse(True, "accepted", "flush rotation completed")
 
     monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr("onoats.control_socket.send_control_command", fake_control)
     # Live readback matches the stored 3rd-line fingerprint → identity confirmed.
     monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot")
     rc = cli.main(["flush"])
     assert rc == 0
-    assert sent["pid"] == 9001
-    assert sent["sig"] == signal.SIGUSR1
+    assert len(sent) == 1
+    assert sent[0][0] == _isolate_env
+    assert sent[0][1].pid == 9001
+    assert sent[0][1].start_epoch == 10.0
+    assert sent[0][2] == "flush"
 
 
 def test_flush_no_pid_file(_isolate_env):
@@ -441,7 +448,7 @@ def test_flush_keeps_pid_file_when_ps_probe_fails(monkeypatch, capsys, _isolate_
     probe failure is indeterminate, not proof the recorder is gone."""
     pid_path = cli._pid_path(_isolate_env)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n10.0\n", encoding="utf-8")
 
     def fake_kill(pid, sig):
         if sig == 0:
@@ -507,43 +514,42 @@ def test_flush_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
 # ---------------------------------------------------------------------------
 
 
-def test_stop_sends_sigterm(monkeypatch, _isolate_env):
-    """Happy path: live process cmdline matches the stored fingerprint."""
+def test_stop_sends_generation_to_control_channel_without_signal(
+    monkeypatch, _isolate_env
+):
+    """Happy path: verified generation is delivered as a Stop request."""
     pid_path = cli._pid_path(_isolate_env)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n10.0\n", encoding="utf-8")
 
-    sent = {}
+    sent = []
 
     def fake_kill(pid, sig):
-        # sig 0 is the liveness probe; record only the real signal.
-        if sig != 0:
-            sent["pid"] = pid
-            sent["sig"] = sig
+        assert sig == 0, "normal CLI Stop must never signal the recorder"
+
+    def fake_control(data_dir, record, command):
+        from onoats.control_socket import ControlResponse
+
+        sent.append((data_dir, record, command))
+        return ControlResponse(True, "accepted", "graceful stop requested")
 
     monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr("onoats.control_socket.send_control_command", fake_control)
     # Live readback matches the stored 3rd-line fingerprint → identity confirmed.
     monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot")
     rc = cli.main(["stop"])
     assert rc == 0
-    assert sent["pid"] == 9001
-    assert sent["sig"] == signal.SIGTERM
+    assert len(sent) == 1
+    assert sent[0][0] == _isolate_env
+    assert sent[0][1].pid == 9001
+    assert sent[0][2] == "stop"
 
 
-@pytest.mark.parametrize(
-    ("command", "want_sig", "reject_sig"),
-    [
-        ("stop", signal.SIGTERM, signal.SIGUSR1),
-        ("flush", signal.SIGUSR1, signal.SIGTERM),
-    ],
-)
-def test_stop_and_flush_send_distinct_signals(
-    monkeypatch, _isolate_env, command, want_sig, reject_sig
+@pytest.mark.parametrize("command", ["stop", "flush"])
+def test_stop_and_flush_send_distinct_control_commands(
+    monkeypatch, _isolate_env, command
 ):
-    """Differential guard: the ONLY intended divergence between stop and flush is
-    the signal number. ``stop`` MUST send SIGTERM and NOT SIGUSR1; ``flush`` MUST
-    send SIGUSR1 and NOT SIGTERM. A copy-paste/shared-helper signal swap (or a
-    handler accidentally calling the other) fails here."""
+    """Handler-swap differential: the wire command is the only divergence."""
     pid_path = cli._pid_path(_isolate_env)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text("9001\nonoats-bot\nonoats bot\n0.0\n", encoding="utf-8")
@@ -551,16 +557,21 @@ def test_stop_and_flush_send_distinct_signals(
     sent = []
 
     def fake_kill(pid, sig):
-        if sig != 0:  # ignore the liveness probe
-            sent.append(sig)
+        assert sig == 0, "control commands must not use PID signalling"
+
+    def fake_control(_data_dir, _record, wire_command):
+        from onoats.control_socket import ControlResponse
+
+        sent.append(wire_command)
+        return ControlResponse(True, "accepted", wire_command)
 
     monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr("onoats.control_socket.send_control_command", fake_control)
     monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot")
 
     rc = cli.main([command])
     assert rc == 0
-    assert sent == [want_sig], f"{command} must send exactly {want_sig!r}, got {sent!r}"
-    assert reject_sig not in sent, f"{command} must NOT send {reject_sig!r}"
+    assert sent == [command]
 
 
 @pytest.mark.parametrize("command", ["flush", "stop"])
@@ -571,17 +582,23 @@ def test_stop_and_flush_send_distinct_signals(
 def test_signal_commands_cover_captured_identity_state_space(
     command, identity, signals, monkeypatch, _isolate_env
 ):
-    """A captured UI action can signal only the exact recorder generation."""
+    """A captured UI action can control only the exact recorder generation."""
     pid_path = cli._pid_path(_isolate_env)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text("9001\nonoats-bot\nonoats bot\n10.0\n", encoding="utf-8")
     delivered = []
 
     def fake_kill(pid, sig):
-        if sig != 0:
-            delivered.append((pid, sig))
+        assert sig == 0
+
+    def fake_control(_data_dir, record, wire_command):
+        from onoats.control_socket import ControlResponse
+
+        delivered.append((record, wire_command))
+        return ControlResponse(True, "accepted", wire_command)
 
     monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr("onoats.control_socket.send_control_command", fake_control)
     monkeypatch.setattr(
         "onoats._vendor.pid._live_ps_cmdline", lambda _pid: "onoats bot"
     )
@@ -596,6 +613,9 @@ def test_signal_commands_cover_captured_identity_state_space(
 
     assert cli.main(argv) == (0 if signals else 1)
     assert bool(delivered) is signals
+    if delivered:
+        assert delivered[0][0].start_epoch == 10.0
+        assert delivered[0][1] == command
 
 
 def test_stop_no_pid_file(_isolate_env):
@@ -721,12 +741,37 @@ def test_stop_help_resolves_without_booting(capsys):
     assert "onoats stop" in out
 
 
+@pytest.mark.parametrize("command", ["flush", "stop"])
+def test_control_channel_failure_never_falls_back_to_pid_signal(
+    command, monkeypatch, _isolate_env, capsys
+):
+    from onoats.control_socket import ControlError
+
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot\n10.0\n", encoding="utf-8")
+
+    def fake_kill(_pid, sig):
+        assert sig == 0, "missing control endpoint must not restore PID signalling"
+
+    def unavailable(*_args, **_kwargs):
+        raise ControlError("legacy recorder has no control channel")
+
+    monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr(
+        "onoats._vendor.pid._live_ps_cmdline", lambda _pid: "onoats bot"
+    )
+    monkeypatch.setattr("onoats.control_socket.send_control_command", unavailable)
+    assert cli.main([command]) == 1
+    assert "control channel" in capsys.readouterr().err
+
+
 def test_stop_stale_cleanup_preserves_freshly_written_pid(monkeypatch, _isolate_env):
     """[high] regression (Codex adversarial review round 6): stale cleanup must
     COMPARE-and-unlink. A blind unlink would delete a NEWER recorder's pid file
     written in the window between stale resolution and cleanup (the new recorder
     won the single-instance lock and published its pid). Simulate that racing
-    write inside signal_flush_target; the stale cleanup must NOT delete it."""
+    write inside generation resolution; stale cleanup must NOT delete it."""
     import os as _os
 
     from onoats._vendor.pid import FlushTarget, PidRecord
@@ -738,7 +783,7 @@ def test_stop_stale_cleanup_preserves_freshly_written_pid(monkeypatch, _isolate_
 
     fresh_pid = _os.getpid()  # a live pid standing in for the new recorder
 
-    def _racing_signal(p, _signal, **_expected):
+    def _racing_resolution(p, **_expected):
         # The new recorder won the lock and published its pid in the window
         # between our prior-read and the stale cleanup.
         p.write_text(f"{fresh_pid}\nonoats-bot\nonoats bot\n123.0\n", encoding="utf-8")
@@ -749,7 +794,7 @@ def test_stop_stale_cleanup_preserves_freshly_written_pid(monkeypatch, _isolate_
             record=PidRecord(999999, "onoats bot", 0.0),
         )
 
-    monkeypatch.setattr("onoats._vendor.pid.signal_flush_target", _racing_signal)
+    monkeypatch.setattr("onoats._vendor.pid.resolve_flush_target", _racing_resolution)
     rc = cli.main(["stop"])
     assert rc == 1
     # The freshly-written pid file MUST survive — never deleted by stale cleanup.
@@ -779,11 +824,19 @@ def test_signal_command_fails_closed_if_pid_record_changes_during_authentication
         return "onoats bot A"
 
     def fake_kill(pid, sig):
-        if sig != 0:
-            delivered.append((pid, sig))
+        assert sig == 0
+
+    def fake_control(_data_dir, record, wire_command):
+        from onoats.control_socket import ControlResponse
+
+        delivered.append((record, wire_command))
+        return ControlResponse(
+            False, "generation-mismatch", "recorder generation changed"
+        )
 
     monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", replace_during_probe)
     monkeypatch.setattr("os.kill", fake_kill)
+    monkeypatch.setattr("onoats.control_socket.send_control_command", fake_control)
 
     rc = cli.main(
         [
@@ -795,8 +848,11 @@ def test_signal_command_fails_closed_if_pid_record_changes_during_authentication
         ]
     )
     assert rc == 1
-    assert delivered == []
-    assert "identity changed during verification" in capsys.readouterr().err
+    assert len(delivered) == 1
+    assert delivered[0][0].pid == 9001
+    assert delivered[0][0].start_epoch == 10.0
+    assert delivered[0][1] == command
+    assert "generation changed" in capsys.readouterr().err
     assert pid_path.read_text(encoding="utf-8").startswith("9002\n")
 
 

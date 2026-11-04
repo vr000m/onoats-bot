@@ -123,39 +123,27 @@ registry dep, not a git pin).
   `dual.main` and the supervisor route through it, so interactive/category
   handling can't drift.
 
-## Identity-checked signalling (`onoats flush` / `onoats stop`)
+## Recorder-owned control (`onoats flush` / `onoats stop`)
 
-Both CLI signal subcommands share **one** authenticated-delivery operation —
-`signal_flush_target` (`_vendor/pid.py`) — and differ **only** in the signal sent:
-
-- `onoats flush` → **SIGUSR1** (continuation flush: rotate buffer, keep recording).
-- `onoats stop` → **SIGTERM** (graceful shutdown: drain + final flush, then exit;
-  same trigger as a single Ctrl-C and the menu bar's owned `Process.terminate()`).
+Normal CLI control uses `.active/onoats-control.sock`; it never sends a PID
+signal. Every bounded v1 JSON request carries the complete expected
+PID/start-epoch generation, and the server requires same-UID Darwin
+`LOCAL_PEERCRED`. Direct SIGUSR1/SIGTERM remain compatibility inputs for
+terminals and service managers. See `docs/control-socket-contract.md`.
 
 Load-bearing invariants (pinned by `tests/test_cli.py`):
 
-- **Never signal an unverified, replaced, or recycled pid.** One pid-file record
-  remains authoritative from the expected-generation comparison through marker,
-  liveness (`kill(0)`), live `ps` fingerprint, an immediate path-record recheck,
-  and signal delivery. A captured action never validates one record and resolves
-  another. Only a fully verified generation is signalled; unlink **only** when
-  `stale=True`, and even then
-  **compare-and-unlink** (`_compare_and_unlink_stale_pid` → `_remove_pid_file`
-  ownership check) — never blindly, or a fresh recorder that won the lock and wrote
-  its pid in the resolve→cleanup window would be deleted; treat `ProcessLookupError`
-  at signal time (TOCTOU) as stale. This matters **more** for `stop` than `flush`
-  — SIGTERM kills by default, so a blind signal to a recycled foreign pid would
-  terminate an unrelated process. A differential test asserts `stop` sends
-  SIGTERM-not-SIGUSR1 and `flush` sends SIGUSR1-not-SIGTERM, so a copy-paste
-  signal swap fails.
+- **Never target an unverified, replaced, or recycled generation.** The CLI
+  verifies one complete PID record, then sends that record's PID/start epoch to
+  the socket. A missing, legacy, replaced endpoint or dropped acknowledgement
+  fails closed. Stale cleanup compares PID, cmdline, and start epoch, so a
+  same-PID successor survives.
 - **A captured UI action is generation-bound.** The menu bar passes the pid and
   start epoch it observed as `--expected-pid` / `--expected-start-epoch`; both
-  signal commands reject the action if the pid file now names another
+  commands reject the action if the pid file now names another
   generation. Direct CLI calls without those optional arguments still target
   the currently verified recorder in the selected data directory.
-- **`stop` is a near-clone of `flush`, not a refactor.** Drift is pinned by tests
-  rather than a shared helper, keeping the shipped `flush` path untouched.
-- Both return on **signal delivery**, not confirmed exit — a consumer must derive
+- Both return on **command acceptance**, not confirmed exit — a consumer must derive
   "stopped" from the process actually exiting, never from the CLI exit code.
 - **`onoats stop --help` resolves without booting a service** (local argparse +
   lazy resolver import), like `flush`.
@@ -195,13 +183,16 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   place — mirrors `onoats.status.write_status`. A concurrent reader (a draining
   recorder's owner-checked removal) sees either the complete old record or the
   complete new one, never an empty/partial file mid-write.
-- **Pid removal is ownership-checked and fails closed.**
-  `_remove_pid_file(pid_path, owner_pid=…)` unlinks **only** when the file still
-  records exactly that pid. If it reads back as `None` (unreadable/foreign/already
+- **Pid removal is exact-record checked and fails closed.**
+  `compare_and_unlink_pid_record` removes **only** when the file still records
+  the captured PID, cmdline, and start epoch. It atomically moves the public
+  entry to a private same-directory quarantine and verifies the moved inode
+  before removal, so a check-to-unlink successor race cannot delete the new
+  record. If it reads back as `None` (unreadable/foreign/already
   gone) it is left in place — it must never be assumed to be our own benign
-  mid-write. Because `stop` returns on signal delivery (not exit), a
+  mid-write. Because `stop` returns on command acceptance (not exit), a
   `stop`-then-immediate-`bot` could otherwise let a draining recorder delete a
-  NEWER recorder's pid file. Recorder teardown passes `owner_pid=os.getpid()`; the
+  NEWER recorder's pid file. Recorder teardown passes its immutable `PidRecord`; the
   GUI's menu gating (Start only in `.stopped`) already prevents this from the app,
   so the guard protects the CLI/scripted path. A leftover invalid pid file is
   self-healing: `status` reports no valid recorder and the next start atomically

@@ -55,8 +55,10 @@ from onoats.runtime import (  # noqa: E402
     RecorderAlreadyRunningError,
     SttPreflightError,
     _acquire_instance_lock,
+    _build_pid_record,
     _create_stt_service,
     _install_signal_handlers,
+    _mark_graceful_shutdown_requested,
     _mark_status_rotation,
     _mint_start_epoch,
     _remove_pid_file,
@@ -83,6 +85,7 @@ def _finalize_shutdown_status(
     ended_by_error: bool,
     old_terminal_settings: object | None = None,
     telemetry_cleanup=None,
+    owner_record=None,
 ) -> None:
     """Single-writer shutdown tail: write status-stopped BEFORE removing the pid.
 
@@ -120,7 +123,10 @@ def _finalize_shutdown_status(
         except Exception as exc:
             logger.warning(f"Could not clean up UI telemetry: {exc}")
     _restore_terminal(old_terminal_settings)
-    _remove_pid_file(pid_path, owner_pid=os.getpid())
+    if owner_record is not None:
+        _remove_pid_file(pid_path, owner_record=owner_record)
+    else:
+        _remove_pid_file(pid_path, owner_pid=os.getpid())
     # The single-instance lock is intentionally NOT released here: it is held for
     # the whole process lifetime and the kernel frees it on exit. Releasing now
     # would free the slot while the socket supervisor is still tearing down its
@@ -736,7 +742,29 @@ async def run_onoats_dual(
         silence_detector,
         loop,
     )
-    pid_path = _write_pid_file(data_dir, start_epoch=start_epoch)
+    from onoats.control_socket import ControlServer
+
+    pid_record = _build_pid_record(start_epoch=start_epoch)
+
+    async def _control_flush() -> None:
+        await _flush_continuation("Control socket flush")
+
+    def _control_stop() -> None:
+        _mark_graceful_shutdown_requested()
+        shutdown_event.set()
+
+    control_server = ControlServer(
+        data_dir,
+        pid_record,
+        on_flush=_control_flush,
+        on_stop=_control_stop,
+    )
+    await control_server.start()
+    try:
+        pid_path = _write_pid_file(data_dir, start_epoch=start_epoch, record=pid_record)
+    except BaseException:
+        await control_server.close()
+        raise
     # Write ordering (status-file contract): pid file FIRST, then status. So a
     # reader that catches us mid-start sees pid-alive (backstop) before the rich
     # status record exists, never the reverse.
@@ -747,6 +775,10 @@ async def run_onoats_dual(
         start_epoch=start_epoch,
         warning=preflight_recovery_warning,
     )
+    if not status_published:
+        await control_server.close()
+        _remove_pid_file(pid_path, owner_record=pid_record)
+        raise RuntimeError("could not publish recorder running status")
     telemetry_publisher = None
     if telemetry_state is not None and status_published:
         from onoats.ui_telemetry import UITelemetryPublisher
@@ -824,6 +856,10 @@ async def run_onoats_dual(
                 telemetry_publisher, force_exit_event=force_exit_event
             )
 
+        # Revoke command acceptance and remove only this generation's socket
+        # before publishing stopped state or removing its exact PID record.
+        await control_server.close()
+
         # Single-writer shutdown tail: status-stopped BEFORE pid removal, plus
         # terminal restore. Extracted to a module-level helper so the write
         # ordering is exercisable at runtime without booting the recorder stack
@@ -837,6 +873,7 @@ async def run_onoats_dual(
             telemetry_cleanup=(
                 telemetry_publisher.cleanup if telemetry_publisher is not None else None
             ),
+            owner_record=pid_record,
         )
         logger.info("Shutdown: complete")
 

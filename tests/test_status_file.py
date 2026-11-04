@@ -671,6 +671,49 @@ def test_dual_wires_producers_at_start_rotation_stop():
     assert "if telemetry_state is not None and status_published:" in src
 
 
+@pytest.mark.parametrize("relative", ["src/onoats/dual.py", "src/onoats/__main__.py"])
+def test_recorder_entrypoints_publish_and_teardown_control_generation_in_order(
+    relative: str,
+):
+    source = (Path(__file__).resolve().parents[1] / relative).read_text()
+    server = source.index("ControlServer(")
+    bind = source.index("await control_server.start()", server)
+    pid_publish = source.index("_write_pid_file(", bind)
+    running_publish = source.index("_write_status_running(", pid_publish)
+    assert server < bind < pid_publish < running_publish
+
+    shutdown = source.index("await control_server.close()", running_publish)
+    if relative.endswith("dual.py"):
+        finalizer_call = source.index("_finalize_shutdown_status(", shutdown)
+        assert shutdown < finalizer_call
+        helper = source.split("def _finalize_shutdown_status(", 1)[1].split(
+            "\ndef ", 1
+        )[0]
+        stopped = helper.index("_write_status_stopped(")
+        pid_remove = helper.index("_remove_pid_file(pid_path")
+        assert stopped < pid_remove
+        assert "owner_record=owner_record" in helper[pid_remove : pid_remove + 200]
+    else:
+        stopped = source.index("_write_status_stopped(", shutdown)
+        pid_remove = source.index("_remove_pid_file(pid_path", stopped)
+        assert shutdown < stopped < pid_remove
+        assert "owner_record=pid_record" in source[pid_remove : pid_remove + 200]
+
+
+def test_control_handlers_keep_flush_and_stop_actions_differential():
+    for relative in ("src/onoats/dual.py", "src/onoats/__main__.py"):
+        source = (Path(__file__).resolve().parents[1] / relative).read_text()
+        flush = source.split("async def _control_flush()", 1)[1].split(
+            "def _control_stop()", 1
+        )[0]
+        stop = source.split("def _control_stop()", 1)[1].split("control_server =", 1)[0]
+        assert "_flush_continuation" in flush
+        assert "shutdown_event.set()" not in flush
+        assert "_mark_graceful_shutdown_requested()" in stop
+        assert "shutdown_event.set()" in stop
+        assert "_flush_continuation" not in stop
+
+
 def test_dual_threads_captured_recovery_warning_into_status_running():
     """Phase 3 race fix: the preflight's on_recovery message fires before any
     running record exists, so dual.py must capture it into a local variable
@@ -1030,6 +1073,119 @@ def test_remove_pid_file_skips_when_owned_by_newer_recorder(tmp_path):
     # The rightful owner can remove it.
     _remove_pid_file(pid_path, owner_pid=55555)
     assert not pid_path.exists()
+
+
+def test_exact_record_cleanup_preserves_every_successor_dimension(tmp_path):
+    """PID equality alone is never cleanup authority."""
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / ".active" / PID_FILENAME
+    pid_path.parent.mkdir(parents=True)
+    old = PidRecord(55555, "onoats bot --old", 10.0)
+    successors = [
+        PidRecord(old.pid, "onoats bot --new", old.start_epoch),
+        PidRecord(old.pid, old.cmdline, old.start_epoch + 1),
+        PidRecord(old.pid + 1, old.cmdline, old.start_epoch),
+    ]
+    for successor in successors:
+        pid_path.write_text(
+            f"{successor.pid}\nonoats-bot\n{successor.cmdline}\n"
+            f"{successor.start_epoch}\n",
+            encoding="utf-8",
+        )
+        assert compare_and_unlink_pid_record(pid_path, old) is False
+        assert pid_path.exists(), successor
+
+    pid_path.write_text(
+        f"{old.pid}\nonoats-bot\n{old.cmdline}\n{old.start_epoch}\n",
+        encoding="utf-8",
+    )
+    assert compare_and_unlink_pid_record(pid_path, old) is True
+    assert not pid_path.exists()
+
+
+def _pid_record_text(record):
+    return f"{record.pid}\nonoats-bot\n{record.cmdline}\n{record.start_epoch}\n"
+
+
+def test_exact_record_cleanup_preserves_same_pid_successor_at_final_boundary(
+    tmp_path, monkeypatch
+):
+    """Replacing the pathname after verification cannot delete the successor."""
+    import onoats._vendor.pid as pid_module
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / "onoats.pid"
+    old = PidRecord(55555, "onoats bot", 10.0)
+    successor = PidRecord(old.pid, old.cmdline, old.start_epoch + 1)
+    pid_path.write_text(_pid_record_text(old), encoding="utf-8")
+    real_rename = pid_module.os.rename
+    raced = False
+
+    def replace_at_final_boundary(source, destination):
+        nonlocal raced
+        if Path(source) == pid_path and not raced:
+            raced = True
+            replacement = tmp_path / "successor.pid"
+            replacement.write_text(_pid_record_text(successor), encoding="utf-8")
+            os.replace(replacement, pid_path)
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(pid_module.os, "rename", replace_at_final_boundary)
+
+    assert compare_and_unlink_pid_record(pid_path, old) is False
+    assert raced
+    assert pid_path.read_text(encoding="utf-8") == _pid_record_text(successor)
+
+
+def test_exact_record_cleanup_quarantine_never_overwrites_newer_public_record(
+    tmp_path, monkeypatch
+):
+    """A raced entry stays quarantined when its public name is occupied."""
+    import onoats._vendor.pid as pid_module
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / "onoats.pid"
+    old = PidRecord(55555, "onoats bot", 10.0)
+    raced_successor = PidRecord(old.pid, old.cmdline, old.start_epoch + 1)
+    newer = PidRecord(old.pid, old.cmdline, old.start_epoch + 2)
+    pid_path.write_text(_pid_record_text(old), encoding="utf-8")
+    real_rename = pid_module.os.rename
+
+    def collide_with_restore(source, destination):
+        replacement = tmp_path / "successor.pid"
+        replacement.write_text(_pid_record_text(raced_successor), encoding="utf-8")
+        os.replace(replacement, pid_path)
+        result = real_rename(source, destination)
+        pid_path.write_text(_pid_record_text(newer), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(pid_module.os, "rename", collide_with_restore)
+
+    assert compare_and_unlink_pid_record(pid_path, old) is False
+    assert pid_path.read_text(encoding="utf-8") == _pid_record_text(newer)
+    quarantined = list(tmp_path.glob(".onoats-pid-quarantine-*/onoats.pid"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == _pid_record_text(
+        raced_successor
+    )
+
+
+def test_runtime_teardown_delegates_to_exact_record_cleanup(tmp_path, monkeypatch):
+    from onoats._vendor.pid import PidRecord
+
+    pid_path = _seed_pid_file(tmp_path, 55555)
+    expected = PidRecord(55555, "onoats bot", 10.0)
+    observed = []
+
+    def compare(path, record):
+        observed.append((path, record))
+        return False
+
+    monkeypatch.setattr("onoats._vendor.pid.compare_and_unlink_pid_record", compare)
+    _remove_pid_file(pid_path, owner_record=expected)
+    assert observed == [(pid_path, expected)]
+    assert pid_path.exists()
 
 
 def test_remove_pid_file_unconditional_without_owner(tmp_path):

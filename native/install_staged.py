@@ -26,6 +26,8 @@ CHMOD = "/bin/chmod"
 CODESIGN = "/usr/bin/codesign"
 DITTO = "/usr/bin/ditto"
 MAKE = "/usr/bin/make"
+BUNDLE_ID = "net.varunsingh.onoats"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class InstallError(RuntimeError):
@@ -555,46 +557,64 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("--record", required=True)
     restore.add_argument("--makefile-dir", required=True)
     restore.add_argument("--bundle-id", required=True)
-    subparsers.add_parser("make-identity")
-    subparsers.add_parser("make-install")
-    subparsers.add_parser("make-rollback")
+    subparsers.add_parser("env-identity")
+    subparsers.add_parser("env-install")
+    subparsers.add_parser("env-rollback")
     return parser
 
 
-def _make_value(name: str) -> str:
+def _env_value(name: str, default: str | None = None) -> str:
     value = os.environ.get(name)
     if value is None:
-        raise InstallError(f"missing Make environment value: {name}")
+        if default is not None:
+            return default
+        raise InstallError(f"missing installer environment value: {name}")
     return value
 
 
-def _make_install_args() -> argparse.Namespace:
+def _env_paths() -> tuple[str, str, str, str]:
+    install_dir = _env_value("ONOATS_INSTALL_DIR", str(Path.home() / "Applications"))
+    backup_dir = _env_value(
+        "ONOATS_INSTALL_BACKUP_DIR",
+        str(Path.home() / "Library/Application Support/Onoats/app-backups"),
+    )
+    record = _env_value(
+        "ONOATS_INSTALL_ROLLBACK_RECORD",
+        str(Path(backup_dir) / "approved-rollback.txt"),
+    )
+    app = _env_value("ONOATS_INSTALL_APP", str(SCRIPT_DIR / "Onoats.app"))
+    return app, install_dir, backup_dir, record
+
+
+def _env_install_args() -> argparse.Namespace:
+    app, install_dir, backup_dir, record = _env_paths()
     try:
-        approved = int(_make_value("ONOATS_MAKE_ROLLBACK_BASELINE_APPROVED"))
+        approved = int(_env_value("ONOATS_INSTALL_ROLLBACK_APPROVED", "0"))
     except ValueError as exc:
         raise InstallError("rollback approval must be an integer") from exc
     return argparse.Namespace(
-        app=_make_value("ONOATS_MAKE_APP"),
-        install_dir=_make_value("ONOATS_MAKE_INSTALL_DIR"),
-        backup_dir=_make_value("ONOATS_MAKE_BACKUP_DIR"),
-        record=_make_value("ONOATS_MAKE_ROLLBACK_RECORD"),
-        expected_identity=_make_value("ONOATS_MAKE_STAGED_APP_TREE_HASH"),
+        app=app,
+        install_dir=install_dir,
+        backup_dir=backup_dir,
+        record=record,
+        expected_identity=_env_value("ONOATS_INSTALL_EXPECTED_IDENTITY"),
         approved=approved,
-        baseline_dr_hash=_make_value("ONOATS_MAKE_ROLLBACK_BASELINE_DR_HASH"),
-        baseline_cdhash=_make_value("ONOATS_MAKE_ROLLBACK_BASELINE_CDHASH"),
-        makefile_dir=_make_value("ONOATS_MAKEFILE_DIR"),
-        bundle_id=_make_value("ONOATS_MAKE_BUNDLE_ID"),
+        baseline_dr_hash=_env_value("ONOATS_INSTALL_BASELINE_DR_HASH", ""),
+        baseline_cdhash=_env_value("ONOATS_INSTALL_BASELINE_CDHASH", ""),
+        makefile_dir=str(SCRIPT_DIR),
+        bundle_id=_env_value("ONOATS_INSTALL_BUNDLE_ID", BUNDLE_ID),
     )
 
 
-def _make_rollback_args() -> argparse.Namespace:
+def _env_rollback_args() -> argparse.Namespace:
+    app, install_dir, backup_dir, record = _env_paths()
     return argparse.Namespace(
-        app_name=_make_value("ONOATS_MAKE_APP_NAME"),
-        install_dir=_make_value("ONOATS_MAKE_INSTALL_DIR"),
-        backup_dir=_make_value("ONOATS_MAKE_BACKUP_DIR"),
-        record=_make_value("ONOATS_MAKE_ROLLBACK_RECORD"),
-        makefile_dir=_make_value("ONOATS_MAKEFILE_DIR"),
-        bundle_id=_make_value("ONOATS_MAKE_BUNDLE_ID"),
+        app_name=Path(app).name,
+        install_dir=install_dir,
+        backup_dir=backup_dir,
+        record=record,
+        makefile_dir=str(SCRIPT_DIR),
+        bundle_id=_env_value("ONOATS_INSTALL_BUNDLE_ID", BUNDLE_ID),
     )
 
 
@@ -603,14 +623,20 @@ def main() -> int:
     try:
         if args.command == "identity":
             print(app_identity(Path(args.app)))
-        elif args.command == "make-identity":
-            print(app_identity(Path(_make_value("ONOATS_MAKE_APP"))))
+        elif args.command == "env-identity":
+            print(
+                app_identity(
+                    Path(
+                        _env_value("ONOATS_INSTALL_APP", str(SCRIPT_DIR / "Onoats.app"))
+                    )
+                )
+            )
         elif args.command == "install":
             install(args)
-        elif args.command == "make-install":
-            install(_make_install_args())
-        elif args.command == "make-rollback":
-            rollback(_make_rollback_args())
+        elif args.command == "env-install":
+            install(_env_install_args())
+        elif args.command == "env-rollback":
+            rollback(_env_rollback_args())
         else:
             rollback(args)
     except InstallError as exc:

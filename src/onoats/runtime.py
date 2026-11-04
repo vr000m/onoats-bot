@@ -2063,7 +2063,16 @@ def _mint_start_epoch() -> float:
     return time.time()
 
 
-def _write_pid_file(data_dir: Path, *, start_epoch: float) -> Path:
+def _build_pid_record(*, start_epoch: float):
+    """Construct the exact recorder identity published after control bind."""
+    from onoats._vendor.pid import PidRecord
+
+    return PidRecord(
+        pid=os.getpid(), cmdline=_own_ps_cmdline(), start_epoch=start_epoch
+    )
+
+
+def _write_pid_file(data_dir: Path, *, start_epoch: float, record=None) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint.
 
     Single-instance enforcement lives in ``_acquire_instance_lock`` (the flock +
@@ -2103,11 +2112,15 @@ def _write_pid_file(data_dir: Path, *, start_epoch: float) -> Path:
         except PermissionError:
             logger.warning("PID file exists, process may be running as different user")
 
-    cmdline = _own_ps_cmdline()
+    if record is None:
+        record = _build_pid_record(start_epoch=start_epoch)
+    if record.pid != os.getpid() or record.start_epoch != start_epoch:
+        raise ValueError("pid record does not identify this recorder generation")
+    cmdline = record.cmdline
     # Wall-clock start_epoch is included as the 4th line so live-view
     # readers can distinguish a freshly-started bot from one that
     # happens to have inherited a recycled pid (see onoats._vendor.pid).
-    payload = f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n"
+    payload = f"{record.pid}\n{PID_MARKER}\n{cmdline}\n{record.start_epoch}\n"
     # Atomic replace (temp + os.replace in the SAME dir) — never truncate the pid
     # file in place. A draining recorder's owner-checked `_remove_pid_file` reads
     # this path concurrently; an in-place write_text would expose an empty/partial
@@ -2137,7 +2150,12 @@ def _write_pid_file(data_dir: Path, *, start_epoch: float) -> Path:
     return pid_path
 
 
-def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
+def _remove_pid_file(
+    pid_path: Path,
+    *,
+    owner_record=None,
+    owner_pid: int | None = None,
+) -> None:
     """Remove the PID file on shutdown.
 
     When ``owner_pid`` is given, unlink ONLY if the file still records exactly that
@@ -2152,6 +2170,15 @@ def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
     is correct. A leftover invalid pid file is self-healing: ``status`` reports no
     valid recorder and the next ``_write_pid_file`` atomically replaces it.
     """
+    if owner_record is not None:
+        from onoats._vendor.pid import compare_and_unlink_pid_record
+
+        if not compare_and_unlink_pid_record(pid_path, owner_record):
+            logger.warning(
+                f"PID file {pid_path} no longer contains this complete recorder "
+                "generation; not removing."
+            )
+        return
     if owner_pid is not None:
         current = _read_pid_file(pid_path)
         if current != owner_pid:

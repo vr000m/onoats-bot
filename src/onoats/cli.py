@@ -1280,8 +1280,8 @@ def _cmd_convert(rest: list[str]) -> int:
     return convert_main(rest)
 
 
-def _compare_and_unlink_stale_pid(pid_path: Path, expected_pid: int | None) -> None:
-    """Remove a stale/dead pid file ONLY if it still records ``expected_pid``.
+def _compare_and_unlink_stale_pid(pid_path: Path, expected_record) -> None:
+    """Remove a stale/dead pid file only if its complete record is unchanged.
 
     A blind ``unlink`` during stale cleanup can delete a NEWER recorder's pid
     file: ``stop``/``flush`` resolve an old dead/recycled pid as stale, but in the
@@ -1293,23 +1293,22 @@ def _compare_and_unlink_stale_pid(pid_path: Path, expected_pid: int | None) -> N
     file was unparseable when we resolved it) → skip entirely; a future start
     atomically replaces it (self-healing).
     """
-    if expected_pid is None:
+    if expected_record is None:
         return
-    from onoats.runtime import _remove_pid_file
+    from onoats._vendor.pid import compare_and_unlink_pid_record
 
-    _remove_pid_file(pid_path, owner_pid=expected_pid)
+    compare_and_unlink_pid_record(pid_path, expected_record)
 
 
 def _cmd_flush(rest: list[str]) -> int:
-    """Send SIGUSR1 to the running recorder so it rotates its buffer.
+    """Ask the authenticated recorder generation to rotate its buffer.
 
     This is the seam an integrating consumer's ``flush`` pass-through execs. It
     resolves the pid from ``<data_dir>/.active/onoats.pid`` (marker
     ``onoats-bot``) under the forwarded ``ONOATS_DATA_DIR`` root.
 
-    Near-clone: ``_cmd_stop`` mirrors this verbatim except for the signal
-    (SIGTERM vs SIGUSR1). Keep the two in sync — a new error branch here must be
-    copied there (parity is pinned by tests, not a shared helper).
+    ``_cmd_stop`` follows the same identity and control-channel path with a
+    distinct wire command. Neither command falls back to PID signalling.
     """
     parser = argparse.ArgumentParser(prog="onoats flush")
     parser.add_argument(
@@ -1336,12 +1335,12 @@ def _cmd_flush(rest: list[str]) -> int:
         parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import signal_flush_target
+    from onoats._vendor.pid import resolve_flush_target
+    from onoats.control_socket import ControlError, send_control_command
 
     pid_path = _pid_path(data_dir)
-    target = signal_flush_target(
+    target = resolve_flush_target(
         pid_path,
-        signal.SIGUSR1,
         expected_pid=args.expected_pid,
         expected_start_epoch=args.expected_start_epoch,
     )
@@ -1350,29 +1349,32 @@ def _cmd_flush(rest: list[str]) -> int:
         # the next run starts clean, but never signal an unverified pid — and only
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
-            _compare_and_unlink_stale_pid(
-                pid_path, target.record.pid if target.record else None
-            )
+            _compare_and_unlink_stale_pid(pid_path, target.record)
         print(f"onoats flush: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
-    pid = target.pid
-    print(f"onoats flush: sent SIGUSR1 to recorder pid {pid}")
+    if target.record is None:
+        print("onoats flush: recorder identity is incomplete", file=sys.stderr)
+        return 1
+    try:
+        response = send_control_command(
+            data_dir or _resolve_data_dir(), target.record, "flush"
+        )
+    except ControlError as exc:
+        print(f"onoats flush: {exc}", file=sys.stderr)
+        return 1
+    if not response.ok:
+        print(f"onoats flush: {response.message}", file=sys.stderr)
+        return 1
+    print(f"onoats flush: recorder pid {target.record.pid} accepted flush")
     return 0
 
 
 def _cmd_stop(rest: list[str]) -> int:
-    """Send SIGTERM to the running recorder so it shuts down gracefully.
+    """Ask the authenticated recorder generation to shut down gracefully.
 
-    Near-clone of ``_cmd_flush``: the safe authenticated signal delivery
-    (``signal_flush_target`` → generation + marker + cmdline fingerprint) is reused verbatim,
-    so a recycled foreign pid is never signalled. The PID-recycling guard matters
-    *more* here than for flush — SIGTERM's default disposition kills, so
-    signalling an unrelated pid would terminate it. The only behavioural change
-    from flush is the signal: SIGTERM (the graceful-shutdown trigger,
-    ``runtime.py`` — same as a single Ctrl-C / the GUI's owned
-    ``Process.terminate()``) instead of SIGUSR1. The recorder drains and writes a
-    final flush before exiting; the command returns on signal delivery, NOT on
-    confirmed exit.
+    The complete verified PID/start-epoch generation is sent to the recorder's
+    own control socket. The recorder marks graceful shutdown before acknowledging;
+    the command returns on acceptance, not confirmed process exit.
     """
     parser = argparse.ArgumentParser(prog="onoats stop")
     parser.add_argument(
@@ -1399,12 +1401,12 @@ def _cmd_stop(rest: list[str]) -> int:
         parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import signal_flush_target
+    from onoats._vendor.pid import resolve_flush_target
+    from onoats.control_socket import ControlError, send_control_command
 
     pid_path = _pid_path(data_dir)
-    target = signal_flush_target(
+    target = resolve_flush_target(
         pid_path,
-        signal.SIGTERM,
         expected_pid=args.expected_pid,
         expected_start_epoch=args.expected_start_epoch,
     )
@@ -1413,13 +1415,23 @@ def _cmd_stop(rest: list[str]) -> int:
         # the next run starts clean, but never signal an unverified pid — and only
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
-            _compare_and_unlink_stale_pid(
-                pid_path, target.record.pid if target.record else None
-            )
+            _compare_and_unlink_stale_pid(pid_path, target.record)
         print(f"onoats stop: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
-    pid = target.pid
-    print(f"onoats stop: sent SIGTERM to recorder pid {pid} (graceful shutdown)")
+    if target.record is None:
+        print("onoats stop: recorder identity is incomplete", file=sys.stderr)
+        return 1
+    try:
+        response = send_control_command(
+            data_dir or _resolve_data_dir(), target.record, "stop"
+        )
+    except ControlError as exc:
+        print(f"onoats stop: {exc}", file=sys.stderr)
+        return 1
+    if not response.ok:
+        print(f"onoats stop: {response.message}", file=sys.stderr)
+        return 1
+    print(f"onoats stop: recorder pid {target.record.pid} accepted graceful shutdown")
     return 0
 
 

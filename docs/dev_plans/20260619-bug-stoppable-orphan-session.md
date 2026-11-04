@@ -546,6 +546,18 @@ before signal delivery. Swift passes the last displayed generation rather than
 rereading and retargeting to a successor that the panel never displayed. The
 signal numbers and return-on-delivery semantics recorded above are unchanged.
 
+### 2026-11-04 correction — recorder-owned command acceptance
+
+Phase 10 of
+[`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+supersedes the remaining normal-path signal-delivery decision. `onoats stop` and
+`onoats flush` now send the complete verified PID/start-epoch generation over a
+same-UID recorder-owned Unix control socket. The recorder serializes commands and
+acknowledges Flush only after continuation rotation, or Stop only after graceful
+shutdown is marked. There is no PID-signal fallback. Direct SIGTERM/SIGUSR1 remain
+compatibility inputs outside the CLI command path. PID cleanup now compares PID,
+cmdline, and start epoch so a same-PID successor record cannot be removed.
+
 ## Final Results
 
 [Fill when complete]
