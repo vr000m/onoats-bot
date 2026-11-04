@@ -451,6 +451,10 @@ private func testExternalRoutingAndPidReuse(_ root: URL) throws {
 
     choice.url = next
     model.refresh()
+    // The panel still displays generation 77/10. A successor may publish its
+    // pid record before the next refresh, but the captured action must remain
+    // bound to the displayed generation and let the CLI fail closed.
+    putPid(ops, directory: directory, pid: 78, epoch: 11)
     model.stopExternal()
     try require(ops.requests.last?.arguments == [
         "stop", "--data-dir", directory.path,
@@ -458,6 +462,8 @@ private func testExternalRoutingAndPidReuse(_ root: URL) throws {
     ],
                 "external Stop used next-session directory")
     try require(model.stopRequested, "external Stop did not guard duplicate requests")
+    try require(ops.requests.last?.environment?["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin",
+                "external Stop helper did not receive the minimal environment")
 
     putPid(ops, directory: directory, pid: 77, epoch: 11)
     model.refresh()
@@ -470,6 +476,18 @@ private func testExternalRoutingAndPidReuse(_ root: URL) throws {
         "--expected-pid", "77", "--expected-start-epoch", "11.0",
     ],
                 "external Flush used next-session directory")
+
+    let planted = RecorderModel.auxiliaryEnvironment(from: [
+        "HOME": "/Users/test", "TMPDIR": "/tmp/test", "LANG": "en_US.UTF-8",
+        "OPENAI_API_KEY": "secret", "DYLD_INSERT_LIBRARIES": "/tmp/inject.dylib",
+        "ONOATS_STT_WS_URI": "ws://user:password@example.invalid",
+    ])
+    try require(planted["HOME"] == "/Users/test" && planted["TMPDIR"] == "/tmp/test",
+                "helper environment dropped required user context")
+    try require(planted["OPENAI_API_KEY"] == nil
+                    && planted["DYLD_INSERT_LIBRARIES"] == nil
+                    && planted["ONOATS_STT_WS_URI"] == nil,
+                "helper environment forwarded a secret or injection variable")
 }
 
 @MainActor

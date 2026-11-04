@@ -125,8 +125,8 @@ registry dep, not a git pin).
 
 ## Identity-checked signalling (`onoats flush` / `onoats stop`)
 
-Both CLI signal subcommands share **one** identity gate — `resolve_flush_target`
-(`_vendor/pid.py`) — and differ **only** in the signal sent:
+Both CLI signal subcommands share **one** authenticated-delivery operation —
+`signal_flush_target` (`_vendor/pid.py`) — and differ **only** in the signal sent:
 
 - `onoats flush` → **SIGUSR1** (continuation flush: rotate buffer, keep recording).
 - `onoats stop` → **SIGTERM** (graceful shutdown: drain + final flush, then exit;
@@ -134,10 +134,12 @@ Both CLI signal subcommands share **one** identity gate — `resolve_flush_targe
 
 Load-bearing invariants (pinned by `tests/test_cli.py`):
 
-- **Never signal an unverified or recycled pid.** The resolver validates the
-  marker, requires a cmdline fingerprint, probes liveness (`kill(0)`), and
-  compares the live `ps` cmdline against the stored one. Only a fully-verified
-  pid is signalled; unlink **only** when `stale=True`, and even then
+- **Never signal an unverified, replaced, or recycled pid.** One pid-file record
+  remains authoritative from the expected-generation comparison through marker,
+  liveness (`kill(0)`), live `ps` fingerprint, an immediate path-record recheck,
+  and signal delivery. A captured action never validates one record and resolves
+  another. Only a fully verified generation is signalled; unlink **only** when
+  `stale=True`, and even then
   **compare-and-unlink** (`_compare_and_unlink_stale_pid` → `_remove_pid_file`
   ownership check) — never blindly, or a fresh recorder that won the lock and wrote
   its pid in the resolve→cleanup window would be deleted; treat `ProcessLookupError`

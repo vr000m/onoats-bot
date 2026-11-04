@@ -1336,49 +1336,26 @@ def _cmd_flush(rest: list[str]) -> int:
         parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import read_pid_record, resolve_flush_target
+    from onoats._vendor.pid import signal_flush_target
 
     pid_path = _pid_path(data_dir)
-    # Capture the pid the file records BEFORE resolving, so stale cleanup can
-    # compare-and-unlink (never delete a newer recorder's freshly-written file).
-    prior_rec = read_pid_record(pid_path)
-    if args.expected_pid is not None and (
-        prior_rec is None
-        or prior_rec.pid != args.expected_pid
-        or prior_rec.start_epoch != args.expected_start_epoch
-    ):
-        print(
-            "onoats flush: requested recorder identity is no longer active "
-            f"(pid file {pid_path})",
-            file=sys.stderr,
-        )
-        return 1
-    target = resolve_flush_target(pid_path)
+    target = signal_flush_target(
+        pid_path,
+        signal.SIGUSR1,
+        expected_pid=args.expected_pid,
+        expected_start_epoch=args.expected_start_epoch,
+    )
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so
         # the next run starts clean, but never signal an unverified pid — and only
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
             _compare_and_unlink_stale_pid(
-                pid_path, prior_rec.pid if prior_rec else None
+                pid_path, target.record.pid if target.record else None
             )
         print(f"onoats flush: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
     pid = target.pid
-    try:
-        os.kill(pid, signal.SIGUSR1)
-    except ProcessLookupError:
-        # Raced: the verified recorder exited between the identity check and
-        # the signal. Treat as stale rather than signalling a recycled pid.
-        _compare_and_unlink_stale_pid(pid_path, pid)
-        print(
-            f"onoats flush: recorder pid {pid} is not running (stale pid file)",
-            file=sys.stderr,
-        )
-        return 1
-    except OSError as exc:
-        print(f"onoats flush: could not signal pid {pid}: {exc}", file=sys.stderr)
-        return 1
     print(f"onoats flush: sent SIGUSR1 to recorder pid {pid}")
     return 0
 
@@ -1386,8 +1363,8 @@ def _cmd_flush(rest: list[str]) -> int:
 def _cmd_stop(rest: list[str]) -> int:
     """Send SIGTERM to the running recorder so it shuts down gracefully.
 
-    Near-clone of ``_cmd_flush``: the safe identity-checked signalling
-    (``resolve_flush_target`` → marker + cmdline fingerprint) is reused verbatim,
+    Near-clone of ``_cmd_flush``: the safe authenticated signal delivery
+    (``signal_flush_target`` → generation + marker + cmdline fingerprint) is reused verbatim,
     so a recycled foreign pid is never signalled. The PID-recycling guard matters
     *more* here than for flush — SIGTERM's default disposition kills, so
     signalling an unrelated pid would terminate it. The only behavioural change
@@ -1422,49 +1399,26 @@ def _cmd_stop(rest: list[str]) -> int:
         parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import read_pid_record, resolve_flush_target
+    from onoats._vendor.pid import signal_flush_target
 
     pid_path = _pid_path(data_dir)
-    # Capture the pid the file records BEFORE resolving, so stale cleanup can
-    # compare-and-unlink (never delete a newer recorder's freshly-written file).
-    prior_rec = read_pid_record(pid_path)
-    if args.expected_pid is not None and (
-        prior_rec is None
-        or prior_rec.pid != args.expected_pid
-        or prior_rec.start_epoch != args.expected_start_epoch
-    ):
-        print(
-            "onoats stop: requested recorder identity is no longer active "
-            f"(pid file {pid_path})",
-            file=sys.stderr,
-        )
-        return 1
-    target = resolve_flush_target(pid_path)
+    target = signal_flush_target(
+        pid_path,
+        signal.SIGTERM,
+        expected_pid=args.expected_pid,
+        expected_start_epoch=args.expected_start_epoch,
+    )
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so
         # the next run starts clean, but never signal an unverified pid — and only
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
             _compare_and_unlink_stale_pid(
-                pid_path, prior_rec.pid if prior_rec else None
+                pid_path, target.record.pid if target.record else None
             )
         print(f"onoats stop: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
     pid = target.pid
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        # Raced: the verified recorder exited between the identity check and
-        # the signal. Treat as stale rather than signalling a recycled pid.
-        _compare_and_unlink_stale_pid(pid_path, pid)
-        print(
-            f"onoats stop: recorder pid {pid} is not running (stale pid file)",
-            file=sys.stderr,
-        )
-        return 1
-    except OSError as exc:
-        print(f"onoats stop: could not signal pid {pid}: {exc}", file=sys.stderr)
-        return 1
     print(f"onoats stop: sent SIGTERM to recorder pid {pid} (graceful shutdown)")
     return 0
 

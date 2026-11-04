@@ -415,7 +415,20 @@ final class RecorderModel: ObservableObject {
     static let runLogSuffix = ".log"
     static let maxRunLogs = 10
     static let categoryErrorTailBytes = 64 * 1024
-    static let telemetryMaxBytes = 64 * 1024
+    static let telemetryMaxBytes = UiTelemetryContract.maxSnapshotBytes
+
+    /// Stop/Flush helpers need only a deterministic executable search path and
+    /// basic user/locale context. Never forward the app's API keys, recorder
+    /// configuration, or dynamic-loader injection variables to these helpers.
+    static func auxiliaryEnvironment(
+        from source: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        for key in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
+            if let value = source[key], !value.contains("\0") { environment[key] = value }
+        }
+        return environment
+    }
 
     @Published var state: RecorderState = .stopped
     @Published var micDevice = "—"
@@ -816,7 +829,8 @@ final class RecorderModel: ObservableObject {
             flushNote = "Flush failed: no active recorder directory"
             return
         }
-        guard let target = readPid(under: directory), target.startEpoch > 0 else {
+        guard let target = telemetryAuthority, target.directory == directory,
+              target.startEpoch > 0 else {
             flushNote = "Flush failed: recorder identity is unavailable"
             return
         }
@@ -831,8 +845,8 @@ final class RecorderModel: ObservableObject {
 
     func stopExternal() {
         guard proc == nil, let directory = activeDataDir else { return }
-        let stopping = readPid(under: directory)
-        guard let stopping, stopping.startEpoch > 0 else {
+        guard let stopping = telemetryAuthority, stopping.directory == directory,
+              stopping.startEpoch > 0 else {
             flushNote = "Stop failed: recorder identity is unavailable"
             return
         }
@@ -855,7 +869,8 @@ final class RecorderModel: ObservableObject {
     ) {
         let request = ProcessRequest(
             executable: URL(fileURLWithPath: cliPath), arguments: arguments,
-            environment: nil, outputSink: logOwnedOutput ? mostRecentRunLogSink : nil)
+            environment: Self.auxiliaryEnvironment(),
+            outputSink: logOwnedOutput ? mostRecentRunLogSink : nil)
         do {
             let handle = try ops.spawn(request) { [weak self] handle in
                 guard let self else { return }

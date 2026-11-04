@@ -500,8 +500,8 @@ def test_flush_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
 
 # ---------------------------------------------------------------------------
 # stop — behavioural twin of flush, EXCEPT it sends SIGTERM (graceful shutdown)
-# instead of SIGUSR1. The identity-checked signalling (resolve_flush_target →
-# marker + cmdline fingerprint) is reused verbatim, so a recycled foreign pid is
+# instead of SIGUSR1. The authenticated signal delivery (signal_flush_target →
+# generation + marker + cmdline fingerprint) is reused verbatim, so a recycled foreign pid is
 # never signalled — which matters MORE here because SIGTERM kills by default.
 # Every test_flush_* branch is mirrored 1:1 below.
 # ---------------------------------------------------------------------------
@@ -726,10 +726,10 @@ def test_stop_stale_cleanup_preserves_freshly_written_pid(monkeypatch, _isolate_
     COMPARE-and-unlink. A blind unlink would delete a NEWER recorder's pid file
     written in the window between stale resolution and cleanup (the new recorder
     won the single-instance lock and published its pid). Simulate that racing
-    write inside resolve_flush_target; the stale cleanup must NOT delete it."""
+    write inside signal_flush_target; the stale cleanup must NOT delete it."""
     import os as _os
 
-    from onoats._vendor.pid import FlushTarget
+    from onoats._vendor.pid import FlushTarget, PidRecord
 
     pid_path = cli._pid_path(_isolate_env)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -738,18 +738,66 @@ def test_stop_stale_cleanup_preserves_freshly_written_pid(monkeypatch, _isolate_
 
     fresh_pid = _os.getpid()  # a live pid standing in for the new recorder
 
-    def _racing_resolve(p):
+    def _racing_signal(p, _signal, **_expected):
         # The new recorder won the lock and published its pid in the window
         # between our prior-read and the stale cleanup.
         p.write_text(f"{fresh_pid}\nonoats-bot\nonoats bot\n123.0\n", encoding="utf-8")
-        return FlushTarget(pid=None, reason="stale (dead pid)", stale=True)
+        return FlushTarget(
+            pid=None,
+            reason="stale (dead pid)",
+            stale=True,
+            record=PidRecord(999999, "onoats bot", 0.0),
+        )
 
-    monkeypatch.setattr("onoats._vendor.pid.resolve_flush_target", _racing_resolve)
+    monkeypatch.setattr("onoats._vendor.pid.signal_flush_target", _racing_signal)
     rc = cli.main(["stop"])
     assert rc == 1
     # The freshly-written pid file MUST survive — never deleted by stale cleanup.
     assert pid_path.exists(), "stale cleanup must not delete a newer recorder's file"
     assert pid_path.read_text(encoding="utf-8").startswith(f"{fresh_pid}\n")
+
+
+@pytest.mark.parametrize("command", ["flush", "stop"])
+def test_signal_command_fails_closed_if_pid_record_changes_during_authentication(
+    command, monkeypatch, capsys, _isolate_env
+):
+    """The record authenticated by the cmdline probe is the only signal target.
+
+    Replacing the atomic pid record during authentication must not retarget the
+    action to the successor and must not signal the now-unpublished predecessor.
+    Restoring the old validate-one-record/resolve-another flow makes this fail by
+    delivering a signal to pid 9002.
+    """
+    pid_path = cli._pid_path(_isolate_env)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("9001\nonoats-bot\nonoats bot A\n10.0\n", encoding="utf-8")
+    delivered = []
+
+    def replace_during_probe(pid):
+        assert pid == 9001
+        pid_path.write_text("9002\nonoats-bot\nonoats bot B\n11.0\n", encoding="utf-8")
+        return "onoats bot A"
+
+    def fake_kill(pid, sig):
+        if sig != 0:
+            delivered.append((pid, sig))
+
+    monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", replace_during_probe)
+    monkeypatch.setattr("os.kill", fake_kill)
+
+    rc = cli.main(
+        [
+            command,
+            "--expected-pid",
+            "9001",
+            "--expected-start-epoch",
+            "10.0",
+        ]
+    )
+    assert rc == 1
+    assert delivered == []
+    assert "identity changed during verification" in capsys.readouterr().err
+    assert pid_path.read_text(encoding="utf-8").startswith("9002\n")
 
 
 def test_bot_single_held_lock_fails_before_device_selection(monkeypatch, _isolate_env):

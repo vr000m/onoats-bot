@@ -27,6 +27,7 @@ This module only owns the *read* side — the write/remove primitives live in
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,6 +116,7 @@ class FlushTarget:
     pid: int | None
     reason: str = ""
     stale: bool = False
+    record: PidRecord | None = None
 
 
 def _live_ps_cmdline(pid: int) -> str | None:
@@ -141,7 +143,12 @@ def _live_ps_cmdline(pid: int) -> str | None:
     return out or None
 
 
-def resolve_flush_target(pid_path: Path) -> FlushTarget:
+def resolve_flush_target(
+    pid_path: Path,
+    *,
+    expected_pid: int | None = None,
+    expected_start_epoch: float | None = None,
+) -> FlushTarget:
     """Resolve a pid that is safe to signal for ``onoats flush``.
 
     Performs, in order: marker-validated parse, cmdline-fingerprint presence,
@@ -155,24 +162,39 @@ def resolve_flush_target(pid_path: Path) -> FlushTarget:
         return FlushTarget(
             None, "no running recorder found (no valid pid file)", stale=False
         )
+    if expected_pid is not None and (
+        rec.pid != expected_pid or rec.start_epoch != expected_start_epoch
+    ):
+        return FlushTarget(
+            None,
+            "requested recorder identity is no longer active",
+            stale=False,
+            record=rec,
+        )
     if not rec.cmdline:
         return FlushTarget(
             None,
             "pid file has no cmdline fingerprint (legacy/incomplete) — refusing to signal",
             stale=False,
+            record=rec,
         )
     try:
         os.kill(rec.pid, 0)
     except ProcessLookupError:
         return FlushTarget(
-            None, f"recorder pid {rec.pid} is not running (stale pid file)", stale=True
+            None,
+            f"recorder pid {rec.pid} is not running (stale pid file)",
+            stale=True,
+            record=rec,
         )
     except PermissionError:
         # Alive but owned by another user — fall through to the cmdline check,
         # which still distinguishes the recorder from a recycled foreign pid.
         pass
     except OSError as exc:
-        return FlushTarget(None, f"could not probe pid {rec.pid}: {exc}", stale=False)
+        return FlushTarget(
+            None, f"could not probe pid {rec.pid}: {exc}", stale=False, record=rec
+        )
 
     live = _live_ps_cmdline(rec.pid)
     if live is None:
@@ -191,6 +213,7 @@ def resolve_flush_target(pid_path: Path) -> FlushTarget:
             f"could not verify recorder identity for pid {rec.pid} "
             f"(ps probe failed) — refusing to signal",
             stale=False,
+            record=rec,
         )
     if live != rec.cmdline:
         return FlushTarget(
@@ -198,8 +221,64 @@ def resolve_flush_target(pid_path: Path) -> FlushTarget:
             f"pid {rec.pid} identity mismatch (likely PID reuse): live process is "
             f"not the onoats recorder — refusing to signal",
             stale=True,
+            record=rec,
         )
-    return FlushTarget(rec.pid)
+    return FlushTarget(rec.pid, record=rec)
+
+
+def signal_flush_target(
+    pid_path: Path,
+    signal_number: signal.Signals,
+    *,
+    expected_pid: int | None = None,
+    expected_start_epoch: float | None = None,
+) -> FlushTarget:
+    """Authenticate one recorder generation and deliver one signal to it.
+
+    The marker/cmdline/generation checks and signal delivery deliberately live
+    in one operation.  In particular, a captured UI identity is compared with
+    the *same* record whose process fingerprint is authenticated; callers must
+    never validate one path read and then resolve a second record as the target.
+
+    The pathname is compared with the authenticated record immediately before
+    delivery.  If the recorder removed or replaced its atomic pid record while
+    its process identity was being checked, delivery fails closed.  The
+    authenticated record remains the sole signal authority throughout.
+    """
+    target = resolve_flush_target(
+        pid_path,
+        expected_pid=expected_pid,
+        expected_start_epoch=expected_start_epoch,
+    )
+    if target.pid is None:
+        return target
+    record = target.record
+    if record is None:  # Defensive: successful resolution always carries it.
+        return FlushTarget(None, "internal recorder identity error", stale=False)
+    if _parse_pid_file(pid_path) != record:
+        return FlushTarget(
+            None,
+            "recorder identity changed during verification — refusing to signal",
+            stale=False,
+            record=record,
+        )
+    try:
+        os.kill(record.pid, signal_number)
+    except ProcessLookupError:
+        return FlushTarget(
+            None,
+            f"recorder pid {record.pid} is not running (stale pid file)",
+            stale=True,
+            record=record,
+        )
+    except OSError as exc:
+        return FlushTarget(
+            None,
+            f"could not signal pid {record.pid}: {exc}",
+            stale=False,
+            record=record,
+        )
+    return target
 
 
 def fingerprint_matches(rec: PidRecord) -> bool:
