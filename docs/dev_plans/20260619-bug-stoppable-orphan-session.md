@@ -534,6 +534,18 @@ sound flow rather than re-deriving it. Verified against current code
   `_release_instance_lock` / `_write_pid_file`), `src/onoats/dual.py` +
   `src/onoats/__main__.py` (release on teardown).
 
+### 2026-11-03 correction — captured-generation signalling authority
+
+The original `resolve_flush_target`-then-`os.kill` decision is superseded by
+the menu-bar control-panel remediation in
+[`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md).
+Stop and Flush now use one `signal_flush_target` operation: the expected UI
+generation is compared with the same PID record whose marker, liveness, and
+command fingerprint are authenticated; that record is rechecked immediately
+before signal delivery. Swift passes the last displayed generation rather than
+rereading and retargeting to a successor that the panel never displayed. The
+signal numbers and return-on-delivery semantics recorded above are unchanged.
+
 ## Final Results
 
 [Fill when complete]
