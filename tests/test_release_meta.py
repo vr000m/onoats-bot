@@ -957,8 +957,21 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
         "STAGED_APP_TREE_HASH",
     ):
         assert re.search(rf"(?m)^{variable}\s*\?=", makefile)
-        assert f"$({variable})" in body
-    assert "$(INSTALL_STAGED_SCRIPT) install" in body
+    recipe = next(line.strip() for line in body.splitlines() if line.startswith("\t"))
+    assert recipe == "@python3 install_staged.py make-install"
+    assert "$(" not in recipe, "operator values must never become shell source"
+    for exported in (
+        "ONOATS_MAKE_APP",
+        "ONOATS_MAKE_INSTALL_DIR",
+        "ONOATS_MAKE_ROLLBACK_RECORD",
+        "ONOATS_MAKE_STAGED_APP_TREE_HASH",
+        "ONOATS_MAKE_ROLLBACK_BASELINE_APPROVED",
+        "ONOATS_MAKE_ROLLBACK_BASELINE_DR_HASH",
+        "ONOATS_MAKE_ROLLBACK_BASELINE_CDHASH",
+        "ONOATS_MAKEFILE_DIR",
+        "ONOATS_MAKE_BUNDLE_ID",
+    ):
+        assert re.search(rf"(?m)^export {exported}\s*:=", makefile)
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert '_run(DITTO, "-c", "-k", "--keepParent"' in installer
     assert "tempfile.mkstemp(" in installer and 'suffix=".zip"' in installer
@@ -966,6 +979,52 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
     assert "_replace_verified(candidate, installed, verify, commit)" in installer
     assert "_write_record(record, record_fields)" in installer
     assert "commit()" in installer
+
+
+def test_staged_make_recipes_treat_hostile_paths_as_data(tmp_path: Path):
+    """Make-expanded checkout/install values never become shell program text."""
+    hostile = tmp_path / "checkout `touch CHECKOUT_PWNED` $(touch ALSO_PWNED)"
+    hostile.mkdir()
+    shutil.copy2(NATIVE_MAKEFILE, hostile / "Makefile")
+    (hostile / "install_staged.py").write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path('captured.txt').write_text("
+        "sys.argv[1] + '\\n' + os.environ['ONOATS_MAKE_APP'] + '\\n' + "
+        "os.environ['ONOATS_MAKE_INSTALL_DIR'], encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    hostile_app = "Onoats`touch APP_PWNED`.app"
+    hostile_install = str(tmp_path / "Install; touch INSTALL_PWNED; #")
+    for target, subcommand in (
+        ("app-tree-hash", "make-identity"),
+        ("install-staged", "make-install"),
+        ("rollback", "make-rollback"),
+    ):
+        result = subprocess.run(
+            [
+                "make",
+                "-s",
+                target,
+                f"APP={hostile_app}",
+                f"INSTALL_DIR={hostile_install}",
+            ],
+            cwd=hostile,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        for marker in (
+            "CHECKOUT_PWNED",
+            "ALSO_PWNED",
+            "APP_PWNED",
+            "INSTALL_PWNED",
+        ):
+            assert not (hostile / marker).exists()
+            assert not (tmp_path / marker).exists()
+        assert (hostile / "captured.txt").read_text(encoding="utf-8") == (
+            f"{subcommand}\n{hostile_app}\n{hostile_install}"
+        )
 
 
 def test_install_staged_binds_install_to_pre_smoke_tree_digest(
@@ -1138,10 +1197,11 @@ def test_complete_explicit_approval_creates_verified_rollback_record(
 
 def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
-    _, install_body = _make_target(makefile, "install-staged")
+    _make_target(makefile, "install-staged")
     _, body = _make_target(makefile, "rollback")
-    assert "$(INSTALL_STAGED_SCRIPT) rollback" in body
-    assert '--app-name "$(APP_NAME)"' in body
+    recipe = next(line.strip() for line in body.splitlines() if line.startswith("\t"))
+    assert recipe == "@python3 install_staged.py make-rollback"
+    assert "$(" not in recipe, "operator values must never become shell source"
     assert "APP_NAME := $(notdir $(APP))" in makefile
     installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "_read_record(Path(args.record), backup_dir)" in installer
@@ -1150,13 +1210,8 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     assert "_replace_verified(" in installer
     assert 'archive = Path(fields["archive"])' in installer
     assert "archive.relative_to(backup_dir)" in installer
-    approval_vars = set(
-        re.findall(r"\$\(([A-Z_]*(?:APPROV|MANIFEST|RECORD)[A-Z_]*)\)", install_body)
-    ) & set(re.findall(r"\$\(([A-Z_]*(?:APPROV|MANIFEST|RECORD)[A-Z_]*)\)", body))
-    assert approval_vars, (
-        "install-staged and rollback must share one persisted approval record; "
-        "rollback may not accept an arbitrary archive path"
-    )
+    assert "ONOATS_MAKE_ROLLBACK_RECORD" in makefile
+    assert '_make_value("ONOATS_MAKE_ROLLBACK_RECORD")' in installer
 
     unpack = installer.index('_run(DITTO, "-x", "-k", str(archive), str(parent))')
     verify = installer.index(
