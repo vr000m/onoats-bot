@@ -82,6 +82,9 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Verify installed-smoke telemetry rejects non-finite numbers, out-of-range levels, negative ages, and future timestamps before evaluating the Me floor.
 - Verify telemetry-attested transcript run identity flows from `TranscriptBuffer` through schema-v2 Python/Swift parity and matches JSONL line 1; directory novelty remains non-authoritative.
 - Verify every cleanup signal rechecks the kernel process-birth tuple and that PID/command/PGID/second-level start collisions cannot pass.
+- Verify every external Stop/Flush request carries the complete PID/start-epoch generation, the server requires same-UID Darwin peer credentials, and no normal CLI path falls back to PID signalling.
+- Verify both recorder entrypoints bind the control server before identity publication and close its owned endpoint before exact-record PID teardown; simultaneous commands follow the documented lock-order state machine.
+- Verify staged-installer operator values never enter Make expansion, legacy Make-variable overrides fail before Python or mutation, and Swift decodes with the parity-checked run-ID pattern.
 
 ## Implementation Checklist
 
@@ -228,8 +231,8 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Run `python3 scripts/check_review_markers.py`.
 - Build the unsigned compile-smoke binaries with `make -C native build`.
 - Before any commit, inspect only explicitly staged paths for secrets, credentials, private transcripts, PII, and unintended binary metadata.
-- This phase ends before any signing. The initial auto-chained gauntlet found contract-level defects; Phase 8 owns their first reviewed redesign plus installed-branch feedback, while Phase 9 owns the later smoke-authority redesign. The Post-Gauntlet Release Steps start only after Phase 9 and a fresh gauntlet converge, so no accepted fix can land after the final bytes have been signed, smoked, or installed (the Phase 5 sign is a throwaway verification sign and does not count).
-- Operator workflow: Phase 1 is the completed human design gate, and Phases 2–8 remain completed evidence. `/conduct --resume` executes the newly reviewed Phase 9 only. Conduct owns its implementation and automated verification. The gauntlet fires after Phase 9, now the last parsed phase. Signing, interaction/accessibility smoke, exact-byte installation, and rollback validation remain exclusively in the unnumbered Post-Gauntlet Release Steps.
+- This phase ends before any signing. The initial auto-chained gauntlet found contract-level defects; Phases 8–10 own their successive reviewed redesigns and installed-branch feedback. The Post-Gauntlet Release Steps start only after Phase 10 and a fresh gauntlet converge, so no accepted fix can land after the final bytes have been signed, smoked, or installed (the Phase 5 sign is a throwaway verification sign and does not count).
+- Operator workflow: Phase 1 is the completed human design gate, and Phases 2–9 remain completed evidence. `/conduct --resume` executes the newly reviewed Phase 10 only. Conduct owns its implementation and automated verification. The gauntlet fires after Phase 10, now the last parsed phase. Signing, interaction/accessibility smoke, exact-byte installation, and rollback validation remain exclusively in the unnumbered Post-Gauntlet Release Steps.
 
 ### Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
 
@@ -254,7 +257,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Add an opt-in live variant using the existing `ONOATS_STT_FIXTURE` and real websocket STT endpoint. It feeds the same 16 kHz mono PCM speech fixture through the full socket/supervisor recording path and asserts a durable Me utterance without committing audio or transcript text.
 - Add `native/installed_recording_smoke.py` for the signed app gate with explicit `--app`, `--data-dir`, and per-stage timeout inputs. It snapshots session files; resolves the one running signed app PID for the expected bundle path and identity; walks the recorder PID's process ancestry to prove descent from that app; waits boundedly for matching status and fresh telemetry; requires at least one Me level above a conservative non-zero floor while the operator speaks; waits boundedly for graceful Stop; then requires a new JSONL utterance whose canonical source is `me`. Each wait reports a stage-specific timeout without transcript text. The smoke fails on readiness-only, stale, external-session, system-only, wrong-ancestor, or multiple-app evidence. Timeout regressions cover every wait.
 - Record the installed feedback and the terminal-attributed mic-permission diagnostic below the marker. The terminal denial is not treated as evidence about Onoats.app's grant; only the signed installed-app smoke is authoritative for app-owned TCC capture.
-- After focused tests pass, run the full suite, Ruff format/check, review-marker validation, and native build. Inspect explicitly staged files for secrets, PII, private transcripts, audio, credentials, and unintended binary metadata before committing. Phase 8 completes at that implementation-and-verification commit. Its post-phase gauntlet may add a newly reviewed remediation phase; Phase 9 is the current result of that handback.
+- After focused tests pass, run the full suite, Ruff format/check, review-marker validation, and native build. Inspect explicitly staged files for secrets, PII, private transcripts, audio, credentials, and unintended binary metadata before committing. Phase 8 completes at that implementation-and-verification commit. Its post-phase gauntlet may add a newly reviewed remediation phase; Phases 9 and 10 are the current results of those handbacks.
 
 ### Phase 9: Run-Bound Recording Proof and Captured-Identity Teardown
 
@@ -273,11 +276,32 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - Add transcript regressions for an attested run, continuation files, an old run renamed from `.active` to `pending`, copied and hard-linked old files, missing/malformed/non-first `session_meta`, telemetry/JSONL ID mismatch, multiple directory-new IDs, and Me/Them/blank utterance variants. Mutation checks must fail if acceptance falls back to novelty, path, inode, mtime, or size alone.
 - Add telemetry regressions for `-0.0`, `0.0`, `1.0`, finite negative values, `1.0000001`, `NaN`, positive/negative `Infinity`, stale/fresh ages, future snapshot time, future observation time, ownership mismatch, and invalid floor arguments. Structural validation accepts finite levels only in `[0, 1]`; proof still requires `level > me_floor`. Invalid `--me-floor` values (`NaN`, infinities, negative, or greater than one) fail before app launch, discovery, or settings mutation; a mutation moving validation after launch must fail.
 - If implementation or review exposes any manual-smoke defect outside this phase's reviewed files or contract, stop Conduct, append a new final remediation phase, refresh review, run its focused and full validation, and restart the gauntlet. Do not patch it opportunistically in the release steps.
-- Run the focused test, then the full validation command. Inspect explicitly staged files for secrets, PII, private transcripts, audio, credentials, and unintended binary metadata before committing. Conduct then restarts the full gauntlet from the new Phase 9 boundary; signing and installation remain blocked until that gauntlet converges.
+- Run the focused test, then the full validation command. Inspect explicitly staged files for secrets, PII, private transcripts, audio, credentials, and unintended binary metadata before committing. Conduct then advances to Phase 10; signing and installation remain blocked until the post-Phase-10 gauntlet converges.
+
+### Phase 10: Recorder-Owned Control Channel and Boundary Hardening
+
+**Impl files:** `src/onoats/control_socket.py, src/onoats/cli.py, src/onoats/_vendor/pid.py, src/onoats/runtime.py, src/onoats/dual.py, src/onoats/__main__.py, native/onoats-menubar/Sources/RecorderModel.swift, native/onoats-menubar/Sources/UiTelemetry.swift, native/Makefile, native/install_staged.py`
+**Test files:** `tests/test_control_socket.py, tests/test_control_socket_contract_parity.py, tests/test_cli.py, tests/test_status_file.py, tests/test_dual_socket_source.py, tests/test_socket_supervisor.py, tests/test_native_contract_parity.py, tests/test_release_meta.py, native/onoats-menubar/Tests/UiTelemetryDecoderHarness.swift, native/test_ui_telemetry.sh`
+**Test command:** `uv run pytest tests/test_control_socket.py tests/test_control_socket_contract_parity.py tests/test_cli.py tests/test_status_file.py tests/test_dual_socket_source.py tests/test_socket_supervisor.py tests/test_native_contract_parity.py tests/test_release_meta.py -q && native/test_ui_telemetry.sh`
+**Validation cmd:** `uv run ruff format && uv run ruff check && uv run pytest && python3 scripts/check_review_markers.py && make -C native build`
+**Goal:** Stop and Flush bind command acceptance to the recorder generation rather than a reusable PID, stale cleanup cannot delete a successor record, and installer/telemetry boundaries consume one authoritative representation without evaluating operator input.
+
+- Add a stdlib-only recorder-owned Unix control server at `<data_dir>/.active/onoats-control.sock`, parameterised by the exact `PidRecord` plus async `flush` and `stop` callbacks. In both dual/supervisor and `bot-single` entrypoints, acquire the instance lock, mint the epoch, construct the record and callbacks, bind the control server, then atomically publish the PID record and running status. If either publication fails, close the server and compare-and-unlink its socket before returning failure. On shutdown, stop accepting new connections, settle already accepted commands under the command lock, close the server, compare-and-unlink the owned socket, finalise status, then exact-record-remove the PID file. The `.active` directory and socket are owner-only; descriptor/inode compare-and-unlink prevents an old generation from removing a successor socket.
+- Define a bounded newline-delimited JSON v1 protocol in `docs/control-socket-contract.md`. Every request contains a command (`flush` or `stop`) and the complete expected generation (`pid` plus `start_epoch`); absent, partial, or mismatched identity is always rejected. The server also rejects malformed/oversized/multi-message input, unsupported versions/commands, and unauthorised peers. On macOS it reads `LOCAL_PEERCRED` with `getsockopt(SOL_LOCAL, ...)`, validates the returned `xucred` layout/version, and requires `cr_uid == os.geteuid()`; unsupported or malformed peer credentials fail closed. Owner-only directory/socket modes remain defence in depth.
+- Serialize accepted commands through one recorder-loop command lock. A Flush that wins the lock completes the existing continuation rotation before acknowledgement. A Stop that wins marks graceful shutdown and sets the shutdown event before acknowledgement; duplicate Stop is idempotently acknowledged. After Stop is accepted, any later Flush is rejected as stopping. This defines the result of simultaneous Stop/Flush by lock acquisition order and keeps acknowledgement bound to the action it reports.
+- Route `onoats flush` and `onoats stop` through the control socket with the fully verified PID-file generation. There is no PID-signal fallback for a missing, legacy, or invalid socket: fail closed with an actionable incompatibility error. Keep SIGUSR1/SIGTERM handlers for direct terminal and service-manager compatibility, but do not use `os.kill(pid, signal)` in the normal CLI control path. An already-retained native `Process` handle remains valid authority for stopping an app-owned child; external native Stop/Flush use the CLI control channel and pinned data directory.
+- Make every stale PID-file removal compare the complete captured `PidRecord`, including `pid`, `cmdline`, and `start_epoch`, immediately before unlink. A same-PID successor or any unreadable/foreign/replaced record is preserved. Centralise this exact-record compare-and-unlink primitive so runtime teardown and CLI stale cleanup cannot drift.
+- Remove operator-controlled Make expansion from staged installer authority. `install_staged.py` reads dedicated environment-only inputs (`ONOATS_INSTALL_APP`, `ONOATS_INSTALL_DIR`, rollback archive/identity inputs) directly and owns defaults and derived app names. Fixed Make recipes must not expand, export, or transform operator-provided path/identity values. Document the environment interface and reject legacy Make-variable overrides where accepting them would require evaluation.
+- Make Swift telemetry validation compile and use the same shared `transcriptRunIDPattern` constant that parity tests inspect; remove duplicated run-ID grammar.
+- Add whole-space and mutation regressions for stale/successor socket paths, reconnecting to a successor with an old expected generation, missing/legacy servers, absent/partial identity, peer-credential absence/malformed version/wrong UID, oversized and malformed requests, dropped acknowledgements, simultaneous Stop/Flush in both acquisition orders, duplicate Stop, Flush-after-Stop, cleanup replacement races, and restoration of a PID-signal fallback. Use action spies plus a handler-swap mutation to prove Flush rotates only and Stop requests graceful shutdown only. Prove same-PID/new-epoch PID records survive stale cleanup.
+- Add a control-contract parity test modelled on `tests/test_audio_socket_contract_parity.py`, pinning protocol version, request and response fields, byte/message limits, peer policy, command state machine, acknowledgement points, and every documented rejection rule.
+- Add hostile installer-input regressions containing Make function syntax, command substitution syntax, whitespace, and path metacharacters. Prove no marker command executes and the exact environment bytes reach Python. Invoke every legacy Make-variable override and require failure before Python starts or installation state changes. Add Swift parity mutation coverage proving the checked pattern is the pattern used for decode validation.
+- Update `AGENTS.md`, `README.md`, `native/README.md`, and the materially superseded 20260619 stop/orphan decision record with the control-channel, exact-record-cleanup, and environment-only installer contracts. Grep sibling plans and add dated corrections only where an earlier decision is now materially stale.
+- Run the focused test, then the full validation command. Inspect explicitly staged files for secrets, PII, private transcripts, audio, credentials, and unintended binary metadata before committing. Conduct then restarts the full gauntlet from the Phase 10 boundary; signing and installation remain blocked until that gauntlet converges.
 
 ### Post-Gauntlet Release Steps (manual; not a `/conduct` phase)
 
-**Goal:** The bytes that pass smoke are exactly the bytes that are installed, and they are the post-gauntlet bytes. A failed install can only roll back to a verified prior baseline. These steps change no code; any fix goes back through the current final Phase 9 contract and the gauntlet, then re-smokes.
+**Goal:** The bytes that pass smoke are exactly the bytes that are installed, and they are the post-gauntlet bytes. A failed install can only roll back to a verified prior baseline. These steps change no code; any fix goes back through the current final Phase 10 contract and the gauntlet, then re-smokes.
 
 - After the gauntlet converges, rerun Phase 7's documentation and historic-decision audit plus deterministic recording integration and installed-smoke unit/mutation tests against the final diff, then run Ruff format/check, review-marker validation, the full pytest suite, `native/test_ui_telemetry.sh`, and `make -C native build` on the post-gauntlet tree before signing. Do not launch the real microphone/TCC smoke before signing. Run focused tests for every file the gauntlet touched. If the documentation audit changes any file, rerun the marker check and gauntlet; repeat until both code and documentation reach a fixed point.
 - Assemble and sign a staged `Onoats.app`. Verify the resource allowlist, signature, designated requirement, and canonical app identity with `make -s -C native app-tree-hash`, plus `make -C native cdhash`. Record the CLI identity: `git rev-parse HEAD` with an empty `git status --porcelain`, plus `command -v onoats`. Resolve the shim interpreter and installed distribution metadata, then run an import probe and require `Path(onoats.__file__).resolve()` to belong to this checkout before accepting the CLI identity. Before staged smoke, snapshot `config.toml` bytes and every touched Onoats `UserDefaults` key, including `cliPath` and transcript-preview visibility, and use a dedicated temporary smoke data directory. Restore and byte/value-verify all settings in a finally-style cleanup before `install-staged` and again after post-install smoke.
@@ -293,14 +317,16 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 
 - `native/onoats-menubar/Sources/OnoatsMenuBarApp.swift` — window-style scene, main-panel state, stateful template icon.
 - `native/onoats-menubar/Sources/RecorderModel.swift` — `ProcessHandle` plus `SystemOps` seams, telemetry state, authoritative active/next directories for launch/read/signal/exit, pre-PID warning detail, per-run log files and log/folder actions, stable-tag category-error detection, validated refresh integration, retained lifecycle actions.
+- `native/onoats-menubar/Sources/UiTelemetry.swift` — strict schema-v2 decoding whose run-ID validation consumes the same shared pattern pinned by parity tests.
 - `native/onoats-menubar/Sources/RecordingPanelView.swift` — compact `Oats - Organized Transcript System` identity, grouped Seminar switch, truthful activity labels, and existing lifecycle surfaces.
 - `native/onoats-menubar/Sources/ConfigStore.swift` — only if settings navigation needs an existing-key read/write helper; do not broaden it into a full TOML parser.
 - `native/onoats-menubar/Info.plist` — app icon metadata only.
-- `native/Makefile` and `native/install_staged.py` — explicit resource assembly and verification inputs (Phase 5), a canonical `app-tree-hash` producer, and failure-atomic `install-staged`/`rollback` targets that validate private snapshots before atomic exchange. `install` and `setup` stay unchanged.
+- `native/Makefile` and `native/install_staged.py` — explicit resource assembly and verification inputs (Phase 5), a canonical `app-tree-hash` producer, failure-atomic `install-staged`/`rollback` targets, and an environment-only operator-input boundary that never expands path/identity data through Make. `install` and `setup` stay unchanged.
 - `src/onoats/transports/socket_audio.py` — optional keyword-only `on_level` callback on the `UnixSocketAudioTransport` facade and its inner input transport, called after frame validation.
 - `src/onoats/dual.py` — telemetry state holder carrying `TranscriptBuffer.run_id`, publisher task created after running status and cancelled before stopped status, branch wiring through `_build_socket_transports(cfg, *, on_mic_level, on_system_level)`, STT state wiring, and owner-checked cleanup through a new keyword-only `telemetry_cleanup` callable on `_finalize_shutdown_status`.
 - `src/onoats/processors/transcript_buffer.py` — optional finalized-utterance observation hook.
 - `src/onoats/runtime.py` — backend-neutral STT state publication around service creation/preflight, and the one caller-minted run epoch: one epoch helper, `_write_pid_file` takes a required `start_epoch`, `_write_status_running` forwards `start_time`, both return success; new keyword-only `on_ready`/`on_recovering`/`on_failed` parameters on `_create_stt_service`.
+- `src/onoats/cli.py` and `src/onoats/_vendor/pid.py` — Stop/Flush control-socket client routing plus exact-record compare-and-unlink cleanup; no normal CLI PID-signal fallback.
 - `src/onoats/__main__.py` — `run_onoats` (`bot-single`) mints its own epoch and passes it to `_write_pid_file`; it builds no telemetry.
 - `src/onoats/stt/websocket_stt_service.py` — keyword-only `on_ready`, `on_recovering`, and `on_failed` callbacks without changing reconnect semantics.
 - `tests/test_socket_audio_transport.py` — callback isolation, branch identity, invalid PCM and backpressure regression coverage.
@@ -314,6 +340,7 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - `tests/test_socket_supervisor.py` — shared run epoch, identity publication order, `_finalize_shutdown_status` `telemetry_cleanup` ordering, and paired status/PID evidence.
 - `tests/test_release_meta.py` — resource, Info.plist, canonical identity, archive allocation, and failure-atomic `install-staged`/`rollback` contract matrices.
 - `tests/test_recording_integration.py` — deterministic full supervisor-to-durable-Me path plus an opt-in real-STT fixture variant.
+- `tests/test_cli.py`, `tests/test_status_file.py`, and `tests/test_socket_supervisor.py` — control-channel routing, exact-record stale cleanup, publication/teardown ordering, and no-PID-signal mutation coverage.
 - `native/installed_recording_smoke.py` — signed-app smoke with `proc_pidinfo` generation teardown, finite telemetry validation, recorder-attested run identity, bounded secret-safe JSONL reads, and durable Me proof.
 - `README.md`, `native/README.md` — user and maintainer documentation.
 - `AGENTS.md` — Leaf modules entry for `ui_telemetry.py` and the telemetry invariants.
@@ -323,6 +350,10 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 ### New Files to Create
 
 - `src/onoats/ui_telemetry.py` — stdlib-only leaf module: ephemeral schema, bounded publisher, atomic writer, tolerant reader, and owner-checked cleanup.
+- `src/onoats/control_socket.py` — stdlib-only Unix control server/client and bounded versioned protocol, with no runtime/status/dual imports.
+- `tests/test_control_socket.py` — protocol, peer permission, generation authentication, concurrency, acknowledgement, replacement, cleanup, and mutation tests.
+- `tests/test_control_socket_contract_parity.py` — parity between the versioned control contract and code constants, limits, response fields, state machine, and rejection rules.
+- `docs/control-socket-contract.md` — versioned Stop/Flush wire contract, ownership, lifecycle, limits, and compatibility behavior.
 - `tests/test_ui_telemetry.py` — contract, freshness, throttling, ownership, atomicity, permissions, failure, and cleanup tests.
 - `native/onoats-menubar/Sources/UiTelemetry.swift` — strict Swift decoding and freshness/ownership validation.
 - `native/onoats-menubar/Sources/RecordingPanelView.swift` — main recording-control panel.
@@ -370,7 +401,10 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 - **Decision (grilled):** Show a pre-PID permission-wait warning only for the matching retained app-owned supervisor. It decorates `.starting` but never establishes recorder liveness.
 - **Decision (grilled):** Carry per-branch audio-observation timestamps. Judge branch age per branch after snapshot acceptance, so one stale branch never drops the other branch or STT state. A stale branch renders as a visible greyed `No signal` row, not a hidden row, so panel height stays stable. A branch with continuing frames publishes an observation-time refresh at least every 500 ms inside the 4 Hz cap; heartbeats never advance branch age. The five-second snapshot expiry continues to govern the overall telemetry record. Producers reject, never clamp, out-of-range levels.
 - **Decision (grilled):** Permit a clean install after staged app verification when no trustworthy prior app and CLI baseline exists. Use rollback only when the prior baseline passes preflight.
-- **Decision (grilled):** Phase 9 is the last conduct-driven phase. `Review Gates: full` auto-chains the review gauntlet only after Phase 9 reaches its implementation-and-verification commit. The Post-Gauntlet Release Steps remain unnumbered and manual, so signing, staged smoke, exact-byte installation, and rollback preflight happen only after convergence.
+- **Decision (approved after gauntlet seam escalation):** Phase 10 is the last conduct-driven phase. `Review Gates: full` auto-chains the review gauntlet only after Phase 10 reaches its implementation-and-verification commit. The Post-Gauntlet Release Steps remain unnumbered and manual, so signing, staged smoke, exact-byte installation, and rollback preflight happen only after convergence.
+- **Decision (grilled and accepted after gauntlet seam escalation):** Every normal CLI Stop and Flush request uses a recorder-owned Unix control socket and carries the complete expected PID/start-epoch generation; there is no identity-free request mode. The server verifies the generation and same effective UID via Darwin `LOCAL_PEERCRED`, then acknowledges only at the command-specific acceptance point. Missing/legacy servers, absent peer credentials, and malformed or mismatched identities fail closed. Direct OS signals remain compatibility inputs, not the CLI transport. Apple's [`kill(2)` contract](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kill.2.html) targets a PID and exposes no process-generation argument, so normal CLI control never signals a PID after userspace verification.
+- **Decision (grilled and accepted after gauntlet seam escalation):** Control commands serialize through one recorder-loop lock. Flush-first completes and acknowledges rotation before Stop; Stop-first marks graceful shutdown and acknowledges before rejecting later Flush. Duplicate Stop is idempotent. Both recorder entrypoints bind the server before identity publication and close/remove it before exact-record PID teardown.
+- **Decision (approved after gauntlet seam escalation):** Stale PID cleanup compares the complete captured record immediately before unlink, and staged-installer operator values enter only through dedicated environment variables read by Python. Make never evaluates operator path or identity data.
 - **Decision (grilled):** Installed-smoke transcript authority is recorder-owned schema-v2 telemetry carrying `TranscriptBuffer.run_id`, accepted only with the exact recorder PID/start epoch. Filenames, corpus novelty, inode changes, mtime, and size are discovery or defence-in-depth hints only. Durable Me acceptance requires the telemetry-attested run ID in JSONL line 1 and a canonical Me utterance in that session.
 - **Decision (grilled):** Installed-smoke process ownership becomes immutable evidence once captured. Live app ancestry authorises discovery; exact macOS kernel process birth from `proc_pidinfo(PROC_PIDTBSDINFO)` plus PID/command/PGID/member evidence authorises teardown after the app disappears. Capture all generations immediately after ancestry proof and recheck before every signal. Second-resolution `ps lstart` is never authority.
 - **Decision (grilled):** Pre-sign validation runs deterministic recording tests and installed-smoke unit/mutation tests only. The real microphone/TCC smoke runs only after the staged app is signed, and installation copies those exact verified bytes without rebuilding or re-signing.
@@ -416,12 +450,15 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 | Transcript run attestation | `TranscriptBuffer.run_id` | UI telemetry publisher, Swift decoder, installed smoke | Required schema-v2 `transcript_run_id`; exact recorder PID/start-epoch ownership; JSONL line-1 match |
 | UI snapshot | UI telemetry publisher | Swift telemetry reader | Atomic schema-v2 JSON, 4 Hz cap, 2 s heartbeat, 5 s expiry, shared PID/epoch, mode 0600 |
 | Lifecycle state | Status/PID files | `RecorderModel` | PID identity remains authoritative; telemetry cannot change recorder state; matching pre-PID detail may decorate app-owned starting only |
+| Recorder control | Recorder-owned Unix socket | CLI Stop/Flush and external native controls | Bounded JSON v1 request; required PID/start epoch; same-UID `LOCAL_PEERCRED`; serialized command state machine; command-specific acknowledgement by the matching live generation; no PID-signal fallback |
+| Stale identity cleanup | Complete captured `PidRecord` | Runtime and CLI teardown | Compare PID, cmdline, and start epoch immediately before unlink; preserve unreadable, foreign, replaced, or same-PID successor records |
 | Recorder settings | Swift `ConfigStore` | Python config loader and CLI actions | Existing narrow TOML edits preserve unrelated content; one Start-time directory snapshot governs launch/read/signal/exit while changes apply next Start |
 | Diagnostics | Per-run app-captured log (`onoats-bot-<spawnEpoch>.log`) of the most recent app-owned run | Panel and settings | Open this process's most recent run file when present, otherwise reveal folder (newest-file scan only after relaunch); Open Log on warning surfaces only for app-owned sessions; never tail content in the popover |
 | Log output authority | Exclusively reserved append descriptor | App-owned recorder and owned Flush helpers | Every child receives a duplicate of the retained descriptor; owned Stop terminates the retained supervisor; category-tag reads use the retained sink; no writer or machine reader reopens the pathname |
 | Category-error detection | App-captured run log | `RecorderModel` | Bounded tail read, matched against the stable `ONOATS-ERROR invalid-category` tag only on a non-zero exit with no recorder PID ever published; human prose is display-only |
 | Native assets | Canonical SVG/exports | Makefile and Swift panel | Explicit filenames, template semantics, resource copy before signing |
 | Install pairing | Verified staged app hash and CLI identity (SHA, clean tree, shim metadata, import path) | Native install workflow (`install-staged`, `rollback`) | App bytes stay unchanged after smoke; rollback requires a complete prior baseline and the exact extracted-and-verified archive before installed-app removal |
+| Installer operator input | Dedicated `ONOATS_INSTALL_*` environment values | `install_staged.py` | Python owns defaults/derivation; fixed Make recipes do not expand or transform operator-controlled path/identity bytes |
 | Recording proof | Fixture-fed mic socket or signed app-owned microphone | Full recorder pipeline and session JSONL | Readiness is insufficient; acceptance requires fresh non-zero Me evidence and a durable canonical `source=me` utterance |
 | Smoke process identity | `proc_pidinfo(PROC_PIDTBSDINFO)` plus process topology | Installed-smoke teardown | Kernel `(tvsec, tvusec)` birth is signal authority; PID/command/PGID are secondary and every signal rechecks the captured generation |
 | Historic plans | Current plan | Prior decision records | Dated correction and cross-link only when a prior decision is materially superseded |
@@ -432,7 +469,8 @@ Explore facts in this plan are point-in-time contract facts. A later correction 
 graph LR
     U["User"] -->|"Start, Stop, Seminar, settings"| M["Onoats menu-bar app"]
     M -->|"owned Start and Stop"| P["Python CLI and supervisor"]
-    M -->|"identity-checked external Stop and Flush"| P
+    M -->|"generation-authenticated external Stop and Flush"| Q["Recorder control socket"]
+    Q -->|"accepted command"| P
     M <-->|"selected settings"| C["config.toml"]
     P -->|"spawn and supervise"| N["Native capturer"]
     N -->|"framed Me and Them PCM"| R["Recorder pipelines"]
@@ -465,7 +503,8 @@ sequenceDiagram
     M->>F: Poll state, warnings, health, and activity
     F-->>M: Current run-scoped snapshot
     U->>M: Stop recording
-    M->>P: SIGTERM owned process or identity-checked CLI Stop
+    M->>P: Terminate retained owned Process handle
+    M->>P: Or CLI Stop via generation-authenticated control socket
     P->>R: Drain and finalise
     R->>F: Persist final status and invalidate live telemetry
     P-->>M: Exit
@@ -483,6 +522,8 @@ sequenceDiagram
 ### Automated Test Approach
 
 - Unit-test UI telemetry schema, numeric validation, truncation, permissions, atomic replacement, throttling, freshness, owner-checking, cleanup, and fail-open writes.
+- Unit-test the control socket's byte/message bounds, peer and file permissions, expected-generation authentication, command acknowledgement, successor rejection, cleanup races, and missing/legacy-server failure. Mutations restoring PID signalling or weakening the complete-record comparison must fail.
+- Unit-test the installer environment boundary with hostile Make syntax and exact-byte paths; prove fixed recipes do not evaluate operator input. Pin Swift decoding to the shared run-ID pattern with a mutation that fails when validation duplicates the grammar.
 - Mutation-test ownership/freshness by substituting stale PID, same PID with a different start epoch, stale update time, schema drift, malformed JSON, and non-finite or out-of-range levels (`-0.0`, `0.0`, `1.0`, `1.0000001`, `inf`, `nan`; rejected, never clamped). Assert the one minted epoch is identical in PID, status, and telemetry. Assert a branch observation older than 1 second yields a per-branch `No signal` while the snapshot, the other branch, and STT state stay accepted, and that a branch emitting only rejected values for more than 1 second does too. Read the boundary verdict table from `tests/fixtures/ui_telemetry/` in both Python and Swift; it stores levels as strings because JSON cannot carry `inf`/`nan`, and the writer's `allow_nan=False` is asserted too.
 - Fake-clock changed writes, unchanged 2-second heartbeats, 4 Hz suppression, 1-second branch expiry, 5-second snapshot expiry, repeated-failure warning suppression, recovery logging, and fail-open cleanup. Assert heartbeats do not advance branch observation times, and that a constant level with continuous frames writes at least every 500 ms.
 - Exercise the menu-bar source matrix: Me/Them, socket telemetry present/absent, unsupported external capture, transcript preview enabled/disabled, and owned/external session. PortAudio and `bot-single` remain outside new telemetry scope: assert `portaudio` builds no publisher and `run_onoats` never constructs one.
@@ -543,7 +584,7 @@ sequenceDiagram
 - The menu-bar item opens a window-style panel whose dominant action is Start when stopped and Stop when running.
 - Seminar is one interaction away before Start, remains next-session-only, and displays read-only during an app-owned locked run even without telemetry. External sessions require fresh matching category telemetry or show `Category unavailable`.
 - Every existing control remains available either on the main panel or in its settings destination.
-- Owned Stop, external Stop, Flush, Quit, liveness, warnings, and drain semantics remain unchanged and covered.
+- Owned Stop, external Stop, Flush, Quit, liveness, warnings, and drain semantics remain covered. Retained app-owned Process handles may terminate their exact child; external Stop/Flush receive acceptance from the matching recorder generation over the control socket and never fall back to PID signalling.
 - Me/Them indicators use separate fresh CoreAudio/socket values with producer observation times; a branch older than one second renders a visible greyed `No signal` row, and any stale, missing, malformed, or unsupported external telemetry renders unavailable.
 - The primary combined STT row never shows green unless both menu-bar branches confirm ready; non-ready states identify unhealthy branches, and Swift rejects a published aggregate that disagrees with its branches.
 - Transcript preview is opt-in, bounded, source-labelled for Me or Them, and never leaks a previous run.
@@ -557,7 +598,7 @@ sequenceDiagram
 - The assembled clean staged app contains only allowlisted resources and passes signature verification. Staged smoke and installation use the exact same hashed app bytes and the same verified CLI identity (SHA, clean tree, shim metadata, and import path); rollback uses only the exact extracted-and-verified archive from a complete prior baseline. This run is explicitly clean-install because its Phase 1 baseline is incomplete.
 - README/native docs describe the final UI and telemetry meanings; only materially superseded historic decisions receive dated corrections.
 - After accepted review fixes, focused tests, full pytest, Ruff format/check, review-marker validation, native compile, signed-app verification, and manual smoke all pass on the final bytes.
-- Pre-merge documentation, code, security, and full review gates (the auto-chained gauntlet after Phase 9) report no unresolved findings before the Post-Gauntlet Release Steps sign anything.
+- Pre-merge documentation, code, security, and full review gates (the auto-chained gauntlet after Phase 10) report no unresolved findings before the Post-Gauntlet Release Steps sign anything.
 - The STT row shows `ready` only for the websocket backend with both branches' own handshakes confirmed; `whisper` and `deepgram` sessions show neutral grey `status not reported`.
 - A failed app-owned Start on a missing `seminars` category explains the cause and offers `Open Config`.
 - The panel visibly identifies itself as `Oats - Organized Transcript System`, uses a grouped Seminar switch, and distinguishes `Signal`, `Silent`, and stale `No signal` states.
@@ -568,8 +609,11 @@ sequenceDiagram
 - Installed-app smoke transcript proof belongs to the recorder-owned schema-v2 telemetry `transcript_run_id` and a matching JSONL first line; path movement, corpus novelty, or historical-file recovery cannot satisfy it.
 - Installed-app smoke cleanup reaches every still-matching captured recorder/group identity after app-first exit, while recycled or foreign identities remain unsignalled; kernel process birth, not second-resolution start text, is signal authority.
 - Installed-app smoke rejects non-finite or future-dated telemetry and validates its configured Me floor before launch.
+- Stop and Flush are accepted only by the recorder generation named in the request; missing, legacy, mismatched, malformed, oversized, or replaced control endpoints fail closed without signalling a PID.
+- Stale PID and control-socket cleanup preserve successor generations, including same-PID/new-epoch records and replacement sockets.
+- Staged installer paths and identities cross Make as environment data only; hostile Make syntax is never evaluated, while exact path bytes reach Python.
 
-<!-- reviewed: 2026-11-02 @ 374ee3f04b903e3ba442ffbfb9a232de58c9e6e7 -->
+<!-- reviewed: 2026-11-04 @ df6967877da5e9f61813830d0e85605c1bdc9cce -->
 
 ## Progress
 
@@ -582,6 +626,7 @@ sequenceDiagram
 - [x] Phase 7: Documentation, Historic Decision Corrections, and Pre-Gauntlet Verification
 - [x] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
 - [x] Phase 9: Run-Bound Recording Proof and Captured-Identity Teardown
+- [ ] Phase 10: Recorder-Owned Control Channel and Boundary Hardening
 
 ## Findings
 
