@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import json
 import math
 import os
@@ -21,13 +22,72 @@ from typing import NamedTuple, TypeVar
 T = TypeVar("T")
 _PROC_PIDTBSDINFO = 3
 _MAXCOMLEN = 16
-_TRANSCRIPT_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 JSONL_LINE_LIMIT = 1024 * 1024
 CONTROL_FILE_LIMIT = 64 * 1024
+TIMEOUT_DEFAULTS = {
+    "app_timeout": 15.0,
+    "recording_timeout": 120.0,
+    "activity_timeout": 120.0,
+    "stop_timeout": 120.0,
+    "transcript_timeout": 30.0,
+}
+
+
+def _load_telemetry_contract():
+    """Load constants from this checkout, never from an installed package."""
+    path = Path(__file__).resolve().parents[1] / "src/onoats/ui_telemetry_contract.py"
+    spec = importlib.util.spec_from_file_location(
+        "onoats_smoke_telemetry_contract", path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("UI telemetry contract source is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_TELEMETRY_CONTRACT = _load_telemetry_contract()
+UI_TELEMETRY_SCHEMA_VERSION = _TELEMETRY_CONTRACT.UI_TELEMETRY_SCHEMA_VERSION
+SNAPSHOT_EXPIRY_SECONDS = _TELEMETRY_CONTRACT.SNAPSHOT_EXPIRY_SECONDS
+AUDIO_OBSERVATION_EXPIRY_SECONDS = _TELEMETRY_CONTRACT.AUDIO_OBSERVATION_EXPIRY_SECONDS
+LEVEL_MIN = _TELEMETRY_CONTRACT.LEVEL_MIN
+LEVEL_MAX = _TELEMETRY_CONTRACT.LEVEL_MAX
+_TRANSCRIPT_RUN_ID_RE = re.compile(_TELEMETRY_CONTRACT.TRANSCRIPT_RUN_ID_PATTERN)
 
 
 class SmokeFailure(RuntimeError):
     """One stage of the installed recording proof failed."""
+
+
+def _invalidate_receipt(path: Path) -> None:
+    from install_staged import invalidate_smoke_receipt
+
+    invalidate_smoke_receipt(path)
+
+
+def _publish_receipt(path: Path, identity) -> None:
+    from install_staged import write_smoke_receipt
+
+    write_smoke_receipt(path, identity)
+
+
+def _positive_finite_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return value
+
+
+def _validate_timeout_arguments(args: argparse.Namespace) -> None:
+    for field, default in TIMEOUT_DEFAULTS.items():
+        value = float(getattr(args, field, default))
+        if not math.isfinite(value) or value <= 0:
+            option = field.replace("_", "-")
+            raise SmokeFailure(f"--{option} must be finite and greater than zero")
+        setattr(args, field, value)
 
 
 def _verify_release_identity(app: Path, identity_path: Path):
@@ -830,11 +890,27 @@ def _verify_signed_app(app: Path) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    _validate_timeout_arguments(args)
     if not math.isfinite(args.me_floor) or not 0.0 <= args.me_floor <= 1.0:
         raise SmokeFailure("--me-floor must be finite and inside [0.0, 1.0]")
     app = Path(args.app).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser().resolve()
     identity_path = Path(args.release_identity).expanduser().resolve()
+    receipt_path = (
+        Path(
+            getattr(
+                args,
+                "smoke_receipt",
+                identity_path.with_name(f"{identity_path.name}.smoke-receipt.json"),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+    try:
+        _invalidate_receipt(receipt_path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SmokeFailure("smoke receipt could not be invalidated") from exc
     expected_release = _verify_release_identity(app, identity_path)
     _verify_signed_app(app)
     executable = (app / "Contents/MacOS/Onoats").resolve()
@@ -890,7 +966,7 @@ def run(args: argparse.Namespace) -> None:
                 raise SmokeFailure(
                     "telemetry ownership failed: stale or external session"
                 )
-            if telemetry.get("schema") != 2:
+            if telemetry.get("schema") != UI_TELEMETRY_SCHEMA_VERSION:
                 return None
             transcript_run_id = telemetry.get("transcript_run_id")
             if (
@@ -916,14 +992,14 @@ def run(args: argparse.Namespace) -> None:
                 not all(
                     math.isfinite(value) for value in (level, observed_at, updated_at)
                 )
-                or not 0.0 <= level <= 1.0
+                or not LEVEL_MIN <= level <= LEVEL_MAX
             ):
                 return None
             snapshot_age = now - updated_at
             observation_age = now - observed_at
             if (
-                not 0.0 <= snapshot_age <= 5.0
-                or not 0.0 <= observation_age <= 1.0
+                not 0.0 <= snapshot_age <= SNAPSHOT_EXPIRY_SECONDS
+                or not 0.0 <= observation_age <= AUDIO_OBSERVATION_EXPIRY_SECONDS
                 or observed_at > updated_at
             ):
                 return None
@@ -952,9 +1028,6 @@ def run(args: argparse.Namespace) -> None:
         )
         _verify_dynamic_release_identity(app_pid, expected_release)
         _verify_release_identity(app, identity_path)
-        print(
-            "Installed recording smoke passed: app-owned Me activity and durable utterance."
-        )
     except BaseException as exc:
         primary_error = exc
         raise
@@ -975,6 +1048,13 @@ def run(args: argparse.Namespace) -> None:
             )
             if primary_error is None:
                 raise
+    try:
+        _publish_receipt(receipt_path, expected_release)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SmokeFailure("successful smoke receipt could not be published") from exc
+    print(
+        "Installed recording smoke passed: app-owned Me activity and durable utterance."
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -982,11 +1062,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--app", required=True)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--release-identity", required=True)
-    parser.add_argument("--app-timeout", type=float, default=15)
-    parser.add_argument("--recording-timeout", type=float, default=120)
-    parser.add_argument("--activity-timeout", type=float, default=120)
-    parser.add_argument("--stop-timeout", type=float, default=120)
-    parser.add_argument("--transcript-timeout", type=float, default=30)
+    parser.add_argument("--smoke-receipt", required=True)
+    parser.add_argument("--app-timeout", type=_positive_finite_float, default=15.0)
+    parser.add_argument(
+        "--recording-timeout", type=_positive_finite_float, default=120.0
+    )
+    parser.add_argument(
+        "--activity-timeout", type=_positive_finite_float, default=120.0
+    )
+    parser.add_argument("--stop-timeout", type=_positive_finite_float, default=120.0)
+    parser.add_argument(
+        "--transcript-timeout", type=_positive_finite_float, default=30.0
+    )
     parser.add_argument("--me-floor", type=float, default=0.01)
     return parser
 

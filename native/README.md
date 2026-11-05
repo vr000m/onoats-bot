@@ -231,7 +231,8 @@ that surface:
   ```sh
   python3 native/installed_recording_smoke.py \
     --app native/Onoats.app --data-dir "$SMOKE_DATA_DIR" \
-    --release-identity /tmp/onoats-release-identity.json
+    --release-identity /tmp/onoats-release-identity.json \
+    --smoke-receipt /tmp/onoats-smoke-receipt.json
   ```
 
   The smoke is interactive: speak when prompted. It passes only after fresh Me
@@ -244,6 +245,7 @@ that surface:
   ```sh
   ONOATS_INSTALL_EXPECTED_IDENTITY=<app-tree-hash-output> \
     ONOATS_INSTALL_RELEASE_IDENTITY=/tmp/onoats-release-identity.json \
+    ONOATS_INSTALL_SMOKE_RECEIPT=/tmp/onoats-smoke-receipt.json \
     ONOATS_INSTALL_ROLLBACK_APPROVED=0 \
     make -C native install-staged
   ```
@@ -266,6 +268,7 @@ root, run:
 ```sh
 ONOATS_INSTALL_EXPECTED_IDENTITY=<smoked-app-tree-hash> \
   ONOATS_INSTALL_RELEASE_IDENTITY=/tmp/onoats-release-identity.json \
+  ONOATS_INSTALL_SMOKE_RECEIPT=/tmp/onoats-smoke-receipt.json \
   ONOATS_INSTALL_ROLLBACK_APPROVED=1 \
   ONOATS_INSTALL_BASELINE_DR_HASH=<verified-sha256> \
   ONOATS_INSTALL_BASELINE_CDHASH=<verified-cdhash> \
@@ -288,9 +291,14 @@ All staged-installer operator input is environment-only data read directly by
 `ONOATS_INSTALL_EXPECTED_IDENTITY`, `ONOATS_INSTALL_ROLLBACK_APPROVED`,
 `ONOATS_INSTALL_BASELINE_DR_HASH`, `ONOATS_INSTALL_BASELINE_CDHASH`, and
 `ONOATS_INSTALL_BUNDLE_ID`, plus mandatory
-`ONOATS_INSTALL_RELEASE_IDENTITY`. `ONOATS_INSTALL_BUNDLE_ID`, when supplied,
-may only redundantly name the canonical identifier; it is rejected before any
-LaunchServices query or installation mutation otherwise.
+`ONOATS_INSTALL_RELEASE_IDENTITY` and mandatory
+`ONOATS_INSTALL_SMOKE_RECEIPT`. The smoke invalidates any prior receipt before
+launch and atomically publishes a receipt only after recording, identity
+re-verification, and cleanup succeed. The installer binds that receipt to the
+canonical release-identity digest before any LaunchServices query or mutation.
+`ONOATS_INSTALL_BUNDLE_ID`, when supplied, may only redundantly name the
+canonical identifier; it is rejected before any LaunchServices query or
+installation mutation otherwise.
 Python owns defaults and derives the app name. The former Make-variable names
 are rejected for `app-tree-hash`, `install-staged`, and `rollback`; staged
 inputs must use the `NAME=value make ...` environment-prefix form shown above.

@@ -233,8 +233,11 @@ a later status record or make rich status a prerequisite for recording.
   designated requirement, cdhash, app-tree hash, main-executable hash, and an
   independently verified CLI git identity. Smoke verifies the static identity
   before and after recording and uses Security.framework to verify the running
-  app PID's designated requirement and cdhash. A static path/signature check is
-  not dynamic running-code proof.
+  app PID's designated requirement and cdhash. The smoke invalidates any prior
+  receipt before launch and atomically publishes an identity-digest receipt only
+  after success and cleanup; staged installation requires that exact receipt
+  before mutation. A static path/signature check is not dynamic running-code
+  proof.
 - **Supported release runtimes are jointly gated.** Python 3.12 runs the full
   release suite and Python 3.13 runs the recorder contract lane; PyPI publication
   depends on both jobs.

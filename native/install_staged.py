@@ -21,6 +21,7 @@ from typing import Callable, NamedTuple
 
 
 IDENTITY_VERSION = b"onoats-app-identity-v1\0"
+SMOKE_RECEIPT_VERSION = 1
 RENAME_SWAP = 0x00000002
 LSREGISTER = Path(
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -73,6 +74,116 @@ class ReleaseIdentity(NamedTuple):
         if not identity.cli_git_identity.strip():
             raise InstallError("release identity CLI git identity is empty")
         return identity
+
+
+class SmokeReceipt(NamedTuple):
+    """Successful signed-smoke proof bound to one ReleaseIdentity digest."""
+
+    version: int
+    release_identity_sha256: str
+
+    def to_json(self) -> str:
+        return json.dumps(self._asdict(), sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, raw: str) -> "SmokeReceipt":
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise InstallError("smoke receipt is not valid JSON") from exc
+        if not isinstance(value, dict) or set(value) != set(cls._fields):
+            raise InstallError("smoke receipt fields do not match v1")
+        if (
+            type(value["version"]) is not int
+            or value["version"] != SMOKE_RECEIPT_VERSION
+        ):
+            raise InstallError("smoke receipt version is unsupported")
+        digest = value["release_identity_sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise InstallError("smoke receipt identity digest is not sha256")
+        return cls(value["version"], digest)
+
+
+def release_identity_digest(identity: ReleaseIdentity) -> str:
+    return hashlib.sha256(identity.to_json().encode("utf-8")).hexdigest()
+
+
+def _atomic_write_private(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise InstallError("smoke receipt output must be a regular non-symlink file")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise InstallError(
+                "smoke receipt output changed to an unsafe file before publication"
+            )
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def invalidate_smoke_receipt(path: Path) -> None:
+    """Atomically make any prior receipt unusable before a new smoke starts."""
+    _atomic_write_private(path, b'{"status":"in-progress"}\n')
+
+
+def write_smoke_receipt(path: Path, identity: ReleaseIdentity) -> None:
+    receipt = SmokeReceipt(SMOKE_RECEIPT_VERSION, release_identity_digest(identity))
+    _atomic_write_private(path, (receipt.to_json() + "\n").encode("utf-8"))
+
+
+def _read_smoke_receipt(path: Path) -> SmokeReceipt:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 64 * 1024:
+            raise InstallError("smoke receipt is not a bounded regular file")
+        raw = os.read(descriptor, before.st_size + 1)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    finally:
+        os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or (before.st_dev, before.st_ino, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+        or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise InstallError("smoke receipt changed while being read")
+    try:
+        return SmokeReceipt.from_json(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise InstallError("smoke receipt is not UTF-8") from exc
+
+
+def _require_smoke_receipt(path: Path, identity: ReleaseIdentity) -> SmokeReceipt:
+    receipt = _read_smoke_receipt(path)
+    if receipt.release_identity_sha256 != release_identity_digest(identity):
+        raise InstallError("smoke receipt does not match the approved release identity")
+    return receipt
 
 
 class SourceExecutableEvidence(NamedTuple):
@@ -344,6 +455,23 @@ def _cdhash(app: Path) -> str:
     raise InstallError(f"app bundle has no cdhash: {app}")
 
 
+def _make_verifier_env(
+    app: Path, *, environ: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Return the complete deny-by-default environment for resource Make."""
+    source = os.environ if environ is None else environ
+    child = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LC_ALL": "C",
+        "ONOATS_VERIFY_RESOURCES_APP": str(app),
+    }
+    # Preserve an operator-selected temporary filesystem location without
+    # forwarding unrelated application credentials or Make control variables.
+    if source.get("TMPDIR"):
+        child["TMPDIR"] = source["TMPDIR"]
+    return child
+
+
 def _verify_app(
     app: Path,
     *,
@@ -354,8 +482,7 @@ def _verify_app(
     if expected_identity is not None and identity != expected_identity.lower():
         raise InstallError("app differs from the canonical approved identity")
     if makefile_dir is not None:
-        env = os.environ.copy()
-        env["ONOATS_VERIFY_RESOURCES_APP"] = str(app)
+        env = _make_verifier_env(app)
         _run(MAKE, "-s", "verify-resources", cwd=makefile_dir, env=env)
     _run(CODESIGN, "--verify", "--deep", "--strict", str(app))
     requirement = _designated_requirement(app)
@@ -364,8 +491,7 @@ def _verify_app(
 
 def _verify_resources(app: Path, makefile_dir: Path | None) -> None:
     if makefile_dir is not None:
-        env = os.environ.copy()
-        env["ONOATS_VERIFY_RESOURCES_APP"] = str(app)
+        env = _make_verifier_env(app)
         _run(MAKE, "-s", "verify-resources", cwd=makefile_dir, env=env)
 
 
@@ -630,6 +756,10 @@ def install(args: argparse.Namespace) -> None:
         if not release_identity_path:
             raise InstallError("installation requires an approved release identity")
         expected_release = _read_release_identity(Path(release_identity_path))
+        receipt_path = getattr(args, "smoke_receipt", None)
+        if not receipt_path:
+            raise InstallError("installation requires a successful smoke receipt")
+        _require_smoke_receipt(Path(receipt_path), expected_release)
         observed_cli_identity = observed_cli_git_identity()
         observed_release = release_identity(
             staged, cli_git_identity=observed_cli_identity
@@ -816,6 +946,7 @@ def _parser() -> argparse.ArgumentParser:
     staged.add_argument("--makefile-dir", required=True)
     staged.add_argument("--bundle-id", required=True)
     staged.add_argument("--release-identity", required=True)
+    staged.add_argument("--smoke-receipt", required=True)
 
     restore = subparsers.add_parser("rollback")
     restore.add_argument("--app-name", required=True)
@@ -871,6 +1002,7 @@ def _env_install_args() -> argparse.Namespace:
         makefile_dir=str(SCRIPT_DIR),
         bundle_id=_env_value("ONOATS_INSTALL_BUNDLE_ID", BUNDLE_ID),
         release_identity=_env_value("ONOATS_INSTALL_RELEASE_IDENTITY", ""),
+        smoke_receipt=_env_value("ONOATS_INSTALL_SMOKE_RECEIPT", ""),
     )
 
 

@@ -36,7 +36,7 @@
 # environment variables consumed directly by Python.  Reject command-line and
 # override origins by NAME only, before any recipe can expand an operator value.
 ifneq ($(filter app-tree-hash install-staged rollback,$(MAKECMDGOALS)),)
-$(foreach input,ONOATS_INSTALL_APP ONOATS_INSTALL_DIR ONOATS_INSTALL_BACKUP_DIR ONOATS_INSTALL_ROLLBACK_RECORD ONOATS_INSTALL_EXPECTED_IDENTITY ONOATS_INSTALL_ROLLBACK_APPROVED ONOATS_INSTALL_BASELINE_DR_HASH ONOATS_INSTALL_BASELINE_CDHASH ONOATS_INSTALL_BUNDLE_ID,$(if $(or $(findstring command line,$(origin $(input))),$(findstring override,$(origin $(input)))),$(error staged-installer input $(input) must be supplied as an environment-prefix assignment),))
+$(foreach input,ONOATS_INSTALL_APP ONOATS_INSTALL_DIR ONOATS_INSTALL_BACKUP_DIR ONOATS_INSTALL_ROLLBACK_RECORD ONOATS_INSTALL_EXPECTED_IDENTITY ONOATS_INSTALL_ROLLBACK_APPROVED ONOATS_INSTALL_BASELINE_DR_HASH ONOATS_INSTALL_BASELINE_CDHASH ONOATS_INSTALL_BUNDLE_ID ONOATS_INSTALL_RELEASE_IDENTITY ONOATS_INSTALL_SMOKE_RECEIPT,$(if $(or $(findstring command line,$(origin $(input))),$(findstring override,$(origin $(input)))),$(error staged-installer input $(input) must be supplied as an environment-prefix assignment),))
 $(foreach legacy,APP APP_NAME INSTALL_DIR BACKUP_DIR ROLLBACK_RECORD STAGED_APP_TREE_HASH ROLLBACK_BASELINE_APPROVED ROLLBACK_BASELINE_DR_HASH ROLLBACK_BASELINE_CDHASH BUNDLE_ID,$(if $(or $(filter environment,$(origin $(legacy))),$(findstring command line,$(origin $(legacy))),$(findstring override,$(origin $(legacy)))),$(error legacy staged-installer variable $(legacy) is unsupported; use ONOATS_INSTALL_* environment variables),))
 endif
 

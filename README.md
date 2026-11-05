@@ -14,14 +14,15 @@ analysis; onoats itself stays files-only.
 
 ## Quickstart
 
-onoats installs **from source** (it is not published on PyPI). Three install
-paths, by platform and how you want to drive it:
+The Onoats CLI is published on PyPI. The native macOS menu-bar app and capturer
+are source-built and are not distributed through PyPI. Choose an install path by
+platform and how you want to drive it:
 
 | Path | One command (after clone) | Works on |
 |------|---------------------------|----------|
 | **Menu bar + native capture** (recommended) | `make -C native setup` | macOS 14.4+ |
 | **CLI + native capture** | `make -C native setup-cli` | macOS 14.4+ |
-| **CLI + PortAudio** | `uv tool install --editable .` then `onoats init` | everywhere else (Linux / Windows / Intel mac / macOS ≤ 14.3) — no native toolchain |
+| **CLI + PortAudio** | `uv tool install onoats` then `onoats init` | everywhere else (Linux / Windows / Intel mac / macOS ≤ 14.3) — no native toolchain |
 
 ### macOS 14.4+ — menu bar + native capture (recommended)
 

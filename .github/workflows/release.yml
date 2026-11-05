@@ -14,27 +14,7 @@ permissions:
 
 jobs:
   python-313-contracts:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install system deps (PortAudio for pyaudio)
-        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.13"
-      - name: Sync dependencies
-        run: uv sync --dev --python 3.13
-      - name: Supported-runtime recorder contracts
-        run: >-
-          uv run --python 3.13 pytest -q
-          tests/test_control_socket.py
-          tests/test_control_socket_contract_parity.py
-          tests/test_recorder_lifecycle.py
-          tests/test_socket_supervisor.py
-          tests/test_status_file.py
-          tests/test_stt_config_wiring.py
-          tests/test_runtime_preflight.py
+    uses: ./.github/workflows/python-313-contracts.yml
 
   build:
     runs-on: ubuntu-latest

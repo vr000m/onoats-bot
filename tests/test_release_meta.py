@@ -773,10 +773,12 @@ def _run_install_staged(
     install_dir: Path | None = None,
     bundle_id: str = "net.varunsingh.onoats",
     release_identity: Path | None = None,
+    smoke_receipt: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     staged_app_tree_hash = staged_app_tree_hash or _app_tree_hash(work / "Onoats.app")
     install_dir = install_dir or work / "installed"
     release_identity = release_identity or work / "release-identity.json"
+    smoke_receipt = smoke_receipt or work / "smoke-receipt.json"
     command = ["make", "-s", "install-staged"]
     env = os.environ.copy()
     env["HOME"] = str(work / "home")
@@ -792,6 +794,7 @@ def _run_install_staged(
             "ONOATS_INSTALL_BASELINE_CDHASH": cdhash or "",
             "ONOATS_INSTALL_BUNDLE_ID": bundle_id,
             "ONOATS_INSTALL_RELEASE_IDENTITY": str(release_identity),
+            "ONOATS_INSTALL_SMOKE_RECEIPT": str(smoke_receipt),
         }
     )
     return subprocess.run(
@@ -838,7 +841,8 @@ def _configure_test_cli_authority(work: Path) -> str:
         "/backups/\n"
         "/home/\n"
         "/installed/\n"
-        "/release-identity*.json\n",
+        "/release-identity*.json\n"
+        "/smoke-receipt*.json\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "-q"], cwd=work, check=True)
@@ -930,6 +934,7 @@ def staged_install_workflow(tmp_path: Path) -> Path:
     (tmp_path / "release-identity.json").write_text(
         identity.to_json() + "\n", encoding="utf-8"
     )
+    INSTALL_STAGED.write_smoke_receipt(tmp_path / "smoke-receipt.json", identity)
     (tmp_path / "installed").mkdir()
     return tmp_path
 
@@ -1014,6 +1019,79 @@ def test_staged_installer_never_resolves_trust_executables_through_path():
 )
 def test_staged_installer_executable_authority_table(name, expected):
     assert getattr(INSTALL_STAGED, name) == expected
+
+
+def test_make_resource_verifier_environment_is_deny_by_default(
+    tmp_path: Path, monkeypatch
+):
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "verify-resources:\n"
+        "\t@command -v sh sort find basename diff mktemp rm >/dev/null\n"
+        '\t@test -n "$$ONOATS_VERIFY_RESOURCES_APP"\n'
+        '\t@test -z "$$PLANTED_API_SECRET"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PLANTED_API_SECRET", "must-not-cross")
+    app = tmp_path / "Onoats.app"
+    app.mkdir()
+
+    INSTALL_STAGED._verify_resources(app, tmp_path)
+
+    child = INSTALL_STAGED._make_verifier_env(
+        app,
+        environ={"PLANTED_API_SECRET": "must-not-cross", "TMPDIR": str(tmp_path)},
+    )
+    assert child == {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LC_ALL": "C",
+        "ONOATS_VERIFY_RESOURCES_APP": str(app),
+        "TMPDIR": str(tmp_path),
+    }
+
+
+def test_smoke_receipt_state_space_is_atomic_and_identity_bound(
+    tmp_path: Path, monkeypatch
+):
+    identity = INSTALL_STAGED.ReleaseIdentity(
+        INSTALL_STAGED.BUNDLE_ID,
+        "identifier net.varunsingh.onoats",
+        "a" * 40,
+        "b" * 64,
+        "c" * 64,
+        "d" * 40,
+    )
+    other = identity._replace(tree_hash="e" * 64)
+    receipt_path = tmp_path / "smoke-receipt.json"
+
+    INSTALL_STAGED.write_smoke_receipt(receipt_path, identity)
+    receipt = INSTALL_STAGED._read_smoke_receipt(receipt_path)
+    assert receipt.release_identity_sha256 == INSTALL_STAGED.release_identity_digest(
+        identity
+    )
+    assert receipt.release_identity_sha256 != INSTALL_STAGED.release_identity_digest(
+        other
+    )
+    with pytest.raises(INSTALL_STAGED.InstallError, match="does not match"):
+        INSTALL_STAGED._require_smoke_receipt(receipt_path, other)
+
+    INSTALL_STAGED.invalidate_smoke_receipt(receipt_path)
+    with pytest.raises(INSTALL_STAGED.InstallError, match="fields"):
+        INSTALL_STAGED._read_smoke_receipt(receipt_path)
+
+    INSTALL_STAGED.write_smoke_receipt(receipt_path, identity)
+    replacement = tmp_path / "replacement.json"
+    INSTALL_STAGED.write_smoke_receipt(replacement, other)
+    real_read = INSTALL_STAGED.os.read
+
+    def replace_after_read(descriptor, size):
+        payload = real_read(descriptor, size)
+        os.replace(replacement, receipt_path)
+        return payload
+
+    monkeypatch.setattr(INSTALL_STAGED.os, "read", replace_after_read)
+    with pytest.raises(INSTALL_STAGED.InstallError, match="changed while being read"):
+        INSTALL_STAGED._read_smoke_receipt(receipt_path)
 
 
 def test_designated_requirement_extraction_is_path_independent_and_fail_closed():
@@ -1472,6 +1550,26 @@ def test_install_requires_every_release_identity_field_before_mutation(
     assert not (work / "installed" / "Onoats.app").exists()
 
 
+@pytest.mark.parametrize("receipt_state", ["missing", "invalidated", "wrong-identity"])
+def test_install_requires_matching_successful_smoke_receipt_before_mutation(
+    staged_install_workflow: Path, receipt_state: str
+):
+    work = staged_install_workflow
+    receipt = work / f"receipt-{receipt_state}.json"
+    identity = INSTALL_STAGED._read_release_identity(work / "release-identity.json")
+    if receipt_state == "invalidated":
+        INSTALL_STAGED.invalidate_smoke_receipt(receipt)
+    elif receipt_state == "wrong-identity":
+        INSTALL_STAGED.write_smoke_receipt(
+            receipt, identity._replace(executable_hash="f" * 64)
+        )
+
+    result = _run_install_staged(work, smoke_receipt=receipt)
+
+    assert result.returncode != 0
+    assert not (work / "installed" / "Onoats.app").exists()
+
+
 def test_release_identity_is_portable_across_a_distinct_bundle_copy(
     staged_install_workflow: Path, tmp_path: Path
 ):
@@ -1517,10 +1615,14 @@ def test_release_identity_rejects_source_path_replacement_during_snapshot(
 
 def test_release_publish_waits_for_both_supported_runtime_gates():
     workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    contracts = (REPO_ROOT / ".github/workflows/python-313-contracts.yml").read_text(
+        encoding="utf-8"
+    )
     publish = workflow.split("\n  publish:\n", 1)[1]
     assert "needs: [build, python-313-contracts]" in publish
     assert 'python-version: "3.12"' in workflow
-    assert 'python-version: "3.13"' in workflow
+    assert 'python-version: "3.13"' in contracts
+    assert "uses: ./.github/workflows/python-313-contracts.yml" in workflow
 
 
 def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
@@ -1680,6 +1782,32 @@ def test_existing_install_and_setup_contracts_are_unchanged():
     assert 'config.toml"' in setup
     assert "skipping 'onoats init'" in setup
     assert '"$$HOME/.local/bin/onoats" init' in setup
+
+
+def test_python313_contract_lane_has_one_reusable_workflow_owner():
+    workflow = REPO_ROOT / ".github/workflows/python-313-contracts.yml"
+    ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    release = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    authority = workflow.read_text(encoding="utf-8")
+    call = "uses: ./.github/workflows/python-313-contracts.yml"
+
+    assert call in ci
+    assert call in release
+    assert 'python-version: "3.13"' not in ci
+    assert 'python-version: "3.13"' not in release
+    for test_file in (
+        "test_control_socket.py",
+        "test_control_socket_contract_parity.py",
+        "test_recorder_lifecycle.py",
+        "test_socket_supervisor.py",
+        "test_status_file.py",
+        "test_stt_config_wiring.py",
+        "test_runtime_preflight.py",
+    ):
+        assert authority.count(test_file) == 1
+        assert test_file not in ci
+        assert test_file not in release
+    assert "needs: [build, python-313-contracts]" in release
 
 
 # --- diarization contract wiring (Phase 8) ---------------------------------

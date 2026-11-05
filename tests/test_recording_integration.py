@@ -72,6 +72,8 @@ def _stub_release_identity(monkeypatch):
     )
     monkeypatch.setattr(SMOKE, "_verify_release_identity", lambda *_args: expected)
     monkeypatch.setattr(SMOKE, "_verify_dynamic_release_identity", lambda *_args: None)
+    monkeypatch.setattr(SMOKE, "_invalidate_receipt", lambda *_args: None)
+    monkeypatch.setattr(SMOKE, "_publish_receipt", lambda *_args: None)
 
 
 @pytest.mark.parametrize(
@@ -330,6 +332,7 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
         "durable Me utterance": True,
     }
     cleaned = []
+    receipt_events: list[str] = []
     monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
     monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
     monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
@@ -348,6 +351,9 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
     monkeypatch.setattr(SMOKE, "_owned_descendant_groups", lambda *_args: ())
     monkeypatch.setattr(
         SMOKE, "_cleanup_after_failure", lambda *args, **kwargs: cleaned.append(kwargs)
+    )
+    monkeypatch.setattr(
+        SMOKE, "_publish_receipt", lambda *_args: receipt_events.append("published")
     )
     SMOKE.run(
         SimpleNamespace(
@@ -371,6 +377,7 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
             "groups": (),
         }
     ]
+    assert receipt_events == ["published"]
 
 
 def test_installed_smoke_app_cleanup_preserves_argument_bearing_identity(
@@ -1247,6 +1254,62 @@ def test_installed_smoke_rejects_invalid_me_floor_before_any_external_action(
             )
         )
     assert touched == []
+
+
+@pytest.mark.parametrize("field", sorted(SMOKE.TIMEOUT_DEFAULTS))
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 0.0, -0.01])
+def test_installed_smoke_rejects_every_unbounded_timeout_before_external_action(
+    tmp_path, monkeypatch, field, value
+):
+    touched: list[str] = []
+    monkeypatch.setattr(
+        SMOKE, "_invalidate_receipt", lambda *_: touched.append("receipt")
+    )
+    monkeypatch.setattr(
+        SMOKE, "_verify_signed_app", lambda *_: touched.append("verify")
+    )
+    values = dict(SMOKE.TIMEOUT_DEFAULTS)
+    values[field] = value
+    with pytest.raises(SMOKE.SmokeFailure, match="finite and greater than zero"):
+        SMOKE.run(
+            SimpleNamespace(
+                app=tmp_path / "Onoats.app",
+                data_dir=tmp_path / "data",
+                release_identity=tmp_path / "identity.json",
+                smoke_receipt=tmp_path / "receipt.json",
+                me_floor=0.01,
+                **values,
+            )
+        )
+    assert touched == []
+
+
+def test_installed_smoke_consumes_shared_telemetry_freshness_authority(
+    tmp_path, monkeypatch
+):
+    telemetry = _telemetry(
+        updated_at=999.0,
+        audio={"me": {"level": 0.5, "observed_at": 999.0}, "them": None},
+    )
+    monkeypatch.setattr(SMOKE, "SNAPSHOT_EXPIRY_SECONDS", 0.5)
+    with pytest.raises(SMOKE.SmokeFailure, match="Me activity rejected"):
+        _exercise_activity_probe(tmp_path, monkeypatch, telemetry)
+
+
+def test_native_smoke_loads_contract_from_exact_checkout_source():
+    source = SMOKE_PATH.read_text(encoding="utf-8")
+    assert (
+        'Path(__file__).resolve().parents[1] / "src/onoats/ui_telemetry_contract.py"'
+        in source
+    )
+    probe = source.split("def nonzero_me()", 1)[1].split(
+        "transcript_run_id = wait_for", 1
+    )[0]
+    assert "UI_TELEMETRY_SCHEMA_VERSION" in probe
+    assert "SNAPSHOT_EXPIRY_SECONDS" in probe
+    assert "AUDIO_OBSERVATION_EXPIRY_SECONDS" in probe
+    assert "<= 5.0" not in probe
+    assert "<= 1.0" not in probe
 
 
 def _write_stopped_status(path: Path, **overrides: object) -> None:
