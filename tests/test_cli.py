@@ -506,10 +506,9 @@ def test_flush_refuses_recycled_pid_identity_mismatch(capsys, _isolate_env):
 
 
 # ---------------------------------------------------------------------------
-# stop — behavioural twin of flush, EXCEPT it sends SIGTERM (graceful shutdown)
-# instead of SIGUSR1. The authenticated signal delivery (signal_flush_target →
-# generation + marker + cmdline fingerprint) is reused verbatim, so a recycled foreign pid is
-# never signalled — which matters MORE here because SIGTERM kills by default.
+# stop — behavioural twin of flush over the generation-authenticated recorder
+# control socket. Both share the same fail-closed identity checks, so a recycled
+# foreign pid never receives a command.
 # Every test_flush_* branch is mirrored 1:1 below.
 # ---------------------------------------------------------------------------
 

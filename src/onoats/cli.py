@@ -1590,10 +1590,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Guided first-run setup (config.toml + secrets.env).")
     sub.add_parser("bot", help="Dual-input recorder (mic + system loopback).")
     sub.add_parser("bot-single", help="Legacy single-input (mic-only) recorder.")
-    sub.add_parser("flush", help="Signal the running recorder to rotate its buffer.")
+    sub.add_parser(
+        "flush", help="Ask the running recorder to rotate its current buffer."
+    )
     sub.add_parser(
         "stop",
-        help="Signal the running recorder to stop gracefully (drain + final flush).",
+        help="Ask the running recorder to stop gracefully (drain + final flush).",
     )
     sub.add_parser("convert", help="Render pending/*.jsonl into markdown transcripts.")
     sub.add_parser("devices", help="List audio input/output devices.")

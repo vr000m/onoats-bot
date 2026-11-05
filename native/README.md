@@ -126,10 +126,10 @@ that surface:
 - **Start** runs `~/.local/bin/onoats bot` with `AUDIO_SOURCE=socket` and
   `ONOATS_CAPTURER_BIN` pointing at the embedded capturer. Override the CLI
   path with `defaults write net.varunsingh.onoats cliPath /abs/path`.
-- **Stop** SIGTERMs the supervisor it spawned (graceful drain) — never the
-  capturer directly. A verified external session routes Stop through the
-  identity-checked CLI path; Flush uses the same identity gate with its own
-  signal.
+- **Stop** asks the supervisor it spawned for a graceful drain — never the
+  capturer directly. A verified external session routes Stop and Flush through
+  the recorder-owned, generation-authenticated control socket; neither command
+  falls back to PID signalling.
 - Quit requests the same owned graceful stop during startup and recording,
   then waits for the recorder and any in-flight Flush/Stop helper to exit.
   A 15-second timeout keeps the app open with a cleanup error and retained

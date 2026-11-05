@@ -27,7 +27,6 @@ This module only owns the *read* side — the write/remove primitives live in
 from __future__ import annotations
 
 import os
-import signal
 import stat
 import subprocess
 import tempfile
@@ -228,13 +227,12 @@ def resolve_flush_target(
     expected_pid: int | None = None,
     expected_start_epoch: float | None = None,
 ) -> FlushTarget:
-    """Resolve a pid that is safe to signal for ``onoats flush``.
+    """Resolve the complete recorder generation used by the control client.
 
     Performs, in order: marker-validated parse, cmdline-fingerprint presence,
     liveness (``os.kill(pid, 0)``), and a live-vs-stored cmdline comparison
     that defends against pid recycling — a crashed recorder can leave a stale
-    pid file whose pid the kernel later reassigns to an unrelated program, and
-    SIGUSR1's default disposition would terminate it.
+    pid file whose pid the kernel later reassigns to an unrelated program.
     """
     rec = _parse_pid_file(pid_path)
     if rec is None:
@@ -303,61 +301,6 @@ def resolve_flush_target(
             record=rec,
         )
     return FlushTarget(rec.pid, record=rec)
-
-
-def signal_flush_target(
-    pid_path: Path,
-    signal_number: signal.Signals,
-    *,
-    expected_pid: int | None = None,
-    expected_start_epoch: float | None = None,
-) -> FlushTarget:
-    """Authenticate one recorder generation and deliver one signal to it.
-
-    The marker/cmdline/generation checks and signal delivery deliberately live
-    in one operation.  In particular, a captured UI identity is compared with
-    the *same* record whose process fingerprint is authenticated; callers must
-    never validate one path read and then resolve a second record as the target.
-
-    The pathname is compared with the authenticated record immediately before
-    delivery.  If the recorder removed or replaced its atomic pid record while
-    its process identity was being checked, delivery fails closed.  The
-    authenticated record remains the sole signal authority throughout.
-    """
-    target = resolve_flush_target(
-        pid_path,
-        expected_pid=expected_pid,
-        expected_start_epoch=expected_start_epoch,
-    )
-    if target.pid is None:
-        return target
-    record = target.record
-    if record is None:  # Defensive: successful resolution always carries it.
-        return FlushTarget(None, "internal recorder identity error", stale=False)
-    if _parse_pid_file(pid_path) != record:
-        return FlushTarget(
-            None,
-            "recorder identity changed during verification — refusing to signal",
-            stale=False,
-            record=record,
-        )
-    try:
-        os.kill(record.pid, signal_number)
-    except ProcessLookupError:
-        return FlushTarget(
-            None,
-            f"recorder pid {record.pid} is not running (stale pid file)",
-            stale=True,
-            record=record,
-        )
-    except OSError as exc:
-        return FlushTarget(
-            None,
-            f"could not signal pid {record.pid}: {exc}",
-            stale=False,
-            record=record,
-        )
-    return target
 
 
 def fingerprint_matches(rec: PidRecord) -> bool:
