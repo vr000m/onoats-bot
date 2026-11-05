@@ -368,11 +368,11 @@ def _owned_descendant_groups(
 
 
 def _signal_owned_group(group: OwnedProcessGroup, sig: signal.Signals) -> bool:
-    """Signal a captured group only while at least one exact member survives."""
-    if not any(_identity_matches(member) for member in group.members):
-        return False
-    os.killpg(group.pgid, sig)
-    return True
+    """Signal only exact captured members; the PGID grants no extra authority."""
+    signalled = False
+    for member in group.members:
+        signalled = _signal_identity(member, sig) or signalled
+    return signalled
 
 
 def _cleanup_groups(groups: tuple[OwnedProcessGroup, ...], timeout: float) -> None:

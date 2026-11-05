@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
 import struct
 import tempfile
 from types import SimpleNamespace
@@ -163,13 +164,15 @@ def _write_capturer_fixture(
 
 @pytest.mark.parametrize("sample", [1234, 0], ids=["speech", "silence"])
 def test_full_supervisor_socket_pipeline_requires_durable_me_speech(
-    tmp_path, monkeypatch, sample
+    tmp_path, monkeypatch, request, sample
 ):
     """Exercise supervisor→socket transports→dual pipeline→tagger→JSONL."""
     speech = struct.pack("<320h", *([sample] * 320))
     chunks = [speech] * 20 + [bytes(640)] * 25
     capturer = _write_capturer_fixture(tmp_path, chunks)
-    data_dir = tmp_path / "data"
+    short_root = Path(tempfile.mkdtemp(prefix="onoats-ri-", dir="/private/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(short_root, ignore_errors=True))
+    data_dir = short_root / "data"
     monkeypatch.setenv("AUDIO_SOURCE", "socket")
     monkeypatch.setenv("ONOATS_DATA_DIR", str(data_dir))
     monkeypatch.setenv("ONOATS_CAPTURER_BIN", str(capturer))
@@ -512,14 +515,12 @@ def test_installed_smoke_group_cleanup_survives_reaped_leader_and_rejects_reuse(
     monkeypatch.setattr(SMOKE, "_processes", lambda: dict(processes))
     births = {5002: member_birth}
     monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
-    monkeypatch.setattr(
-        SMOKE.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
-    )
+    monkeypatch.setattr(SMOKE.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
     assert SMOKE._signal_owned_group(group, signal.SIGKILL) is True
     processes[5002] = SMOKE.ProcessRow(1, 5001, "reused-start", "/capturer/helper")
     births[5002] = _birth(50, 61)
     assert SMOKE._signal_owned_group(group, signal.SIGKILL) is False
-    assert signalled == [(5001, signal.SIGKILL)]
+    assert signalled == [(5002, signal.SIGKILL)]
 
 
 @pytest.mark.parametrize("app_state", ["live", "gone", "recycled"])
@@ -562,24 +563,15 @@ def test_installed_smoke_captured_identity_cleanup_whole_state_space(
     )
     groups = (SMOKE.OwnedProcessGroup(5001, (member,)),)
     pid_signals: list[tuple[int, signal.Signals]] = []
-    group_signals: list[tuple[int, signal.Signals]] = []
 
     def kill(pid, sig):
         pid_signals.append((pid, sig))
         rows.pop(pid, None)
         births.pop(pid, None)
 
-    def killpg(pgid, sig):
-        group_signals.append((pgid, sig))
-        for pid, row in list(rows.items()):
-            if row.pgid == pgid:
-                rows.pop(pid)
-                births.pop(pid, None)
-
     monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
     monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
     monkeypatch.setattr(SMOKE.os, "kill", kill)
-    monkeypatch.setattr(SMOKE.os, "killpg", killpg)
     SMOKE._cleanup_after_failure(
         app,
         app_identity=_app_identity(app, start="same-second", process_birth=app_birth),
@@ -592,8 +584,8 @@ def test_installed_smoke_captured_identity_cleanup_whole_state_space(
 
     assert ((4321, signal.SIGTERM) in pid_signals) is (recorder_state == "live")
     assert ((1234, signal.SIGTERM) in pid_signals) is (app_state == "live")
-    assert ((5001, signal.SIGTERM) in group_signals) is (group_state == "live")
-    assert all(pid in {1234, 4321} for pid, _sig in pid_signals)
+    assert ((5002, signal.SIGTERM) in pid_signals) is (group_state == "live")
+    assert all(pid in {1234, 4321, 5002} for pid, _sig in pid_signals)
 
 
 def test_installed_smoke_rechecks_kernel_birth_before_each_group_signal(monkeypatch):
@@ -610,17 +602,56 @@ def test_installed_smoke_rechecks_kernel_birth_before_each_group_signal(monkeypa
     rows = {5002: SMOKE.ProcessRow(1, 5001, "same-second", "/capturer/helper")}
     signalled = []
 
-    def killpg(pgid, sig):
-        signalled.append((pgid, sig))
+    def kill(pid, sig):
+        signalled.append((pid, sig))
         births[5002] = _birth(40, 401)
 
     monkeypatch.setattr(SMOKE, "_processes", lambda: rows)
     monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
-    monkeypatch.setattr(SMOKE.os, "killpg", killpg)
+    monkeypatch.setattr(SMOKE.os, "kill", kill)
 
     assert SMOKE._signal_owned_group(group, signal.SIGTERM) is True
     assert SMOKE._signal_owned_group(group, signal.SIGKILL) is False
-    assert signalled == [(5001, signal.SIGTERM)]
+    assert signalled == [(5002, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("captured_state", ["live", "gone", "recycled"])
+@pytest.mark.parametrize("foreign_member_present", [False, True])
+def test_installed_smoke_group_cleanup_signals_only_exact_captured_members(
+    monkeypatch, captured_state, foreign_member_present
+):
+    captured_birth = _birth(70, 700)
+    member = SMOKE.ProcessIdentity(
+        pid=5002,
+        pgid=5001,
+        start="captured-start",
+        command="/capturer/helper",
+        process_birth=captured_birth,
+    )
+    group = SMOKE.OwnedProcessGroup(5001, (member,))
+    rows = {}
+    births = {}
+    if captured_state != "gone":
+        rows[5002] = SMOKE.ProcessRow(1, 5001, "captured-start", "/capturer/helper")
+        births[5002] = captured_birth if captured_state == "live" else _birth(70, 701)
+    if foreign_member_present:
+        rows[5999] = SMOKE.ProcessRow(1, 5001, "foreign-start", "/foreign/helper")
+        births[5999] = _birth(80, 800)
+    signals = []
+
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
+    monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(SMOKE.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(
+        SMOKE.os,
+        "killpg",
+        lambda *_args: pytest.fail("group-wide signalling exceeds captured authority"),
+    )
+
+    assert SMOKE._signal_owned_group(group, signal.SIGTERM) is (
+        captured_state == "live"
+    )
+    assert signals == ([(5002, signal.SIGTERM)] if captured_state == "live" else [])
 
 
 def test_installed_smoke_cleanup_attempts_recorder_groups_and_app_independently(
@@ -644,14 +675,9 @@ def test_installed_smoke_cleanup_attempts_recorder_groups_and_app_independently(
         attempted.append(("pid", pid))
         raise PermissionError(f"pid-{pid}")
 
-    def killpg(pgid, _sig):
-        attempted.append(("group", pgid))
-        raise PermissionError(f"group-{pgid}")
-
     monkeypatch.setattr(SMOKE, "_processes", lambda: rows)
     monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
     monkeypatch.setattr(SMOKE.os, "kill", kill)
-    monkeypatch.setattr(SMOKE.os, "killpg", killpg)
     group = SMOKE.OwnedProcessGroup(
         5001,
         (
@@ -675,10 +701,10 @@ def test_installed_smoke_cleanup_attempts_recorder_groups_and_app_independently(
             groups=(group,),
             timeout=0.01,
         )
-    assert {("pid", 4321), ("group", 5001), ("pid", 1234)} <= set(attempted)
+    assert {("pid", 4321), ("pid", 5002), ("pid", 1234)} <= set(attempted)
     message = str(raised.value)
     assert "pid-4321" in message
-    assert "group-5001" in message
+    assert "pid-5002" in message
     assert "pid-1234" in message
 
 
