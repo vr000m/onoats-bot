@@ -648,6 +648,7 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
     permission_event = asyncio.Event()
     rc = 0
     startup_cancelled = False
+    teardown_failed = False
     sock_dir = tempfile.mkdtemp(prefix="onoats-sock-")
     try:
         os.chmod(sock_dir, 0o700)
@@ -822,14 +823,8 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
         if capturer_proc is not None:
             teardown_ok = await _stop_capturer(capturer_proc, logger)
             if not teardown_ok:
+                teardown_failed = True
                 rc = 1
-                if startup_cancelled:
-                    # The outer startup-signal owner normally maps cancellation
-                    # to rc=0. A surviving capturer group is stronger evidence:
-                    # teardown failed and must remain fail-loud.
-                    raise CapturerTeardownError(
-                        "capturer process group survived bounded teardown"
-                    )
         if stderr_task is not None:
             # The capturer group is gone, so the pipe's EOF is imminent — give
             # the reader a bounded grace to consume it (flushing any final
@@ -854,6 +849,13 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = prior
+        if startup_cancelled and teardown_failed:
+            # The outer startup-signal owner normally maps cancellation to rc=0.
+            # A surviving capturer group is stronger evidence, but report it only
+            # after every owned resource and process-global override is cleaned.
+            raise CapturerTeardownError(
+                "capturer process group survived bounded teardown"
+            )
 
     return rc
 

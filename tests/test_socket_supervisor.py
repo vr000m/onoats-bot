@@ -2884,6 +2884,21 @@ def test_supervisor_return_code_includes_teardown_whole_state_space(
 
 def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monkeypatch):
     """Startup cancellation cannot mask a capturer group that survives teardown."""
+    import tempfile as _tempfile
+
+    socket_keys = (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    )
+    prior = {key: os.environ.get(key) for key in socket_keys}
+    minted: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def mint(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        minted.append(path)
+        return path
 
     class EmptyStderr:
         async def readline(self):
@@ -2906,12 +2921,15 @@ def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monke
     async def teardown_failed(*_args, **_kwargs):
         return False
 
+    monkeypatch.setattr(_tempfile, "mkdtemp", mint)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
     monkeypatch.setattr(cli, "_run_recorder_with_capturer", cancel)
     monkeypatch.setattr(cli, "_stop_capturer", teardown_failed)
 
     assert _run_supervisor_bounded([]) == 1
+    assert minted and all(not Path(path).exists() for path in minted)
+    assert {key: os.environ.get(key) for key in socket_keys} == prior
 
 
 def test_diarization_flag_off_never_calls_preflight_in_supervisor(sup_env, monkeypatch):
