@@ -845,6 +845,24 @@ sequenceDiagram
   helper. Launchd reported it running and TCP port 9865 was reachable after the
   bootstrap. Focused recovery/config/preflight coverage passed (160 tests).
 
+### 2026-11-04: Gauntlet round 2 boundary redesigns
+
+- Control endpoint ownership now starts at a private bind and reaches the public
+  pathname through an exclusive no-replace rename. Python 3.13 automatic socket
+  cleanup is disabled by runtime-version contract, and cleanup uses exclusive
+  restoration so no raced pathname can become owned or be deleted as a successor.
+- Installed-smoke failure cleanup now applies one complete TERM, bounded wait,
+  KILL, final bounded wait contract to the recorder, every exact captured group
+  member, and the app. Gone and recycled identities remain non-targets; survivors
+  and independent cleanup errors are aggregated and fail the smoke.
+- The staged installer passes bundle paths to resource verification only as
+  child environment data consumed by the recipe shell. Operator paths no longer
+  enter Make command-line assignments or Make expansion.
+- Dual recording and `bot-single` each load one immutable session config and pass
+  it to STT construction. Dual telemetry plus both STT arms therefore select one
+  backend even if the config changes during startup; direct helper calls retain
+  the deliberate load-on-call boundary.
+
 ## Final Results
 
 ### Summary
