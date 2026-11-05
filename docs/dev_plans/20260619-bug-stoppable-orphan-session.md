@@ -558,6 +558,18 @@ shutdown is marked. There is no PID-signal fallback. Direct SIGTERM/SIGUSR1 rema
 compatibility inputs outside the CLI command path. PID cleanup now compares PID,
 cmdline, and start epoch so a same-PID successor record cannot be removed.
 
+### 2026-11-05 correction — one lifecycle authority behind every adapter
+
+Phase 11 of
+[`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+supersedes the Phase 10 description of a control-server command lock. The
+stdlib-only `RecorderLifecycleController` now owns the one async lock, lifecycle
+state, shutdown event, continuation rotation, and terminal rotation for both
+recorder entrypoints. Control requests and direct SIGUSR1/SIGINT/SIGTERM handlers
+only adapt intent into that controller, so Stop or terminal admission closes
+Flush admission regardless of which boundary delivered it. Generation-authenticated
+control and exact-record cleanup described above remain unchanged.
+
 ## Final Results
 
 [Fill when complete]

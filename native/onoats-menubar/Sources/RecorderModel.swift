@@ -490,7 +490,13 @@ final class RecorderModel: ObservableObject {
     private var telemetryPoll: PollHandle?
     private var stopRequestedForPid: Int32?
     private var stopRequestedForStartEpoch: Double?
-    private var fingerprintCache: [Int32: (match: Bool, at: Date)] = [:]
+    private struct RecorderGeneration: Hashable {
+        let pid: Int32
+        let command: String
+        let startEpoch: Double
+    }
+    private var fingerprintCache: [RecorderGeneration: (match: Bool, at: Date)] = [:]
+    private var ownedRecorderGeneration: RecorderGeneration?
     private let fingerprintTTL: TimeInterval = 30
 
     private struct TelemetryAuthority: Equatable {
@@ -590,16 +596,22 @@ final class RecorderModel: ObservableObject {
                 lines.count >= 4 ? (Double(lines[3]) ?? 0) : 0)
     }
 
-    private func processAlive(_ pid: Int32, storedCmdline: String) -> Bool {
-        guard ops.processIsAlive(pid) else {
-            fingerprintCache[pid] = nil
+    private func processAlive(
+        _ pid: Int32, storedCmdline: String, startEpoch: Double
+    ) -> Bool {
+        guard !storedCmdline.isEmpty, startEpoch.isFinite, startEpoch > 0 else {
             return false
         }
-        if storedCmdline.isEmpty { return true }
-        if let cached = fingerprintCache[pid],
+        let generation = RecorderGeneration(
+            pid: pid, command: storedCmdline, startEpoch: startEpoch)
+        guard ops.processIsAlive(pid) else {
+            fingerprintCache[generation] = nil
+            return false
+        }
+        if let cached = fingerprintCache[generation],
            ops.now().timeIntervalSince(cached.at) < fingerprintTTL { return cached.match }
         let match = ops.commandLine(pid) == storedCmdline
-        fingerprintCache[pid] = (match, ops.now())
+        fingerprintCache[generation] = (match, ops.now())
         return match
     }
 
@@ -621,7 +633,9 @@ final class RecorderModel: ObservableObject {
         refreshDirectoryDisplays(configured: configured)
         let status = readStatus(under: directory)
         let pid = readPid(under: directory)
-        let alive = pid.map { processAlive($0.pid, storedCmdline: $0.cmdline) } ?? false
+        let alive = pid.map {
+            processAlive($0.pid, storedCmdline: $0.cmdline, startEpoch: $0.startEpoch)
+        } ?? false
         if proc == nil, alive, activeDataDir == nil {
             activeDataDir = directory
             activeDataDirDisplay = displayPath(directory)
@@ -654,6 +668,10 @@ final class RecorderModel: ObservableObject {
         if let handle = proc, handle.isRunning {
             if ownedPublication {
                 ownedRecorderPidWasPublished = true
+                if let pid {
+                    ownedRecorderGeneration = RecorderGeneration(
+                        pid: pid.pid, command: pid.cmdline, startEpoch: pid.startEpoch)
+                }
                 prestartDetail = nil
                 if case .stopping = state {} else { state = .running(ours: true) }
             } else {
@@ -738,6 +756,7 @@ final class RecorderModel: ObservableObject {
         seminarConfigurationFailure = false
         lastFailureWasAppOwned = false
         ownedRecorderPidWasPublished = false
+        ownedRecorderGeneration = nil
         setTelemetryAuthority(nil)
         let pinned = dataDirResolver()
         activeDataDir = pinned
@@ -899,17 +918,20 @@ final class RecorderModel: ObservableObject {
         guard let owned = proc, owned === handle else { return }
         defer { finishQuitIfReady() }
         let directory = activeDataDir
-        let knownEpoch = telemetryAuthority?.startEpoch
+        let knownGeneration = ownedRecorderGeneration
         prestartDetail = nil
         setTelemetryAuthority(nil)
-        if userRequestedStop || handle.terminationStatus == 0 {
+        if handle.terminationStatus == 0 {
             state = .stopped
         } else {
             var status = directory.flatMap { readStatus(under: $0) }
             if let value = status {
-                if value.pid != handle.pid || spawnedAt == nil
+                if knownGeneration == nil
+                    || knownGeneration!.pid != handle.pid
+                    || knownGeneration!.command.isEmpty
+                    || value.pid != knownGeneration!.pid || spawnedAt == nil
                     || value.start_time < spawnedAt!.timeIntervalSince1970
-                    || (knownEpoch != nil && value.start_time != knownEpoch!) {
+                    || value.start_time != knownGeneration!.startEpoch {
                     status = nil
                 }
             }
@@ -923,6 +945,7 @@ final class RecorderModel: ObservableObject {
                 && runLogTailContainsInvalidCategoryTag()
         }
         userRequestedStop = false
+        ownedRecorderGeneration = nil
         seminarMode = false
         proc = nil
         runLogFinishing = true
@@ -939,9 +962,12 @@ final class RecorderModel: ObservableObject {
         handle: ProcessHandle, directory: URL?
     ) -> Bool {
         guard let directory, let attempt = spawnedAt,
+              let generation = ownedRecorderGeneration,
+              generation.pid == handle.pid, !generation.command.isEmpty,
               let status = readStatus(under: directory)
         else { return false }
-        return status.pid == handle.pid
+        return status.pid == generation.pid
+            && status.start_time == generation.startEpoch
             && status.start_time >= attempt.timeIntervalSince1970
             && !status.stt_label.isEmpty
     }

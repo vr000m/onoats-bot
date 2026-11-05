@@ -408,6 +408,37 @@ private func testPollingDiscipline(_ root: URL) throws {
 }
 
 @MainActor
+private func testGenerationCacheRequiresPidCommandAndPositiveEpoch(_ root: URL) throws {
+    let directory = root.appendingPathComponent("generation-cache")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.generation-cache",
+        directory: DirectoryChoice(directory))
+
+    putPid(ops, directory: directory, pid: 88, epoch: 40, command: "onoats bot --one")
+    model.refresh()
+    let firstReads = ops.commandLineCount
+    try require(model.state == .running(ours: false), "complete generation was rejected")
+
+    putPid(ops, directory: directory, pid: 88, epoch: 40, command: "onoats bot --two")
+    model.refresh()
+    try require(ops.commandLineCount == firstReads + 1,
+                "same-PID new-command generation reused a stale cache entry")
+
+    putPid(ops, directory: directory, pid: 88, epoch: 41, command: "onoats bot --two")
+    model.refresh()
+    try require(ops.commandLineCount == firstReads + 2,
+                "same-PID new-epoch generation reused a stale cache entry")
+
+    putPid(ops, directory: directory, pid: 88, epoch: 0, command: "onoats bot --two")
+    model.refresh()
+    try require(model.state == .stopped, "zero-epoch generation was accepted")
+    putPid(ops, directory: directory, pid: 88, epoch: 42, command: "")
+    model.refresh()
+    try require(model.state == .stopped, "missing-command generation was accepted")
+}
+
+@MainActor
 private func testModelDeallocation(_ root: URL) throws {
     let ops = FakeSystemOps()
     weak var completed: RecorderModel?
@@ -1034,8 +1065,8 @@ private func testInvalidCategoryStableTagMatrix(_ root: URL) throws {
         root, suite: "onoats.harness.invalid-tag-publish-exit-race", exit: 2,
         contents: tag, publication: "current", refreshAfterPublication: false,
         removePidBeforeExit: true)
-    try require(!publishedThenExited.seminarConfigurationFailure,
-                "recorder status was missed after teardown removed its PID before the exit callback")
+    try require(publishedThenExited.seminarConfigurationFailure,
+                "status without a stored command-bearing generation suppressed a pre-PID failure")
 
     let (stalePublication, _) = try invalidCategoryCase(
         root, suite: "onoats.harness.invalid-tag-stale-publication", exit: 2,
@@ -1113,7 +1144,10 @@ private func testExitDiagnosticIdentityStateSpace(_ root: URL) throws {
             record["last_error"] = "owned-detail"
             try ops.putJSON(record, active(root, "onoats.status.json"))
             ops.finish(handle, status: 1)
-            let accepted = matchingPid && (published ? offset == 0 : offset >= 0)
+            // Exit diagnostics require the complete stored generation.  A
+            // status record alone cannot substitute for the PID-file command
+            // fingerprint captured while the owned recorder was alive.
+            let accepted = published && matchingPid && offset == 0
             try require(model.state == .failed(
                 reason: accepted ? "owned-diagnostic" : "exit code 1",
                 detail: accepted ? "owned-detail" : nil),
@@ -1213,12 +1247,14 @@ struct RecorderModelHarness {
         try testInvalidCategoryStableTagMatrix(root)
         try testRunLogCollisionReservesFreshPath(home)
         try testPollingDiscipline(root)
+        try testGenerationCacheRequiresPidCommandAndPositiveEpoch(root)
         try testModelDeallocation(root)
         for suite in [
             "onoats.harness.directory", "onoats.harness.publication-association",
             "onoats.harness.external", "onoats.harness.prestart",
             "onoats.harness.prestart-publication", "onoats.harness.telemetry",
             "onoats.harness.polling", "onoats.harness.deallocation-complete",
+            "onoats.harness.generation-cache",
             "onoats.harness.deallocation-failed",
             "onoats.harness.panel-telemetry", "onoats.harness.owned-seminar",
             "onoats.harness.missing-cli", "onoats.harness.logs",

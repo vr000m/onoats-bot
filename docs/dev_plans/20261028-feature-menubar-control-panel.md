@@ -679,7 +679,7 @@ sequenceDiagram
 - [x] Phase 8: Contract Redesign, Panel Refinement, and Recording Proof
 - [x] Phase 9: Run-Bound Recording Proof and Captured-Identity Teardown
 - [x] Phase 10: Recorder-Owned Control Channel and Boundary Hardening
-- [ ] Phase 11: Unified Recorder Lifecycle Authority and Release Identity Closure
+- [x] Phase 11: Unified Recorder Lifecycle Authority and Release Identity Closure
 
 ## Findings
 

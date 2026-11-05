@@ -133,6 +133,14 @@ terminals and service managers. See `docs/control-socket-contract.md`.
 
 Load-bearing invariants (pinned by `tests/test_cli.py`):
 
+- **One lifecycle owner.** `RecorderLifecycleController` is the sole session
+  state machine for both recorder entrypoints. Control requests, SIGUSR1,
+  SIGINT/SIGTERM, and pipeline-finally paths are adapters into its one async
+  lock; they do not set the shutdown event or rotate buffers independently. A
+  Flush admitted first completes its continuation rotation before Stop; once
+  Stop or terminal rotation is admitted, every later Flush is rejected. The
+  second termination signal retains the force-exit escape without reopening
+  lifecycle admission.
 - **Never target an unverified, replaced, or recycled generation.** The CLI
   verifies one complete PID record, then sends that record's PID/start epoch to
   the socket. A missing, legacy, replaced endpoint or dropped acknowledgement
@@ -197,6 +205,44 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   so the guard protects the CLI/scripted path. A leftover invalid pid file is
   self-healing: `status` reports no valid recorder and the next start atomically
   replaces it.
+
+Running-status publication is a fail-open display boundary after the fail-loud
+PID/control authority has been published. If the initial running-status write
+raises `OSError` or returns false, the recorder logs one redacted warning,
+creates no UI telemetry publisher for that run, and continues capture, STT,
+control, transcript persistence, and cleanup with unchanged return semantics.
+The owned process exit and run log are then the failure authority; do not invent
+a later status record or make rich status a prerequisite for recording.
+
+## Per-run configuration and native/release identity
+
+- **One immutable recorder configuration per Start.** Both entrypoints capture
+  `RecorderSessionConfig` once after the instance lock and initial config read.
+  STT construction for both arms, banner/display text, telemetry, diarization
+  preflight, reconnect/kickstart authority, and shutdown RSS diagnostics consume
+  that same snapshot. Recorder paths must not reload configuration on demand;
+  only explicitly standalone diagnostics may omit the snapshot.
+- **Native caches are generation-complete.** Menu-bar liveness cache keys contain
+  PID, the stored command fingerprint, and a positive start epoch. Missing or
+  malformed epochs and changed commands/epochs invalidate the entry. An owned
+  process exit is clean only at status `0`; a requested Stop never masks a
+  non-zero exit, and status diagnostics are accepted only from the matching
+  generation, spawn floor, and active data directory.
+- **One mandatory release identity.** Staged installation and signed-app smoke
+  consume the same immutable `ReleaseIdentity`: canonical bundle identifier,
+  designated requirement, cdhash, app-tree hash, main-executable hash, and an
+  independently verified CLI git identity. Smoke verifies the static identity
+  before and after recording and uses Security.framework to verify the running
+  app PID's designated requirement and cdhash. A static path/signature check is
+  not dynamic running-code proof.
+- **Supported release runtimes are jointly gated.** Python 3.12 runs the full
+  release suite and Python 3.13 runs the recorder contract lane; PyPI publication
+  depends on both jobs.
+- **macOS signal delivery has one accepted residual race.** Installed-smoke
+  cleanup rechecks `proc_pidinfo` birth identity plus secondary evidence
+  immediately before TERM/KILL, but userspace cannot make that check and signal
+  delivery generation-atomic. Do not describe the check-to-signal race as
+  eliminated.
 
 ## Reviewing a subprocess / process-boundary change
 

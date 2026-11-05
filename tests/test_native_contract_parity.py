@@ -651,10 +651,28 @@ def test_ui_telemetry_contract_matches_swift():
 
     assert py.UI_TELEMETRY_SCHEMA_VERSION == 2
     assert re.search(r"let\s+transcriptRunID:\s*String", swift)
-    required = re.search(
-        r'required:\s*\[([^\]]*"transcript_run_id"[^\]]*)\]', swift, re.DOTALL
-    )
-    assert required, "schema-v2 transcript_run_id must be a required exact-shape key"
+    field_sets = {
+        "rootRequiredFields": py.ROOT_REQUIRED_FIELDS,
+        "rootOptionalFields": py.ROOT_OPTIONAL_FIELDS,
+        "audioFields": py.AUDIO_FIELDS,
+        "sttFields": py.STT_FIELDS,
+        "sttBranchRequiredFields": py.STT_BRANCH_REQUIRED_FIELDS,
+        "sttBranchOptionalFields": py.STT_BRANCH_OPTIONAL_FIELDS,
+        "transcriptRequiredFields": py.TRANSCRIPT_REQUIRED_FIELDS,
+        "transcriptOptionalFields": py.TRANSCRIPT_OPTIONAL_FIELDS,
+    }
+    for name, expected in field_sets.items():
+        declaration = re.search(
+            rf"(?:static\s+)?let\s+{name}\s*:\s*Set<String>\s*=\s*\[([^\]]*)\]",
+            swift,
+            re.DOTALL,
+        )
+        assert declaration, f"UiTelemetry.swift missing {name}"
+        assert set(re.findall(r'"([^"]+)"', declaration.group(1))) == set(expected)
+        assert swift.count(f"UiTelemetryContract.{name}") >= 1, (
+            f"Swift decoder does not enforce parity-checked {name}"
+        )
+    assert "transcript_run_id" in py.ROOT_REQUIRED_FIELDS
     assert re.search(r"let\s+transcript_run_id:\s*String", swift)
     run_id_pattern = re.search(
         r'(?:static\s+)?let\s+transcriptRunIDPattern\s*(?::[^=]+)?=\s*"([^"]+)"',

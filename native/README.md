@@ -129,7 +129,9 @@ that surface:
 - **Stop** asks the supervisor it spawned for a graceful drain — never the
   capturer directly. A verified external session routes Stop and Flush through
   the recorder-owned, generation-authenticated control socket; neither command
-  falls back to PID signalling.
+  falls back to PID signalling. Control requests and direct compatibility
+  signals enter one Python `RecorderLifecycleController`; the control server and
+  signal handlers are adapters, not independent locks or rotation owners.
 - Quit requests the same owned graceful stop during startup and recording,
   then waits for the recorder and any in-flight Flush/Stop helper to exit.
   A 15-second timeout keeps the app open with a cleanup error and retained
@@ -147,7 +149,19 @@ that surface:
   numeric, and aggregate mismatches; missing telemetry degrades the panel and
   never changes recorder liveness or success. Snapshot writes and cleanup use
   one daemon I/O worker with bounded coalescing, so a slow data volume cannot
-  block capture or app-requested recorder shutdown.
+  block capture or app-requested recorder shutdown. If initial running-status
+  publication fails after PID/control publication, recording and control remain
+  live, UI telemetry is disabled for that run, and the app derives the result
+  from the owned process exit and run log.
+- Native liveness caches use the complete recorder generation: PID, stored
+  command fingerprint, and positive start epoch. Incomplete or changed
+  generations miss the cache. A requested Stop does not turn a non-zero owned
+  process exit into success; diagnostic status is consumed only when its
+  generation, spawn floor, and active directory match.
+- The recorder captures one immutable `RecorderSessionConfig` per Start. Both
+  STT arms, banner, telemetry, recovery/kickstart policy, diarization, and
+  shutdown diagnostics retain that snapshot until exit; configuration edits
+  are next-session changes.
 - Data dir resolves from `~/.config/onoats/config.toml` `[storage].data_dir`,
   else `~/.local/share/onoats` (a GUI app sees no shell env, so
   `ONOATS_DATA_DIR`/XDG exports don't apply here). The model snapshots this path
@@ -197,16 +211,39 @@ that surface:
   ```sh
   SMOKE_DATA_DIR="$(mktemp -d)"
   trap 'rm -rf "$SMOKE_DATA_DIR"' EXIT
+  ```
+
+  First create the mandatory release identity from the signed staged bundle and
+  the clean CLI checkout revision:
+
+  ```sh
+  python3 native/install_staged.py release-identity native/Onoats.app \
+    --cli-git-identity "$(git rev-parse HEAD)" \
+    --output /tmp/onoats-release-identity.json
+  ```
+
+  Pass that same immutable record to smoke. It contains the canonical bundle
+  identifier, designated requirement, cdhash, tree hash, main-executable hash,
+  and CLI git identity. The smoke re-derives it before and after recording and
+  verifies the running app PID's designated requirement and cdhash through
+  Security.framework; static path/signature checks alone are insufficient.
+
+  ```sh
   python3 native/installed_recording_smoke.py \
-    --app native/Onoats.app --data-dir "$SMOKE_DATA_DIR"
+    --app native/Onoats.app --data-dir "$SMOKE_DATA_DIR" \
+    --release-identity /tmp/onoats-release-identity.json
   ```
 
   The smoke is interactive: speak when prompted. It passes only after fresh Me
-  telemetry and a durable Me utterance from the attested recorder run. For an
-  explicit clean install from the repository root, run:
+  telemetry and a durable Me utterance from the attested recorder run. Its
+  TERM/KILL cleanup rechecks the captured macOS process birth immediately before
+  delivery, but the userspace check and signal are not generation-atomic; that
+  residual race is accepted. For an explicit clean install from the repository
+  root, run:
 
   ```sh
   ONOATS_INSTALL_EXPECTED_IDENTITY=<app-tree-hash-output> \
+    ONOATS_INSTALL_RELEASE_IDENTITY=/tmp/onoats-release-identity.json \
     ONOATS_INSTALL_ROLLBACK_APPROVED=0 \
     make -C native install-staged
   ```
@@ -228,6 +265,7 @@ root, run:
 
 ```sh
 ONOATS_INSTALL_EXPECTED_IDENTITY=<smoked-app-tree-hash> \
+  ONOATS_INSTALL_RELEASE_IDENTITY=/tmp/onoats-release-identity.json \
   ONOATS_INSTALL_ROLLBACK_APPROVED=1 \
   ONOATS_INSTALL_BASELINE_DR_HASH=<verified-sha256> \
   ONOATS_INSTALL_BASELINE_CDHASH=<verified-cdhash> \
@@ -249,11 +287,17 @@ All staged-installer operator input is environment-only data read directly by
 `ONOATS_INSTALL_BACKUP_DIR`, `ONOATS_INSTALL_ROLLBACK_RECORD`,
 `ONOATS_INSTALL_EXPECTED_IDENTITY`, `ONOATS_INSTALL_ROLLBACK_APPROVED`,
 `ONOATS_INSTALL_BASELINE_DR_HASH`, `ONOATS_INSTALL_BASELINE_CDHASH`, and
-`ONOATS_INSTALL_BUNDLE_ID`.
+`ONOATS_INSTALL_BUNDLE_ID`, plus mandatory
+`ONOATS_INSTALL_RELEASE_IDENTITY`. `ONOATS_INSTALL_BUNDLE_ID`, when supplied,
+may only redundantly name the canonical identifier; it is rejected before any
+LaunchServices query or installation mutation otherwise.
 Python owns defaults and derives the app name. The former Make-variable names
 are rejected for `app-tree-hash`, `install-staged`, and `rollback`; staged
 inputs must use the `NAME=value make ...` environment-prefix form shown above.
 Their values are never expanded by Make.
+
+Release CI runs the full suite on Python 3.12 and a separate recorder-contract
+lane on Python 3.13. PyPI publication depends on both jobs.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 

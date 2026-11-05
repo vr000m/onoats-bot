@@ -683,6 +683,7 @@ def test_create_stt_service_config_snapshot_boundary(
     cfg = OnoatsConfig(
         raw={"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
     )
+    snapshot = runtime.RecorderSessionConfig.capture(cfg)
     loads = 0
 
     def load():
@@ -695,11 +696,46 @@ def test_create_stt_service_config_snapshot_boundary(
 
     monkeypatch.setattr("onoats.config.load_config", load)
     monkeypatch.setattr(runtime, "_preflight_stt_ws", no_preflight)
-    kwargs = {"config": cfg} if supplied else {}
+    kwargs = {"config": snapshot} if supplied else {}
     result = asyncio.run(runtime._create_stt_service(**kwargs))
 
     assert result.service is not None
     assert loads == expected_loads
+
+
+def test_recorder_session_config_retains_all_stt_consumers_after_env_mutation(
+    monkeypatch,
+):
+    monkeypatch.delenv("STT_SERVICE", raising=False)
+    monkeypatch.delenv("STT_WS_SOCKET", raising=False)
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    cfg = OnoatsConfig(
+        raw={
+            "stt": {
+                "service": "websocket",
+                "ws_socket": "/tmp/captured.sock",
+                "launchd_label": "net.varunsingh.captured-stt",
+                "language": "sv",
+                "diarization": True,
+                "diarization_idle_remint_sec": 321,
+            }
+        }
+    )
+    snapshot = runtime.RecorderSessionConfig.capture(cfg)
+
+    monkeypatch.setenv("STT_SERVICE", "whisper")
+    monkeypatch.setenv("STT_WS_SOCKET", "/tmp/mutated.sock")
+    monkeypatch.setenv("STT_LAUNCHD_LABEL", "net.varunsingh.mutated-stt")
+
+    assert snapshot.stt_service == "websocket"
+    assert snapshot.stt_endpoint["socket_path"] == "/tmp/captured.sock"
+    assert snapshot.stt_launchd_label == "net.varunsingh.captured-stt"
+    assert snapshot.stt_language == "sv"
+    assert snapshot.diarization is True
+    assert snapshot.diarization_idle_remint_sec == 321
+    assert "captured.sock" in runtime.stt_banner(snapshot)
+    with pytest.raises(TypeError):
+        snapshot.stt_endpoint["socket_path"] = "/tmp/forbidden.sock"
 
 
 def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):

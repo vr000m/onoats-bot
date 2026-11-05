@@ -47,6 +47,16 @@ _RENAME_EXCL = 0x00000004
 STT_STATES = frozenset({"failed", "recovering", "starting", "unknown", "ready"})
 STT_PRECEDENCE = ("failed", "recovering", "starting", "unknown", "ready")
 BRANCHES = ("me", "them")
+ROOT_REQUIRED_FIELDS = frozenset(
+    {"schema", "pid", "start_epoch", "transcript_run_id", "updated_at", "audio", "stt"}
+)
+ROOT_OPTIONAL_FIELDS = frozenset({"transcript", "locked_category"})
+AUDIO_FIELDS = frozenset({"level", "observed_at"})
+STT_FIELDS = frozenset({"me", "them", "aggregate"})
+STT_BRANCH_REQUIRED_FIELDS = frozenset({"state"})
+STT_BRANCH_OPTIONAL_FIELDS = frozenset({"detail"})
+TRANSCRIPT_REQUIRED_FIELDS = frozenset({"text"})
+TRANSCRIPT_OPTIONAL_FIELDS = frozenset({"source", "speaker_label"})
 
 _LOG = logging.getLogger(__name__)
 _TRANSCRIPT_RUN_ID_RE = re.compile(TRANSCRIPT_RUN_ID_PATTERN)
@@ -195,6 +205,32 @@ class UITelemetryState:
             record["transcript"] = dict(self._transcript)
         if self.locked_category:
             record["locked_category"] = self.locked_category
+        if not ROOT_REQUIRED_FIELDS.issubset(record) or not set(record).issubset(
+            ROOT_REQUIRED_FIELDS | ROOT_OPTIONAL_FIELDS
+        ):
+            raise AssertionError("telemetry producer root fields drifted")
+        audio = record["audio"]
+        if set(audio) != set(BRANCHES):
+            raise AssertionError("telemetry producer audio branches drifted")
+        for value in audio.values():
+            if value is not None and set(value) != AUDIO_FIELDS:
+                raise AssertionError("telemetry producer audio fields drifted")
+        stt = record["stt"]
+        if set(stt) != STT_FIELDS:
+            raise AssertionError("telemetry producer STT fields drifted")
+        for branch in BRANCHES:
+            fields = set(stt[branch])
+            if not STT_BRANCH_REQUIRED_FIELDS.issubset(fields) or not fields.issubset(
+                STT_BRANCH_REQUIRED_FIELDS | STT_BRANCH_OPTIONAL_FIELDS
+            ):
+                raise AssertionError("telemetry producer STT branch fields drifted")
+        transcript = record.get("transcript")
+        if transcript is not None:
+            fields = set(transcript)
+            if not TRANSCRIPT_REQUIRED_FIELDS.issubset(fields) or not fields.issubset(
+                TRANSCRIPT_REQUIRED_FIELDS | TRANSCRIPT_OPTIONAL_FIELDS
+            ):
+                raise AssertionError("telemetry producer transcript fields drifted")
         return record
 
 

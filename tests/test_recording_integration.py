@@ -66,6 +66,39 @@ def _app_identity(app: Path, **overrides):
     return SMOKE.ProcessIdentity(**values)
 
 
+def _stub_release_identity(monkeypatch):
+    expected = SimpleNamespace(
+        designated_requirement="identifier canonical", cdhash="abc123"
+    )
+    monkeypatch.setattr(SMOKE, "_verify_release_identity", lambda *_args: expected)
+    monkeypatch.setattr(SMOKE, "_verify_dynamic_release_identity", lambda *_args: None)
+
+
+@pytest.mark.parametrize(
+    ("requirement", "cdhash", "accepted"),
+    [
+        ("identifier canonical", "abc123", True),
+        ("identifier impostor", "abc123", False),
+        ("identifier canonical", "ffff00", False),
+    ],
+)
+def test_installed_smoke_dynamic_pid_identity_is_exact(
+    monkeypatch, requirement: str, cdhash: str, accepted: bool
+):
+    expected = SimpleNamespace(
+        designated_requirement="identifier canonical", cdhash="abc123"
+    )
+    monkeypatch.setattr(
+        SMOKE, "_dynamic_code_identity", lambda _pid: (requirement, cdhash)
+    )
+
+    if accepted:
+        SMOKE._verify_dynamic_release_identity(4242, expected)
+    else:
+        with pytest.raises(SMOKE.SmokeFailure, match="dynamic code identity"):
+            SMOKE._verify_dynamic_release_identity(4242, expected)
+
+
 class _IdentityVAD(FrameProcessor):
     def __init__(self, **_kwargs):
         super().__init__()
@@ -263,6 +296,7 @@ def test_installed_smoke_refuses_preexisting_app_before_open(tmp_path, monkeypat
     executable = app / "Contents/MacOS/Onoats"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"fixture")
+    _stub_release_identity(monkeypatch)
     monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
     monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: 777)
     opened = []
@@ -270,7 +304,14 @@ def test_installed_smoke_refuses_preexisting_app_before_open(tmp_path, monkeypat
         SMOKE.subprocess, "run", lambda *args, **kwargs: opened.append(args)
     )
     with pytest.raises(SMOKE.SmokeFailure, match="already running"):
-        SMOKE.run(SimpleNamespace(app=app, data_dir=tmp_path / "data", me_floor=0.01))
+        SMOKE.run(
+            SimpleNamespace(
+                app=app,
+                data_dir=tmp_path / "data",
+                release_identity=tmp_path / "release-identity.json",
+                me_floor=0.01,
+            )
+        )
     assert opened == []
 
 
@@ -279,6 +320,7 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
     executable = app / "Contents/MacOS/Onoats"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"fixture")
+    _stub_release_identity(monkeypatch)
     recorder = _recorder_identity(command="/onoats bot")
     results = {
         "signed app launch": 1234,
@@ -311,6 +353,7 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
         SimpleNamespace(
             app=app,
             data_dir=tmp_path / "data",
+            release_identity=tmp_path / "release-identity.json",
             app_timeout=1,
             recording_timeout=1,
             activity_timeout=1,
@@ -1059,6 +1102,7 @@ def _exercise_activity_probe(
     telemetry_path.write_text(json.dumps(telemetry), encoding="utf-8")
     recorder = _recorder_identity()
 
+    _stub_release_identity(monkeypatch)
     monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
     monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
     monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
@@ -1092,6 +1136,7 @@ def _exercise_activity_probe(
         SimpleNamespace(
             app=app,
             data_dir=data_dir,
+            release_identity=tmp_path / "release-identity.json",
             app_timeout=1,
             recording_timeout=1,
             activity_timeout=1,

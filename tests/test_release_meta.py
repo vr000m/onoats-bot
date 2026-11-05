@@ -9,6 +9,7 @@ import re
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import plistlib
 import shutil
@@ -290,7 +291,7 @@ def _make_adhoc_app(path: Path) -> None:
         plistlib.dump(
             {
                 "CFBundleExecutable": "Onoats",
-                "CFBundleIdentifier": "net.varunsingh.onoats.tests",
+                "CFBundleIdentifier": "net.varunsingh.onoats",
                 "CFBundleName": "Onoats",
                 "CFBundlePackageType": "APPL",
                 "CFBundleVersion": "1",
@@ -770,9 +771,12 @@ def _run_install_staged(
     cdhash: str | None = None,
     staged_app_tree_hash: str | None = None,
     install_dir: Path | None = None,
+    bundle_id: str = "net.varunsingh.onoats",
+    release_identity: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     staged_app_tree_hash = staged_app_tree_hash or _app_tree_hash(work / "Onoats.app")
     install_dir = install_dir or work / "installed"
+    release_identity = release_identity or work / "release-identity.json"
     command = ["make", "-s", "install-staged"]
     env = os.environ.copy()
     env["HOME"] = str(work / "home")
@@ -786,7 +790,8 @@ def _run_install_staged(
             "ONOATS_INSTALL_ROLLBACK_APPROVED": str(int(approved)),
             "ONOATS_INSTALL_BASELINE_DR_HASH": designated_requirement_sha256 or "",
             "ONOATS_INSTALL_BASELINE_CDHASH": cdhash or "",
-            "ONOATS_INSTALL_BUNDLE_ID": "net.varunsingh.onoats.install-test",
+            "ONOATS_INSTALL_BUNDLE_ID": bundle_id,
+            "ONOATS_INSTALL_RELEASE_IDENTITY": str(release_identity),
         }
     )
     return subprocess.run(
@@ -799,6 +804,101 @@ def _run_install_staged(
     )
 
 
+def _configure_test_cli_authority(work: Path) -> str:
+    """Create a clean checkout and independently observable CLI authority."""
+    authority = work / "test-authority"
+    interpreter = authority / "python"
+    cli_entry = authority / "onoats"
+    module = work / "src/onoats/__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("", encoding="utf-8")
+    authority.mkdir()
+
+    observed = {
+        "python": str(interpreter),
+        "module": str(module),
+        "direct_url": json.dumps(
+            {"url": work.as_uri(), "dir_info": {"editable": True}}
+        ),
+    }
+    interpreter.write_text(
+        f"#!/usr/bin/python3\nimport json\nprint({json.dumps(json.dumps(observed))})\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+    cli_entry.write_text(f"#!{interpreter}\n", encoding="utf-8")
+    cli_entry.chmod(0o755)
+    shim = work / "home/.local/bin/onoats"
+    shim.parent.mkdir(parents=True)
+    shim.symlink_to(cli_entry)
+
+    (work / ".gitignore").write_text(
+        "/Onoats.app/\n"
+        "/approved-rollback.txt\n"
+        "/backups/\n"
+        "/home/\n"
+        "/installed/\n"
+        "/release-identity*.json\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=work, check=True)
+    subprocess.run(
+        [
+            "git",
+            "add",
+            ".gitignore",
+            "Makefile",
+            "install_staged.py",
+            "native/Makefile",
+            "native/install_staged.py",
+            "src/onoats/__init__.py",
+            "test-authority/onoats",
+            "test-authority/python",
+        ],
+        cwd=work,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Onoats Test",
+            "-c",
+            "user.email=onoats-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "test fixture",
+        ],
+        cwd=work,
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=work,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_install_staged_rejects_conflicting_bundle_id_before_mutation(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    installed = work / "installed" / "Onoats.app"
+
+    result = _run_install_staged(
+        work, bundle_id="net.varunsingh.onoats.conflicting-override"
+    )
+
+    assert result.returncode != 0
+    assert "may only redundantly name the canonical bundle" in (
+        result.stdout + result.stderr
+    )
+    assert not installed.exists()
+
+
 @pytest.fixture
 def staged_install_workflow(tmp_path: Path) -> Path:
     if sys.platform != "darwin":
@@ -806,9 +906,30 @@ def staged_install_workflow(tmp_path: Path) -> Path:
     missing = [tool for tool in ("codesign", "ditto", "make") if not shutil.which(tool)]
     if missing:
         pytest.skip(f"native install tools unavailable: {', '.join(missing)}")
-    shutil.copy2(NATIVE_MAKEFILE, tmp_path / "Makefile")
-    shutil.copy2(NATIVE_INSTALL_SCRIPT, tmp_path / "install_staged.py")
+    native = tmp_path / "native"
+    native.mkdir()
+    shutil.copy2(NATIVE_MAKEFILE, native / "Makefile")
+    (tmp_path / "Makefile").symlink_to("native/Makefile")
+    installer = native / "install_staged.py"
+    shutil.copy2(NATIVE_INSTALL_SCRIPT, installer)
+    (tmp_path / "install_staged.py").symlink_to(installer.relative_to(tmp_path))
+    source = installer.read_text(encoding="utf-8")
+    source = source.replace(
+        "LSREGISTER = Path(\n"
+        '    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"\n'
+        '    "LaunchServices.framework/Support/lsregister"\n'
+        ")",
+        'LSREGISTER = Path("/usr/bin/true")',
+    )
+    installer.write_text(source, encoding="utf-8")
     _make_adhoc_app(tmp_path / "Onoats.app")
+    cli_git_identity = _configure_test_cli_authority(tmp_path)
+    identity = INSTALL_STAGED.release_identity(
+        tmp_path / "Onoats.app", cli_git_identity=cli_git_identity
+    )
+    (tmp_path / "release-identity.json").write_text(
+        identity.to_json() + "\n", encoding="utf-8"
+    )
     (tmp_path / "installed").mkdir()
     return tmp_path
 
@@ -1151,7 +1272,7 @@ def test_install_staged_binds_install_to_pre_smoke_tree_digest(
     result = _run_install_staged(work, staged_app_tree_hash=expected)
 
     assert result.returncode != 0
-    assert "canonical approved identity" in result.stdout + result.stderr
+    assert "approved release identity" in result.stdout + result.stderr
     assert installed.stat().st_ino == inode_before
 
 
@@ -1315,6 +1436,91 @@ def test_complete_explicit_approval_creates_verified_rollback_record(
     record_text = record.read_text(encoding="utf-8")
     assert str(archives[0]) in record_text
     assert hashlib.sha256(archives[0].read_bytes()).hexdigest() in record_text
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "bundle_id",
+        "designated_requirement",
+        "cdhash",
+        "tree_hash",
+        "executable_hash",
+        "cli_git_identity",
+    ],
+)
+def test_install_requires_every_release_identity_field_before_mutation(
+    staged_install_workflow: Path, field: str
+):
+    work = staged_install_workflow
+    identity_path = work / "release-identity.json"
+    value = json.loads(identity_path.read_text(encoding="utf-8"))
+    value[field] = {
+        "bundle_id": "net.varunsingh.onoats.impostor",
+        "designated_requirement": "identifier impostor",
+        "cdhash": "f" * 40,
+        "tree_hash": "f" * 64,
+        "executable_hash": "f" * 64,
+        "cli_git_identity": "f" * 40,
+    }[field]
+    mismatch = work / f"release-identity-{field}.json"
+    mismatch.write_text(json.dumps(value), encoding="utf-8")
+
+    result = _run_install_staged(work, release_identity=mismatch)
+
+    assert result.returncode != 0
+    assert not (work / "installed" / "Onoats.app").exists()
+
+
+def test_release_identity_is_portable_across_a_distinct_bundle_copy(
+    staged_install_workflow: Path, tmp_path: Path
+):
+    source = staged_install_workflow / "Onoats.app"
+    copied = tmp_path / "portable" / "Onoats.app"
+    copied.parent.mkdir()
+    shutil.copytree(source, copied, copy_function=_copy_file_without_flags)
+
+    source_identity = INSTALL_STAGED.release_identity(
+        source, cli_git_identity="test-head"
+    )
+    copied_identity = INSTALL_STAGED.release_identity(
+        copied, cli_git_identity="test-head"
+    )
+
+    assert copied_identity == source_identity
+    assert (source / "Contents/MacOS/Onoats").stat().st_ino != (
+        copied / "Contents/MacOS/Onoats"
+    ).stat().st_ino
+
+
+def test_release_identity_rejects_source_path_replacement_during_snapshot(
+    tmp_path: Path, monkeypatch
+):
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"first")
+
+    def replace_during_copy(_ditto: str, source: str, destination: str) -> None:
+        shutil.copytree(source, destination)
+        replacement = executable.with_suffix(".replacement")
+        replacement.write_bytes(b"second")
+        os.replace(replacement, executable)
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", replace_during_copy)
+
+    with pytest.raises(
+        INSTALL_STAGED.InstallError, match="path/inode changed during identity snapshot"
+    ):
+        INSTALL_STAGED.release_identity(app, cli_git_identity="test-head")
+
+
+def test_release_publish_waits_for_both_supported_runtime_gates():
+    workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    publish = workflow.split("\n  publish:\n", 1)[1]
+    assert "needs: [build, python-313-contracts]" in publish
+    assert 'python-version: "3.12"' in workflow
+    assert 'python-version: "3.13"' in workflow
 
 
 def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():

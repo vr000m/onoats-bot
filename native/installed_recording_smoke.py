@@ -30,6 +30,156 @@ class SmokeFailure(RuntimeError):
     """One stage of the installed recording proof failed."""
 
 
+def _verify_release_identity(app: Path, identity_path: Path):
+    """Re-derive the immutable staged identity before and after recording."""
+    try:
+        from install_staged import (
+            InstallError,
+            _read_release_identity,
+            observed_cli_git_identity,
+            release_identity,
+        )
+
+        expected = _read_release_identity(identity_path)
+        observed = release_identity(app, cli_git_identity=observed_cli_git_identity())
+    except (OSError, ValueError, InstallError) as exc:
+        raise SmokeFailure("release identity could not be verified") from exc
+    if observed != expected:
+        raise SmokeFailure("release identity changed")
+    return expected
+
+
+def _dynamic_code_identity(pid: int) -> tuple[str, str]:
+    """Read designated requirement and cdhash for a running PID via Security."""
+    if sys.platform != "darwin":
+        raise SmokeFailure("dynamic code identity requires macOS Security.framework")
+    security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    core = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    ref = ctypes.c_void_p
+    core.CFRelease.argtypes = [ref]
+    core.CFNumberCreate.argtypes = [ref, ctypes.c_long, ctypes.c_void_p]
+    core.CFNumberCreate.restype = ref
+    core.CFDictionaryCreate.argtypes = [
+        ref,
+        ctypes.POINTER(ref),
+        ctypes.POINTER(ref),
+        ctypes.c_long,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    core.CFDictionaryCreate.restype = ref
+    core.CFDictionaryGetValue.argtypes = [ref, ref]
+    core.CFDictionaryGetValue.restype = ref
+    core.CFStringGetLength.argtypes = [ref]
+    core.CFStringGetLength.restype = ctypes.c_long
+    core.CFStringGetMaximumSizeForEncoding.argtypes = [ctypes.c_long, ctypes.c_uint]
+    core.CFStringGetMaximumSizeForEncoding.restype = ctypes.c_long
+    core.CFStringGetCString.argtypes = [
+        ref,
+        ctypes.c_char_p,
+        ctypes.c_long,
+        ctypes.c_uint,
+    ]
+    core.CFStringGetCString.restype = ctypes.c_bool
+    core.CFDataGetLength.argtypes = [ref]
+    core.CFDataGetLength.restype = ctypes.c_long
+    core.CFDataGetBytePtr.argtypes = [ref]
+    core.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_ubyte)
+
+    security.SecCodeCopyGuestWithAttributes.argtypes = [
+        ref,
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecCodeCopyGuestWithAttributes.restype = ctypes.c_int32
+    security.SecCodeCopyDesignatedRequirement.argtypes = [
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecCodeCopyDesignatedRequirement.restype = ctypes.c_int32
+    security.SecRequirementCopyString.argtypes = [
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecRequirementCopyString.restype = ctypes.c_int32
+    security.SecCodeCopySigningInformation.argtypes = [
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecCodeCopySigningInformation.restype = ctypes.c_int32
+
+    pid_key = ref.in_dll(security, "kSecGuestAttributePid")
+    unique_key = ref.in_dll(security, "kSecCodeInfoUnique")
+    pid_value = ctypes.c_int32(pid)
+    pid_number = core.CFNumberCreate(None, 3, ctypes.byref(pid_value))
+    if not pid_number:
+        raise SmokeFailure("dynamic code identity could not allocate PID attribute")
+    attributes = code = requirement = requirement_text = signing = None
+    try:
+        keys = (ref * 1)(pid_key)
+        values = (ref * 1)(pid_number)
+        attributes = core.CFDictionaryCreate(None, keys, values, 1, None, None)
+        code = ref()
+        if not attributes or security.SecCodeCopyGuestWithAttributes(
+            None, attributes, 0, ctypes.byref(code)
+        ):
+            raise SmokeFailure(
+                "running app PID has no Security.framework code identity"
+            )
+        requirement = ref()
+        if security.SecCodeCopyDesignatedRequirement(
+            code, 0, ctypes.byref(requirement)
+        ):
+            raise SmokeFailure("running app has no designated requirement")
+        requirement_text = ref()
+        if security.SecRequirementCopyString(
+            requirement, 0, ctypes.byref(requirement_text)
+        ):
+            raise SmokeFailure("running app requirement could not be rendered")
+        encoding = 0x08000100
+        size = (
+            core.CFStringGetMaximumSizeForEncoding(
+                core.CFStringGetLength(requirement_text), encoding
+            )
+            + 1
+        )
+        buffer = ctypes.create_string_buffer(size)
+        if not core.CFStringGetCString(requirement_text, buffer, size, encoding):
+            raise SmokeFailure("running app requirement is not UTF-8")
+        signing = ref()
+        if security.SecCodeCopySigningInformation(code, 1 << 1, ctypes.byref(signing)):
+            raise SmokeFailure("running app signing information is unavailable")
+        unique = core.CFDictionaryGetValue(signing, unique_key)
+        if not unique:
+            raise SmokeFailure("running app signing information has no cdhash")
+        length = core.CFDataGetLength(unique)
+        cdhash = bytes(core.CFDataGetBytePtr(unique)[:length]).hex()
+        return buffer.value.decode("utf-8"), cdhash
+    finally:
+        for value in (
+            signing,
+            requirement_text,
+            requirement,
+            code,
+            attributes,
+            pid_number,
+        ):
+            if value:
+                core.CFRelease(value)
+
+
+def _verify_dynamic_release_identity(pid: int, expected) -> None:
+    requirement, cdhash = _dynamic_code_identity(pid)
+    if requirement != expected.designated_requirement or cdhash != expected.cdhash:
+        raise SmokeFailure("running app dynamic code identity does not match release")
+
+
 class ProcessBirth(NamedTuple):
     seconds: int
     microseconds: int
@@ -684,6 +834,8 @@ def run(args: argparse.Namespace) -> None:
         raise SmokeFailure("--me-floor must be finite and inside [0.0, 1.0]")
     app = Path(args.app).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser().resolve()
+    identity_path = Path(args.release_identity).expanduser().resolve()
+    expected_release = _verify_release_identity(app, identity_path)
     _verify_signed_app(app)
     executable = (app / "Contents/MacOS/Onoats").resolve()
     verified_executable = executable.stat()
@@ -711,6 +863,7 @@ def run(args: argparse.Namespace) -> None:
         app_identity = _capture_process_identity(app_pid)
         if app_identity is None:
             raise SmokeFailure("app launch failed: new process vanished")
+        _verify_dynamic_release_identity(app_pid, expected_release)
         current_executable = executable.stat()
         if (verified_executable.st_dev, verified_executable.st_ino) != (
             current_executable.st_dev,
@@ -797,6 +950,8 @@ def run(args: argparse.Namespace) -> None:
             args.transcript_timeout,
             lambda: _new_me_utterance(data_dir, transcript_run_id),
         )
+        _verify_dynamic_release_identity(app_pid, expected_release)
+        _verify_release_identity(app, identity_path)
         print(
             "Installed recording smoke passed: app-owned Me activity and durable utterance."
         )
@@ -826,6 +981,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", required=True)
     parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--release-identity", required=True)
     parser.add_argument("--app-timeout", type=float, default=15)
     parser.add_argument("--recording-timeout", type=float, default=120)
     parser.add_argument("--activity-timeout", type=float, default=120)

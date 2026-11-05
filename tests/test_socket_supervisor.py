@@ -1145,6 +1145,48 @@ def test_stop_requested_recorder_drain_overrun_is_force_cancelled_and_stamped(
     assert st.supervisor_rc == 1
 
 
+def test_capturer_post_sigkill_reap_is_bounded_and_reports_survivor(monkeypatch):
+    class CapturingLogger:
+        def __init__(self):
+            self.records: list[str] = []
+
+        def warning(self, message):
+            self.records.append(message)
+
+        def error(self, message):
+            self.records.append(message)
+
+    logger = CapturingLogger()
+
+    class UnkillableCapturer:
+        pid = 8765
+        returncode = None
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    signals: list[int] = []
+
+    def still_alive(_proc, sig, _logger):
+        signals.append(sig)
+        return True
+
+    monkeypatch.setattr(cli, "_signal_capturer_group", still_alive)
+    monkeypatch.setattr(cli, "_CAPTURER_TERM_GRACE_SEC", 0.01)
+    monkeypatch.setattr(cli, "_CAPTURER_KILL_REAP_GRACE_SEC", 0.01)
+
+    async def exercise():
+        return await asyncio.wait_for(
+            cli._stop_capturer(UnkillableCapturer(), logger), timeout=0.5
+        )
+
+    assert asyncio.run(exercise()) is False
+    assert signal.SIGTERM in signals
+    assert signal.SIGKILL in signals
+    assert signals[-1] == 0, "final survivor report lacked a post-reap probe"
+    assert any("survived bounded SIGTERM/SIGKILL" in row for row in logger.records)
+
+
 # ---------------------------------------------------------------------------
 # I3 PROCESS-GROUP TEARDOWN: the capturer is a process-group leader
 # (start_new_session=True), so the supervisor must tear down the WHOLE group on

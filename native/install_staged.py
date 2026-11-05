@@ -6,14 +6,18 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import stat
 import subprocess
 import tempfile
 import time
+from urllib.parse import unquote, urlparse
 import warnings
+from typing import Callable, NamedTuple
 
 
 IDENTITY_VERSION = b"onoats-app-identity-v1\0"
@@ -32,6 +36,223 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 class InstallError(RuntimeError):
     """A staged install or rollback contract check failed."""
+
+
+class ReleaseIdentity(NamedTuple):
+    """Immutable identity shared by staged installation and signed-app smoke."""
+
+    bundle_id: str
+    designated_requirement: str
+    cdhash: str
+    tree_hash: str
+    executable_hash: str
+    cli_git_identity: str
+
+    def to_json(self) -> str:
+        return json.dumps(self._asdict(), sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, raw: str) -> "ReleaseIdentity":
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise InstallError("release identity is not valid JSON") from exc
+        if not isinstance(value, dict) or set(value) != set(cls._fields):
+            raise InstallError("release identity fields do not match v1")
+        if not all(isinstance(value[field], str) for field in cls._fields):
+            raise InstallError("release identity fields must all be strings")
+        identity = cls(**value)
+        for field in ("tree_hash", "executable_hash"):
+            digest = getattr(identity, field)
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise InstallError(f"release identity {field} is not sha256")
+        if identity.bundle_id != BUNDLE_ID:
+            raise InstallError("release identity bundle identifier is not canonical")
+        if not identity.designated_requirement or not identity.cdhash:
+            raise InstallError("release identity signing fields are empty")
+        if not identity.cli_git_identity.strip():
+            raise InstallError("release identity CLI git identity is empty")
+        return identity
+
+
+class SourceExecutableEvidence(NamedTuple):
+    """Non-portable evidence used only while deriving a portable identity."""
+
+    device: int
+    inode: int
+
+
+def observed_cli_git_identity(
+    *,
+    checkout: Path | None = None,
+    shim: Path | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str:
+    """Return HEAD only after independently binding the installed CLI to it."""
+    checkout = (checkout or SCRIPT_DIR.parent).resolve()
+    shim = shim or Path.home() / ".local/bin/onoats"
+    try:
+        root = run(
+            ["/usr/bin/git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        head = run(
+            ["/usr/bin/git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = run(
+            ["/usr/bin/git", "-C", str(checkout), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if Path(root).resolve() != checkout or dirty:
+            raise InstallError("CLI checkout is not the expected clean worktree")
+
+        if not shim.is_symlink():
+            raise InstallError("CLI shim is not the stable ~/.local/bin/onoats link")
+        target = shim.resolve(strict=True)
+        first_line = target.read_bytes().splitlines()[0]
+        if not first_line.startswith(b"#!"):
+            raise InstallError("CLI shim target has no interpreter authority")
+        interpreter = Path(os.fsdecode(first_line[2:]))
+        if not interpreter.is_absolute() or not interpreter.is_file():
+            raise InstallError("CLI shim interpreter is unavailable")
+        probe = (
+            "import importlib.metadata as m,json,onoats,sys;"
+            "d=m.distribution('onoats');"
+            "print(json.dumps({'python':sys.executable,'module':onoats.__file__,"
+            "'direct_url':d.read_text('direct_url.json')}))"
+        )
+        observed = json.loads(
+            run(
+                [str(interpreter), "-I", "-c", probe],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd="/",
+            ).stdout
+        )
+        direct_url = json.loads(observed["direct_url"])
+        origin = urlparse(direct_url["url"])
+        editable_root = Path(unquote(origin.path)).resolve()
+        module = Path(observed["module"]).resolve()
+        if (
+            Path(observed["python"]).resolve() != interpreter.resolve()
+            or origin.scheme != "file"
+            or direct_url.get("dir_info", {}).get("editable") is not True
+            or editable_root != checkout
+            or not module.is_relative_to(checkout / "src" / "onoats")
+        ):
+            raise InstallError("installed CLI is not owned by the verified checkout")
+    except InstallError:
+        raise
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        raise InstallError(
+            "CLI git identity could not be independently verified"
+        ) from exc
+    if len(head) != 40 or any(
+        character not in "0123456789abcdef" for character in head
+    ):
+        raise InstallError("CLI checkout HEAD is not a canonical git identity")
+    return head
+
+
+def _identity_from_private_snapshot(
+    app: Path, *, cli_git_identity: str
+) -> tuple[ReleaseIdentity, SourceExecutableEvidence]:
+    info_path = app / "Contents/Info.plist"
+    executable = app / "Contents/MacOS/Onoats"
+    try:
+        with executable.open("rb") as opened:
+            before = os.fstat(opened.fileno())
+            executable_hash = hashlib.file_digest(opened, "sha256").hexdigest()
+            after = os.fstat(opened.fileno())
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise InstallError("snapshot executable changed during identity derivation")
+        with info_path.open("rb") as stream:
+            bundle_id = plistlib.load(stream)["CFBundleIdentifier"]
+    except (OSError, KeyError, plistlib.InvalidFileException) as exc:
+        raise InstallError("staged app has no stable canonical identity") from exc
+    if bundle_id != BUNDLE_ID:
+        raise InstallError("staged app bundle identifier is not canonical")
+    return (
+        ReleaseIdentity(
+            bundle_id=bundle_id,
+            designated_requirement=_designated_requirement(app),
+            cdhash=_cdhash(app),
+            tree_hash=app_identity(app),
+            executable_hash=executable_hash,
+            cli_git_identity=cli_git_identity,
+        ),
+        SourceExecutableEvidence(before.st_dev, before.st_ino),
+    )
+
+
+def release_identity(app: Path, *, cli_git_identity: str) -> ReleaseIdentity:
+    """Derive one portable identity from a private bundle snapshot.
+
+    Source inode/device evidence is deliberately not serialized: an installed
+    copy must have different inode identity.  It is used only to reject a
+    source-path replacement while the private snapshot is being made.
+    """
+    app = app.resolve()
+    executable = app / "Contents/MacOS/Onoats"
+    try:
+        source_before = executable.stat()
+        app_before = app.stat()
+    except OSError as exc:
+        raise InstallError("staged app identity source is unavailable") from exc
+    with tempfile.TemporaryDirectory(prefix="onoats-release-identity-") as directory:
+        snapshot = Path(directory) / "snapshot"
+        _run(DITTO, str(app), str(snapshot))
+        try:
+            source_after = executable.stat()
+            app_after = app.stat()
+        except OSError as exc:
+            raise InstallError("staged app changed during identity snapshot") from exc
+        if (source_before.st_dev, source_before.st_ino) != (
+            source_after.st_dev,
+            source_after.st_ino,
+        ) or (app_before.st_dev, app_before.st_ino) != (
+            app_after.st_dev,
+            app_after.st_ino,
+        ):
+            raise InstallError("staged app path/inode changed during identity snapshot")
+        identity, _evidence = _identity_from_private_snapshot(
+            snapshot, cli_git_identity=cli_git_identity
+        )
+        return identity
+
+
+def _read_release_identity(path: Path) -> ReleaseIdentity:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise InstallError("release identity is not a bounded regular file")
+        raw = os.read(descriptor, info.st_size + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) != info.st_size:
+        raise InstallError("release identity changed while being read")
+    try:
+        return ReleaseIdentity.from_json(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise InstallError("release identity is not UTF-8") from exc
 
 
 def _field(digest: "hashlib._Hash", value: bytes) -> None:
@@ -398,7 +619,25 @@ def _archive_baseline(
 
 
 def install(args: argparse.Namespace) -> None:
+    if args.bundle_id != BUNDLE_ID:
+        raise InstallError(
+            "ONOATS_INSTALL_BUNDLE_ID may only redundantly name the canonical bundle"
+        )
     staged = Path(args.app)
+    release_identity_path = getattr(args, "release_identity", None)
+    expected_release = None
+    if release_identity_path is not None:
+        if not release_identity_path:
+            raise InstallError("installation requires an approved release identity")
+        expected_release = _read_release_identity(Path(release_identity_path))
+        observed_cli_identity = observed_cli_git_identity()
+        observed_release = release_identity(
+            staged, cli_git_identity=observed_cli_identity
+        )
+        if observed_release != expected_release:
+            raise InstallError(
+                "staged app does not match the approved release identity"
+            )
     install_dir = Path(args.install_dir)
     installed = install_dir / staged.name
     backup_dir = Path(args.backup_dir)
@@ -412,6 +651,8 @@ def install(args: argparse.Namespace) -> None:
         )
     if args.approved not in (0, 1):
         raise InstallError("ROLLBACK_BASELINE_APPROVED must be 0 or 1")
+    if expected_release is not None and expected != expected_release.tree_hash:
+        raise InstallError("tree hash and release identity disagree")
 
     install_dir.mkdir(parents=True, exist_ok=True)
     _clear_verified_staged_registration(
@@ -429,6 +670,12 @@ def install(args: argparse.Namespace) -> None:
         candidate_identity, candidate_dr, _candidate_cdhash = _verify_app(
             candidate, expected_identity=expected
         )
+        if expected_release is not None:
+            candidate_release = release_identity(
+                candidate, cli_git_identity=observed_cli_identity
+            )
+            if candidate_release != expected_release:
+                raise InstallError("installed copy candidate changed release identity")
         _verify_resources(candidate, Path(args.makefile_dir))
         record_fields = None
         if args.approved:
@@ -446,11 +693,18 @@ def install(args: argparse.Namespace) -> None:
                 )
 
         def verify(path: Path) -> tuple[str, str, str]:
-            return _verify_app(
+            verified = _verify_app(
                 path,
                 expected_identity=candidate_identity,
                 makefile_dir=Path(args.makefile_dir),
             )
+            if expected_release is not None:
+                installed_release = release_identity(
+                    path, cli_git_identity=observed_cli_identity
+                )
+                if installed_release != expected_release:
+                    raise InstallError("installed app changed release identity")
+            return verified
 
         def commit() -> None:
             nonlocal archive, committed
@@ -545,6 +799,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     digest = subparsers.add_parser("identity")
     digest.add_argument("app")
+    release = subparsers.add_parser("release-identity")
+    release.add_argument("app")
+    release.add_argument("--cli-git-identity", required=True)
+    release.add_argument("--output", required=True)
 
     staged = subparsers.add_parser("install")
     staged.add_argument("--app", required=True)
@@ -557,6 +815,7 @@ def _parser() -> argparse.ArgumentParser:
     staged.add_argument("--baseline-cdhash", default="")
     staged.add_argument("--makefile-dir", required=True)
     staged.add_argument("--bundle-id", required=True)
+    staged.add_argument("--release-identity", required=True)
 
     restore = subparsers.add_parser("rollback")
     restore.add_argument("--app-name", required=True)
@@ -611,6 +870,7 @@ def _env_install_args() -> argparse.Namespace:
         baseline_cdhash=_env_value("ONOATS_INSTALL_BASELINE_CDHASH", ""),
         makefile_dir=str(SCRIPT_DIR),
         bundle_id=_env_value("ONOATS_INSTALL_BUNDLE_ID", BUNDLE_ID),
+        release_identity=_env_value("ONOATS_INSTALL_RELEASE_IDENTITY", ""),
     )
 
 
@@ -631,6 +891,11 @@ def main() -> int:
     try:
         if args.command == "identity":
             print(app_identity(Path(args.app)))
+        elif args.command == "release-identity":
+            identity = release_identity(
+                Path(args.app), cli_git_identity=args.cli_git_identity
+            )
+            Path(args.output).write_text(identity.to_json() + "\n")
         elif args.command == "env-identity":
             print(
                 app_identity(

@@ -23,6 +23,10 @@ from onoats.control_socket import (
     ControlError,
     send_control_command,
 )
+from onoats.recorder_lifecycle import (
+    LifecycleStoppingError,
+    RecorderLifecycleController,
+)
 
 
 RECORD = PidRecord(pid=4100, cmdline="onoats bot", start_epoch=1234.5)
@@ -74,6 +78,32 @@ async def _raw_exchange(path: Path, payload: bytes) -> dict[str, object]:
 
 async def _send(path: Path, value: dict[str, object]) -> dict[str, object]:
     return await _raw_exchange(path, json.dumps(value).encode() + b"\n")
+
+
+def _lifecycle_callbacks(
+    actions: list[str],
+    rotate=None,
+) -> tuple[RecorderLifecycleController, object, object]:
+    async def default_rotate(_reason: str, continue_session: bool) -> None:
+        if continue_session:
+            actions.append("flush")
+
+    controller = RecorderLifecycleController(
+        rotate or default_rotate,
+        mark_graceful=lambda: actions.append("stop"),
+    )
+
+    async def flush() -> bool:
+        try:
+            await controller.flush("control flush")
+        except LifecycleStoppingError:
+            return False
+        return True
+
+    async def stop() -> None:
+        await controller.stop("control stop")
+
+    return controller, flush, stop
 
 
 @pytest.fixture
@@ -436,9 +466,10 @@ async def test_malformed_peer_credential_probe_fails_closed(
 
 @_async_test
 async def test_duplicate_stop_is_idempotent_and_flush_after_stop_is_rejected(
-    control_data_dir: Path, callbacks
+    control_data_dir: Path,
 ) -> None:
-    actions, flush, stop = callbacks
+    actions: list[str] = []
+    _controller, flush, stop = _lifecycle_callbacks(actions)
     server = ControlServer(
         control_data_dir,
         RECORD,
@@ -471,22 +502,21 @@ async def test_duplicate_stop_is_idempotent_and_flush_after_stop_is_rejected(
 )
 async def test_signal_and_socket_stop_share_the_complete_command_state_space(
     control_data_dir: Path,
-    callbacks,
     signal_stop_requested: bool,
     command: str,
     accepted: bool,
     expected_actions: list[str],
 ) -> None:
-    actions, flush, stop = callbacks
-    stopping_event = asyncio.Event()
+    actions: list[str] = []
+    controller, flush, stop = _lifecycle_callbacks(actions)
     if signal_stop_requested:
-        stopping_event.set()
+        await controller.stop("signal")
+        actions.clear()
     server = ControlServer(
         control_data_dir,
         RECORD,
         on_flush=flush,
         on_stop=stop,
-        stopping_event=stopping_event,
         peer_uid_getter=lambda _sock: os.geteuid(),
     )
     await server.start()
@@ -507,20 +537,21 @@ async def test_flush_first_finishes_but_signal_stop_rejects_the_next_flush(
 ) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
-    stopping_event = asyncio.Event()
     actions: list[str] = []
 
-    async def flush() -> None:
+    async def rotate(_reason: str, continue_session: bool) -> None:
+        assert continue_session is True
         actions.append("flush")
         entered.set()
         await release.wait()
+
+    controller, flush, stop = _lifecycle_callbacks(actions, rotate)
 
     server = ControlServer(
         control_data_dir,
         RECORD,
         on_flush=flush,
-        on_stop=lambda: None,
-        stopping_event=stopping_event,
+        on_stop=stop,
         peer_uid_getter=lambda _sock: os.geteuid(),
     )
     await server.start()
@@ -528,10 +559,12 @@ async def test_flush_first_finishes_but_signal_stop_rejects_the_next_flush(
     try:
         first_task = asyncio.create_task(_send(path, _request("flush")))
         await asyncio.wait_for(entered.wait(), timeout=2)
-        stopping_event.set()
+        stop_task = asyncio.create_task(controller.stop("signal"))
+        await asyncio.sleep(0)
         second_task = asyncio.create_task(_send(path, _request("flush")))
         release.set()
         first, second = await asyncio.gather(first_task, second_task)
+        assert await stop_task is True
     finally:
         await server.close()
     assert first["ok"] is True
@@ -541,7 +574,7 @@ async def test_flush_first_finishes_but_signal_stop_rejects_the_next_flush(
         "code": "stopping",
         "message": "recorder is stopping",
     }
-    assert actions == ["flush"]
+    assert actions == ["flush", "stop"]
 
 
 @_async_test
@@ -553,17 +586,14 @@ async def test_simultaneous_commands_follow_lock_acquisition_order(
     release = asyncio.Event()
     actions: list[str] = []
 
-    async def flush() -> None:
+    async def rotate(_reason: str, continue_session: bool) -> None:
+        assert continue_session is True
         actions.append("flush")
         if first == "flush":
             entered.set()
             await release.wait()
 
-    async def stop() -> None:
-        actions.append("stop")
-        if first == "stop":
-            entered.set()
-            await release.wait()
+    controller, flush, stop = _lifecycle_callbacks(actions, rotate)
 
     server = ControlServer(
         control_data_dir,
@@ -576,6 +606,9 @@ async def test_simultaneous_commands_follow_lock_acquisition_order(
     path = control_data_dir / ".active" / CONTROL_SOCKET_FILENAME
     second = "stop" if first == "flush" else "flush"
     try:
+        if first == "stop":
+            assert await controller.stop("signal") is True
+            entered.set()
         first_task = asyncio.create_task(_send(path, _request(first)))
         await asyncio.wait_for(entered.wait(), timeout=2)
         second_task = asyncio.create_task(_send(path, _request(second)))

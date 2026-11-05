@@ -66,6 +66,7 @@ from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
+    RecorderSessionConfig,
     RecorderAlreadyRunningError,
     SttPreflightError,
     _acquire_instance_lock,
@@ -156,7 +157,8 @@ async def run_onoats(
     # mis-configured.
     from onoats.config import load_config as _load_config
 
-    cfg = _load_config()
+    session_config = RecorderSessionConfig.capture(_load_config())
+    cfg = session_config
     if cfg.diarization:
         logger.warning(
             "diarization is enabled but ignored in single-input mode "
@@ -204,39 +206,49 @@ async def run_onoats(
     # TranscriptBuffer: accumulates utterances + silence_gap hints → .active/session_*.jsonl
     transcript_buffer = TranscriptBuffer(locked_category=locked_category)
 
-    _flush_lock = asyncio.Lock()
-
-    async def _rotate_flush(reason: str, *, continue_session: bool) -> None:
+    async def _rotate_flush(reason: str, continue_session: bool) -> None:
         """Flush the transcript buffer and rotate the session file into pending/.
 
         The bot is now a thin recorder — it does NOT run post-processing
         inline. A cron-driven worker drains the pending/ queue.
         ``continue_session`` distinguishes a continuation flush
         (silence-timeout / Ctrl+T / SIGUSR1 — opens a fresh .active/ session)
-        from a terminal flush (EndFrame / shutdown). Serialized via
-        _flush_lock so concurrent flushes do not race.
+        from a terminal flush (EndFrame / shutdown). Serialization is owned by
+        the RecorderLifecycleController below.
         """
-        async with _flush_lock:
-            await flush_and_rotate(
-                transcript_buffer,
-                reason,
-                continue_session=continue_session,
-                data_dir=data_dir,
-                locked_category=locked_category,
-            )
+        await flush_and_rotate(
+            transcript_buffer,
+            reason,
+            continue_session=continue_session,
+            data_dir=data_dir,
+            locked_category=locked_category,
+        )
 
-    async def _flush_continuation(reason: str) -> None:
+    from onoats.recorder_lifecycle import (
+        LifecycleStoppingError,
+        RecorderLifecycleController,
+    )
+
+    lifecycle = RecorderLifecycleController(
+        _rotate_flush, mark_graceful=_mark_graceful_shutdown_requested
+    )
+
+    async def _flush_continuation(reason: str) -> bool:
         """Continuation-flush entry point for Ctrl+T / SIGUSR1 / silence.
 
         Signal and keypress handlers call this with a single ``reason``
         string; it always rotates with ``continue_session=True`` so the
         ongoing recording gets a fresh .active/ session.
         """
-        await _rotate_flush(reason, continue_session=True)
+        try:
+            await lifecycle.flush(reason)
+        except LifecycleStoppingError:
+            return False
+        return True
 
     # Silence timeout callback — triggered by SilenceDetector after N minutes of inactivity
     async def on_silence_timeout() -> None:
-        await _rotate_flush("Silence timeout fired", continue_session=True)
+        await _flush_continuation("Silence timeout fired")
 
     silence_timeout_sec = float(os.getenv("SILENCE_TIMEOUT_SEC", "300"))
     silence_detector = SilenceDetector(
@@ -259,7 +271,7 @@ async def run_onoats(
     # whatever record happens to already be on disk (e.g. a stale, stopped
     # record left by an earlier dual/socket-mode session on the same
     # data_dir), misattributing an `stt:` warning to an unrelated session.
-    stt = (await _create_stt_service(config=cfg, data_dir=None)).service
+    stt = (await _create_stt_service(config=session_config, data_dir=None)).service
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
@@ -300,11 +312,16 @@ async def run_onoats(
     # have an owner throughout the externally visible recorder lifetime.)
     # ----------------------------------------------------------------
     loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-    force_exit_event = asyncio.Event()
+    shutdown_event = lifecycle.shutdown_event
+    force_exit_event = lifecycle.force_exit_event
     # SIGUSR1 is a continuation flush — wired to _flush_continuation.
     _install_signal_handlers(
-        shutdown_event, force_exit_event, _flush_continuation, silence_detector, loop
+        shutdown_event,
+        force_exit_event,
+        _flush_continuation,
+        silence_detector,
+        loop,
+        lifecycle_controller=lifecycle,
     )
 
     # ----------------------------------------------------------------
@@ -315,19 +332,17 @@ async def run_onoats(
 
     pid_record = _build_pid_record(start_epoch=start_epoch)
 
-    async def _control_flush() -> None:
-        await _flush_continuation("Control socket flush")
+    async def _control_flush() -> bool:
+        return await _flush_continuation("Control socket flush")
 
-    def _control_stop() -> None:
-        _mark_graceful_shutdown_requested()
-        shutdown_event.set()
+    async def _control_stop() -> None:
+        await lifecycle.stop("Control socket stop")
 
     control_server = ControlServer(
         data_dir,
         pid_record,
         on_flush=_control_flush,
         on_stop=_control_stop,
-        stopping_event=shutdown_event,
     )
     await control_server.start()
     try:
@@ -338,14 +353,9 @@ async def run_onoats(
     status_published = _write_status_running(
         data_dir,
         audio_source="portaudio",
-        stt_label=stt_banner(),
+        stt_label=stt_banner(session_config),
         start_epoch=start_epoch,
     )
-    if not status_published:
-        await control_server.close()
-        _remove_pid_file(pid_path, owner_record=pid_record)
-        raise RuntimeError("could not publish recorder running status")
-
     _shutdown_started = False
     _shutdown_complete = asyncio.Event()
 
@@ -398,7 +408,7 @@ async def run_onoats(
             # Terminal flush: rotate the final buffer into pending/ for the
             # cron worker. The bot no longer runs post-processing inline.
             try:
-                await _rotate_flush("Shutdown", continue_session=False)
+                await lifecycle.terminal_rotation("Shutdown")
             except Exception as exc:
                 logger.error(
                     f"Shutdown: flush rotation failed ({exc}). "
@@ -432,7 +442,7 @@ async def run_onoats(
     if locked_category:
         logger.info(f"  Category:  {locked_category} (locked via --category)")
     logger.info(f"  Data dir:  {data_dir}")
-    logger.info(f"  STT:       {stt_banner()}")
+    logger.info(f"  STT:       {stt_banner(session_config)}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
     logger.info(
         f"  Input device: {input_dev if input_dev is not None else 'system default'}"
@@ -472,13 +482,13 @@ async def run_onoats(
     finally:
         await _on_shutdown()
         await control_server.close()
-        if ended_by_error:
+        if status_published and ended_by_error:
             _write_status_stopped(
                 data_dir,
                 exit_reason="fatal_error_frame",
                 last_error="single-input pipeline ended without a shutdown request",
             )
-        else:
+        elif status_published:
             _write_status_stopped(data_dir, exit_reason="graceful")
         _restore_terminal(_old_terminal_settings)
         _remove_pid_file(pid_path, owner_record=pid_record)

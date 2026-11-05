@@ -13,17 +13,25 @@ import sys
 import pytest
 
 from onoats.ui_telemetry import (
+    AUDIO_FIELDS,
     AUDIO_OBSERVATION_EXPIRY_SECONDS,
     AUDIO_OBSERVATION_REFRESH_SECONDS,
     DETAIL_LIMIT,
     HEARTBEAT_SECONDS,
     MAX_WRITE_HZ,
+    ROOT_OPTIONAL_FIELDS,
+    ROOT_REQUIRED_FIELDS,
     SEMINAR_CATEGORY,
     SNAPSHOT_EXPIRY_SECONDS,
     TRANSCRIPT_LIMIT,
+    TRANSCRIPT_OPTIONAL_FIELDS,
+    TRANSCRIPT_REQUIRED_FIELDS,
     UI_TELEMETRY_FILENAME,
     UI_TELEMETRY_MODE,
     UI_TELEMETRY_SCHEMA_VERSION,
+    STT_BRANCH_OPTIONAL_FIELDS,
+    STT_BRANCH_REQUIRED_FIELDS,
+    STT_FIELDS,
     UITelemetryPublisher,
     UITelemetryState,
     _restore_quarantined,
@@ -103,6 +111,29 @@ def test_contract_constants_are_independent_and_bounded():
     assert SEMINAR_CATEGORY == "seminars"
     assert TRANSCRIPT_LIMIT == 240
     assert DETAIL_LIMIT == 256
+
+
+def test_producer_emits_every_parity_checked_exact_field_shape():
+    state = _state()
+    minimal = state.snapshot()
+    assert ROOT_REQUIRED_FIELDS.issubset(minimal)
+    assert set(minimal).issubset(ROOT_REQUIRED_FIELDS | ROOT_OPTIONAL_FIELDS)
+    assert set(minimal["stt"]) == STT_FIELDS
+    for branch in ("me", "them"):
+        assert STT_BRANCH_REQUIRED_FIELDS.issubset(minimal["stt"][branch])
+        assert set(minimal["stt"][branch]).issubset(
+            STT_BRANCH_REQUIRED_FIELDS | STT_BRANCH_OPTIONAL_FIELDS
+        )
+
+    state.observe_level("me", 0.5)
+    state.set_stt_state("me", "recovering", "retrying")
+    state.set_transcript("hello", source="them", speaker_label="Them (S1)")
+    complete = state.snapshot()
+    assert set(complete["audio"]["me"]) == AUDIO_FIELDS
+    assert set(complete["transcript"]) == (
+        TRANSCRIPT_REQUIRED_FIELDS | TRANSCRIPT_OPTIONAL_FIELDS
+    )
+    assert set(complete) == ROOT_REQUIRED_FIELDS | ROOT_OPTIONAL_FIELDS
 
 
 LEVEL_VERDICTS = json.loads(

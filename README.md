@@ -160,7 +160,10 @@ less-frequent settings and diagnostics without leaving the panel.
   normal-path PID signal. Each request includes the complete PID/start-epoch
   generation and is accepted only from the same macOS uid; missing or legacy
   recorder endpoints fail closed. Direct SIGUSR1/SIGTERM remain compatibility
-  inputs for terminal and service-manager control.
+  inputs for terminal and service-manager control. All control and signal
+  requests enter the same recorder lifecycle controller: Flush admitted first
+  finishes its continuation rotation, while Stop admitted first rejects later
+  Flush requests.
 - **Seminar** — before Start, the toggle adds `--category seminars` to that next
   recording only (other categories are classified downstream). It becomes a
   read-only lock badge during the app-owned session and resets when the session
@@ -188,7 +191,14 @@ less-frequent settings and diagnostics without leaving the panel.
   `Unavailable` means telemetry is missing, stale, malformed, unsupported, or
   belongs to another run. STT is ready only when both websocket branches report
   ready; whisper and deepgram show neutral `status not reported`. Telemetry
-  failure never stops recording or transcript persistence.
+  failure never stops recording or transcript persistence. The richer running
+  status is also fail-open after recorder PID/control ownership exists: if its
+  first write fails, recording and CLI control continue, telemetry stays off,
+  and the app uses the owned process exit plus its run log for the outcome.
+- **Session settings** — each Start captures one immutable STT/session snapshot.
+  Both transcription arms, status label, recovery policy, telemetry, diarization,
+  and shutdown diagnostics use those same values even if `config.toml` changes
+  mid-run; edits apply to the next Start.
 - **Transcript privacy** — the latest-transcript preview is off by default and
   can be enabled in Settings. It is bounded and display-only; complete utterances
   remain in the session JSONL.
@@ -364,6 +374,13 @@ precedence (CLI flag > env `AUDIO_SOURCE` > `config.toml` > default).
 > platforms, or below macOS 14.4, keep the default `portaudio` source — a
 > loopback driver remains the system-audio fallback there
 > ([docs/blackhole-fallback.md](docs/blackhole-fallback.md)).
+
+Release publication keeps Python 3.12 as the full-suite lane and independently
+runs the recorder/control contracts on Python 3.13; PyPI publishing waits for
+both. Signed-app staging additionally uses one release-identity record shared by
+installation and smoke, including the bundle/signing/tree/executable identity
+and an independently verified CLI git revision. See
+[`native/README.md`](native/README.md) for the exact workflow.
 
 ### Data location
 

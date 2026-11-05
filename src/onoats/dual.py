@@ -87,6 +87,7 @@ def _finalize_shutdown_status(
     old_terminal_settings: object | None = None,
     telemetry_cleanup=None,
     owner_record=None,
+    status_published: bool = True,
 ) -> None:
     """Single-writer shutdown tail: write status-stopped BEFORE removing the pid.
 
@@ -107,7 +108,7 @@ def _finalize_shutdown_status(
     ``_shutdown_watcher`` and the outer ``finally`` block), so it does not need to
     be internally idempotent.
     """
-    if ended_by_error:
+    if status_published and ended_by_error:
         _write_status_stopped(
             data_dir,
             exit_reason="fatal_error_frame",
@@ -116,7 +117,7 @@ def _finalize_shutdown_status(
                 "EOF / read-idle / framing failure)"
             ),
         )
-    else:
+    elif status_published:
         _write_status_stopped(data_dir, exit_reason="graceful")
     if telemetry_cleanup is not None:
         try:
@@ -484,6 +485,7 @@ async def run_onoats_dual(
     live_terminal: bool = False,
     locked_category: str | None = None,
     data_dir: Path | None = None,
+    session_config=None,
 ) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.pipeline.runner import PipelineRunner
@@ -510,9 +512,17 @@ async def run_onoats_dual(
 
     from onoats.config import load_config
 
-    cfg = load_config()
+    from onoats.runtime import RecorderSessionConfig
+
+    if session_config is None:
+        session_config = RecorderSessionConfig.capture(load_config())
+    cfg = session_config
     audio_source = cfg.audio_source
     start_epoch = _mint_start_epoch()
+    # One run-wide display-publication gate.  Initial running-status failure
+    # disables every later status mutation and telemetry publication without
+    # affecting recorder/control/transcript authority.
+    status_publication_enabled = [True]
 
     # Mint the durable transcript identity before display telemetry so the
     # schema-v2 snapshot can attest the exact run written into every JSONL
@@ -605,9 +615,7 @@ async def run_onoats_dual(
     # overlapping speech won't produce spurious silence_gap entries.
     # Enabling this restores Segmenter's ability to split short sessions
     # (segmenter fast-skips no-gap buffers with <=10 utterances).
-    flush_lock = asyncio.Lock()
-
-    async def _rotate_flush(reason: str, *, continue_session: bool) -> None:
+    async def _rotate_flush(reason: str, continue_session: bool) -> None:
         """Flush the dual buffer and rotate the session file into pending/.
 
         The bot no longer runs post-processing inline — a cron worker drains
@@ -615,30 +623,43 @@ async def run_onoats_dual(
         (silence-timeout / Ctrl+T / SIGUSR1 — opens a fresh .active/ session)
         from a terminal flush (EndFrame / shutdown).
         """
-        async with flush_lock:
-            await flush_and_rotate(
-                transcript_buffer,
-                reason,
-                continue_session=continue_session,
-                data_dir=data_dir,
-                locked_category=locked_category,
-            )
+        await flush_and_rotate(
+            transcript_buffer,
+            reason,
+            continue_session=continue_session,
+            data_dir=data_dir,
+            locked_category=locked_category,
+        )
         # Stamp last-rotation on the status file after a successful rotation
         # (terminal or continuation) so the menu bar / `onoats status` can show
         # when the session last rolled over.
-        _mark_status_rotation(data_dir)
+        if status_publication_enabled[0]:
+            _mark_status_rotation(data_dir)
 
-    async def _flush_continuation(reason: str) -> None:
+    from onoats.recorder_lifecycle import (
+        LifecycleStoppingError,
+        RecorderLifecycleController,
+    )
+
+    lifecycle = RecorderLifecycleController(
+        _rotate_flush, mark_graceful=_mark_graceful_shutdown_requested
+    )
+
+    async def _flush_continuation(reason: str) -> bool:
         """Continuation-flush entry point for Ctrl+T / SIGUSR1 / silence.
 
         Signal and keypress handlers call this with a single ``reason``
         string; it always rotates with ``continue_session=True`` so the
         ongoing recording gets a fresh .active/ session.
         """
-        await _rotate_flush(reason, continue_session=True)
+        try:
+            await lifecycle.flush(reason)
+        except LifecycleStoppingError:
+            return False
+        return True
 
     async def on_silence_timeout() -> None:
-        await _rotate_flush("Dual silence timeout fired", continue_session=True)
+        await _flush_continuation("Dual silence timeout fired")
 
     silence_timeout_sec = float(os.getenv("SILENCE_TIMEOUT_SEC", "300"))
     silence_detector = DualSilenceDetector(
@@ -682,9 +703,10 @@ async def run_onoats_dual(
         }
 
     mic_result = await _create_stt_service(
-        config=cfg,
+        config=session_config,
         data_dir=data_dir,
         branch_instance="mic",
+        status_publication_enabled=lambda: status_publication_enabled[0],
         **_stt_callbacks("me"),
     )
     mic_stt = mic_result.service
@@ -692,10 +714,11 @@ async def run_onoats_dual(
     # the system ("them") arm stamps VAD spans; the mic arm never does.
     diarization_on = bool(cfg.diarization)
     system_result = await _create_stt_service(
-        config=cfg,
+        config=session_config,
         data_dir=data_dir,
         branch_instance="system",
         stamp_segment_samples=diarization_on,
+        status_publication_enabled=lambda: status_publication_enabled[0],
         **_stt_callbacks("them"),
     )
     system_stt = system_result.service
@@ -707,7 +730,7 @@ async def run_onoats_dual(
     # ``shutdown`` entry logged from `_run_shutdown` to get a free
     # soak datapoint out of every real-world session — no dedicated
     # harness needed.
-    await log_stt_server_rss("startup")
+    await log_stt_server_rss("startup", config=session_config)
 
     call_id = _generate_call_id()
     logger.info(f"Dual pipeline session call_id={call_id}")
@@ -737,8 +760,8 @@ async def run_onoats_dual(
     await silence_detector.start_monitoring()
 
     loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-    force_exit_event = asyncio.Event()
+    shutdown_event = lifecycle.shutdown_event
+    force_exit_event = lifecycle.force_exit_event
     # SIGUSR1 is a continuation flush — wired to _flush_continuation.
     _install_signal_handlers(
         shutdown_event,
@@ -746,24 +769,23 @@ async def run_onoats_dual(
         _flush_continuation,
         silence_detector,
         loop,
+        lifecycle_controller=lifecycle,
     )
     from onoats.control_socket import ControlServer
 
     pid_record = _build_pid_record(start_epoch=start_epoch)
 
-    async def _control_flush() -> None:
-        await _flush_continuation("Control socket flush")
+    async def _control_flush() -> bool:
+        return await _flush_continuation("Control socket flush")
 
-    def _control_stop() -> None:
-        _mark_graceful_shutdown_requested()
-        shutdown_event.set()
+    async def _control_stop() -> None:
+        await lifecycle.stop("Control socket stop")
 
     control_server = ControlServer(
         data_dir,
         pid_record,
         on_flush=_control_flush,
         on_stop=_control_stop,
-        stopping_event=shutdown_event,
     )
     await control_server.start()
     try:
@@ -777,14 +799,11 @@ async def run_onoats_dual(
     status_published = _write_status_running(
         data_dir,
         audio_source=audio_source,
-        stt_label=stt_banner(),
+        stt_label=stt_banner(session_config),
         start_epoch=start_epoch,
         warning=preflight_recovery_warning,
     )
-    if not status_published:
-        await control_server.close()
-        _remove_pid_file(pid_path, owner_record=pid_record)
-        raise RuntimeError("could not publish recorder running status")
+    status_publication_enabled[0] = status_published
     telemetry_publisher = None
     if telemetry_state is not None and status_published:
         from onoats.ui_telemetry import UITelemetryPublisher
@@ -840,7 +859,7 @@ async def run_onoats_dual(
             # Terminal flush: rotate the final buffer into pending/ for the
             # cron worker. The bot no longer runs post-processing inline.
             try:
-                await _rotate_flush("Shutdown", continue_session=False)
+                await lifecycle.terminal_rotation("Shutdown")
             except Exception as exc:
                 logger.error(
                     f"Shutdown: flush rotation failed ({exc}). "
@@ -853,7 +872,7 @@ async def run_onoats_dual(
         logger.info("Shutdown: draining dual STT services")
         await _shutdown_stt_service(mic_stt, "mic")
         await _shutdown_stt_service(system_stt, "system")
-        await log_stt_server_rss("shutdown")
+        await log_stt_server_rss("shutdown", config=session_config)
 
         # Display telemetry is not allowed to delay the recorder's force-exit
         # path. Its bounded stop cancels a task that owns no durable data.
@@ -880,6 +899,7 @@ async def run_onoats_dual(
                 telemetry_publisher.cleanup if telemetry_publisher is not None else None
             ),
             owner_record=pid_record,
+            status_published=status_published,
         )
         logger.info("Shutdown: complete")
 
@@ -897,7 +917,7 @@ async def run_onoats_dual(
     if locked_category:
         logger.info(f"  Category:         {locked_category} (locked via --category)")
     logger.info(f"  Data dir:         {data_dir}")
-    logger.info(f"  STT:              {stt_banner()}")
+    logger.info(f"  STT:              {stt_banner(session_config)}")
     logger.info(f"  Silence timeout:  {silence_timeout_sec}s")
     logger.info(f"  Mic input:        {mic_input_label}")
     logger.info(f"  System input:     {system_input_label}")

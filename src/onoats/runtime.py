@@ -26,9 +26,10 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -72,6 +73,85 @@ if sys.platform != "win32":
 BOT_NAME = "onoats"
 STT_SERVICE = os.getenv("STT_SERVICE", "whisper").lower().strip()
 STT_MODEL = os.getenv("STT_MODEL", "").strip()
+
+
+@dataclass(frozen=True)
+class RecorderSessionConfig:
+    """Immutable STT/config authority captured once for a recorder run."""
+
+    audio_source: str
+    mic_device: str | None
+    system_device: str | None
+    mic_device_source: str
+    system_device_source: str
+    mic_socket: str | None
+    system_socket: str | None
+    capturer_nonce: str | None
+    stt_service: str
+    stt_model: str
+    stt_language: str
+    stt_endpoint: Mapping[str, object]
+    stt_launchd_label: str | None
+    diarization: bool
+    diarization_idle_remint_sec: float | None
+    display_label: str
+    secrets: Mapping[str, str]
+
+    @classmethod
+    def capture(cls, config: OnoatsConfig | None = None) -> RecorderSessionConfig:
+        if config is None:
+            from onoats.config import load_config
+
+            config = load_config()
+        endpoint = MappingProxyType(
+            dict(_resolve_stt_ws_target(_ws_env(config), warn_on_cleartext=False))
+        )
+        secrets = MappingProxyType(
+            {
+                name: value
+                for name in ("DEEPGRAM_API_KEY",)
+                if (value := config.get_secret(name)) is not None
+            }
+        )
+        return cls(
+            audio_source=config.audio_source,
+            mic_device=config.mic_device,
+            system_device=config.system_device,
+            mic_device_source=config.mic_device_source,
+            system_device_source=config.system_device_source,
+            mic_socket=config.mic_socket,
+            system_socket=config.system_socket,
+            capturer_nonce=config.capturer_nonce,
+            stt_service=config.stt_service,
+            stt_model=config.stt_model,
+            stt_language=config.stt_language,
+            stt_endpoint=endpoint,
+            stt_launchd_label=config.stt_launchd_label,
+            diarization=bool(config.diarization),
+            diarization_idle_remint_sec=config.diarization_idle_remint_sec,
+            display_label=_stt_banner_for_config(config),
+            secrets=secrets,
+        )
+
+    def require_secret(
+        self,
+        name: str,
+        *,
+        validate: Callable[[str], bool] | None = None,
+        hint: str | None = None,
+    ) -> str:
+        """Return a secret captured with the rest of the session snapshot."""
+        value = self.secrets.get(name, "").strip()
+        if not value:
+            message = f"Missing required secret: {name}"
+            if hint:
+                message += f" — {hint}"
+            raise RuntimeError(message)
+        if validate is not None and not validate(value):
+            raise RuntimeError(
+                f"Secret {name} is set but looks invalid (failed validation)"
+            )
+        return value
 
 
 class SttPreflightError(RuntimeError):
@@ -400,7 +480,16 @@ def _display_target(kwargs: dict) -> str:
 # public name.
 
 
-def stt_banner() -> str:
+def _stt_banner_for_config(cfg: OnoatsConfig) -> str:
+    if cfg.stt_service == "websocket":
+        target = _display_target(
+            _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
+        )
+        return f"websocket (server={target}, model pinned by server)"
+    return f"{cfg.stt_service} / model={cfg.stt_model or 'default'}"
+
+
+def stt_banner(config: OnoatsConfig | RecorderSessionConfig | None = None) -> str:
     """One-line STT description for the startup banner.
 
     For the websocket backend the model is pinned by the server (via the
@@ -410,15 +499,13 @@ def stt_banner() -> str:
     Show the resolved server target instead; the real backend + model is
     logged on connect by ``WebSocketSTTService._ensure_connected``.
     """
-    from onoats.config import load_config
+    if isinstance(config, RecorderSessionConfig):
+        return config.display_label
+    if config is None:
+        from onoats.config import load_config
 
-    cfg = load_config()
-    if cfg.stt_service == "websocket":
-        target = _display_target(
-            _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
-        )
-        return f"websocket (server={target}, model pinned by server)"
-    return f"{cfg.stt_service} / model={cfg.stt_model or 'default'}"
+        config = load_config()
+    return _stt_banner_for_config(config)
 
 
 def _ws_env(cfg) -> dict[str, str]:
@@ -522,7 +609,9 @@ _preflight_cache: dict[tuple[object, object, object, object], str | None] = {}
 _RSS_PROBE_TIMEOUT_SEC = 2.0
 
 
-async def log_stt_server_rss(phase: str) -> None:
+async def log_stt_server_rss(
+    phase: str, *, config: OnoatsConfig | RecorderSessionConfig | None = None
+) -> None:
     """Log the stt_server's PID + peak RSS at ``phase`` (``startup`` / ``shutdown``).
 
     Queries the running server via the ``server.status`` wire probe
@@ -549,7 +638,11 @@ async def log_stt_server_rss(phase: str) -> None:
         # which the data path (``_create_stt_service``) and banner
         # (``stt_banner``) both layer in. Skipping it lands on the default
         # socket and probes a stale/wrong server (e.g. mlx instead of nemotron).
-        kwargs = _resolve_stt_ws_target(_ws_env(load_config()), warn_on_cleartext=False)
+        if isinstance(config, RecorderSessionConfig):
+            kwargs = dict(config.stt_endpoint)
+        else:
+            cfg = config or load_config()
+            kwargs = _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
         client = TranscriptionClient(
             socket_path=kwargs.get("socket_path"),
             host=kwargs.get("host"),
@@ -1313,13 +1406,14 @@ class SttServiceResult:
 
 async def _create_stt_service(
     *,
-    config: OnoatsConfig | None = None,
+    config: OnoatsConfig | RecorderSessionConfig | None = None,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
     stamp_segment_samples: bool = False,
     on_ready: Callable[[], None] | None = None,
     on_recovering: Callable[[], None] | None = None,
     on_failed: Callable[[str], None] | None = None,
+    status_publication_enabled: Callable[[], bool] | None = None,
 ) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -1423,6 +1517,11 @@ async def _create_stt_service(
                 # path that just recovered — a status-file failure must not
                 # turn a successful self-heal into an uncaught crash, and must
                 # not be misread by `_ensure_connected` as a failed connect.
+                if (
+                    status_publication_enabled is not None
+                    and not status_publication_enabled()
+                ):
+                    return
                 try:
                     _status_mod.set_warning_branch(data_dir, branch, msg)
                 except Exception as exc:
@@ -1458,7 +1557,11 @@ async def _create_stt_service(
             def on_preflight_confirmed() -> None:
                 _clear_preflight(None)
 
-        kwargs = _resolve_stt_ws_target(_ws_env(cfg))
+        kwargs = (
+            dict(cfg.stt_endpoint)
+            if isinstance(cfg, RecorderSessionConfig)
+            else _resolve_stt_ws_target(_ws_env(cfg))
+        )
         target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
         await _preflight_stt_ws(
@@ -2236,7 +2339,7 @@ def _write_status_running(
     live-path equivalent still goes through ``status.set_warning_branch``.
     """
     try:
-        _status_mod.write_running(
+        result = _status_mod.write_running(
             data_dir,
             pid=os.getpid(),
             audio_source=audio_source,
@@ -2244,9 +2347,18 @@ def _write_status_running(
             start_time=start_epoch,
             warning=warning,
         )
+        if result is False:
+            logger.warning(
+                "Could not write status file (start): status writer returned false; "
+                "status and UI telemetry disabled for this run"
+            )
+            return False
         return True
     except OSError as exc:
-        logger.warning(f"Could not write status file (start): {exc}")
+        logger.warning(
+            "Could not write status file (start): "
+            f"{safe_exc_text(exc)}; status and UI telemetry disabled for this run"
+        )
         return False
 
 
@@ -2338,6 +2450,8 @@ def _install_signal_handlers(
     flush_callback,
     silence_detector,
     loop: asyncio.AbstractEventLoop,
+    *,
+    lifecycle_controller=None,
 ) -> None:
     """Install signal handlers.
 
@@ -2348,6 +2462,17 @@ def _install_signal_handlers(
     """
 
     def _handle_shutdown(sig):
+        if lifecycle_controller is not None:
+            forced = lifecycle_controller.signal(loop)
+            if forced:
+                logger.warning(
+                    "Received second Ctrl+C — forcing exit (cancelling pending tasks)"
+                )
+            else:
+                logger.info(
+                    f"Received signal {sig.name} — initiating graceful shutdown"
+                )
+            return
         if shutdown_event.is_set():
             logger.warning(
                 "Received second Ctrl+C — forcing exit (cancelling pending tasks)"

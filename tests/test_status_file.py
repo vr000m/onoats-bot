@@ -56,6 +56,36 @@ def _record(**over) -> StatusRecord:
     return StatusRecord(**base)
 
 
+@pytest.mark.parametrize("mode", ["success", "false", "error"])
+def test_initial_running_status_publication_is_fail_open_and_warns_once(
+    tmp_path, monkeypatch, mode
+):
+    from onoats import runtime
+
+    warnings: list[str] = []
+    monkeypatch.setattr(runtime.logger, "warning", warnings.append)
+
+    def writer(*_args, **_kwargs):
+        if mode == "error":
+            raise OSError("ws://secret:hunter2@status.invalid/path?token=leak")
+        return mode != "false"
+
+    monkeypatch.setattr(runtime._status_mod, "write_running", writer)
+    result = runtime._write_status_running(
+        tmp_path,
+        audio_source="socket",
+        stt_label="captured",
+        start_epoch=100.0,
+    )
+
+    assert result is (mode == "success")
+    assert len(warnings) == (0 if mode == "success" else 1)
+    combined = "\n".join(warnings)
+    assert "secret" not in combined and "hunter2" not in combined
+    if mode != "success":
+        assert "status and UI telemetry disabled for this run" in combined
+
+
 # ---------------------------------------------------------------------------
 # (a) schema round-trip
 # ---------------------------------------------------------------------------
@@ -709,8 +739,9 @@ def test_control_handlers_keep_flush_and_stop_actions_differential():
         stop = source.split("def _control_stop()", 1)[1].split("control_server =", 1)[0]
         assert "_flush_continuation" in flush
         assert "shutdown_event.set()" not in flush
-        assert "_mark_graceful_shutdown_requested()" in stop
-        assert "shutdown_event.set()" in stop
+        assert 'lifecycle.stop("Control socket stop")' in stop
+        assert "_mark_graceful_shutdown_requested()" not in stop
+        assert "shutdown_event.set()" not in stop
         assert "_flush_continuation" not in stop
 
 

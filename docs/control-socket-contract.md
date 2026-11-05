@@ -16,7 +16,8 @@ service managers, but the CLI never falls back to them.
 The recorder binds a socket inside a private mode-`0700` directory under
 `<data_dir>/.active`, captures that unpublished socket's device/inode, and
 atomically publishes it as `.active/onoats-control.sock` with an exclusive
-no-replace rename before publishing its PID and running status. `.active` is
+no-replace rename before publishing its PID and attempting the best-effort
+running-status write. `.active` is
 mode `0700` and the socket is `0600`.
 If that absolute pathname exceeds Darwin's `sockaddr_un` limit, startup and
 clients fail closed with guidance to choose a shorter data directory; neither
@@ -28,7 +29,10 @@ public entry into a private same-directory quarantine, verifies the moved inode,
 and removes only that socket; a raced foreign entry is restored by the same
 exclusive rename without overwriting a successor, or retained in quarantine.
 Shutdown stops acceptance and settles accepted commands before removing the
-socket, writing stopped status, and exact-record PID teardown.
+socket, attempting stopped status when status publication is enabled, and
+performing exact-record PID teardown. Failure of the initial running-status
+write disables status and UI telemetry for that run but does not revoke the
+already-published PID/control authority or stop recording.
 
 On macOS every accepted connection must provide Darwin `LOCAL_PEERCRED`. The
 server requires a complete `xucred` with `cr_version == XUCRED_VERSION`, a valid
@@ -60,9 +64,15 @@ unterminated or oversized input, an unsupported version, an unsupported command,
 mismatch, and unauthorised peers all fail closed. A missing, legacy, replaced,
 or incompatible endpoint is never converted into a PID signal: there is **no PID-signal fallback**.
 
-## Serialized command state
+## Recorder lifecycle state
 
-One recorder-loop lock serializes accepted commands:
+`RecorderLifecycleController` is the sole state machine for both recorder
+entrypoints. The control server authenticates and validates one request, then
+awaits the controller action it acknowledges; it owns no second command lock,
+shutdown event, or rotation path. Direct signal handlers are adapters into the
+same controller.
+
+The controller's one async lock orders accepted commands:
 
 - A Flush that acquires the lock first completes continuation rotation before
   its success acknowledgement.
@@ -70,8 +80,9 @@ One recorder-loop lock serializes accepted commands:
   before acknowledgement.
 - A duplicate Stop is idempotently acknowledged.
 - Any Flush acquiring the lock after Stop acceptance is rejected as `stopping`.
-- SIGINT/SIGTERM and socket Stop share the same shutdown event, so a Flush
-  observed after either shutdown source begins is rejected as `stopping`.
+- SIGINT/SIGTERM enter the same Stop admission, so a Flush observed after any
+  shutdown source begins is rejected as `stopping`. SIGUSR1 enters the same
+  continuation path as socket Flush.
 
 Therefore simultaneous Stop/Flush is resolved solely by lock acquisition order,
 and an acknowledgement always describes an action already accepted by that same

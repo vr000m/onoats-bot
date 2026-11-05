@@ -194,9 +194,10 @@ def _encoded_response(ok: bool, code: str, message: str) -> bytes:
     return encoded
 
 
-async def _maybe_await(value: Any) -> None:
+async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
-        await value
+        return await value
+    return value
 
 
 class ControlServer:
@@ -209,18 +210,14 @@ class ControlServer:
         *,
         on_flush: Callable[[], Awaitable[None] | None],
         on_stop: Callable[[], Awaitable[None] | None],
-        stopping_event: asyncio.Event | None = None,
         peer_uid_getter: Callable[[socket.socket], int] | None = None,
     ) -> None:
         self.path = control_socket_path(data_dir)
         self._pid, self._start_epoch = _record_generation(record)
         self._on_flush = on_flush
         self._on_stop = on_stop
-        self._stopping_event = stopping_event
         self._peer_uid_getter = peer_uid_getter or _darwin_peer_uid
         self._server: asyncio.AbstractServer | None = None
-        self._command_lock = asyncio.Lock()
-        self._stopping = False
         self._closing = False
         self._handlers: set[asyncio.Task[Any]] = set()
         self._owned_identity: tuple[int, int] | None = None
@@ -402,21 +399,13 @@ class ControlServer:
                 False, "generation-mismatch", "recorder generation changed"
             )
 
-        async with self._command_lock:
-            if command == "flush":
-                if self._stopping or (
-                    self._stopping_event is not None and self._stopping_event.is_set()
-                ):
-                    return ControlResponse(False, "stopping", "recorder is stopping")
-                await _maybe_await(self._on_flush())
-                return ControlResponse(True, "accepted", "flush rotation completed")
-            if self._stopping or (
-                self._stopping_event is not None and self._stopping_event.is_set()
-            ):
-                return ControlResponse(True, "accepted", "stop already accepted")
-            await _maybe_await(self._on_stop())
-            self._stopping = True
-            return ControlResponse(True, "accepted", "graceful stop requested")
+        if command == "flush":
+            accepted = await _maybe_await(self._on_flush())
+            if accepted is False:
+                return ControlResponse(False, "stopping", "recorder is stopping")
+            return ControlResponse(True, "accepted", "flush rotation completed")
+        await _maybe_await(self._on_stop())
+        return ControlResponse(True, "accepted", "graceful stop requested")
 
     async def close(self) -> None:
         """Stop accepting, settle accepted commands, then remove our socket."""

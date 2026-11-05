@@ -330,6 +330,16 @@ Context lifecycle — what enters context at each step, and whether it clears or
 
 ## Findings
 
+- **2026-11-05 correction — recovery-warning publication is conditional on the
+  fail-open display boundary.** Phase 11 of
+  [`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+  preserves the captured preflight warning when the initial running-status write
+  succeeds, but no longer lets a failed status write abort an otherwise viable
+  recording. After PID/control authority exists, an `OSError` or false status
+  result disables status and UI telemetry for that run; capture, STT recovery,
+  control, and transcript persistence continue, with process exit and the run log
+  carrying failure detail. The original ordering fix remains authoritative for
+  status-present runs.
 - (append findings here as work proceeds)
 - **Phase 5 native spike, core path (2026-09-19, by the user)**: `make -C native install` built and linked cleanly — first real Xcode build of this branch's Swift changes (`AudioDevices.swift`, `ConfigStore.swift`, `LoginItemManager.swift`, `OnoatsMenuBarApp.swift`, `RecorderModel.swift`), previously only `swiftc -typecheck`-checked. Codesigning succeeded (`Code Signing` identity, `net.varunsingh.onoats`), app installed to `~/Applications/Onoats.app`, launched and showed the menu bar UI correctly (mic/system device pickers, STT service selector, data dir, wired to a live `websocket` STT server). Setting `[app].launch_at_login = true` in `config.toml` and relaunching triggered macOS's native "Login Item Added" notification — `SMAppService.register()` succeeded with **no `.requiresApproval` friction** for this self-signed, non-notarized, `~/Applications`-installed bundle, resolving the plan's previously-unverified assumption about that combination. Toggling to `false` and relaunching unregistered it. A real reboot with the key set to `true` confirmed Onoats.app actually launches automatically at login, not just that `.register()` returns success. Remaining Phase 5 edge cases (explicit-denial `.requiresApproval` hint, absent-key-with-out-of-band-registration no-op, non-bare-boolean-value handling) were not exercised in this pass.
 - **Phase 3 mid-phase reviewer (advisory, 2026-09-15), 2 Important findings not yet fixed — carry into review-gauntlet / manual follow-up:**

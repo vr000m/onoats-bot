@@ -213,6 +213,46 @@ private func runTranscriptDisplayLabels() throws {
     }
 }
 
+private func runUnknownKeyRejections() throws {
+    var cases: [(String, [String: Any])] = []
+
+    var root = baseSnapshot(transcript: "preview")
+    root["unknown"] = true
+    cases.append(("root", root))
+
+    var audioRoot = baseSnapshot()
+    audioRoot["audio"] = [
+        "me": ["level": 0.5, "observed_at": 1_700_000_000.0, "unknown": true],
+        "them": NSNull(),
+    ]
+    cases.append(("audio branch", audioRoot))
+
+    var sttRoot = baseSnapshot()
+    var stt = sttRoot["stt"] as! [String: Any]
+    stt["unknown"] = true
+    sttRoot["stt"] = stt
+    cases.append(("stt", sttRoot))
+
+    var branchRoot = baseSnapshot()
+    var branchStt = branchRoot["stt"] as! [String: Any]
+    var me = branchStt["me"] as! [String: Any]
+    me["unknown"] = true
+    branchStt["me"] = me
+    branchRoot["stt"] = branchStt
+    cases.append(("stt branch", branchRoot))
+
+    var transcriptRoot = baseSnapshot(transcript: "preview")
+    var transcript = transcriptRoot["transcript"] as! [String: Any]
+    transcript["unknown"] = true
+    transcriptRoot["transcript"] = transcript
+    cases.append(("transcript", transcriptRoot))
+
+    for (name, snapshot) in cases {
+        let decoded = try decode(snapshot)
+        try require(decoded == nil, "\(name): unknown key was accepted")
+    }
+}
+
 @main
 struct UiTelemetryDecoderHarness {
     static func main() throws {
@@ -226,6 +266,7 @@ struct UiTelemetryDecoderHarness {
         try runLevelVerdicts(root)
         try runAllAggregatePairs()
         try runTranscriptDisplayLabels()
+        try runUnknownKeyRejections()
         print("UiTelemetryDecoderHarness: ok")
     }
 }

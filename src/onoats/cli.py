@@ -21,6 +21,8 @@ or importing pyaudio / pipecat / MLX. This keeps the import-guard clean: a bare
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import math
 import os
 import signal
@@ -207,6 +209,7 @@ _CAPTURER_RC_REASONS = {
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +
 # rotate) after the capturer dies, before the supervisor force-cancels it.
 _RECORDER_DRAIN_GRACE_SEC = 30.0
+_SUPERVISOR_HARD_EXIT = os._exit
 
 # Stable prefix for machine-parseable capturer stderr lines (mirrored by
 # Support.swift emitEvent; parity-pinned by tests/test_native_contract_parity.py
@@ -221,6 +224,8 @@ _STDERR_READER_GRACE_SEC = 2.0
 
 # Grace for the capturer to exit on SIGTERM before SIGKILL during teardown.
 _CAPTURER_TERM_GRACE_SEC = 5.0
+# After SIGKILL, bound both leader reaping and process-group survivor probes.
+_CAPTURER_KILL_REAP_GRACE_SEC = 2.0
 
 # Poll cadence for the deferred device-field apply (see
 # _apply_device_fields_when_recorded): the capturer's `device` events fire
@@ -613,19 +618,6 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
     # on exit (so the slot stays ours through the capturer teardown in `finally`).
     _acquire_instance_lock(data_dir / ".active")
 
-    # Diarization config-time gate: right after the lock, before the capturer
-    # spawn (no TCC prompt / device touch for a doomed start). Import-free and
-    # non-downloading; only when the flag is on. A failure raises
-    # DiarizationPreflightError (an SttPreflightError → rc=1 in
-    # _run_socket_supervisor). run_onoats_dual calls it again: the backend check
-    # re-runs, but the extra/weights probes are memoized (see its docstring).
-    from onoats.config import load_config as _load_config
-    from onoats.runtime import _preflight_diarization
-
-    _diar_cfg = _load_config()
-    if _diar_cfg.diarization:
-        _preflight_diarization(_diar_cfg)
-
     # 1. Private, supervisor-owned socket dir (0700). mkdtemp already creates the
     # dir 0700 and owner-only; a fresh per-generation dir means any stale socket
     # from a prior generation lives at a path the new recorder never references
@@ -657,6 +649,16 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
     os.environ["ONOATS_MIC_SOCKET"] = mic_sock
     os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
     os.environ["ONOATS_CAPTURER_NONCE"] = nonce
+
+    # Capture the one immutable recorder configuration only after the
+    # generation socket values exist, but before any capture side effect.  The
+    # same object crosses supervisor preflight and the recorder entrypoint.
+    from onoats.config import load_config as _load_config
+    from onoats.runtime import RecorderSessionConfig, _preflight_diarization
+
+    session_config = RecorderSessionConfig.capture(_load_config())
+    if session_config.diarization:
+        _preflight_diarization(session_config)
 
     capturer_proc: asyncio.subprocess.Process | None = None
     stderr_task: asyncio.Task[None] | None = None
@@ -804,7 +806,12 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
         # 5. Run the recorder against the sockets, watching the capturer
         # concurrently so its death tears the session down.
         rc = await _run_recorder_with_capturer(
-            rest, capturer_proc, logger, data_dir, device_state
+            rest,
+            capturer_proc,
+            logger,
+            data_dir,
+            device_state,
+            session_config=session_config,
         )
     finally:
         if capturer_proc is not None:
@@ -987,7 +994,13 @@ def _settle_recorder_rc(rc, logger, data_dir) -> int:
 
 
 async def _run_recorder_with_capturer(
-    rest, capturer_proc, logger, data_dir, device_state=None
+    rest,
+    capturer_proc,
+    logger,
+    data_dir,
+    device_state=None,
+    *,
+    session_config=None,
 ) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
 
@@ -1021,14 +1034,20 @@ async def _run_recorder_with_capturer(
     # Any write_running at/after this instant belongs to THIS session — the
     # deferred device-apply task keys on it so it never stamps a stale record.
     session_floor = time.time()
+    recorder_kwargs = {
+        "live_terminal": args.live_terminal,
+        "locked_category": args.category,
+        "data_dir": data_dir,
+    }
+    recorder_parameters = inspect.signature(run_onoats_dual).parameters.values()
+    if any(
+        parameter.name == "session_config"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in recorder_parameters
+    ):
+        recorder_kwargs["session_config"] = session_config
     recorder_task = asyncio.create_task(
-        run_onoats_dual(
-            live_terminal=args.live_terminal,
-            locked_category=args.category,
-            # Same resolution the supervisor's own status stamps use — one
-            # canonical data dir per session (see run_onoats_dual).
-            data_dir=data_dir,
-        ),
+        run_onoats_dual(**recorder_kwargs),
         name="socket_supervisor_recorder",
     )
     capturer_task = asyncio.create_task(
@@ -1151,9 +1170,21 @@ async def _run_recorder_with_capturer(
         # outer finally tears down capture; do not leave it running orphaned.
         recorder_task.cancel()
         capturer_task.cancel()
-        await asyncio.wait(
+        _done, pending = await asyncio.wait(
             {recorder_task, capturer_task}, timeout=_RECORDER_DRAIN_GRACE_SEC
         )
+        if recorder_task in pending:
+            status_file.stamp_supervisor_failure(
+                data_dir,
+                exit_reason="recorder-drain-timeout",
+                supervisor_rc=1,
+                last_error=(
+                    "recorder suppressed startup cancellation past its bounded "
+                    "drain grace; supervisor forced process exit"
+                ),
+            )
+            await _stop_capturer(capturer_proc, logger)
+            _SUPERVISOR_HARD_EXIT(1)
         raise
     finally:
         if device_flush_task is not None:
@@ -1208,7 +1239,7 @@ def _signal_capturer_group(capturer_proc, sig, logger) -> bool:
         return False
 
 
-async def _stop_capturer(capturer_proc, logger) -> None:
+async def _stop_capturer(capturer_proc, logger) -> bool:
     """Stop the capturer's whole process group: SIGTERM, bounded grace, then
     SIGKILL. Idempotent.
 
@@ -1223,31 +1254,24 @@ async def _stop_capturer(capturer_proc, logger) -> None:
     leader_alive = capturer_proc.returncode is None
     # SIGTERM the whole group. If nothing in the group is left, we're done.
     if not _signal_capturer_group(capturer_proc, signal.SIGTERM, logger):
-        return
+        return True
 
     # Give the group a bounded grace to exit on SIGTERM. When the leader is
     # still alive we await it directly. When it has already been reaped (crash
     # path) we cannot await it, so we poll the group with signal 0 until it
     # drains or the grace elapses.
-    drained = False
-    try:
-        if leader_alive:
+    loop = asyncio.get_running_loop()
+    term_deadline = loop.time() + _CAPTURER_TERM_GRACE_SEC
+    if leader_alive:
+        with contextlib.suppress(TimeoutError, ProcessLookupError):
             await asyncio.wait_for(
-                capturer_proc.wait(), timeout=_CAPTURER_TERM_GRACE_SEC
+                capturer_proc.wait(),
+                timeout=max(0.0, term_deadline - loop.time()),
             )
-            drained = True
-        else:
-            loop = asyncio.get_event_loop()
-            deadline = loop.time() + _CAPTURER_TERM_GRACE_SEC
-            while loop.time() < deadline:
-                if not _signal_capturer_group(capturer_proc, 0, logger):
-                    drained = True
-                    break
-                await asyncio.sleep(0.05)
-    except TimeoutError:
-        pass
-    if drained:
-        return
+    while loop.time() < term_deadline:
+        if not _signal_capturer_group(capturer_proc, 0, logger):
+            return True
+        await asyncio.sleep(min(0.05, max(0.0, term_deadline - loop.time())))
 
     # Stragglers remain (a live leader that ignored SIGTERM, or orphaned
     # children of a dead leader) — SIGKILL the whole group.
@@ -1256,11 +1280,24 @@ async def _stop_capturer(capturer_proc, logger) -> None:
             "Socket supervisor: capturer process group did not exit on SIGTERM "
             f"within {_CAPTURER_TERM_GRACE_SEC}s — sent SIGKILL to the group."
         )
-    if leader_alive:
-        try:
-            await capturer_proc.wait()
-        except ProcessLookupError:
-            pass
+    kill_deadline = loop.time() + _CAPTURER_KILL_REAP_GRACE_SEC
+    if capturer_proc.returncode is None:
+        with contextlib.suppress(TimeoutError, ProcessLookupError):
+            await asyncio.wait_for(
+                capturer_proc.wait(),
+                timeout=max(0.0, kill_deadline - loop.time()),
+            )
+    while loop.time() < kill_deadline:
+        if not _signal_capturer_group(capturer_proc, 0, logger):
+            return True
+        await asyncio.sleep(min(0.05, max(0.0, kill_deadline - loop.time())))
+    survivor = _signal_capturer_group(capturer_proc, 0, logger)
+    if survivor:
+        logger.error(
+            "Socket supervisor: capturer process group survived bounded "
+            f"SIGTERM/SIGKILL teardown (pid/pgid={capturer_proc.pid})"
+        )
+    return not survivor
 
 
 def _cmd_bot_single(rest: list[str]) -> int:

@@ -24,6 +24,16 @@ enum UiTelemetryContract {
     static let transcriptRunIDPattern = "^[0-9a-f]{32}$"
     static let sttStates = ["failed", "recovering", "starting", "unknown", "ready"]
     static let sttPrecedence = ["failed", "recovering", "starting", "unknown", "ready"]
+    static let rootRequiredFields: Set<String> = [
+        "schema", "pid", "start_epoch", "transcript_run_id", "updated_at", "audio", "stt",
+    ]
+    static let rootOptionalFields: Set<String> = ["transcript", "locked_category"]
+    static let audioFields: Set<String> = ["level", "observed_at"]
+    static let sttFields: Set<String> = ["me", "them", "aggregate"]
+    static let sttBranchRequiredFields: Set<String> = ["state"]
+    static let sttBranchOptionalFields: Set<String> = ["detail"]
+    static let transcriptRequiredFields: Set<String> = ["text"]
+    static let transcriptOptionalFields: Set<String> = ["source", "speaker_label"]
 }
 
 enum UiSttState: String, Decodable, CaseIterable {
@@ -130,31 +140,36 @@ enum UiTelemetryDecoder {
         guard let root = try? JSONSerialization.jsonObject(with: data),
               exactKeys(
                 root,
-                required: [
-                    "schema", "pid", "start_epoch", "transcript_run_id",
-                    "updated_at", "audio", "stt",
-                ],
-                optional: ["transcript", "locked_category"]
+                required: UiTelemetryContract.rootRequiredFields,
+                optional: UiTelemetryContract.rootOptionalFields
               ),
               let dictionary = root as? [String: Any],
               let audio = dictionary["audio"] as? [String: Any],
               Set(audio.keys) == Set(["me", "them"]),
               let stt = dictionary["stt"],
-              exactKeys(stt, required: ["me", "them", "aggregate"]),
+              exactKeys(stt, required: UiTelemetryContract.sttFields),
               let sttDictionary = stt as? [String: Any],
-              exactKeys(sttDictionary["me"], required: ["state"], optional: ["detail"]),
-              exactKeys(sttDictionary["them"], required: ["state"], optional: ["detail"])
+              exactKeys(
+                sttDictionary["me"],
+                required: UiTelemetryContract.sttBranchRequiredFields,
+                optional: UiTelemetryContract.sttBranchOptionalFields),
+              exactKeys(
+                sttDictionary["them"],
+                required: UiTelemetryContract.sttBranchRequiredFields,
+                optional: UiTelemetryContract.sttBranchOptionalFields)
         else { return false }
 
         for branch in ["me", "them"] {
             if audio[branch] is NSNull { continue }
-            guard exactKeys(audio[branch], required: ["level", "observed_at"]) else {
+            guard exactKeys(audio[branch], required: UiTelemetryContract.audioFields) else {
                 return false
             }
         }
         if let transcript = dictionary["transcript"], !(transcript is NSNull),
            !exactKeys(
-             transcript, required: ["text"], optional: ["source", "speaker_label"]
+             transcript,
+             required: UiTelemetryContract.transcriptRequiredFields,
+             optional: UiTelemetryContract.transcriptOptionalFields
            ) {
             return false
         }
