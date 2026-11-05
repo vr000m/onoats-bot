@@ -151,6 +151,21 @@ stateful icon opens a compact window panel: Start or Stop is the dominant
 action, Seminar is immediately beside that workflow, and the gear opens the
 less-frequent settings and diagnostics without leaving the panel.
 
+<table>
+  <tr>
+    <td width="69%" valign="top">
+      <img src="assets/screenshots/onoats-menu-bar-panel.png" alt="Onoats menu-bar panel ready to record">
+    </td>
+    <td width="31%" valign="top">
+      <img src="assets/screenshots/onoats-settings-panel.png" alt="Onoats settings panel">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><em>Start a recording and set the Seminar label.</em></td>
+    <td align="center"><em>Choose audio, STT, storage, and privacy settings.</em></td>
+  </tr>
+</table>
+
 - **Start / Stop / Flush** — Start runs the recorder (`onoats bot` with the
   native capturer); Stop ends the session gracefully (the recorder drains
   in-flight audio before rotating the buffer into the queue); Flush rotates
