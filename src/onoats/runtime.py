@@ -2434,7 +2434,7 @@ def _pipeline_ended_by_error(
     exception: BaseException | None = None,
 ) -> bool:
     """Classify a runner termination against the recorder's stop authority."""
-    if shutdown_event.is_set():
+    if exception is None and shutdown_event.is_set():
         return False
     detail = "returned" if exception is None else f"raised {type(exception).__name__}"
     logger.error(

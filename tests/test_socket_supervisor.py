@@ -2773,6 +2773,147 @@ def test_diarization_preflight_fails_loud_before_capturer_spawn(sup_env, monkeyp
     assert order == ["lock", "preflight"]
 
 
+@pytest.mark.parametrize("prior_env", [False, True], ids=["unset-env", "set-env"])
+@pytest.mark.parametrize("failure_stage", ["chmod", "nonce", "config", "preflight"])
+def test_supervisor_startup_failure_cleanup_whole_state_space(
+    sup_env, monkeypatch, prior_env, failure_stage
+):
+    """Every failure after socket-dir ownership restores env and removes the dir."""
+    import secrets as _secrets
+    import tempfile as _tempfile
+
+    from onoats import runtime
+
+    keys = (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    )
+    expected = {}
+    for index, key in enumerate(keys):
+        value = f"prior-{index}" if prior_env else None
+        expected[key] = value
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    minted: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def mint(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        minted.append(path)
+        return path
+
+    monkeypatch.setattr(_tempfile, "mkdtemp", mint)
+
+    if failure_stage == "chmod":
+        monkeypatch.setattr(
+            os, "chmod", lambda *_args: (_ for _ in ()).throw(OSError("chmod"))
+        )
+    elif failure_stage == "nonce":
+        monkeypatch.setattr(
+            _secrets,
+            "token_hex",
+            lambda *_args: (_ for _ in ()).throw(ValueError("nonce")),
+        )
+    elif failure_stage == "config":
+        monkeypatch.setattr(
+            runtime.RecorderSessionConfig,
+            "capture",
+            classmethod(
+                lambda _cls, _config=None: (_ for _ in ()).throw(ValueError("config"))
+            ),
+        )
+    else:
+        monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+
+        def fail_preflight(_config):
+            raise runtime.DiarizationPreflightError("preflight")
+
+        monkeypatch.setattr(runtime, "_preflight_diarization", fail_preflight)
+
+    assert _run_supervisor_bounded([]) == 1
+    assert minted and all(not Path(path).exists() for path in minted)
+    assert {key: os.environ.get(key) for key in keys} == expected
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["startup", "running"])
+@pytest.mark.parametrize("recorder_rc", [0, 1])
+@pytest.mark.parametrize("teardown_ok", [False, True])
+def test_supervisor_return_code_includes_teardown_whole_state_space(
+    sup_env, monkeypatch, ready, recorder_rc, teardown_ok
+):
+    """A surviving capturer group dominates every otherwise-clean return path."""
+
+    class EmptyStderr:
+        async def readline(self):
+            return b""
+
+    class Capturer:
+        pid = 43210
+        returncode = None
+        stderr = EmptyStderr()
+
+    async def spawn(*_args, **_kwargs):
+        return Capturer()
+
+    async def sockets(*_args, **_kwargs):
+        return ready
+
+    async def recorder(*_args, **_kwargs):
+        return recorder_rc
+
+    stop_results: list[bool] = []
+
+    async def stop(*_args, **_kwargs):
+        stop_results.append(teardown_ok)
+        return teardown_ok
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+    monkeypatch.setattr(cli, "_run_recorder_with_capturer", recorder)
+    monkeypatch.setattr(cli, "_stop_capturer", stop)
+
+    result = _run_supervisor_bounded([])
+    expected = 1 if not ready or recorder_rc != 0 or not teardown_ok else 0
+    assert result == expected
+    assert stop_results
+
+
+def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monkeypatch):
+    """Startup cancellation cannot mask a capturer group that survives teardown."""
+
+    class EmptyStderr:
+        async def readline(self):
+            return b""
+
+    class Capturer:
+        pid = 43211
+        returncode = None
+        stderr = EmptyStderr()
+
+    async def spawn(*_args, **_kwargs):
+        return Capturer()
+
+    async def sockets(*_args, **_kwargs):
+        return True
+
+    async def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    async def teardown_failed(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+    monkeypatch.setattr(cli, "_run_recorder_with_capturer", cancel)
+    monkeypatch.setattr(cli, "_stop_capturer", teardown_failed)
+
+    assert _run_supervisor_bounded([]) == 1
+
+
 def test_diarization_flag_off_never_calls_preflight_in_supervisor(sup_env, monkeypatch):
     import asyncio as _asyncio
 

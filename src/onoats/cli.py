@@ -499,6 +499,10 @@ async def _apply_device_fields_when_recorded(
         await asyncio.sleep(_DEVICE_FLUSH_POLL_SEC)
 
 
+class CapturerTeardownError(RuntimeError):
+    """The supervisor could not retire its owned capturer process group."""
+
+
 def _run_socket_supervisor(rest: list[str]) -> int:
     """Synchronous entry: drive the async socket session, mirror dual.main's rc.
 
@@ -519,7 +523,7 @@ def _run_socket_supervisor(rest: list[str]) -> int:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
-    except (SocketHandshakeError, OSError, ValueError) as exc:
+    except (SocketHandshakeError, CapturerTeardownError, OSError, ValueError) as exc:
         # A controlled socket-mode launch failure (bad/stale capturer handshake,
         # socket connect error, or a same-socket / config guard rejection) must
         # be a clean non-zero exit per the fail-loud contract — not a traceback.
@@ -624,42 +628,13 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
     # (structurally unreachable — the primary stale-socket defense). The system
     # temp dir keeps the AF_UNIX path well under the macOS ~104-byte sun_path
     # limit (a data-dir-nested path can blow it).
-    sock_dir = tempfile.mkdtemp(prefix="onoats-sock-")
-    os.chmod(sock_dir, 0o700)
-    mic_sock = os.path.join(sock_dir, MIC_SOCKET_NAME)
-    system_sock = os.path.join(sock_dir, SYSTEM_SOCKET_NAME)
-
-    # 2. Fresh generation nonce. A restarted capturer presents a new nonce in its
-    # handshake; combined with the fresh dir this invalidates stale fds.
-    nonce = secrets.token_hex(16)
-
-    # 3. Point the recorder at the private-dir sockets AND the generation nonce.
-    # The recorder resolves these through OnoatsConfig (ONOATS_MIC_SOCKET /
-    # ONOATS_SYSTEM_SOCKET / ONOATS_CAPTURER_NONCE env > [audio] toml), so
-    # exporting them here is all dual._build_socket_transports needs to (a)
-    # connect to the right sockets and (b) gate on the nonce — rejecting a
-    # capturer that handshakes with a missing/stale nonce. Capture any prior
-    # values so the `finally` can restore them — these are process-global, and
-    # leaving them set would leak our private-dir paths / nonce into any
-    # in-process caller (e.g. tests) that runs after us.
+    # Snapshot process-global state and initialize cleanup bookkeeping before
+    # taking ownership of any resource. Once mkdtemp succeeds, every operation
+    # is inside the authoritative cleanup boundary below.
     _prior_socket_env = {
         k: os.environ.get(k)
         for k in ("ONOATS_MIC_SOCKET", "ONOATS_SYSTEM_SOCKET", "ONOATS_CAPTURER_NONCE")
     }
-    os.environ["ONOATS_MIC_SOCKET"] = mic_sock
-    os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
-    os.environ["ONOATS_CAPTURER_NONCE"] = nonce
-
-    # Capture the one immutable recorder configuration only after the
-    # generation socket values exist, but before any capture side effect.  The
-    # same object crosses supervisor preflight and the recorder entrypoint.
-    from onoats.config import load_config as _load_config
-    from onoats.runtime import RecorderSessionConfig, _preflight_diarization
-
-    session_config = RecorderSessionConfig.capture(_load_config())
-    if session_config.diarization:
-        _preflight_diarization(session_config)
-
     capturer_proc: asyncio.subprocess.Process | None = None
     stderr_task: asyncio.Task[None] | None = None
     # Latest device description per branch ("mic"/"system"), written by the
@@ -672,7 +647,34 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
     # its budget while a TCC prompt is pending (release-plan Phase 7).
     permission_event = asyncio.Event()
     rc = 0
+    startup_cancelled = False
+    sock_dir = tempfile.mkdtemp(prefix="onoats-sock-")
     try:
+        os.chmod(sock_dir, 0o700)
+        mic_sock = os.path.join(sock_dir, MIC_SOCKET_NAME)
+        system_sock = os.path.join(sock_dir, SYSTEM_SOCKET_NAME)
+
+        # 2. Fresh generation nonce. A restarted capturer presents a new nonce in
+        # its handshake; combined with the fresh dir this invalidates stale fds.
+        nonce = secrets.token_hex(16)
+
+        # 3. Point the recorder at the private-dir sockets AND the generation
+        # nonce. Capture transports consume these values; the finally restores
+        # the prior process-global state for later in-process callers.
+        os.environ["ONOATS_MIC_SOCKET"] = mic_sock
+        os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
+        os.environ["ONOATS_CAPTURER_NONCE"] = nonce
+
+        # Capture the one immutable recorder configuration only after the
+        # generation socket values exist, but before any capture side effect. The
+        # same object crosses supervisor preflight and the recorder entrypoint.
+        from onoats.config import load_config as _load_config
+        from onoats.runtime import RecorderSessionConfig, _preflight_diarization
+
+        session_config = RecorderSessionConfig.capture(_load_config())
+        if session_config.diarization:
+            _preflight_diarization(session_config)
+
         # 3b. Spawn the capturer pointed at both sockets. Pass the socket paths +
         # nonce via BOTH env and argv (documented in the contract doc) so a
         # capturer can read whichever it prefers.
@@ -813,9 +815,21 @@ async def _supervise_socket_session_inner(rest: list[str]) -> int:
             device_state,
             session_config=session_config,
         )
+    except asyncio.CancelledError:
+        startup_cancelled = True
+        raise
     finally:
         if capturer_proc is not None:
-            await _stop_capturer(capturer_proc, logger)
+            teardown_ok = await _stop_capturer(capturer_proc, logger)
+            if not teardown_ok:
+                rc = 1
+                if startup_cancelled:
+                    # The outer startup-signal owner normally maps cancellation
+                    # to rc=0. A surviving capturer group is stronger evidence:
+                    # teardown failed and must remain fail-loud.
+                    raise CapturerTeardownError(
+                        "capturer process group survived bounded teardown"
+                    )
         if stderr_task is not None:
             # The capturer group is gone, so the pipe's EOF is imminent — give
             # the reader a bounded grace to consume it (flushing any final

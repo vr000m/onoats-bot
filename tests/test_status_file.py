@@ -748,7 +748,7 @@ def test_control_handlers_keep_flush_and_stop_actions_differential():
 @pytest.mark.parametrize(
     ("entrypoint", "requested", "raised", "expected_error"),
     [
-        (entrypoint, requested, raised, not requested)
+        (entrypoint, requested, raised, raised or not requested)
         for entrypoint in ("single", "dual")
         for requested in (False, True)
         for raised in (False, True)
