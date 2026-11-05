@@ -103,8 +103,13 @@ class RecorderSessionConfig:
             from onoats.config import load_config
 
             config = load_config()
+        # Backend-specific validation belongs to the selected backend.  A stale
+        # or malformed websocket-only setting must not abort a whisper or
+        # Deepgram session that will never consume it.
         endpoint = MappingProxyType(
             dict(_resolve_stt_ws_target(_ws_env(config), warn_on_cleartext=False))
+            if config.stt_service == "websocket"
+            else {}
         )
         secrets = MappingProxyType(
             {
@@ -1708,7 +1713,7 @@ async def flush_and_rotate(
     continue_session: bool,
     data_dir: Path,
     locked_category: str | None = None,
-) -> None:
+) -> bool:
     """Flush the transcript buffer and rotate its session file into ``pending/``.
 
     The recorder emits files only — no SQLite, no ``processing_jobs`` row. It
@@ -1756,7 +1761,7 @@ async def flush_and_rotate(
             )
         except OSError as exc:
             logger.error(f"Flush: could not pre-mint fresh .active/ session: {exc}")
-            return
+            return False
 
     buffer_contents, session_path = await transcript_buffer.flush(
         next_session_file=next_active_path
@@ -1789,7 +1794,7 @@ async def flush_and_rotate(
                     f"Flush: buffer no longer points at {next_active_path.name} — "
                     "leaving file in place (crash_recovery will rotate as no-op)"
                 )
-        return
+        return True
 
     try:
         session_id = session_queue.rotate_active_to_pending(
@@ -1799,10 +1804,10 @@ async def flush_and_rotate(
         logger.warning(
             f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
         )
-        return
+        return False
     except OSError as exc:
         logger.error(f"Flush: could not rotate {session_path.name} to pending/: {exc}")
-        return
+        return False
 
     # File-only: no DB row. The category travels in the session_meta first
     # line (written by the transcript buffer); a consumer back-fills from the
@@ -1813,6 +1818,7 @@ async def flush_and_rotate(
         logger.debug(
             f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
         )
+    return True
 
 
 # ---------------------------------------------------------------------------

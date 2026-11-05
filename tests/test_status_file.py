@@ -737,7 +737,8 @@ def test_control_handlers_keep_flush_and_stop_actions_differential():
             "def _control_stop()", 1
         )[0]
         stop = source.split("def _control_stop()", 1)[1].split("control_server =", 1)[0]
-        assert "_flush_continuation" in flush
+        assert 'lifecycle.flush("Control socket flush")' in flush
+        assert "LifecycleStoppingError" in flush
         assert "shutdown_event.set()" not in flush
         assert 'lifecycle.stop("Control socket stop")' in stop
         assert "_mark_graceful_shutdown_requested()" not in stop
@@ -782,6 +783,33 @@ def test_both_recorder_entrypoints_classify_returns_and_exceptions_before_cleanu
     single = (root / "src/onoats/__main__.py").read_text()
     assert "return 1 if ended_by_error else 0" in single
     assert "return asyncio.run(" in single
+
+
+@pytest.mark.parametrize("entrypoint", ["src/onoats/__main__.py", "src/onoats/dual.py"])
+@pytest.mark.parametrize("watcher_first", [False, True])
+@pytest.mark.parametrize("requested", [False, True])
+@pytest.mark.parametrize("raised", [False, True])
+def test_runner_outcome_precedes_terminal_finalization_whole_state_space(
+    entrypoint: str, watcher_first: bool, requested: bool, raised: bool
+) -> None:
+    """Watcher timing never gains status-finalization authority."""
+    del watcher_first  # Both timing cells consume the same source invariant.
+    import asyncio
+
+    from onoats import runtime
+
+    source = (Path(__file__).resolve().parents[1] / entrypoint).read_text()
+    watcher = source.split("async def _shutdown_watcher()", 1)[1].split(
+        "asyncio.create_task", 1
+    )[0]
+    assert "_on_shutdown()" not in watcher
+    event = asyncio.Event()
+    if requested:
+        event.set()
+    exception = RuntimeError("runner failed") if raised else None
+    assert runtime._pipeline_ended_by_error(event, entrypoint, exception=exception) is (
+        raised or not requested
+    )
 
 
 def test_dual_threads_captured_recovery_warning_into_status_running():

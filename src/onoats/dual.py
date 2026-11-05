@@ -615,7 +615,7 @@ async def run_onoats_dual(
     # overlapping speech won't produce spurious silence_gap entries.
     # Enabling this restores Segmenter's ability to split short sessions
     # (segmenter fast-skips no-gap buffers with <=10 utterances).
-    async def _rotate_flush(reason: str, continue_session: bool) -> None:
+    async def _rotate_flush(reason: str, continue_session: bool) -> bool:
         """Flush the dual buffer and rotate the session file into pending/.
 
         The bot no longer runs post-processing inline — a cron worker drains
@@ -623,7 +623,7 @@ async def run_onoats_dual(
         (silence-timeout / Ctrl+T / SIGUSR1 — opens a fresh .active/ session)
         from a terminal flush (EndFrame / shutdown).
         """
-        await flush_and_rotate(
+        completed = await flush_and_rotate(
             transcript_buffer,
             reason,
             continue_session=continue_session,
@@ -633,10 +633,12 @@ async def run_onoats_dual(
         # Stamp last-rotation on the status file after a successful rotation
         # (terminal or continuation) so the menu bar / `onoats status` can show
         # when the session last rolled over.
-        if status_publication_enabled[0]:
+        if completed and status_publication_enabled[0]:
             _mark_status_rotation(data_dir)
+        return completed
 
     from onoats.recorder_lifecycle import (
+        LifecycleRotationError,
         LifecycleStoppingError,
         RecorderLifecycleController,
     )
@@ -654,7 +656,7 @@ async def run_onoats_dual(
         """
         try:
             await lifecycle.flush(reason)
-        except LifecycleStoppingError:
+        except (LifecycleStoppingError, LifecycleRotationError):
             return False
         return True
 
@@ -776,7 +778,10 @@ async def run_onoats_dual(
     pid_record = _build_pid_record(start_epoch=start_epoch)
 
     async def _control_flush() -> bool:
-        return await _flush_continuation("Control socket flush")
+        try:
+            return await lifecycle.flush("Control socket flush")
+        except LifecycleStoppingError:
+            return False
 
     async def _control_stop() -> None:
         await lifecycle.stop("Control socket stop")
@@ -909,7 +914,6 @@ async def run_onoats_dual(
         # TranscriptBuffer before the flush; hard-cancel fallback on stall/force.
         logger.info("Shutdown: draining dual pipeline (Ctrl+C again to force)")
         await stop_pipeline_for_shutdown(task, force_exit_event)
-        await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher_dual")
 
@@ -1043,7 +1047,7 @@ def _apply_recorder_args(args: argparse.Namespace) -> int | None:
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, session_config=None) -> int:
     """Console entrypoint for the dual-input recorder (``onoats bot``)."""
     args = _parse_args(argv)
     rc = _apply_recorder_args(args)
@@ -1052,7 +1056,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rc = asyncio.run(
             run_onoats_dual(
-                live_terminal=args.live_terminal, locked_category=args.category
+                live_terminal=args.live_terminal,
+                locked_category=args.category,
+                session_config=session_config,
             )
         )
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:

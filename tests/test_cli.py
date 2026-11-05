@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from onoats import cli
@@ -57,15 +59,21 @@ def test_unknown_command_errors():
 
 def test_bot_routes_to_dual(monkeypatch):
     called = {}
+    snapshot = SimpleNamespace(audio_source="portaudio")
 
-    def fake_main(argv=None):
+    def fake_main(argv=None, *, session_config=None):
         called["argv"] = argv
+        called["session_config"] = session_config
         return 0
 
+    monkeypatch.setattr(
+        "onoats.runtime.RecorderSessionConfig.capture", lambda: snapshot
+    )
     monkeypatch.setattr("onoats.dual.main", fake_main)
     rc = cli.main(["bot", "--live-terminal"])
     assert rc == 0
     assert called["argv"] == ["--live-terminal"]
+    assert called["session_config"] is snapshot
 
 
 def test_bot_help_under_socket_does_not_enter_supervisor(monkeypatch, capsys):
@@ -95,21 +103,23 @@ def test_bot_source_socket_flag_enters_supervisor(monkeypatch):
     monkeypatch.setenv("AUDIO_SOURCE", "portaudio")
     called = {}
 
-    def fake_supervisor(rest):
+    def fake_supervisor(rest, *, session_config=None):
         called["rest"] = rest
+        called["session_config"] = session_config
         return 0
 
     monkeypatch.setattr(cli, "_run_socket_supervisor", fake_supervisor)
     rc = cli.main(["bot", "--source", "socket"])
     assert rc == 0
     assert called["rest"] == ["--source", "socket"]
+    assert called["session_config"].audio_source == "socket"
 
 
 def test_bot_source_portaudio_flag_overrides_socket_env(monkeypatch):
     """`--source portaudio` wins over AUDIO_SOURCE=socket (flag > env > config)."""
     monkeypatch.setenv("AUDIO_SOURCE", "socket")
 
-    def _boom(rest):
+    def _boom(rest, **_kwargs):
         raise AssertionError("supervisor entered despite --source portaudio")
 
     monkeypatch.setattr(cli, "_run_socket_supervisor", _boom)
@@ -127,9 +137,39 @@ def test_bot_source_rejects_unknown_backend(capsys):
     assert "invalid choice" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
+def test_bot_captures_once_and_threads_exact_snapshot_to_selected_backend(
+    monkeypatch, source
+):
+    snapshot = SimpleNamespace(audio_source=source)
+    captures: list[object] = []
+    received: list[object] = []
+
+    def capture():
+        captures.append(snapshot)
+        return snapshot
+
+    def dual_main(_rest, *, session_config=None):
+        received.append(session_config)
+        return 0
+
+    def supervisor(_rest, *, session_config=None):
+        received.append(session_config)
+        return 0
+
+    monkeypatch.setattr("onoats.runtime.RecorderSessionConfig.capture", capture)
+    monkeypatch.setattr("onoats.dual.main", dual_main)
+    monkeypatch.setattr(cli, "_run_socket_supervisor", supervisor)
+
+    assert cli.main(["bot", "--source", source]) == 0
+    assert captures == [snapshot]
+    assert received == [snapshot]
+
+
 def _recorder(called):
-    def fake_main(argv=None):
+    def fake_main(argv=None, **kwargs):
         called["argv"] = argv
+        called.update(kwargs)
         return 0
 
     return fake_main

@@ -23,6 +23,10 @@ class LifecycleStoppingError(RuntimeError):
     """Raised when a continuation is requested after stopping won admission."""
 
 
+class LifecycleRotationError(RuntimeError):
+    """Raised when an admitted continuation could not complete its rotation."""
+
+
 class RecorderLifecycleController:
     """The sole ordering authority for one recorder session.
 
@@ -34,7 +38,7 @@ class RecorderLifecycleController:
 
     def __init__(
         self,
-        rotate: Callable[[str, bool], Awaitable[None]],
+        rotate: Callable[[str, bool], Awaitable[bool]],
         *,
         mark_graceful: Callable[[], None] | None = None,
     ) -> None:
@@ -58,17 +62,20 @@ class RecorderLifecycleController:
     def stopping(self) -> bool:
         return self._state is not LifecycleState.RUNNING
 
-    async def flush(self, reason: str) -> None:
+    async def flush(self, reason: str) -> bool:
         """Complete one continuation rotation, or reject after stop admission."""
         async with self._lock:
             if self._state is not LifecycleState.RUNNING:
                 raise LifecycleStoppingError("recorder is stopping")
             rotation = asyncio.create_task(self._rotate(reason, True))
             try:
-                await asyncio.shield(rotation)
+                completed = await asyncio.shield(rotation)
             except asyncio.CancelledError:
                 await asyncio.shield(rotation)
                 raise
+            if not completed:
+                raise LifecycleRotationError("continuation rotation failed")
+            return True
 
     async def stop(self, reason: str = "graceful stop requested") -> bool:
         """Admit a graceful stop; return ``False`` for an already admitted stop."""

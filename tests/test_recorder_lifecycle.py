@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from onoats.recorder_lifecycle import (
+    LifecycleRotationError,
     LifecycleStoppingError,
     RecorderLifecycleController,
 )
@@ -40,11 +41,12 @@ class RotationSpy:
         self.release = asyncio.Event()
         self.release.set()
 
-    async def __call__(self, reason: str, continue_session: bool) -> None:
+    async def __call__(self, reason: str, continue_session: bool) -> bool:
         self.calls.append((reason, continue_session))
         self.started.set()
         await self.release.wait()
         self.completed.set()
+        return True
 
 
 def _controller(
@@ -78,7 +80,7 @@ async def test_flush_first_completes_before_stop_and_terminal_rotation() -> None
     assert not stop.done(), "Stop bypassed the controller lock held by Flush"
 
     rotation.release.set()
-    assert await flush is None
+    assert await flush is True
     assert await stop is True
     assert shutdown.is_set()
     assert marks == ["graceful"]
@@ -194,7 +196,7 @@ async def test_lock_admission_order_prevents_flush_reopening_after_stop() -> Non
     await asyncio.sleep(0)
     rotation.release.set()
 
-    assert await first is None
+    assert await first is True
     assert await stop is True
     with pytest.raises(LifecycleStoppingError):
         await late
@@ -264,6 +266,20 @@ async def test_failed_terminal_rotation_never_reopens_continuations() -> None:
     assert calls == [("terminal error", False)]
 
 
+@_async_test
+async def test_failed_continuation_rotation_is_reported_without_stopping_session() -> (
+    None
+):
+    async def rejected(_reason: str, _continue_session: bool) -> bool:
+        return False
+
+    controller = RecorderLifecycleController(rejected)
+    with pytest.raises(LifecycleRotationError, match="rotation failed"):
+        await controller.flush("control flush")
+    assert controller.state == "running"
+    assert not controller.shutdown_event.is_set()
+
+
 def test_lifecycle_controller_is_a_stdlib_only_leaf() -> None:
     source = (ROOT / "src/onoats/recorder_lifecycle.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -300,4 +316,5 @@ def test_both_entrypoints_delegate_lifecycle_serialization(relative_path: str) -
     control_flush = source.split("async def _control_flush() -> bool:", 1)[1].split(
         "async def _control_stop()", 1
     )[0]
-    assert "return await _flush_continuation" in control_flush
+    assert "return await lifecycle.flush" in control_flush
+    assert "except LifecycleStoppingError" in control_flush

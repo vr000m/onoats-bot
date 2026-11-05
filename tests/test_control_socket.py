@@ -84,9 +84,10 @@ def _lifecycle_callbacks(
     actions: list[str],
     rotate=None,
 ) -> tuple[RecorderLifecycleController, object, object]:
-    async def default_rotate(_reason: str, continue_session: bool) -> None:
+    async def default_rotate(_reason: str, continue_session: bool) -> bool:
         if continue_session:
             actions.append("flush")
+        return True
 
     controller = RecorderLifecycleController(
         rotate or default_rotate,
@@ -491,6 +492,38 @@ async def test_duplicate_stop_is_idempotent_and_flush_after_stop_is_rejected(
 
 
 @_async_test
+async def test_flush_acknowledgement_fails_when_admitted_rotation_fails(
+    control_data_dir: Path,
+) -> None:
+    actions: list[str] = []
+
+    async def rejected(_reason: str, continue_session: bool) -> bool:
+        assert continue_session is True
+        actions.append("attempted")
+        return False
+
+    _controller, flush, stop = _lifecycle_callbacks(actions, rotate=rejected)
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=flush,
+        on_stop=stop,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    await server.start()
+    try:
+        response = await _send(
+            control_data_dir / ".active" / CONTROL_SOCKET_FILENAME,
+            _request("flush"),
+        )
+    finally:
+        await server.close()
+    assert response["ok"] is False
+    assert response["code"] == "server-error"
+    assert actions == ["attempted"]
+
+
+@_async_test
 @pytest.mark.parametrize(
     ("signal_stop_requested", "command", "accepted", "expected_actions"),
     [
@@ -539,11 +572,12 @@ async def test_flush_first_finishes_but_signal_stop_rejects_the_next_flush(
     release = asyncio.Event()
     actions: list[str] = []
 
-    async def rotate(_reason: str, continue_session: bool) -> None:
+    async def rotate(_reason: str, continue_session: bool) -> bool:
         assert continue_session is True
         actions.append("flush")
         entered.set()
         await release.wait()
+        return True
 
     controller, flush, stop = _lifecycle_callbacks(actions, rotate)
 
@@ -586,12 +620,13 @@ async def test_simultaneous_commands_follow_lock_acquisition_order(
     release = asyncio.Event()
     actions: list[str] = []
 
-    async def rotate(_reason: str, continue_session: bool) -> None:
+    async def rotate(_reason: str, continue_session: bool) -> bool:
         assert continue_session is True
         actions.append("flush")
         if first == "flush":
             entered.set()
             await release.wait()
+        return True
 
     controller, flush, stop = _lifecycle_callbacks(actions, rotate)
 

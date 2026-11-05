@@ -206,7 +206,7 @@ async def run_onoats(
     # TranscriptBuffer: accumulates utterances + silence_gap hints → .active/session_*.jsonl
     transcript_buffer = TranscriptBuffer(locked_category=locked_category)
 
-    async def _rotate_flush(reason: str, continue_session: bool) -> None:
+    async def _rotate_flush(reason: str, continue_session: bool) -> bool:
         """Flush the transcript buffer and rotate the session file into pending/.
 
         The bot is now a thin recorder — it does NOT run post-processing
@@ -216,7 +216,7 @@ async def run_onoats(
         from a terminal flush (EndFrame / shutdown). Serialization is owned by
         the RecorderLifecycleController below.
         """
-        await flush_and_rotate(
+        return await flush_and_rotate(
             transcript_buffer,
             reason,
             continue_session=continue_session,
@@ -225,6 +225,7 @@ async def run_onoats(
         )
 
     from onoats.recorder_lifecycle import (
+        LifecycleRotationError,
         LifecycleStoppingError,
         RecorderLifecycleController,
     )
@@ -242,7 +243,7 @@ async def run_onoats(
         """
         try:
             await lifecycle.flush(reason)
-        except LifecycleStoppingError:
+        except (LifecycleStoppingError, LifecycleRotationError):
             return False
         return True
 
@@ -333,7 +334,10 @@ async def run_onoats(
     pid_record = _build_pid_record(start_epoch=start_epoch)
 
     async def _control_flush() -> bool:
-        return await _flush_continuation("Control socket flush")
+        try:
+            return await lifecycle.flush("Control socket flush")
+        except LifecycleStoppingError:
+            return False
 
     async def _control_stop() -> None:
         await lifecycle.stop("Control socket stop")
@@ -429,7 +433,6 @@ async def run_onoats(
         # back to a hard cancel if the drain stalls or a second Ctrl+C forces.
         logger.info("Shutdown: draining pipeline (Ctrl+C again to force)")
         await stop_pipeline_for_shutdown(task, force_exit_event)
-        await _on_shutdown()
 
     asyncio.create_task(_shutdown_watcher(), name="shutdown_watcher")
 

@@ -748,7 +748,8 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
     """
     from onoats.transports.socket_audio import SocketHandshakeError
 
-    async def _raise_handshake(rest):
+    async def _raise_handshake(rest, *, session_config=None):
+        del session_config
         raise SocketHandshakeError("stale/foreign capturer: handshake nonce mismatch")
 
     monkeypatch.setattr(cli, "_supervise_socket_session", _raise_handshake)

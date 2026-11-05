@@ -738,6 +738,22 @@ def test_recorder_session_config_retains_all_stt_consumers_after_env_mutation(
         snapshot.stt_endpoint["socket_path"] = "/tmp/forbidden.sock"
 
 
+@pytest.mark.parametrize("service", ["whisper", "deepgram"])
+def test_session_snapshot_ignores_invalid_websocket_only_settings_for_other_backends(
+    monkeypatch, service
+):
+    cfg = OnoatsConfig(raw={"stt": {"service": service, "ws_port": "not-a-port"}})
+    snapshot = runtime.RecorderSessionConfig.capture(cfg)
+    assert snapshot.stt_service == service
+    assert dict(snapshot.stt_endpoint) == {}
+
+
+def test_session_snapshot_validates_websocket_settings_for_websocket_backend():
+    cfg = OnoatsConfig(raw={"stt": {"service": "websocket", "ws_port": "not-a-port"}})
+    with pytest.raises(ValueError):
+        runtime.RecorderSessionConfig.capture(cfg)
+
+
 def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
     """Run `run_onoats_dual` up to the two `_create_stt_service` calls and
     return `[(branch_instance, stamp_segment_samples), ...]`."""
