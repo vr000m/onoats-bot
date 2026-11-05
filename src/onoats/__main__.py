@@ -156,7 +156,8 @@ async def run_onoats(
     # mis-configured.
     from onoats.config import load_config as _load_config
 
-    if _load_config().diarization:
+    cfg = _load_config()
+    if cfg.diarization:
         logger.warning(
             "diarization is enabled but ignored in single-input mode "
             "(`onoats bot-single`): there is no 'them' arm to diarize."
@@ -258,7 +259,7 @@ async def run_onoats(
     # whatever record happens to already be on disk (e.g. a stale, stopped
     # record left by an earlier dual/socket-mode session on the same
     # data_dir), misattributing an `stt:` warning to an unrelated session.
-    stt = (await _create_stt_service(data_dir=None)).service
+    stt = (await _create_stt_service(config=cfg, data_dir=None)).service
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(

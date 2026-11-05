@@ -5,7 +5,8 @@ Subcommands::
     onoats init          # guided first-run setup (config.toml + secrets.env)
     onoats bot           # dual-input recorder (mic + system loopback)
     onoats bot-single    # legacy single-input (mic-only) recorder
-    onoats flush         # signal the running recorder to rotate its buffer
+    onoats flush         # ask the running recorder to rotate its buffer
+    onoats stop          # ask the running recorder to drain and stop
     onoats convert       # render pending/*.jsonl -> markdown transcripts
     onoats devices       # list audio input/output devices
     onoats status        # report recorder pid / running state + data dir

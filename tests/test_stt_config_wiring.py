@@ -673,6 +673,35 @@ def test_create_stt_service_threads_ui_state_callbacks(monkeypatch):
     assert svc._stamp_segment_samples is False
 
 
+@pytest.mark.parametrize(("supplied", "expected_loads"), [(False, 1), (True, 0)])
+def test_create_stt_service_config_snapshot_boundary(
+    monkeypatch, supplied, expected_loads
+):
+    """Callers may pin a session snapshot; standalone calls still load now."""
+    import asyncio
+
+    cfg = OnoatsConfig(
+        raw={"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
+    )
+    loads = 0
+
+    def load():
+        nonlocal loads
+        loads += 1
+        return cfg
+
+    async def no_preflight(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("onoats.config.load_config", load)
+    monkeypatch.setattr(runtime, "_preflight_stt_ws", no_preflight)
+    kwargs = {"config": cfg} if supplied else {}
+    result = asyncio.run(runtime._create_stt_service(**kwargs))
+
+    assert result.service is not None
+    assert loads == expected_loads
+
+
 def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
     """Run `run_onoats_dual` up to the two `_create_stt_service` calls and
     return `[(branch_instance, stamp_segment_samples), ...]`."""
@@ -705,8 +734,10 @@ def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
         pass
 
     calls: list[tuple] = []
+    configs: list[OnoatsConfig] = []
 
     async def _spy(**kw):
+        configs.append(kw["config"])
         calls.append((kw.get("branch_instance"), kw.get("stamp_segment_samples")))
         if len(calls) == 2:
             raise _Stop
@@ -715,6 +746,7 @@ def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
     monkeypatch.setattr(dual_mod, "_create_stt_service", _spy)
     with pytest.raises(_Stop):
         asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path))
+    assert len(configs) == 2 and configs[0] is configs[1]
     return calls
 
 

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     # import annotations` (above) makes every annotation a string, so this
     # import never runs at module load time — only under a type checker.
     from pipecat.services.stt_service import STTService
+    from onoats.config import OnoatsConfig
 
 from loguru import logger
 
@@ -1312,6 +1313,7 @@ class SttServiceResult:
 
 async def _create_stt_service(
     *,
+    config: OnoatsConfig | None = None,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
     stamp_segment_samples: bool = False,
@@ -1337,6 +1339,10 @@ async def _create_stt_service(
     MLX / Whisper imports are kept lazy (inside the backend branch) so a plain
     ``import onoats.runtime`` with no ``STT_SERVICE`` set never imports
     ``mlx_whisper`` — the off-mac baseline ships MLX-free.
+
+    ``config`` pins backend selection and all related STT settings to a
+    caller-owned session snapshot. ``None`` preserves the dynamic standalone
+    helper boundary by loading the current config for this call.
 
     ``data_dir``, when given, resolves ``cfg.stt_launchd_label`` and builds
     the ``on_recovery`` callbacks wired into the websocket preflight and the
@@ -1372,9 +1378,11 @@ async def _create_stt_service(
     It is passed explicitly by the caller (system arm only) and is never
     derived from config here.
     """
-    from onoats.config import load_config
+    if config is None:
+        from onoats.config import load_config
 
-    cfg = load_config()
+        config = load_config()
+    cfg = config
     service = cfg.stt_service
     model_name = cfg.stt_model
     language = _resolve_stt_language(cfg)

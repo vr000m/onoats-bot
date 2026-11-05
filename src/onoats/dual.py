@@ -682,13 +682,17 @@ async def run_onoats_dual(
         }
 
     mic_result = await _create_stt_service(
-        data_dir=data_dir, branch_instance="mic", **_stt_callbacks("me")
+        config=cfg,
+        data_dir=data_dir,
+        branch_instance="mic",
+        **_stt_callbacks("me"),
     )
     mic_stt = mic_result.service
     # Resolved once; Phase 7 reuses this bool for `_build_dual_pipeline`. Only
     # the system ("them") arm stamps VAD spans; the mic arm never does.
     diarization_on = bool(cfg.diarization)
     system_result = await _create_stt_service(
+        config=cfg,
         data_dir=data_dir,
         branch_instance="system",
         stamp_segment_samples=diarization_on,
