@@ -237,9 +237,12 @@ def test_native_build_and_model_harness_include_phase6_panel_sources():
 
 
 def _run_resource_verifier(app: Path) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["ONOATS_VERIFY_RESOURCES_APP"] = str(app)
     return subprocess.run(
-        ["make", "-s", "verify-resources", f"APP={app}"],
+        ["make", "-s", "verify-resources"],
         cwd=REPO_ROOT / "native",
+        env=env,
         capture_output=True,
         text=True,
         timeout=30,
@@ -1178,6 +1181,20 @@ def test_install_staged_quotes_paths_with_spaces_and_glob_characters(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert (install_dir / "Onoats.app").is_dir()
+
+
+def test_install_staged_never_expands_operator_path_as_make_syntax(
+    staged_install_workflow: Path,
+):
+    work = staged_install_workflow
+    install_dir = work / "installed $(shell touch MAKE_EXPANSION_RAN) [literal]"
+    install_dir.mkdir()
+
+    result = _run_install_staged(work, install_dir=install_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (install_dir / "Onoats.app").is_dir()
+    assert not (work / "MAKE_EXPANSION_RAN").exists()
 
 
 def test_clean_install_ignores_invalid_existing_app_and_clears_stale_approval(

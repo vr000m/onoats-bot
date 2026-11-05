@@ -89,8 +89,12 @@ def _normalise_private_tree(app: Path) -> None:
             raise InstallError(f"could not strip copied ACL metadata: {result.stderr}")
 
 
-def _run(*argv: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+def _run(
+    *argv: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode:
         detail = (result.stdout + result.stderr).strip()
         raise InstallError(f"command failed ({' '.join(argv)}): {detail}")
@@ -129,7 +133,9 @@ def _verify_app(
     if expected_identity is not None and identity != expected_identity.lower():
         raise InstallError("app differs from the canonical approved identity")
     if makefile_dir is not None:
-        _run(MAKE, "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
+        env = os.environ.copy()
+        env["ONOATS_VERIFY_RESOURCES_APP"] = str(app)
+        _run(MAKE, "-s", "verify-resources", cwd=makefile_dir, env=env)
     _run(CODESIGN, "--verify", "--deep", "--strict", str(app))
     requirement = _designated_requirement(app)
     return identity, hashlib.sha256(requirement.encode()).hexdigest(), _cdhash(app)
@@ -137,7 +143,9 @@ def _verify_app(
 
 def _verify_resources(app: Path, makefile_dir: Path | None) -> None:
     if makefile_dir is not None:
-        _run(MAKE, "-s", "verify-resources", f"APP={app}", cwd=makefile_dir)
+        env = os.environ.copy()
+        env["ONOATS_VERIFY_RESOURCES_APP"] = str(app)
+        _run(MAKE, "-s", "verify-resources", cwd=makefile_dir, env=env)
 
 
 def _remove_path(path: Path) -> None:

@@ -125,7 +125,8 @@ app: build
 # bundle is signed.
 verify-resources:
 	@set -eu; \
-	resources="$(APP)/Contents/Resources"; \
+	app="$${ONOATS_VERIFY_RESOURCES_APP:-Onoats.app}"; \
+	resources="$$app/Contents/Resources"; \
 	[ -d "$$resources" ] && [ ! -L "$$resources" ] || { echo "✗ invalid $$resources"; exit 1; }; \
 	expected=$$(mktemp); actual=$$(mktemp); \
 	trap 'rm -f "$$expected" "$$actual"' EXIT; \
@@ -157,7 +158,7 @@ check-identity:
 # it must get its own explicit codesign line here — an unsigned addition
 # silently invalidates the outer signature.
 sign: app check-identity
-	$(MAKE) verify-resources APP="$(APP)"
+	$(MAKE) verify-resources
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(BIN)
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(APP)
 	codesign --verify --deep --strict $(APP)
