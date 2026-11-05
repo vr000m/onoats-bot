@@ -64,6 +64,15 @@ class OwnedProcessGroup(NamedTuple):
     members: tuple[ProcessIdentity, ...]
 
 
+class CleanupTargetResult(NamedTuple):
+    label: str
+    pid: int
+    initial_state: str
+    term_sent: bool
+    kill_sent: bool
+    final_state: str
+
+
 class _ProcBsdInfo(ctypes.Structure):
     _fields_ = [
         ("pbi_flags", ctypes.c_uint32),
@@ -375,15 +384,64 @@ def _signal_owned_group(group: OwnedProcessGroup, sig: signal.Signals) -> bool:
     return signalled
 
 
-def _cleanup_groups(groups: tuple[OwnedProcessGroup, ...], timeout: float) -> None:
-    for group in groups:
-        if _signal_owned_group(group, signal.SIGTERM):
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline and any(
-                _identity_matches(member) for member in group.members
-            ):
-                time.sleep(0.1)
-            _signal_owned_group(group, signal.SIGKILL)
+def _captured_state(
+    identity: ProcessIdentity, matches: Callable[[ProcessIdentity], bool]
+) -> str:
+    if matches(identity):
+        return "live"
+    row = _processes().get(identity.pid)
+    birth = _process_birth(identity.pid)
+    return "gone" if row is None or birth is None else "recycled"
+
+
+def _wait_captured_not_live(
+    identity: ProcessIdentity,
+    matches: Callable[[ProcessIdentity], bool],
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not matches(identity):
+            return True
+        time.sleep(0.1)
+    return not matches(identity)
+
+
+def _cleanup_captured_target(
+    label: str,
+    identity: ProcessIdentity,
+    *,
+    matches: Callable[[ProcessIdentity], bool],
+    send: Callable[[ProcessIdentity, signal.Signals], bool],
+    timeout: float,
+) -> tuple[CleanupTargetResult, tuple[BaseException, ...]]:
+    """Run the complete bounded cleanup sequence for one captured identity."""
+    initial = _captured_state(identity, matches)
+    term_sent = False
+    kill_sent = False
+    failures: list[BaseException] = []
+    if initial == "live":
+        try:
+            term_sent = send(identity, signal.SIGTERM)
+        except BaseException as exc:
+            failures.append(exc)
+        if matches(identity):
+            _wait_captured_not_live(identity, matches, timeout)
+        if matches(identity):
+            try:
+                kill_sent = send(identity, signal.SIGKILL)
+            except BaseException as exc:
+                failures.append(exc)
+            if matches(identity):
+                _wait_captured_not_live(identity, matches, timeout)
+    final = _captured_state(identity, matches)
+    if final == "live":
+        final = "surviving"
+        failures.append(SmokeFailure(f"{label} pid {identity.pid} survived SIGKILL"))
+    return (
+        CleanupTargetResult(label, identity.pid, initial, term_sent, kill_sent, final),
+        tuple(failures),
+    )
 
 
 def _cleanup_after_failure(
@@ -395,45 +453,58 @@ def _cleanup_after_failure(
     pid_path: Path | None = None,
     groups: tuple[OwnedProcessGroup, ...] = (),
     timeout: float = 5.0,
-) -> None:
+) -> tuple[CleanupTargetResult, ...]:
     """Boundedly stop only identities proven to belong to this smoke run."""
     # Ancestry is a discovery gate only. Once captured, each identity remains
     # independently eligible for cleanup even if its ancestor exits first.
     failures: list[BaseException] = []
+    results: list[CleanupTargetResult] = []
+
+    def cleanup(
+        label: str,
+        identity: ProcessIdentity,
+        *,
+        matches: Callable[[ProcessIdentity], bool] = _identity_matches,
+        send: Callable[[ProcessIdentity, signal.Signals], bool] = _signal_identity,
+    ) -> None:
+        result, target_failures = _cleanup_captured_target(
+            label,
+            identity,
+            matches=matches,
+            send=send,
+            timeout=timeout,
+        )
+        results.append(result)
+        failures.extend(target_failures)
+
     if recorder is not None:
-        recorder_identity = _recorder_process_identity(recorder)
         try:
-            if _signal_identity(recorder_identity, signal.SIGTERM):
-                if not _wait_identity_gone(recorder_identity, timeout):
-                    _signal_identity(recorder_identity, signal.SIGKILL)
-                    _wait_identity_gone(recorder_identity, timeout)
+            cleanup("recorder", _recorder_process_identity(recorder))
         except BaseException as exc:
             failures.append(exc)
 
     for group in groups:
-        try:
-            if _signal_owned_group(group, signal.SIGTERM):
-                deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline and any(
-                    _identity_matches(member) for member in group.members
-                ):
-                    time.sleep(0.1)
-                _signal_owned_group(group, signal.SIGKILL)
-        except BaseException as exc:
-            failures.append(exc)
+        for member in group.members:
+            try:
+                cleanup(f"group {group.pgid} member", member)
+            except BaseException as exc:
+                failures.append(exc)
 
     if app_identity is not None:
         try:
-            if _signal_app(app, app_identity, signal.SIGTERM):
-                if not _wait_identity_gone(app_identity, timeout):
-                    _signal_app(app, app_identity, signal.SIGKILL)
-                    _wait_identity_gone(app_identity, timeout)
+            cleanup(
+                "app",
+                app_identity,
+                matches=lambda identity: _app_process_matches(app, identity),
+                send=lambda identity, sig: _signal_app(app, identity, sig),
+            )
         except BaseException as exc:
             failures.append(exc)
 
     if failures:
         details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
         raise SmokeFailure(f"bounded cleanup encountered errors: {details}")
+    return tuple(results)
 
 
 def _descends_from(pid: int, ancestor: int, processes: dict[int, ProcessRow]) -> bool:

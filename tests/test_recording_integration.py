@@ -337,11 +337,35 @@ def test_installed_smoke_app_cleanup_preserves_argument_bearing_identity(
     command = f"{(app / 'Contents/MacOS/Onoats').resolve()} --launch-argument smoke"
     identity = _app_identity(app, command=command)
     seen: list[SMOKE.ProcessIdentity] = []
+    live = True
 
     def signal_app(_app, captured, _sig):
+        nonlocal live
         seen.append(captured)
-        return False
+        live = False
+        return True
 
+    monkeypatch.setattr(
+        SMOKE,
+        "_processes",
+        lambda: (
+            {
+                identity.pid: SMOKE.ProcessRow(
+                    1, identity.pgid, identity.start, identity.command
+                )
+            }
+            if live
+            else {}
+        ),
+    )
+    monkeypatch.setattr(
+        SMOKE, "_process_birth", lambda pid: identity.process_birth if live else None
+    )
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_executable",
+        lambda _pid: str((app / "Contents/MacOS/Onoats").resolve()),
+    )
     monkeypatch.setattr(SMOKE, "_signal_app", signal_app)
     SMOKE._cleanup_after_failure(app, app_identity=identity, timeout=0.01)
 
@@ -495,7 +519,7 @@ def test_installed_smoke_cleanup_attempts_app_after_recorder_signal_failure(
             pid_path=tmp_path / "pid",
             timeout=0.01,
         )
-    assert attempted == [recorder_pid, app_pid]
+    assert attempted == [recorder_pid, recorder_pid, app_pid]
 
 
 def test_installed_smoke_group_cleanup_survives_reaped_leader_and_rejects_reuse(
@@ -586,6 +610,109 @@ def test_installed_smoke_captured_identity_cleanup_whole_state_space(
     assert ((1234, signal.SIGTERM) in pid_signals) is (app_state == "live")
     assert ((5002, signal.SIGTERM) in pid_signals) is (group_state == "live")
     assert all(pid in {1234, 4321, 5002} for pid, _sig in pid_signals)
+
+
+@pytest.mark.parametrize(
+    ("exit_after", "expected_signals", "expected_final", "raises"),
+    [
+        ("term", [signal.SIGTERM], "gone", False),
+        ("kill", [signal.SIGTERM, signal.SIGKILL], "gone", False),
+        ("never", [signal.SIGTERM, signal.SIGKILL], "surviving", True),
+    ],
+)
+def test_installed_smoke_cleanup_target_runs_complete_term_kill_wait_contract(
+    monkeypatch, exit_after, expected_signals, expected_final, raises
+):
+    birth = _birth(90, 900)
+    identity = SMOKE.ProcessIdentity(
+        pid=6001,
+        pgid=6001,
+        start="captured-start",
+        command="/captured/process",
+        process_birth=birth,
+    )
+    rows = {6001: SMOKE.ProcessRow(1, 6001, "captured-start", "/captured/process")}
+    births = {6001: birth}
+    signals = []
+
+    def send(target, sig):
+        assert target is identity
+        signals.append(sig)
+        if exit_after == "term" or (exit_after == "kill" and sig == signal.SIGKILL):
+            rows.clear()
+            births.clear()
+        return True
+
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
+    monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
+    result, failures = SMOKE._cleanup_captured_target(
+        "fixture",
+        identity,
+        matches=SMOKE._identity_matches,
+        send=send,
+        timeout=0,
+    )
+
+    assert signals == expected_signals
+    assert result.final_state == expected_final
+    assert bool(failures) is raises
+
+
+def test_installed_smoke_cleanup_reports_survivor_after_attempting_every_target(
+    tmp_path, monkeypatch
+):
+    app = tmp_path / "Onoats.app"
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    app_birth = _birth(10, 10)
+    recorder_birth = _birth(20, 20)
+    member_birth = _birth(30, 30)
+    rows = {
+        1234: SMOKE.ProcessRow(1, 1234, "app-start", executable),
+        4321: SMOKE.ProcessRow(1, 4321, "rec-start", "/opt/onoats/bin/onoats bot"),
+        5002: SMOKE.ProcessRow(1, 5001, "member-start", "/capturer/helper"),
+    }
+    births = {1234: app_birth, 4321: recorder_birth, 5002: member_birth}
+    signals = []
+
+    def kill(pid, sig):
+        signals.append((pid, sig))
+        if pid != 4321:
+            rows.pop(pid, None)
+            births.pop(pid, None)
+
+    monkeypatch.setattr(SMOKE, "_process_executable", lambda _pid: executable)
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
+    monkeypatch.setattr(SMOKE, "_process_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(SMOKE.os, "kill", kill)
+    group = SMOKE.OwnedProcessGroup(
+        5001,
+        (
+            SMOKE.ProcessIdentity(
+                5002, 5001, "member-start", "/capturer/helper", member_birth
+            ),
+        ),
+    )
+
+    with pytest.raises(SMOKE.SmokeFailure, match="recorder pid 4321 survived SIGKILL"):
+        SMOKE._cleanup_after_failure(
+            app,
+            app_identity=_app_identity(
+                app, pid=1234, start="app-start", process_birth=app_birth
+            ),
+            recorder=_recorder_identity(
+                pid=4321,
+                command="/opt/onoats/bin/onoats bot",
+                process_start="rec-start",
+                process_birth=recorder_birth,
+            ),
+            groups=(group,),
+            timeout=0,
+        )
+
+    assert (4321, signal.SIGTERM) in signals
+    assert (4321, signal.SIGKILL) in signals
+    assert (5002, signal.SIGTERM) in signals
+    assert (1234, signal.SIGTERM) in signals
 
 
 def test_installed_smoke_rechecks_kernel_birth_before_each_group_signal(monkeypatch):
