@@ -13,17 +13,22 @@ service managers, but the CLI never falls back to them.
 
 ## Endpoint and ownership
 
-The recorder binds `<data_dir>/.active/onoats-control.sock` before publishing
-its PID and running status. `.active` is mode `0700` and the socket is `0600`.
+The recorder binds a socket inside a private mode-`0700` directory under
+`<data_dir>/.active`, captures that unpublished socket's device/inode, and
+atomically publishes it as `.active/onoats-control.sock` with an exclusive
+no-replace rename before publishing its PID and running status. `.active` is
+mode `0700` and the socket is `0600`.
 If that absolute pathname exceeds Darwin's `sockaddr_un` limit, startup and
 clients fail closed with guidance to choose a shorter data directory; neither
 side changes the process-wide working directory to shorten the address.
-The server records the bound socket's device/inode. Cleanup atomically moves the
+The server never derives ownership from a later read of the public pathname.
+Python 3.13's automatic `cleanup_socket` behavior is explicitly disabled;
+Python 3.12 retains its no-keyword call shape. Cleanup atomically moves the
 public entry into a private same-directory quarantine, verifies the moved inode,
-and removes only that socket; a raced foreign entry is restored without
-overwriting a successor or retained in quarantine. Shutdown stops acceptance
-and settles accepted commands before removing the socket, writing stopped
-status, and exact-record PID teardown.
+and removes only that socket; a raced foreign entry is restored by the same
+exclusive rename without overwriting a successor, or retained in quarantine.
+Shutdown stops acceptance and settles accepted commands before removing the
+socket, writing stopped status, and exact-record PID teardown.
 
 On macOS every accepted connection must provide Darwin `LOCAL_PEERCRED`. The
 server requires a complete `xucred` with `cr_version == XUCRED_VERSION`, a valid

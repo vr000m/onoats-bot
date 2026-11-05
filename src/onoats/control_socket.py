@@ -8,6 +8,8 @@ representation of a recorder identity; callers may pass any object exposing
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import inspect
 import json
 import math
@@ -35,6 +37,9 @@ _LOCAL_PEERCRED = 1
 _XUCRED_VERSION = 0
 _XUCRED = struct.Struct("@IIh16I")
 _DARWIN_SUN_PATH_BYTES = 104
+_AT_FDCWD = -100
+_RENAME_EXCL = 0x00000004
+_RENAME_NOREPLACE = 0x00000001
 
 
 class ControlError(RuntimeError):
@@ -68,11 +73,12 @@ async def _start_owned_unix_server(
     """Start a server without delegating endpoint removal to asyncio.
 
     Python 3.13 added ``cleanup_socket`` with a default of ``True``. Python
-    3.12 has no such parameter, so feature-detect the keyword while preserving
-    this module's inode-checked cleanup as the sole removal authority.
+    3.12 has no such parameter. Select by the runtime contract rather than
+    signature introspection: some 3.13 builds expose the keyword only through
+    ``**kwds`` even though omitting it still enables automatic unlinking.
     """
     kwargs: dict[str, Any] = {"sock": listener}
-    if "cleanup_socket" in inspect.signature(asyncio.start_unix_server).parameters:
+    if sys.version_info >= (3, 13):
         kwargs["cleanup_socket"] = False
     return await asyncio.start_unix_server(callback, **kwargs)
 
@@ -81,12 +87,48 @@ def _record_generation(record: Any) -> tuple[int, float]:
     return int(record.pid), float(record.start_epoch)
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish one filesystem entry without replacing another."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(errno.ENOSYS, "exclusive rename is unavailable")
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(source), os.fsencode(destination), _RENAME_EXCL)
+    else:
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOSYS, "exclusive rename is unavailable")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
 def _quarantine_and_remove(path: Path, expected: tuple[int, int]) -> bool:
     """Move the public entry aside, verify it, then remove only that inode.
 
-    If a different entry wins the race, restore it with a no-overwrite hard
-    link. When a newer public entry already exists, retain the raced entry in
-    quarantine rather than deleting either one.
+    If a different entry wins the race, restore it with an exclusive rename.
+    When a newer public entry already exists, retain the raced entry in
+    quarantine rather than deleting either one. Unix sockets cannot be hard
+    linked on Darwin, so restoration must use the same no-replace primitive as
+    endpoint publication.
     """
     try:
         quarantine_dir = Path(
@@ -108,12 +150,9 @@ def _quarantine_and_remove(path: Path, expected: tuple[int, int]) -> bool:
         moved = quarantine_path.lstat()
         if (moved.st_dev, moved.st_ino) != expected:
             try:
-                os.link(quarantine_path, path, follow_symlinks=False)
+                _rename_noreplace(quarantine_path, path)
             except OSError:
                 return False
-            # Retain the quarantine link even after restoration. A successor
-            # may replace the public name immediately, and cleanup must never
-            # delete the raced foreign entry's final link.
             return False
         quarantine_path.unlink()
         return True
@@ -208,22 +247,49 @@ class ControlServer:
                     f"control endpoint changed while removing stale socket {self.path}"
                 )
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        private_dir: Path | None = None
+        private_path: Path | None = None
         try:
-            listener.bind(str(self.path))
+            private_dir = Path(
+                tempfile.mkdtemp(prefix=".onoats-control-bind-", dir=self.path.parent)
+            )
+            os.chmod(private_dir, 0o700)
+            private_path = private_dir / CONTROL_SOCKET_FILENAME
+            listener.bind(str(private_path))
+            os.chmod(private_path, 0o600)
+            opened = private_path.lstat()
+            if not stat.S_ISSOCK(opened.st_mode):
+                raise ControlError("bound control endpoint is not a socket")
+            owned = (opened.st_dev, opened.st_ino)
             listener.setblocking(False)
             listener.listen(socket.SOMAXCONN)
+            try:
+                _rename_noreplace(private_path, self.path)
+            except FileExistsError as exc:
+                raise ControlError(
+                    f"control endpoint appeared while publishing {self.path}"
+                ) from exc
+            self._owned_identity = owned
+            self._closing = False
             self._server = await _start_owned_unix_server(self._accept, listener)
         except BaseException:
             listener.close()
+            owned = self._owned_identity
+            self._owned_identity = None
+            if owned is not None:
+                _quarantine_and_remove(self.path, owned)
             raise
-        os.chmod(self.path, 0o600)
-        opened = self.path.lstat()
-        if not stat.S_ISSOCK(opened.st_mode):
-            await self.close()
-            raise ControlError("bound control endpoint is not a socket")
-        self._owned_identity = (opened.st_dev, opened.st_ino)
-
-        self._closing = False
+        finally:
+            if private_path is not None:
+                try:
+                    private_path.unlink()
+                except FileNotFoundError:
+                    pass
+            if private_dir is not None:
+                try:
+                    private_dir.rmdir()
+                except OSError:
+                    pass
 
     def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

@@ -96,42 +96,112 @@ def _bind_unix_socket(path: Path) -> socket.socket:
 
 
 @_async_test
-@pytest.mark.parametrize("cleanup_socket_supported", [False, True])
+@pytest.mark.parametrize("python_version", [(3, 12), (3, 13)])
 async def test_asyncio_socket_cleanup_is_never_endpoint_owner(
-    monkeypatch, cleanup_socket_supported: bool
+    monkeypatch, python_version: tuple[int, int]
 ) -> None:
-    """Python 3.12/3.13 both leave inode cleanup to ControlServer.close."""
+    """Python 3.12/3.13 both leave inode cleanup to ControlServer.close.
+
+    The 3.13-shaped stub exposes ``cleanup_socket`` only through ``**kwargs``;
+    signature introspection would miss the ownership switch.
+    """
     import onoats.control_socket as control
 
     listener = object()
     server = object()
-    calls: list[tuple[object, object, object]] = []
+    calls: list[tuple[object, object, dict[str, object]]] = []
 
-    if cleanup_socket_supported:
-
-        async def start(callback, *, sock, cleanup_socket=True):
-            calls.append((callback, sock, cleanup_socket))
-            return server
-
-    else:
-
-        async def start(callback, *, sock):
-            calls.append((callback, sock, "unsupported"))
-            return server
+    async def start(callback, *, sock, **kwargs):
+        calls.append((callback, sock, kwargs))
+        return server
 
     monkeypatch.setattr(control.asyncio, "start_unix_server", start)
+    monkeypatch.setattr(control.sys, "version_info", python_version)
 
     def callback(_reader, _writer):
         return None
 
     assert await control._start_owned_unix_server(callback, listener) is server
-    assert calls == [
-        (
-            callback,
-            listener,
-            False if cleanup_socket_supported else "unsupported",
-        )
-    ]
+    expected = {"cleanup_socket": False} if python_version >= (3, 13) else {}
+    assert calls == [(callback, listener, expected)]
+
+
+@_async_test
+async def test_start_never_adopts_endpoint_replaced_after_private_publication(
+    control_data_dir: Path, callbacks, monkeypatch
+) -> None:
+    """Ownership comes from the private bind, never a raced public lstat."""
+    import onoats.control_socket as control
+
+    path = control_data_dir / ".active" / CONTROL_SOCKET_FILENAME
+    real_publish = control._rename_noreplace
+    successor = None
+    successor_inode = None
+
+    def publish_then_replace(source, destination):
+        nonlocal successor, successor_inode
+        real_publish(source, destination)
+        if destination == path:
+            path.unlink()
+            successor = _bind_unix_socket(path)
+            successor_inode = path.stat().st_ino
+
+    monkeypatch.setattr(control, "_rename_noreplace", publish_then_replace)
+    actions, flush, stop = callbacks
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=flush,
+        on_stop=stop,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    try:
+        await server.start()
+        await server.close()
+        assert successor is not None
+        assert path.stat().st_ino == successor_inode
+    finally:
+        if successor is not None:
+            successor.close()
+        path.unlink(missing_ok=True)
+
+
+@_async_test
+async def test_exclusive_publication_preserves_endpoint_that_wins_the_race(
+    control_data_dir: Path, callbacks, monkeypatch
+) -> None:
+    import onoats.control_socket as control
+
+    path = control_data_dir / ".active" / CONTROL_SOCKET_FILENAME
+    real_publish = control._rename_noreplace
+    successor = None
+    successor_inode = None
+
+    def race_publication(source, destination):
+        nonlocal successor, successor_inode
+        if destination == path and successor is None:
+            successor = _bind_unix_socket(path)
+            successor_inode = path.stat().st_ino
+        real_publish(source, destination)
+
+    monkeypatch.setattr(control, "_rename_noreplace", race_publication)
+    actions, flush, stop = callbacks
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=flush,
+        on_stop=stop,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    try:
+        with pytest.raises(control.ControlError, match="appeared while publishing"):
+            await server.start()
+        assert successor is not None
+        assert path.stat().st_ino == successor_inode
+    finally:
+        if successor is not None:
+            successor.close()
+        path.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("operation", ["bind", "connect"])
