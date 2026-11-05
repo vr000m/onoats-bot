@@ -714,6 +714,45 @@ def test_control_handlers_keep_flush_and_stop_actions_differential():
         assert "_flush_continuation" not in stop
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "requested", "raised", "expected_error"),
+    [
+        (entrypoint, requested, raised, not requested)
+        for entrypoint in ("single", "dual")
+        for requested in (False, True)
+        for raised in (False, True)
+    ],
+)
+def test_pipeline_termination_classification_whole_state_space(
+    entrypoint: str, requested: bool, raised: bool, expected_error: bool
+):
+    import asyncio
+
+    from onoats import runtime
+
+    event = asyncio.Event()
+    if requested:
+        event.set()
+    exception = RuntimeError("runner failed") if raised else None
+    assert (
+        runtime._pipeline_ended_by_error(event, entrypoint, exception=exception)
+        is expected_error
+    )
+
+
+def test_both_recorder_entrypoints_classify_returns_and_exceptions_before_cleanup():
+    root = Path(__file__).resolve().parents[1]
+    for relative in ("src/onoats/__main__.py", "src/onoats/dual.py"):
+        source = (root / relative).read_text()
+        run_body = source.split("await runner.run(task)", 1)[1].split("finally:", 1)[0]
+        assert run_body.count("_pipeline_ended_by_error(") == 2
+        assert "except BaseException as exc:" in run_body
+        assert "exception=exc" in run_body
+    single = (root / "src/onoats/__main__.py").read_text()
+    assert "return 1 if ended_by_error else 0" in single
+    assert "return asyncio.run(" in single
+
+
 def test_dual_threads_captured_recovery_warning_into_status_running():
     """Phase 3 race fix: the preflight's on_recovery message fires before any
     running record exists, so dual.py must capture it into a local variable

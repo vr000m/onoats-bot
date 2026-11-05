@@ -20,6 +20,7 @@ from onoats.control_socket import (
     CONTROL_REQUEST_FIELDS,
     CONTROL_SOCKET_FILENAME,
     ControlServer,
+    ControlError,
     send_control_command,
 )
 
@@ -92,6 +93,69 @@ def _bind_unix_socket(path: Path) -> socket.socket:
     endpoint = socket.socket(socket.AF_UNIX)
     endpoint.bind(str(path))
     return endpoint
+
+
+@_async_test
+@pytest.mark.parametrize("cleanup_socket_supported", [False, True])
+async def test_asyncio_socket_cleanup_is_never_endpoint_owner(
+    monkeypatch, cleanup_socket_supported: bool
+) -> None:
+    """Python 3.12/3.13 both leave inode cleanup to ControlServer.close."""
+    import onoats.control_socket as control
+
+    listener = object()
+    server = object()
+    calls: list[tuple[object, object, object]] = []
+
+    if cleanup_socket_supported:
+
+        async def start(callback, *, sock, cleanup_socket=True):
+            calls.append((callback, sock, cleanup_socket))
+            return server
+
+    else:
+
+        async def start(callback, *, sock):
+            calls.append((callback, sock, "unsupported"))
+            return server
+
+    monkeypatch.setattr(control.asyncio, "start_unix_server", start)
+
+    def callback(_reader, _writer):
+        return None
+
+    assert await control._start_owned_unix_server(callback, listener) is server
+    assert calls == [
+        (
+            callback,
+            listener,
+            False if cleanup_socket_supported else "unsupported",
+        )
+    ]
+
+
+@pytest.mark.parametrize("operation", ["bind", "connect"])
+def test_overlong_control_paths_fail_without_changing_process_cwd(
+    tmp_path: Path, operation: str
+) -> None:
+    data_dir = tmp_path / ("x" * 110)
+    cwd_before = Path.cwd()
+
+    with pytest.raises(ControlError, match="sockaddr_un|shorter ONOATS_DATA_DIR"):
+        if operation == "bind":
+            server = ControlServer(
+                data_dir,
+                RECORD,
+                on_flush=lambda: None,
+                on_stop=lambda: None,
+                peer_uid_getter=lambda _sock: os.geteuid(),
+            )
+            asyncio.run(server.start())
+        else:
+            send_control_command(data_dir, RECORD, "flush")
+
+    assert Path.cwd() == cwd_before
+    assert not (data_dir / ".active").exists()
 
 
 @_async_test
@@ -323,6 +387,91 @@ async def test_duplicate_stop_is_idempotent_and_flush_after_stop_is_rejected(
     assert first["ok"] is duplicate["ok"] is True
     assert late_flush["ok"] is False
     assert actions == ["stop"]
+
+
+@_async_test
+@pytest.mark.parametrize(
+    ("signal_stop_requested", "command", "accepted", "expected_actions"),
+    [
+        (False, "flush", True, ["flush"]),
+        (False, "stop", True, ["stop"]),
+        (True, "flush", False, []),
+        (True, "stop", True, []),
+    ],
+)
+async def test_signal_and_socket_stop_share_the_complete_command_state_space(
+    control_data_dir: Path,
+    callbacks,
+    signal_stop_requested: bool,
+    command: str,
+    accepted: bool,
+    expected_actions: list[str],
+) -> None:
+    actions, flush, stop = callbacks
+    stopping_event = asyncio.Event()
+    if signal_stop_requested:
+        stopping_event.set()
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=flush,
+        on_stop=stop,
+        stopping_event=stopping_event,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    await server.start()
+    try:
+        response = await _send(
+            control_data_dir / ".active" / CONTROL_SOCKET_FILENAME,
+            _request(command),
+        )
+    finally:
+        await server.close()
+    assert response["ok"] is accepted
+    assert actions == expected_actions
+
+
+@_async_test
+async def test_flush_first_finishes_but_signal_stop_rejects_the_next_flush(
+    control_data_dir: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    stopping_event = asyncio.Event()
+    actions: list[str] = []
+
+    async def flush() -> None:
+        actions.append("flush")
+        entered.set()
+        await release.wait()
+
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=flush,
+        on_stop=lambda: None,
+        stopping_event=stopping_event,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    await server.start()
+    path = control_data_dir / ".active" / CONTROL_SOCKET_FILENAME
+    try:
+        first_task = asyncio.create_task(_send(path, _request("flush")))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        stopping_event.set()
+        second_task = asyncio.create_task(_send(path, _request("flush")))
+        release.set()
+        first, second = await asyncio.gather(first_task, second_task)
+    finally:
+        await server.close()
+    assert first["ok"] is True
+    assert second == {
+        "version": CONTROL_PROTOCOL_VERSION,
+        "ok": False,
+        "code": "stopping",
+        "message": "recorder is stopping",
+    }
+    assert actions == ["flush"]
 
 
 @_async_test

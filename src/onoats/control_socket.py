@@ -17,7 +17,6 @@ import stat
 import struct
 import sys
 import tempfile
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -36,7 +35,6 @@ _LOCAL_PEERCRED = 1
 _XUCRED_VERSION = 0
 _XUCRED = struct.Struct("@IIh16I")
 _DARWIN_SUN_PATH_BYTES = 104
-_CWD_LOCK = threading.Lock()
 
 
 class ControlError(RuntimeError):
@@ -54,26 +52,29 @@ def control_socket_path(data_dir: Path) -> Path:
     return data_dir / ".active" / CONTROL_SOCKET_FILENAME
 
 
-def _path_needs_relative_address(path: Path) -> bool:
-    return len(os.fsencode(path)) + 1 > _DARWIN_SUN_PATH_BYTES
+def _validate_socket_path(path: Path) -> None:
+    """Reject paths that cannot be represented without process-global state."""
+    if len(os.fsencode(path)) + 1 > _DARWIN_SUN_PATH_BYTES:
+        raise ControlError(
+            "control socket path exceeds Darwin's sockaddr_un limit; "
+            "configure a shorter ONOATS_DATA_DIR"
+        )
 
 
-def _in_parent_directory(path: Path, operation: Callable[[str], None]) -> None:
-    """Run one synchronous sockaddr operation relative to an opened parent.
+async def _start_owned_unix_server(
+    callback: Callable[[asyncio.StreamReader, asyncio.StreamWriter], None],
+    listener: socket.socket,
+) -> asyncio.AbstractServer:
+    """Start a server without delegating endpoint removal to asyncio.
 
-    Darwin's ``sockaddr_un.sun_path`` is only 104 bytes. Binding or connecting
-    with the basename while the parent is the current directory still creates
-    and reaches the canonical filesystem endpoint at ``path``. The cwd change
-    is process-wide, so it is held only across the single non-awaiting syscall.
+    Python 3.13 added ``cleanup_socket`` with a default of ``True``. Python
+    3.12 has no such parameter, so feature-detect the keyword while preserving
+    this module's inode-checked cleanup as the sole removal authority.
     """
-    with _CWD_LOCK:
-        original = os.open(".", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-        try:
-            os.chdir(path.parent)
-            operation(path.name)
-        finally:
-            os.fchdir(original)
-            os.close(original)
+    kwargs: dict[str, Any] = {"sock": listener}
+    if "cleanup_socket" in inspect.signature(asyncio.start_unix_server).parameters:
+        kwargs["cleanup_socket"] = False
+    return await asyncio.start_unix_server(callback, **kwargs)
 
 
 def _record_generation(record: Any) -> tuple[int, float]:
@@ -169,12 +170,14 @@ class ControlServer:
         *,
         on_flush: Callable[[], Awaitable[None] | None],
         on_stop: Callable[[], Awaitable[None] | None],
+        stopping_event: asyncio.Event | None = None,
         peer_uid_getter: Callable[[socket.socket], int] | None = None,
     ) -> None:
         self.path = control_socket_path(data_dir)
         self._pid, self._start_epoch = _record_generation(record)
         self._on_flush = on_flush
         self._on_stop = on_stop
+        self._stopping_event = stopping_event
         self._peer_uid_getter = peer_uid_getter or _darwin_peer_uid
         self._server: asyncio.AbstractServer | None = None
         self._command_lock = asyncio.Lock()
@@ -186,6 +189,7 @@ class ControlServer:
     async def start(self) -> None:
         if self._server is not None:
             return
+        _validate_socket_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, 0o700)
         try:
@@ -205,13 +209,10 @@ class ControlServer:
                 )
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            if _path_needs_relative_address(self.path):
-                _in_parent_directory(self.path, listener.bind)
-            else:
-                listener.bind(str(self.path))
+            listener.bind(str(self.path))
             listener.setblocking(False)
             listener.listen(socket.SOMAXCONN)
-            self._server = await asyncio.start_unix_server(self._accept, sock=listener)
+            self._server = await _start_owned_unix_server(self._accept, listener)
         except BaseException:
             listener.close()
             raise
@@ -337,11 +338,15 @@ class ControlServer:
 
         async with self._command_lock:
             if command == "flush":
-                if self._stopping:
+                if self._stopping or (
+                    self._stopping_event is not None and self._stopping_event.is_set()
+                ):
                     return ControlResponse(False, "stopping", "recorder is stopping")
                 await _maybe_await(self._on_flush())
                 return ControlResponse(True, "accepted", "flush rotation completed")
-            if self._stopping:
+            if self._stopping or (
+                self._stopping_event is not None and self._stopping_event.is_set()
+            ):
                 return ControlResponse(True, "accepted", "stop already accepted")
             await _maybe_await(self._on_stop())
             self._stopping = True
@@ -394,13 +399,11 @@ def send_control_command(
     if len(encoded) > CONTROL_MAX_REQUEST_BYTES:
         raise ControlError("control request exceeded its byte limit")
     path = control_socket_path(data_dir)
+    _validate_socket_path(path)
     peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     peer.settimeout(timeout)
     try:
-        if _path_needs_relative_address(path):
-            _in_parent_directory(path, peer.connect)
-        else:
-            peer.connect(str(path))
+        peer.connect(str(path))
         peer.sendall(encoded)
         peer.shutdown(socket.SHUT_WR)
         chunks: list[bytes] = []

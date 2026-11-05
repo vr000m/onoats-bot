@@ -61,6 +61,7 @@ from onoats.runtime import (  # noqa: E402
     _mark_graceful_shutdown_requested,
     _mark_status_rotation,
     _mint_start_epoch,
+    _pipeline_ended_by_error,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -758,6 +759,7 @@ async def run_onoats_dual(
         pid_record,
         on_flush=_control_flush,
         on_stop=_control_stop,
+        stopping_event=shutdown_event,
     )
     await control_server.start()
     try:
@@ -931,13 +933,12 @@ async def run_onoats_dual(
         # exposes no on_pipeline_error event or PipelineTask observer hook to read
         # the fatal ErrorFrame directly; if a future version adds one, switch to
         # observing the frame and drop this inference.
-        if not shutdown_event.is_set():
-            ended_by_error = True
-            logger.error(
-                "Dual pipeline ended without a shutdown request — a capture "
-                "branch surfaced a fatal ErrorFrame (e.g. capturer EOF / "
-                "read-idle). Reporting non-zero exit."
-            )
+        ended_by_error = _pipeline_ended_by_error(shutdown_event, "Dual recorder")
+    except BaseException as exc:
+        ended_by_error = _pipeline_ended_by_error(
+            shutdown_event, "Dual recorder", exception=exc
+        )
+        raise
     finally:
         await _on_shutdown()
     return 1 if ended_by_error else 0

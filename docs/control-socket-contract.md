@@ -15,6 +15,9 @@ service managers, but the CLI never falls back to them.
 
 The recorder binds `<data_dir>/.active/onoats-control.sock` before publishing
 its PID and running status. `.active` is mode `0700` and the socket is `0600`.
+If that absolute pathname exceeds Darwin's `sockaddr_un` limit, startup and
+clients fail closed with guidance to choose a shorter data directory; neither
+side changes the process-wide working directory to shorten the address.
 The server records the bound socket's device/inode. Cleanup atomically moves the
 public entry into a private same-directory quarantine, verifies the moved inode,
 and removes only that socket; a raced foreign entry is restored without
@@ -62,6 +65,8 @@ One recorder-loop lock serializes accepted commands:
   before acknowledgement.
 - A duplicate Stop is idempotently acknowledged.
 - Any Flush acquiring the lock after Stop acceptance is rejected as `stopping`.
+- SIGINT/SIGTERM and socket Stop share the same shutdown event, so a Flush
+  observed after either shutdown source begins is rejected as `stopping`.
 
 Therefore simultaneous Stop/Flush is resolved solely by lock acquisition order,
 and an acknowledgement always describes an action already accepted by that same

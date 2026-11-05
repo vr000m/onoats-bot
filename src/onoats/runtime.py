@@ -2307,6 +2307,23 @@ def graceful_shutdown_requested() -> bool:
     return _graceful_shutdown_requested
 
 
+def _pipeline_ended_by_error(
+    shutdown_event: asyncio.Event,
+    recorder_label: str,
+    *,
+    exception: BaseException | None = None,
+) -> bool:
+    """Classify a runner termination against the recorder's stop authority."""
+    if shutdown_event.is_set():
+        return False
+    detail = "returned" if exception is None else f"raised {type(exception).__name__}"
+    logger.error(
+        f"{recorder_label} pipeline {detail} without a shutdown request; "
+        "reporting non-zero exit"
+    )
+    return True
+
+
 def _install_signal_handlers(
     shutdown_event: asyncio.Event,
     force_exit_event: asyncio.Event,
@@ -2319,7 +2336,7 @@ def _install_signal_handlers(
     - SIGINT (Ctrl+C once): graceful shutdown (flush + drain tasks)
     - SIGINT (Ctrl+C again during shutdown): force exit (cancel pending tasks)
     - SIGTERM: graceful shutdown
-    - SIGUSR1: flush current transcript, keep listening (used by ``onoats flush``)
+    - SIGUSR1: direct compatibility flush for terminals/service managers
     """
 
     def _handle_shutdown(sig):

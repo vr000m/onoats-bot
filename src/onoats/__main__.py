@@ -74,6 +74,7 @@ from onoats.runtime import (  # noqa: E402
     _install_signal_handlers,
     _mark_graceful_shutdown_requested,
     _mint_start_epoch,
+    _pipeline_ended_by_error,
     _remove_pid_file,
     _restore_terminal,
     _start_keypress_reader,
@@ -126,7 +127,7 @@ def _build_pipeline(transport, vad_processor, stt, transcript_buffer, silence_de
 
 async def run_onoats(
     *, interactive: bool = False, locked_category: str | None = None
-) -> None:
+) -> int:
     """Build and run the full onoats recorder pipeline.
 
     Args:
@@ -294,10 +295,8 @@ async def run_onoats(
 
     # ----------------------------------------------------------------
     # Step 8: Graceful shutdown wiring + signal handlers
-    # (must be installed BEFORE the PID file is published, otherwise a
-    # `onoats flush` during the startup window will send SIGUSR1 to a
-    # process that still has the default disposition for that signal —
-    # terminating the fresh bot instead of flushing.)
+    # (installed before publication so direct terminal/service-manager signals
+    # have an owner throughout the externally visible recorder lifetime.)
     # ----------------------------------------------------------------
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -308,9 +307,7 @@ async def run_onoats(
     )
 
     # ----------------------------------------------------------------
-    # Step 9: Write PID file for onoats flush discovery
-    # (after signal handlers so SIGUSR1 is already wired by the time
-    # the PID file is visible.)
+    # Step 9: Write PID file for control-client generation discovery.
     # ----------------------------------------------------------------
     start_epoch = _mint_start_epoch()
     from onoats.control_socket import ControlServer
@@ -329,6 +326,7 @@ async def run_onoats(
         pid_record,
         on_flush=_control_flush,
         on_stop=_control_stop,
+        stopping_event=shutdown_event,
     )
     await control_server.start()
     try:
@@ -459,16 +457,33 @@ async def run_onoats(
         f"{BOT_NAME} is listening. "
         "Ctrl+T = flush transcript. Ctrl+C = quit. Ctrl+C twice = force quit."
     )
+    ended_by_error = False
     try:
         await runner.run(task)
+        ended_by_error = _pipeline_ended_by_error(
+            shutdown_event, "Single-input recorder"
+        )
+    except BaseException as exc:
+        ended_by_error = _pipeline_ended_by_error(
+            shutdown_event, "Single-input recorder", exception=exc
+        )
+        raise
     finally:
         await _on_shutdown()
         await control_server.close()
-        _write_status_stopped(data_dir, exit_reason="graceful")
+        if ended_by_error:
+            _write_status_stopped(
+                data_dir,
+                exit_reason="fatal_error_frame",
+                last_error="single-input pipeline ended without a shutdown request",
+            )
+        else:
+            _write_status_stopped(data_dir, exit_reason="graceful")
         _restore_terminal(_old_terminal_settings)
         _remove_pid_file(pid_path, owner_record=pid_record)
         # The single-instance lock is held for the process lifetime; the kernel
         # releases it on exit (see runtime._release_instance_lock).
+    return 1 if ended_by_error else 0
 
 
 # ---------------------------------------------------------------------------
@@ -519,13 +534,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
     try:
-        asyncio.run(
+        return asyncio.run(
             run_onoats(interactive=args.interactive, locked_category=args.category)
         )
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":
