@@ -33,14 +33,23 @@ socket; a raced foreign entry is restored by the same exclusive rename without
 overwriting a successor, or retained in quarantine.
 Shutdown stops acceptance and settles accepted commands before removing the
 socket, attempting stopped status when status publication is enabled, and
-performing exact-record PID teardown. Failure of the initial running-status
-write disables status and UI telemetry for that run but does not revoke the
-already-published PID/control authority or stop recording.
+performing exact-record PID teardown. A second termination signal bounds this
+settlement: it cancels accepted handlers and their admitted continuation work,
+then performs a short bounded close before removing only the captured endpoint.
+Failure of the initial running-status write disables status and UI telemetry for
+that run but does not revoke the already-published PID/control authority or stop
+recording.
 
-On macOS every accepted connection must provide Darwin `LOCAL_PEERCRED`. The
-server requires a complete `xucred` with `cr_version == XUCRED_VERSION`, a valid
-group count, and `cr_uid == geteuid()`. Missing, malformed, unsupported, or
-wrong-UID credentials are rejected. Filesystem modes are defence in depth.
+Peer authority follows the host kernel without weakening macOS's credential
+gate. On macOS every accepted connection must provide Darwin `LOCAL_PEERCRED`;
+the server requires a complete `xucred` with
+`cr_version == XUCRED_VERSION`, a valid group count, and
+`cr_uid == geteuid()`. Linux uses kernel `SO_PEERCRED` and requires its uid to
+equal `geteuid()`; other POSIX hosts may use `getpeereid()`. Missing, malformed,
+unsupported, or wrong-UID credentials are rejected. Windows AF_UNIX does not
+expose peer credentials, so its kernel-enforced ACL on the owner-only pathname
+socket and parent directory is the connection authority there; an injected or
+unexpected missing credential is never accepted as that sentinel.
 
 ## Wire format
 
@@ -60,7 +69,9 @@ then EOF. The complete request is at most 4096 bytes. Its exact fields are:
 The response is one newline-terminated JSON object, at most 4096 bytes, with
 exact fields `version`, `ok`, `code`, and `message`. `ok=true` is an
 acknowledgement of command-specific acceptance, not proof that the recorder has
-exited. A dropped or malformed acknowledgement is failure.
+exited. A dropped or malformed acknowledgement is failure. Unexpected callback
+errors are logged with full server-side diagnostics but return only the generic
+`internal control error` message to a client.
 
 Malformed JSON, absent/partial/extra identity fields, multiple messages,
 unterminated or oversized input, an unsupported version, an unsupported command, generation

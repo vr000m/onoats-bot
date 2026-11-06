@@ -5,10 +5,14 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-_AT_FDCWD = -2
+_DARWIN_AT_FDCWD = -2
+_POSIX_AT_FDCWD = -100
+# Compatibility name for callers/tests that assert the Darwin ABI value.
+_AT_FDCWD = _DARWIN_AT_FDCWD
 _RENAME_EXCL = 0x00000004
 _RENAME_NOREPLACE = 0x00000001
 
@@ -18,6 +22,9 @@ def _libc_symbol(name: str) -> Any | None:
 
 
 def rename_noreplace_available() -> bool:
+    if sys.platform == "win32":
+        # Windows os.rename fails rather than replacing an existing target.
+        return True
     return any(
         _libc_symbol(name) is not None
         for name in ("renameatx_np", "renamex_np", "renameat2")
@@ -26,6 +33,11 @@ def rename_noreplace_available() -> bool:
 
 def rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically rename an entry without overwriting ``destination``."""
+    if sys.platform == "win32":
+        os.rename(source, destination)
+        return
+
+    at_fdcwd = _DARWIN_AT_FDCWD if sys.platform == "darwin" else _POSIX_AT_FDCWD
     source_bytes = os.fsencode(source)
     destination_bytes = os.fsencode(destination)
     renameatx_np = _libc_symbol("renameatx_np")
@@ -45,9 +57,9 @@ def rename_noreplace(source: Path, destination: Path) -> None:
         ]
         renameatx_np.restype = ctypes.c_int
         result = renameatx_np(
-            _AT_FDCWD,
+            at_fdcwd,
             source_bytes,
-            _AT_FDCWD,
+            at_fdcwd,
             destination_bytes,
             _RENAME_EXCL,
         )
@@ -65,9 +77,9 @@ def rename_noreplace(source: Path, destination: Path) -> None:
         ]
         renameat2.restype = ctypes.c_int
         result = renameat2(
-            _AT_FDCWD,
+            at_fdcwd,
             source_bytes,
-            _AT_FDCWD,
+            at_fdcwd,
             destination_bytes,
             _RENAME_NOREPLACE,
         )

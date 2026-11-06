@@ -10,6 +10,7 @@ import shutil
 import socket
 import tempfile
 import uuid
+import logging
 from pathlib import Path
 
 import pytest
@@ -535,6 +536,70 @@ async def test_flush_acknowledgement_fails_when_admitted_rotation_fails(
 
 
 @_async_test
+async def test_callback_error_is_diagnostic_server_side_but_generic_to_client(
+    control_data_dir: Path, caplog
+) -> None:
+    secret = "internal-sensitive-detail-/private/path"
+
+    async def flush() -> bool:
+        raise RuntimeError(secret)
+
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=flush,
+        on_stop=lambda: None,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    await server.start()
+    try:
+        with caplog.at_level(logging.ERROR, logger="onoats.control_socket"):
+            response = await _send(
+                control_data_dir / ".active" / CONTROL_SOCKET_FILENAME,
+                _request("flush"),
+            )
+    finally:
+        await server.close()
+    assert response["code"] == "server-error"
+    assert response["message"] == "internal control error"
+    assert secret not in json.dumps(response)
+    assert secret in caplog.text
+
+
+@_async_test
+async def test_force_exit_bounds_close_with_stuck_accepted_flush(
+    control_data_dir: Path,
+) -> None:
+    entered = asyncio.Event()
+    force_exit = asyncio.Event()
+
+    async def stuck_flush() -> bool:
+        entered.set()
+        await asyncio.Event().wait()
+        return True
+
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=stuck_flush,
+        on_stop=lambda: None,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    await server.start()
+    path = control_data_dir / ".active" / CONTROL_SOCKET_FILENAME
+    request = asyncio.create_task(_send(path, _request("flush")))
+    await entered.wait()
+    close = asyncio.create_task(server.close(force_exit_event=force_exit))
+    await asyncio.sleep(0)
+    assert not close.done()
+    force_exit.set()
+    await asyncio.wait_for(close, timeout=0.5)
+    assert not path.exists()
+    request.cancel()
+    await asyncio.gather(request, return_exceptions=True)
+
+
+@_async_test
 @pytest.mark.parametrize(
     ("signal_stop_requested", "command", "accepted", "expected_actions"),
     [
@@ -1022,6 +1087,47 @@ def test_darwin_local_peercred_validates_layout_version_and_uid(monkeypatch) -> 
     )
     with pytest.raises(control.ControlError, match="unsupported"):
         control._darwin_peer_uid(peer)
+
+
+def test_linux_peercred_uses_kernel_uid(monkeypatch) -> None:
+    import onoats.control_socket as control
+
+    monkeypatch.setattr(control.sys, "platform", "linux")
+
+    class Peer:
+        def getsockopt(self, level, option, size):
+            assert (level, option, size) == (
+                socket.SOL_SOCKET,
+                control._SO_PEERCRED,
+                control._UCRED.size,
+            )
+            return control._UCRED.pack(123, os.geteuid(), 456)
+
+    assert control._platform_peer_uid(Peer()) == os.geteuid()
+
+
+def test_default_peer_authority_remains_darwin_fail_closed(monkeypatch) -> None:
+    import onoats.control_socket as control
+
+    monkeypatch.setattr(control.sys, "platform", "darwin")
+
+    class Peer:
+        def getsockopt(self, *_args):
+            raise OSError("credential unavailable")
+
+    with pytest.raises(OSError, match="credential unavailable"):
+        control._platform_peer_uid(Peer())
+
+
+def test_windows_peer_authority_is_the_kernel_enforced_socket_acl(monkeypatch) -> None:
+    import onoats.control_socket as control
+
+    monkeypatch.setattr(control.sys, "platform", "win32")
+    assert control._platform_peer_uid(object()) is None
+    server = ControlServer(
+        Path("data"), RECORD, on_flush=lambda: True, on_stop=lambda: None
+    )
+    assert server._filesystem_peer_authority is True
 
 
 @pytest.mark.parametrize("start_epoch", [0.0, -1.0, float("nan"), float("inf")])

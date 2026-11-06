@@ -184,6 +184,32 @@ async def test_admitted_flush_survives_adapter_cancellation() -> None:
 
 
 @_async_test
+async def test_force_exit_cancels_stuck_rotation_after_adapter_cancellation() -> None:
+    """Force exit bounds an admitted rotation without weakening normal shielding."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stuck(_reason: str, _continue_session: bool) -> bool:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    controller = RecorderLifecycleController(stuck)
+    flush = asyncio.create_task(controller.flush("stuck control flush"))
+    await started.wait()
+    flush.cancel()
+    await asyncio.sleep(0)
+    assert not flush.done(), "ordinary adapter cancellation must preserve admission"
+
+    controller.force_exit_event.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(flush, timeout=0.5)
+    assert cancelled.is_set(), "force exit must cancel the abandoned rotation"
+
+
+@_async_test
 async def test_lock_admission_order_prevents_flush_reopening_after_stop() -> None:
     rotation = RotationSpy()
     rotation.release.clear()

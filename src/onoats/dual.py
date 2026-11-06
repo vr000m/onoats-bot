@@ -766,7 +766,7 @@ async def run_onoats_dual(
     try:
         pid_path = _write_pid_file(data_dir, start_epoch=start_epoch, record=pid_record)
     except BaseException:
-        await control_server.close()
+        await control_server.close(force_exit_event=force_exit_event)
         raise
     # Write ordering (status-file contract): pid file FIRST, then status. So a
     # reader that catches us mid-start sees pid-alive (backstop) before the rich
@@ -865,7 +865,7 @@ async def run_onoats_dual(
 
         # Revoke command acceptance and remove only this generation's socket
         # before publishing stopped state or removing its exact PID record.
-        await control_server.close()
+        await control_server.close(force_exit_event=force_exit_event)
 
         # Single-writer shutdown tail: status-stopped BEFORE pid removal, plus
         # terminal restore. Extracted to a module-level helper so the write

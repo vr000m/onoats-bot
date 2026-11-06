@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 import socket
@@ -20,6 +21,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+logger = logging.getLogger(__name__)
 
 # The recorder owner injects the neutral atomic primitive.  This leaf owns only
 # control protocol and endpoint semantics, never application-package imports.
@@ -38,7 +41,10 @@ _SOL_LOCAL = 0
 _LOCAL_PEERCRED = 1
 _XUCRED_VERSION = 0
 _XUCRED = struct.Struct("@IIh16I")
+_UCRED = struct.Struct("=iii")
+_SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
 _DARWIN_SUN_PATH_BYTES = 104
+CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS = 0.25
 
 
 class ControlError(RuntimeError):
@@ -205,6 +211,35 @@ def _darwin_peer_uid(peer: socket.socket) -> int:
     return uid
 
 
+def _linux_peer_uid(peer: socket.socket) -> int:
+    """Return the Linux SO_PEERCRED uid from the accepted socket."""
+    raw = peer.getsockopt(socket.SOL_SOCKET, _SO_PEERCRED, _UCRED.size)
+    if len(raw) != _UCRED.size:
+        raise ControlError("SO_PEERCRED returned malformed credentials")
+    _pid, uid, _gid = _UCRED.unpack(raw)
+    if uid < 0:
+        raise ControlError("SO_PEERCRED returned an invalid uid")
+    return uid
+
+
+def _platform_peer_uid(peer: socket.socket) -> int | None:
+    """Return a kernel uid, or Windows' filesystem-authority sentinel."""
+    if sys.platform == "darwin":
+        return _darwin_peer_uid(peer)
+    if sys.platform.startswith("linux"):
+        return _linux_peer_uid(peer)
+    if sys.platform == "win32":
+        # Windows AF_UNIX exposes no peer credentials. Its kernel instead
+        # enforces access to pathname sockets through the socket/directory ACL.
+        # Returning None is accepted only for this non-injected default path.
+        return None
+    getpeereid = getattr(peer, "getpeereid", None)
+    if getpeereid is not None:
+        uid, _gid = getpeereid()
+        return int(uid)
+    raise ControlError("peer credentials are unavailable on this platform")
+
+
 def _encoded_response(ok: bool, code: str, message: str) -> bytes:
     payload = {
         "version": CONTROL_PROTOCOL_VERSION,
@@ -234,8 +269,8 @@ class ControlServer:
         data_dir: Path,
         record: Any,
         *,
-        on_flush: Callable[[], Awaitable[None] | None],
-        on_stop: Callable[[], Awaitable[None] | None],
+        on_flush: Callable[[], Awaitable[bool | None] | bool | None],
+        on_stop: Callable[[], Awaitable[bool | None] | bool | None],
         peer_uid_getter: Callable[[socket.socket], int] | None = None,
         rename_noreplace: Callable[[Path, Path], None] | None = None,
     ) -> None:
@@ -243,7 +278,10 @@ class ControlServer:
         self._pid, self._start_epoch = _record_generation(record)
         self._on_flush = on_flush
         self._on_stop = on_stop
-        self._peer_uid_getter = peer_uid_getter or _darwin_peer_uid
+        self._peer_uid_getter = peer_uid_getter or _platform_peer_uid
+        self._filesystem_peer_authority = (
+            peer_uid_getter is None and sys.platform == "win32"
+        )
         self._rename_noreplace = rename_noreplace or _rename_noreplace
         self._server: asyncio.AbstractServer | None = None
         self._closing = False
@@ -370,9 +408,12 @@ class ControlServer:
                 _encoded_response(response.ok, response.code, response.message)
             )
             await writer.drain()
-        except Exception as exc:
+        except Exception:
+            logger.exception("Control request handler failed")
             try:
-                writer.write(_encoded_response(False, "server-error", str(exc)))
+                writer.write(
+                    _encoded_response(False, "server-error", "internal control error")
+                )
                 await writer.drain()
             except Exception:
                 pass
@@ -397,7 +438,12 @@ class ControlServer:
             return ControlResponse(
                 False, "unauthorized", "peer credentials unavailable"
             )
-        if uid != os.geteuid():
+        if uid is None:
+            if not self._filesystem_peer_authority:
+                return ControlResponse(
+                    False, "unauthorized", "peer credentials unavailable"
+                )
+        elif uid != os.geteuid():
             return ControlResponse(
                 False, "unauthorized", "peer uid does not own recorder"
             )
@@ -454,21 +500,58 @@ class ControlServer:
         await _maybe_await(self._on_stop())
         return ControlResponse(True, "accepted", "graceful stop requested")
 
-    async def close(self) -> None:
-        """Stop accepting, settle accepted commands, then remove our socket."""
+    async def close(self, *, force_exit_event: asyncio.Event | None = None) -> None:
+        """Settle accepted commands, unless force exit bounds their teardown."""
         self._closing = True
         server, self._server = self._server, None
         if server is not None:
             server.close()
-            await server.wait_closed()
         current = asyncio.current_task()
         await asyncio.sleep(0)
         while True:
             pending = [task for task in self._handlers if task is not current]
             if not pending:
                 break
-            await asyncio.gather(*pending, return_exceptions=True)
+            if force_exit_event is None:
+                await asyncio.gather(*pending, return_exceptions=True)
+            else:
+                settled = asyncio.gather(*pending, return_exceptions=True)
+                force_wait = asyncio.create_task(force_exit_event.wait())
+                done, _ = await asyncio.wait(
+                    (settled, force_wait), return_when=asyncio.FIRST_COMPLETED
+                )
+                if force_wait in done:
+                    for task in pending:
+                        task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS,
+                        )
+                    except TimeoutError:
+                        logger.error(
+                            "Forced control shutdown left %d handler(s) pending",
+                            sum(not task.done() for task in pending),
+                        )
+                    settled.cancel()
+                    await asyncio.gather(settled, return_exceptions=True)
+                    force_wait.cancel()
+                    await asyncio.gather(force_wait, return_exceptions=True)
+                    break
+                force_wait.cancel()
+                await asyncio.gather(force_wait, return_exceptions=True)
             await asyncio.sleep(0)
+        if server is not None:
+            if force_exit_event is None or not force_exit_event.is_set():
+                await server.wait_closed()
+            else:
+                try:
+                    await asyncio.wait_for(
+                        server.wait_closed(),
+                        timeout=CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    logger.error("Forced control shutdown left server clients open")
         owned = self._owned_identity
         self._owned_identity = None
         if owned is None:

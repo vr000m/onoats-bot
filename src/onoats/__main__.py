@@ -354,7 +354,7 @@ async def run_onoats(
     try:
         pid_path = _write_pid_file(data_dir, start_epoch=start_epoch, record=pid_record)
     except BaseException:
-        await control_server.close()
+        await control_server.close(force_exit_event=force_exit_event)
         raise
     status_published = _write_status_running(
         data_dir,
@@ -488,7 +488,7 @@ async def run_onoats(
         raise
     finally:
         await _on_shutdown()
-        await control_server.close()
+        await control_server.close(force_exit_event=force_exit_event)
         if status_published and ended_by_error:
             _write_status_stopped(
                 data_dir,

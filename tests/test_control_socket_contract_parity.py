@@ -100,6 +100,8 @@ def test_contract_and_code_pin_peer_policy_and_acknowledgement_points() -> None:
     assert "local_peercred" in doc
     assert "xucred" in doc
     assert "cr_uid" in doc
+    assert "so_peercred" in doc
+    assert "kernel-enforced acl" in doc
     assert "fail closed" in doc
 
     assert "flush" in doc and "rotation" in doc and "acknowledg" in doc
@@ -110,6 +112,9 @@ def test_contract_and_code_pin_peer_policy_and_acknowledgement_points() -> None:
     peer_source = inspect.getsource(control._darwin_peer_uid)
     assert "getsockopt" in peer_source
     assert "_XUCRED_VERSION" in peer_source
+    platform_source = inspect.getsource(control._platform_peer_uid)
+    assert "_linux_peer_uid" in platform_source
+    assert 'sys.platform == "win32"' in platform_source
     assert "os.geteuid()" in inspect.getsource(control.ControlServer._handle)
 
 
@@ -132,3 +137,19 @@ def test_contract_pins_owned_endpoint_cleanup_and_successor_safety() -> None:
     assert close_source.index("wait_closed") < close_source.index(
         "_quarantine_and_remove"
     )
+
+
+def test_control_callbacks_and_both_entrypoints_share_force_exit_contract() -> None:
+    signature = inspect.signature(control.ControlServer.__init__)
+    assert "bool" in str(signature.parameters["on_flush"].annotation)
+    close = inspect.signature(control.ControlServer.close)
+    assert "force_exit_event" in close.parameters
+
+    import onoats.__main__ as single
+    import onoats.dual as dual
+
+    for source in (
+        inspect.getsource(single.run_onoats),
+        inspect.getsource(dual.run_onoats_dual),
+    ):
+        assert "close(force_exit_event=force_exit_event)" in source

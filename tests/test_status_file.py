@@ -717,7 +717,10 @@ def test_recorder_entrypoints_publish_and_teardown_control_generation_in_order(
     running_publish = source.index("_write_status_running(", pid_publish)
     assert server < bind < pid_publish < running_publish
 
-    shutdown = source.index("await control_server.close()", running_publish)
+    shutdown = source.index(
+        "await control_server.close(force_exit_event=force_exit_event)",
+        running_publish,
+    )
     if relative.endswith("dual.py"):
         finalizer_call = source.index("_finalize_shutdown_status(", shutdown)
         assert shutdown < finalizer_call

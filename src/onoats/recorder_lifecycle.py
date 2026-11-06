@@ -71,7 +71,22 @@ class RecorderLifecycleController:
             try:
                 completed = await asyncio.shield(rotation)
             except asyncio.CancelledError:
-                await asyncio.shield(rotation)
+                # A disconnected client must not revoke an admitted rotation,
+                # but the process-wide force escape must still bound shutdown.
+                force_wait = asyncio.create_task(self.force_exit_event.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        (rotation, force_wait),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if force_wait in done:
+                        rotation.cancel()
+                        await asyncio.gather(rotation, return_exceptions=True)
+                    else:
+                        await asyncio.shield(rotation)
+                finally:
+                    force_wait.cancel()
+                    await asyncio.gather(force_wait, return_exceptions=True)
                 raise
             if not completed:
                 raise LifecycleRotationError("continuation rotation failed")

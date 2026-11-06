@@ -712,6 +712,33 @@ def test_linux_renameat2_provides_atomic_noreplace_fallback(monkeypatch):
     assert atomic_fs.rename_noreplace_available() is True
 
 
+def test_linux_renameat2_uses_linux_at_fdcwd(monkeypatch):
+    calls = []
+
+    class RenameAt2:
+        def __call__(self, *args):
+            calls.append(args)
+            return 0
+
+    renameat2 = RenameAt2()
+    monkeypatch.setattr(atomic_fs.sys, "platform", "linux")
+    monkeypatch.setattr(
+        atomic_fs,
+        "_libc_symbol",
+        lambda name: renameat2 if name == "renameat2" else None,
+    )
+    atomic_fs.rename_noreplace(Path("source"), Path("destination"))
+    assert calls[0][0] == calls[0][2] == -100
+
+
+def test_windows_rename_uses_atomic_platform_noreplace(monkeypatch):
+    calls = []
+    monkeypatch.setattr(atomic_fs.sys, "platform", "win32")
+    monkeypatch.setattr(atomic_fs.os, "rename", lambda *args: calls.append(args))
+    atomic_fs.rename_noreplace(Path("source"), Path("destination"))
+    assert calls == [(Path("source"), Path("destination"))]
+
+
 def test_cleanup_fails_open_before_move_without_atomic_noreplace(tmp_path, monkeypatch):
     state = _state()
     publisher = UITelemetryPublisher(tmp_path, state)
