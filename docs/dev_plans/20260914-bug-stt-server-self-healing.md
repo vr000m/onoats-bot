@@ -340,6 +340,17 @@ Context lifecycle — what enters context at each step, and whether it clears or
   control, and transcript persistence continue, with process exit and the run log
   carrying failure detail. The original ordering fix remains authoritative for
   status-present runs.
+- **2026-11-06 correction — an unloaded job is now bootstrapped (supersedes the
+  Non-Goal "no fallback to `launchctl bootstrap`").** The 2026-11-03 entry of
+  [`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+  (commit `7ddcee3`, `launchd._bootstrap_stt_server`) added that fallback: when
+  the configured `launchd_label` is not loaded, onoats bootstraps it from the one
+  fixed `~/Library/LaunchAgents/<label>.plist`, only after a bounded no-follow read
+  confirms a regular user-owned file with safe write permissions, an exact
+  `Label` and `RunAtLoad=true`, and from an unlinked descriptor-backed snapshot of
+  those bytes. A successful bootstrap is itself the launch request (no immediate
+  kickstart). No port inference or arbitrary plist path is allowed. A job with no
+  matching plist is still out of scope, as the Non-Goal says.
 - (append findings here as work proceeds)
 - **Phase 5 native spike, core path (2026-09-19, by the user)**: `make -C native install` built and linked cleanly — first real Xcode build of this branch's Swift changes (`AudioDevices.swift`, `ConfigStore.swift`, `LoginItemManager.swift`, `OnoatsMenuBarApp.swift`, `RecorderModel.swift`), previously only `swiftc -typecheck`-checked. Codesigning succeeded (`Code Signing` identity, `net.varunsingh.onoats`), app installed to `~/Applications/Onoats.app`, launched and showed the menu bar UI correctly (mic/system device pickers, STT service selector, data dir, wired to a live `websocket` STT server). Setting `[app].launch_at_login = true` in `config.toml` and relaunching triggered macOS's native "Login Item Added" notification — `SMAppService.register()` succeeded with **no `.requiresApproval` friction** for this self-signed, non-notarized, `~/Applications`-installed bundle, resolving the plan's previously-unverified assumption about that combination. Toggling to `false` and relaunching unregistered it. A real reboot with the key set to `true` confirmed Onoats.app actually launches automatically at login, not just that `.register()` returns success. Remaining Phase 5 edge cases (explicit-denial `.requiresApproval` hint, absent-key-with-out-of-band-registration no-op, non-bare-boolean-value handling) were not exercised in this pass.
 - **Phase 3 mid-phase reviewer (advisory, 2026-09-15), 2 Important findings not yet fixed — carry into review-gauntlet / manual follow-up:**

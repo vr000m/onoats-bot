@@ -1,6 +1,6 @@
 # Task: Stoppable orphaned recorder sessions (`onoats stop` + menu-bar rewiring)
 
-**Status**: Not Started
+**Status**: Superseded by 20261028 (Phases 10-11)
 **Component**: recorder, macos
 **Assigned to**: Varun Singh
 **Priority**: High
@@ -145,7 +145,7 @@ Make any identity-verified live recorder session stoppable from the menu bar —
 - Manual smoke matrix in Phase 2 passes.
 - Docs updated (README/AGENTS/CHANGELOG: new `onoats stop` subcommand).
 
-<!-- reviewed: 2026-06-19 @ f64a8df6909545f5f24a1f087b5a3bf3ef0b273e -->
+<!-- reviewed: 2026-06-19 @ 3f017b6ce367421b1288716e0e73e0ca4ed1733d -->
 
 ## Progress
 
