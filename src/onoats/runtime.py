@@ -71,8 +71,6 @@ if sys.platform != "win32":
 # ---------------------------------------------------------------------------
 
 BOT_NAME = "onoats"
-STT_SERVICE = os.getenv("STT_SERVICE", "whisper").lower().strip()
-STT_MODEL = os.getenv("STT_MODEL", "").strip()
 
 
 @dataclass(frozen=True)
@@ -1420,12 +1418,12 @@ async def _create_stt_service(
     on_failed: Callable[[str], None] | None = None,
     status_publication_enabled: Callable[[], bool] | None = None,
 ) -> SttServiceResult:
-    """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
+    """Build the STT service from one immutable recorder configuration.
 
     Returns an :class:`SttServiceResult`.
 
     Prefers Whisper MLX on Apple Silicon, falls back to CPU Whisper, or uses
-    Deepgram when STT_SERVICE=deepgram.
+    Deepgram when the captured service is ``deepgram``.
 
     Dictionary vocabulary terms (if any) are fed to the backend as recognition
     bias (Deepgram ``keywords`` / Whisper ``initial_prompt``).
@@ -1436,7 +1434,7 @@ async def _create_stt_service(
     but the signature is uniform so callers don't have to branch.
 
     MLX / Whisper imports are kept lazy (inside the backend branch) so a plain
-    ``import onoats.runtime`` with no ``STT_SERVICE`` set never imports
+    ``import onoats.runtime`` never imports
     ``mlx_whisper`` — the off-mac baseline ships MLX-free.
 
     ``config`` pins backend selection and all related STT settings to a

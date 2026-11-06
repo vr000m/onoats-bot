@@ -12,7 +12,7 @@ from onoats.frames import (
     resolve_frame_source,
     resolve_frame_speakers,
 )
-from onoats.render import compose_speaker_label
+from onoats.display_labels import compose_speaker_label
 
 
 def _display_label(source: str) -> str:

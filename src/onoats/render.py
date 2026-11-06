@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from onoats.display_labels import compose_speaker_label
 from onoats.jsonl import Session, Utterance
 
 _DEFAULT_LABELS = {"me": "Me", "them": "Them"}
@@ -61,23 +62,6 @@ def _label_for(source: str | None, labels: dict[str, str]) -> str:
     if source:
         return source
     return "Unknown"
-
-
-def compose_speaker_label(
-    display_label: str, speakers: list[str] | None, overlap: bool
-) -> str:
-    """Compose the display label with the diarization suffix.
-
-    Shared by ``render_session`` and the live terminal (value-based so both
-    call sites can pass plain values). No speakers -> ``display_label``
-    unchanged; ``["S1"]`` -> ``Them (S1)``; overlap with 2+ speakers ->
-    ``Them (S1 / S2, overlapping)``. Display strings are never persisted.
-    """
-    if not speakers:
-        return display_label
-    if overlap and len(speakers) > 1:
-        return f"{display_label} ({' / '.join(speakers)}, overlapping)"
-    return f"{display_label} ({' / '.join(speakers)})"
 
 
 def render_session(

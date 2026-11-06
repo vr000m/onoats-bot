@@ -225,7 +225,7 @@ def test_raising_preview_label_composition_does_not_lose_durable_utterance(
     def _raise(*_args) -> str:
         raise RuntimeError("bad display label")
 
-    monkeypatch.setattr("onoats.render.compose_speaker_label", _raise)
+    monkeypatch.setattr("onoats.display_labels.compose_speaker_label", _raise)
 
     async def _run() -> None:
         buf = TranscriptBuffer(
@@ -551,3 +551,13 @@ def test_frame_label_resolvers():
     assert resolve_frame_overlap(SimpleNamespace()) is None
     assert resolve_frame_overlap(SimpleNamespace(onoats_overlap=1)) is None
     assert resolve_frame_overlap(SimpleNamespace(onoats_overlap=True)) is True
+
+
+def test_transcript_persistence_does_not_import_presentation_renderer():
+    import inspect
+
+    import onoats.processors.transcript_buffer as transcript_buffer
+
+    source = inspect.getsource(transcript_buffer)
+    assert "onoats.render" not in source
+    assert "onoats.display_labels" in source

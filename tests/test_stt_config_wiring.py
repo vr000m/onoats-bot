@@ -19,6 +19,12 @@ import pytest
 from onoats import runtime
 from onoats.config import OnoatsConfig, validate_launchd_label
 
+
+def test_runtime_has_no_import_time_stt_backend_authority():
+    assert not hasattr(runtime, "STT_SERVICE")
+    assert not hasattr(runtime, "STT_MODEL")
+
+
 # --- A. STT selection + ws endpoint come from config.toml -------------------
 
 

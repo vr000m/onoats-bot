@@ -381,7 +381,7 @@ class TranscriptBuffer(FrameProcessor):
             try:
                 speaker_label = None
                 if source:
-                    from onoats.render import compose_speaker_label
+                    from onoats.display_labels import compose_speaker_label
 
                     speaker_label = compose_speaker_label(
                         {"me": "Me", "them": "Them"}.get(source, source),
