@@ -1777,3 +1777,42 @@ def test_pid_authority_read_accepts_safe_bounded_owned_regular_file(tmp_path):
     path.chmod(0o600)
     assert read_pid_file(path) == 4321
     assert read_pid_record(path) == PidRecord(4321, "onoats bot", 10.5)
+
+
+@pytest.mark.parametrize(
+    ("raw_pid", "valid"),
+    [
+        ("0", False),
+        ("-1", False),
+        (str((1 << 31) - 1), True),
+        (str(1 << 31), False),
+        ("not-a-pid", False),
+        ("4321", True),
+    ],
+    ids=["zero", "negative", "pid-t-max", "overflow", "malformed", "valid"],
+)
+def test_pid_value_validation_is_shared_by_all_authority_callers(
+    tmp_path, monkeypatch, raw_pid, valid
+):
+    """Readers and signal/liveness resolution accept only positive pid_t."""
+    from onoats._vendor import pid as pid_module
+
+    path = tmp_path / "onoats.pid"
+    path.write_text(f"{raw_pid}\nonoats-bot\nonoats bot\n10.5\n", encoding="utf-8")
+    record = pid_module.read_pid_record(path)
+    assert (record is not None) is valid
+    assert (pid_module.read_pid_file(path) is not None) is valid
+    probed: list[int] = []
+
+    def kill(pid, _signal):
+        probed.append(pid)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(pid_module.os, "kill", kill)
+    target = pid_module.resolve_flush_target(path)
+    if valid:
+        assert target.record is not None
+        assert probed == [int(raw_pid)]
+    else:
+        assert target.record is None
+        assert probed == []

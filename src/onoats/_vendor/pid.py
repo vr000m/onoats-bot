@@ -26,6 +26,7 @@ This module only owns the *read* side — the write/remove primitives live in
 
 from __future__ import annotations
 
+import ctypes
 import os
 import stat
 import subprocess
@@ -38,6 +39,7 @@ from loguru import logger
 PID_FILENAME = "onoats.pid"
 PID_MARKER = "onoats-bot"
 PID_MAX_BYTES = 65536
+PID_T_MAX = (1 << (ctypes.sizeof(ctypes.c_int) * 8 - 1)) - 1
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,9 @@ def _parse_pid_text(text: str, *, source: Path) -> PidRecord | None:
             logger.warning(f"PID file {source} missing identity marker — ignoring")
             return None
         pid = int(lines[0].strip())
+        if not 0 < pid <= PID_T_MAX:
+            logger.warning(f"PID file {source} contains an invalid pid — ignoring")
+            return None
         # Line 3 (index 2) is the cmdline fingerprint. ``.strip()`` on the
         # whole file content already trimmed a trailing newline; an absent
         # 3rd line (legacy 2-line file) leaves ``cmdline`` empty.
