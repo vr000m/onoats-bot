@@ -550,6 +550,9 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
                 _asyncio.wait(pending, timeout=_RECORDER_DRAIN_GRACE_SEC)
             )
             cancellation_survivors = bool(survivors)
+        if not cancellation_survivors:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
         _asyncio.set_event_loop(None)
         loop.close()
     if cancellation_survivors:
