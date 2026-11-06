@@ -385,11 +385,19 @@ def _control_text(path: Path) -> str | None:
             metadata = os.fstat(fd)
             if (
                 not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 or metadata.st_size > CONTROL_FILE_LIMIT
             ):
                 return None
             data = os.read(fd, CONTROL_FILE_LIMIT + 1)
             if len(data) > CONTROL_FILE_LIMIT:
+                return None
+            current = os.lstat(path)
+            if not stat.S_ISREG(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != (metadata.st_dev, metadata.st_ino):
                 return None
             return data.decode("utf-8")
         finally:
@@ -521,6 +529,64 @@ def _recording_identity(
     row = processes[recorder_pid]
     birth = births_after[recorder_pid]
     assert birth is not None
+    return RecorderIdentity(
+        recorder_pid, epoch, row.command, row.start, row.pgid, birth
+    )
+
+
+def _cleanup_recording_identity(
+    pid_path: Path,
+    *,
+    app_pid: int,
+    app_identity: ProcessIdentity | None = None,
+    expected_release=None,
+) -> RecorderIdentity | None:
+    """Capture a signal-safe recorder identity without trusting status/telemetry.
+
+    This is the failure-cleanup discovery path.  The PID authority record,
+    stable process birth, app ancestry, command fingerprint, and approved
+    interpreter must all agree; partial or stale display records confer no
+    signalling authority.
+    """
+    fields = (_control_text(pid_path) or "").splitlines()
+    if len(fields) < 4 or fields[1].strip() != "onoats-bot":
+        return None
+    try:
+        recorder_pid = int(fields[0])
+        epoch = float(fields[3])
+    except ValueError:
+        return None
+    command = fields[2].strip()
+    if recorder_pid <= 0 or not command or not math.isfinite(epoch) or epoch <= 0:
+        return None
+    initial = _processes()
+    chain = _ancestry_chain(recorder_pid, app_pid, initial)
+    if chain is None:
+        return None
+    births_before = {pid: _process_birth(pid) for pid in chain}
+    if any(birth is None for birth in births_before.values()):
+        return None
+    current = _processes()
+    if _ancestry_chain(recorder_pid, app_pid, current) != chain:
+        return None
+    if app_identity is not None and current.get(app_pid) is not None:
+        if not _identity_matches(app_identity):
+            return None
+    births_after = {pid: _process_birth(pid) for pid in chain}
+    if births_after != births_before:
+        return None
+    row = current.get(recorder_pid)
+    birth = births_after.get(recorder_pid)
+    if row is None or birth is None or row.command.strip() != command:
+        return None
+    if not _pid_file_matches(
+        pid_path, pid=recorder_pid, start_epoch=epoch, command=row.command
+    ):
+        return None
+    if expected_release is not None:
+        interpreter = _verify_effective_cli_authority(expected_release)
+        if _process_executable(recorder_pid) != str(interpreter):
+            return None
     return RecorderIdentity(
         recorder_pid, epoch, row.command, row.start, row.pgid, birth
     )
@@ -1104,6 +1170,15 @@ def run(args: argparse.Namespace) -> None:
         raise
     finally:
         try:
+            if recorder is None and app_pid is not None:
+                recorder = _cleanup_recording_identity(
+                    pid_path,
+                    app_pid=app_pid,
+                    app_identity=app_identity,
+                    expected_release=expected_release,
+                )
+                if recorder is not None:
+                    groups = _owned_descendant_groups(app_pid, recorder.pid)
             cleanup_kwargs = {
                 "app_identity": app_identity,
                 "recorder": recorder,

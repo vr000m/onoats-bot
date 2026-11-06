@@ -467,6 +467,68 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
     assert receipt_events == ["published"]
 
 
+def test_recording_identity_timeout_recovers_verified_cleanup_targets(
+    tmp_path, monkeypatch
+):
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active/onoats.pid"
+    pid_path.parent.mkdir(parents=True)
+    command = "/bin/python3 /opt/onoats bot"
+    pid_path.write_text(f"4321\nonoats-bot\n{command}\n900.25\n", encoding="utf-8")
+    _stub_release_identity(monkeypatch)
+    monkeypatch.setattr(SMOKE, "_preserve_final_component", lambda path: path)
+    monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
+    monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
+    rows = {
+        1234: SMOKE.ProcessRow(1, 1234, "app-start", str(executable.resolve())),
+        4321: SMOKE.ProcessRow(1234, 4321, "rec-start", command),
+    }
+    births = {1234: _birth(10, 20), 4321: _birth(100, 200)}
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
+    monkeypatch.setattr(SMOKE, "_process_birth", births.get)
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_executable",
+        lambda pid: str(executable.resolve()) if pid == 1234 else "/bin/python3",
+    )
+    groups = (SMOKE.OwnedProcessGroup(4321, ()),)
+    monkeypatch.setattr(SMOKE, "_owned_descendant_groups", lambda *_args: groups)
+    cleaned = []
+    monkeypatch.setattr(
+        SMOKE, "_cleanup_after_failure", lambda *_args, **kwargs: cleaned.append(kwargs)
+    )
+
+    def wait(stage, _timeout, _probe):
+        if stage == "signed app launch":
+            return 1234
+        raise SMOKE.SmokeFailure("app-owned recorder identity timed out")
+
+    monkeypatch.setattr(SMOKE, "wait_for", wait)
+    with pytest.raises(SMOKE.SmokeFailure, match="identity timed out"):
+        SMOKE.run(
+            SimpleNamespace(
+                app=app,
+                data_dir=data_dir,
+                release_identity=tmp_path / "release-identity.json",
+                smoke_receipt=tmp_path / "receipt.json",
+                app_timeout=1,
+                recording_timeout=1,
+                activity_timeout=1,
+                stop_timeout=1,
+                transcript_timeout=1,
+                me_floor=0.01,
+            )
+        )
+    assert len(cleaned) == 1
+    assert cleaned[0]["recorder"].pid == 4321
+    assert cleaned[0]["groups"] == groups
+
+
 def test_installed_smoke_app_cleanup_preserves_argument_bearing_identity(
     tmp_path, monkeypatch
 ):
@@ -548,6 +610,39 @@ def test_installed_smoke_rejects_birth_collision_around_topology_snapshot(
         max(index for index, value in enumerate(calls) if value == "birth-4321")
         > ps_positions[1]
     )
+
+
+@pytest.mark.parametrize("app_present", [False, True])
+@pytest.mark.parametrize("display_artifact", ["none", "status", "telemetry"])
+@pytest.mark.parametrize("generation", ["valid", "foreign"])
+def test_recording_timeout_cleanup_discovery_whole_state_space(
+    tmp_path, monkeypatch, app_present, display_artifact, generation
+):
+    """Cleanup authority comes from PID + birth + ancestry, never UI records."""
+    app_pid, recorder_pid = 1234, 4321
+    command = "/opt/onoats/bin/onoats bot"
+    pid_path = tmp_path / "onoats.pid"
+    pid_path.write_text(
+        f"{recorder_pid}\nonoats-bot\n{command}\n900.25\n", encoding="utf-8"
+    )
+    if display_artifact != "none":
+        (tmp_path / display_artifact).write_text("partial", encoding="utf-8")
+    rows = {recorder_pid: SMOKE.ProcessRow(app_pid, recorder_pid, "rec-start", command)}
+    if app_present:
+        rows[app_pid] = SMOKE.ProcessRow(1, app_pid, "app-start", "/app")
+    if generation == "foreign":
+        rows[recorder_pid] = rows[recorder_pid]._replace(command="/tmp/foreign")
+    births = {
+        app_pid: _birth(10, 20),
+        recorder_pid: _birth(100, 200),
+    }
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
+    monkeypatch.setattr(SMOKE, "_process_birth", births.get)
+
+    identity = SMOKE._cleanup_recording_identity(pid_path, app_pid=app_pid)
+    assert (identity is not None) is (generation == "valid")
+    if identity is not None:
+        assert identity.pid == recorder_pid
 
 
 @pytest.mark.parametrize(
