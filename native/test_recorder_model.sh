@@ -26,7 +26,7 @@ cleanup_on_exit() {
 
 trap cleanup_on_exit EXIT
 cleanup_harness_defaults
-for source in AudioDevices.swift ConfigStore.swift LoginItemManager.swift RecorderModel.swift UiTelemetry.swift; do
+for source in AudioDevices.swift ConfigStore.swift LoginItemManager.swift RecorderModel.swift RecorderRecords.swift RecorderSystemOps.swift UiTelemetry.swift; do
   cp "$ROOT/native/onoats-menubar/Sources/$source" "$BUILD_DIR/Sources/$source"
 done
 
@@ -37,6 +37,8 @@ swiftc -parse-as-library \
   "$BUILD_DIR/Sources/ConfigStore.swift" \
   "$BUILD_DIR/Sources/LoginItemManager.swift" \
   "$BUILD_DIR/Sources/UiTelemetry.swift" \
+  "$BUILD_DIR/Sources/RecorderSystemOps.swift" \
+  "$BUILD_DIR/Sources/RecorderRecords.swift" \
   "$BUILD_DIR/Sources/RecorderModel.swift" \
   "$ROOT/native/onoats-menubar/Tests/RecorderModelHarness.swift" \
   -o "$BUILD_DIR/recorder-model-harness"

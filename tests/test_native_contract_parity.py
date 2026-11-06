@@ -42,6 +42,12 @@ def _swift_escape(value: str) -> str:
 
 
 RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel.swift"
+RECORDER_RECORDS = (
+    REPO / "native" / "onoats-menubar" / "Sources" / "RecorderRecords.swift"
+)
+RECORDER_SYSTEM_OPS = (
+    REPO / "native" / "onoats-menubar" / "Sources" / "RecorderSystemOps.swift"
+)
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
 SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
 UI_TELEMETRY = REPO / "native" / "onoats-menubar" / "Sources" / "UiTelemetry.swift"
@@ -84,9 +90,9 @@ def test_status_record_fields_match_swift():
 
     from onoats.status import StatusRecord
 
-    text = RECORDER_MODEL.read_text(encoding="utf-8")
+    text = RECORDER_RECORDS.read_text(encoding="utf-8")
     m = re.search(r"struct StatusRecord: Decodable \{(.*?)\n\}", text, re.DOTALL)
-    assert m, "struct StatusRecord not found in RecorderModel.swift"
+    assert m, "struct StatusRecord not found in RecorderRecords.swift"
     swift_fields = re.findall(r"let (\w+):", m.group(1))
     python_fields = [f.name for f in dc_fields(StatusRecord)]
     assert swift_fields == python_fields
@@ -97,7 +103,7 @@ def test_status_file_relative_path_matches_swift():
 
     python_rel = status_path(Path("X")).relative_to("X").as_posix()
     swift = _extract(
-        r'appendingPathComponent\("(\.active/onoats\.status\.json)"\)', RECORDER_MODEL
+        r'appendingPathComponent\("(\.active/onoats\.status\.json)"\)', RECORDER_RECORDS
     )
     assert swift == python_rel
 
@@ -143,11 +149,11 @@ def test_pid_marker_and_path_match_swift():
     from onoats.cli import PID_FILENAME
     from onoats._vendor.pid import PID_MARKER
 
-    swift_marker = _extract(r'lines\[1\]\s*==\s*"([^"]+)"', RECORDER_MODEL)
+    swift_marker = _extract(r'lines\[1\]\s*==\s*"([^"]+)"', RECORDER_RECORDS)
     assert swift_marker == PID_MARKER
 
     swift_path = _extract(
-        r'appendingPathComponent\("(\.active/onoats\.pid)"\)', RECORDER_MODEL
+        r'appendingPathComponent\("(\.active/onoats\.pid)"\)', RECORDER_RECORDS
     )
     assert swift_path == f".active/{PID_FILENAME}"
 
@@ -846,6 +852,22 @@ def test_swift_telemetry_consumer_has_no_network_probe():
         text = path.read_text(encoding="utf-8")
         assert "URLSession" not in text, path
         assert "NWConnection" not in text, path
+
+
+def test_recorder_model_delegates_system_and_record_parsing_subsystems():
+    model = RECORDER_MODEL.read_text(encoding="utf-8")
+    records = RECORDER_RECORDS.read_text(encoding="utf-8")
+    system_ops = RECORDER_SYSTEM_OPS.read_text(encoding="utf-8")
+    assert "final class RecorderModel" in model
+    assert "protocol SystemOps" not in model
+    assert "final class NativeSystemOps" not in model
+    assert "JSONDecoder" not in model and "JSONSerialization" not in model
+    assert "enum RecorderRecordReader" in records
+    assert "protocol SystemOps" in system_ops
+
+
+def test_unused_ui_telemetry_compatibility_facade_is_absent():
+    assert not (REPO / "src/onoats/ui_telemetry_contract.py").exists()
 
 
 def test_menu_bar_uses_distinct_template_images_for_every_recorder_state():
