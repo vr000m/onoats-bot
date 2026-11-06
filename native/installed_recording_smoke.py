@@ -55,6 +55,16 @@ LEVEL_MIN = _TELEMETRY_CONTRACT.LEVEL_MIN
 LEVEL_MAX = _TELEMETRY_CONTRACT.LEVEL_MAX
 _TRANSCRIPT_RUN_ID_RE = re.compile(_TELEMETRY_CONTRACT.TRANSCRIPT_RUN_ID_PATTERN)
 
+# Recorder-authority file names and PID marker. The smoke stays free of
+# ``onoats`` imports (it inspects an installed app from outside), so these are
+# local copies pinned to their Python owners (``onoats.status.STATUS_FILENAME``,
+# ``onoats._vendor.pid.PID_FILENAME`` / ``PID_MARKER``) by
+# ``tests/test_recording_integration.py``; change them together.
+ACTIVE_DIRNAME = ".active"
+STATUS_FILENAME = "onoats.status.json"
+PID_FILENAME = "onoats.pid"
+PID_MARKER = "onoats-bot"
+
 
 class SmokeFailure(RuntimeError):
     """One stage of the installed recording proof failed."""
@@ -489,7 +499,7 @@ def _pid_file_matches(
         fields = (_control_text(pid_path) or "").splitlines()
         return (
             len(fields) >= 4
-            and fields[1].strip() == "onoats-bot"
+            and fields[1].strip() == PID_MARKER
             and bool(command.strip())
             and fields[2].strip() == command.strip()
             and int(fields[0]) == pid
@@ -571,7 +581,7 @@ def _cleanup_recording_identity(
     signalling authority.
     """
     fields = (_control_text(pid_path) or "").splitlines()
-    if len(fields) < 4 or fields[1].strip() != "onoats-bot":
+    if len(fields) < 4 or fields[1].strip() != PID_MARKER:
         return None
     try:
         recorder_pid = int(fields[0])
@@ -1115,9 +1125,9 @@ def run(args: argparse.Namespace) -> None:
             f"app preflight failed: Onoats is already running (pid {preexisting})"
         )
     prelaunch_run_ids = _prelaunch_run_ids(data_dir)
-    status_path = data_dir / ".active/onoats.status.json"
-    pid_path = data_dir / ".active/onoats.pid"
-    telemetry_path = data_dir / ".active" / UI_TELEMETRY_FILENAME
+    status_path = data_dir / ACTIVE_DIRNAME / STATUS_FILENAME
+    pid_path = data_dir / ACTIVE_DIRNAME / PID_FILENAME
+    telemetry_path = data_dir / ACTIVE_DIRNAME / UI_TELEMETRY_FILENAME
     app_pid: int | None = None
     app_identity: ProcessIdentity | None = None
     recorder: RecorderIdentity | None = None

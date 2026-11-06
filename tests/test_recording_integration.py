@@ -1908,7 +1908,33 @@ def test_native_smoke_telemetry_filename_is_the_contract_constant():
     assert ui_telemetry.UI_TELEMETRY_FILENAME is contract.UI_TELEMETRY_FILENAME
     source = SMOKE_PATH.read_text(encoding="utf-8")
     assert contract.UI_TELEMETRY_FILENAME not in source
-    assert 'telemetry_path = data_dir / ".active" / UI_TELEMETRY_FILENAME' in source
+    assert (
+        "telemetry_path = data_dir / ACTIVE_DIRNAME / UI_TELEMETRY_FILENAME" in source
+    )
+
+
+def test_native_smoke_recorder_authority_literals_match_their_python_owners():
+    """The smoke's status/PID names and PID marker cannot drift from the owners."""
+    from onoats import status
+    from onoats._vendor import pid
+
+    assert SMOKE.STATUS_FILENAME == status.STATUS_FILENAME
+    assert SMOKE.PID_FILENAME == pid.PID_FILENAME == cli.PID_FILENAME
+    assert SMOKE.PID_MARKER == pid.PID_MARKER
+    assert SMOKE.ACTIVE_DIRNAME == status._ACTIVE_DIR
+    assert status.status_path(Path("/d")) == (
+        Path("/d") / SMOKE.ACTIVE_DIRNAME / SMOKE.STATUS_FILENAME
+    )
+    # Every use goes through the named constants: each literal occurs once,
+    # at its definition.
+    source = SMOKE_PATH.read_text(encoding="utf-8")
+    for literal in (
+        status.STATUS_FILENAME,
+        pid.PID_FILENAME,
+        pid.PID_MARKER,
+    ):
+        assert source.count(f'"{literal}"') == 1, literal
+    assert '".active' not in source.replace('ACTIVE_DIRNAME = ".active"', "")
 
 
 def _write_stopped_status(path: Path, **overrides: object) -> None:
