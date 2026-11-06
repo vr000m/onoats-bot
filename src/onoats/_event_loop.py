@@ -46,7 +46,6 @@ def run_bounded_event_loop(
             task.cancel()
 
         cancel_timeout = max(0.0, cancel_timeout)
-        cleanup_deadline = loop.time() + max(cancel_timeout, FINALIZER_TIMEOUT_SECONDS)
         if pending and cancel_timeout == 0:
             cleanup_failed = True
         elif pending:
@@ -59,8 +58,13 @@ def run_bounded_event_loop(
             else:
                 cleanup_failed = bool(survivors)
 
+        # Finalization owns a separate positive budget. A pending task may use
+        # its entire cancellation grace without starving async-generator or
+        # executor shutdown.
+        finalizer_deadline = loop.time() + FINALIZER_TIMEOUT_SECONDS
+
         def run_finalizer(finalizer: Awaitable[object]) -> bool:
-            remaining = cleanup_deadline - loop.time()
+            remaining = finalizer_deadline - loop.time()
             if remaining <= 0:
                 if inspect.iscoroutine(finalizer):
                     finalizer.close()

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 
-from onoats.runtime import _env_float, stop_pipeline_for_shutdown
+import pytest
+
+from onoats.runtime import _env_float, stop_pipeline_for_shutdown, wait_or_force
 
 
 class FakeTask:
@@ -96,6 +98,51 @@ def test_force_exit_during_drain_cancels_immediately():
     asyncio.run(scenario())
     assert task.stop_called is True
     assert task.cancel_called is True
+
+
+def test_wait_or_force_does_not_join_cancellation_resistant_work(monkeypatch):
+    """The force boundary returns even when the cancelled task keeps running."""
+    from onoats import runtime
+
+    monkeypatch.setattr(runtime, "SHUTDOWN_CANCEL_TIMEOUT_SEC", 0.01)
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def resistant():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        force_exit = asyncio.Event()
+        operation = asyncio.create_task(resistant())
+        await started.wait()
+        force_exit.set()
+        await asyncio.wait_for(
+            wait_or_force(operation, "resistant fixture", force_exit_event=force_exit),
+            timeout=0.2,
+        )
+        assert not operation.done()
+        release.set()
+        await operation
+
+    asyncio.run(scenario())
+
+
+def test_wait_or_force_propagates_completed_task_failure():
+    async def scenario():
+        async def fails():
+            raise RuntimeError("fixture failure")
+
+        with pytest.raises(RuntimeError, match="fixture failure"):
+            await wait_or_force(
+                fails(), "failing fixture", force_exit_event=asyncio.Event()
+            )
+
+    asyncio.run(scenario())
 
 
 def test_env_float_clamps_negative(monkeypatch):

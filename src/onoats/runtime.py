@@ -291,15 +291,31 @@ async def wait_or_force(coro_or_future, label: str, *, force_exit_event) -> None
     done, _ = await asyncio.wait(
         {wait_task, force_task}, return_when=asyncio.FIRST_COMPLETED
     )
+    if wait_task in done:
+        force_task.cancel()
+        try:
+            await force_task
+        except asyncio.CancelledError:
+            pass
+        await wait_task
+        return
+
     if force_task in done:
         logger.warning(f"Shutdown: force-cancelling {label}")
         wait_task.cancel()
-        try:
-            await wait_task
-        except asyncio.CancelledError:
-            pass
-    else:
-        force_task.cancel()
+        settled, _ = await asyncio.wait(
+            {wait_task}, timeout=max(0.0, SHUTDOWN_CANCEL_TIMEOUT_SEC)
+        )
+        if wait_task in settled:
+            try:
+                wait_task.result()
+            except asyncio.CancelledError:
+                pass
+        else:
+            logger.error(
+                f"Shutdown: {label} ignored cancellation; "
+                "leaving it to the bounded process cleanup"
+            )
 
 
 async def stop_pipeline_for_shutdown(

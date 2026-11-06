@@ -351,6 +351,51 @@ def test_bounded_event_loop_cleanup_has_one_owner() -> None:
         assert "new_event_loop" not in source
 
 
+def test_event_loop_finalizers_receive_a_budget_after_task_cancellation(
+    monkeypatch,
+) -> None:
+    """Pending-task grace cannot consume the separate loop-finalizer budget."""
+    from onoats import _event_loop
+
+    finalized = []
+    retained = []
+    exits = []
+    monkeypatch.setattr(_event_loop, "FINALIZER_TIMEOUT_SECONDS", 0.15)
+
+    async def generator():
+        try:
+            yield None
+        finally:
+            await asyncio.sleep(0.08)
+            finalized.append(True)
+
+    async def resistant_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.12)
+
+    async def run() -> int:
+        stream = generator()
+        retained.append(stream)
+        await anext(stream)
+        asyncio.create_task(resistant_task())
+        await asyncio.sleep(0)
+        return 0
+
+    assert (
+        _event_loop.run_bounded_event_loop(
+            run(),
+            cancel_timeout=0.15,
+            hard_exit=exits.append,
+            on_cleanup_failure=lambda: None,
+        )
+        == 0
+    )
+    assert finalized == [True]
+    assert exits == []
+
+
 @_async_test
 async def test_lock_admission_order_prevents_flush_reopening_after_stop() -> None:
     rotation = RotationSpy()
