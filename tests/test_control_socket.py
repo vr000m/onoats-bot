@@ -271,6 +271,65 @@ def test_overlong_control_paths_fail_without_changing_process_cwd(
     assert not (data_dir / ".active").exists()
 
 
+_PUBLIC_SUFFIX_BYTES = len(os.fsencode(f"/.active/{CONTROL_SOCKET_FILENAME}"))
+
+
+@pytest.mark.parametrize(
+    ("public_bytes", "accepted"),
+    [
+        (80, True),  # well under the limit, but < bind-path + ~30 bytes pre-fix
+        (control_socket._DARWIN_SUN_PATH_BYTES - 1, True),  # 103 + NUL == 104
+        (control_socket._DARWIN_SUN_PATH_BYTES, False),  # one over
+    ],
+)
+def test_bind_path_is_never_longer_than_the_validated_public_path(
+    control_data_dir: Path, public_bytes: int, accepted: bool
+) -> None:
+    """Contract: ``bind()`` receives a path no longer than the public path.
+
+    One validation of the public path therefore covers the private bind path:
+    an accepted public length binds, publishes the captured identity under the
+    public name, and leaves no private bind directory; a rejected length fails
+    as ``ControlError`` before ``.active`` is created.
+    """
+    pad = public_bytes - _PUBLIC_SUFFIX_BYTES - len(os.fsencode(control_data_dir)) - 1
+    assert pad > 0, "temp root too long to construct the target path length"
+    data_dir = control_data_dir / ("d" * pad)
+    public = data_dir / ".active" / CONTROL_SOCKET_FILENAME
+    assert len(os.fsencode(public)) == public_bytes
+    data_dir.mkdir()
+    server = ControlServer(
+        data_dir,
+        RECORD,
+        on_flush=lambda: True,
+        on_stop=lambda: True,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+
+    async def exercise() -> dict[str, object]:
+        await server.start()
+        try:
+            published = public.lstat()
+            identity = server._owned_identity
+            assert identity is not None
+            assert identity.matches(published)
+            assert sorted(p.name for p in public.parent.iterdir()) == [
+                CONTROL_SOCKET_FILENAME
+            ], "the private bind directory must be removed after publication"
+            return await _send(public, _request("flush"))
+        finally:
+            await server.close()
+
+    if not accepted:
+        with pytest.raises(ControlError, match="sockaddr_un"):
+            asyncio.run(exercise())
+        assert not (data_dir / ".active").exists()
+        return
+    response = asyncio.run(exercise())
+    assert response["ok"] is True
+    assert not public.exists()
+
+
 @_async_test
 async def test_server_uses_owner_only_endpoint_and_command_specific_handlers(
     control_data_dir: Path, callbacks

@@ -21,6 +21,9 @@ running-status write. On Linux, an `O_PATH` descriptor pins the captured node
 until cleanup completes so an unlinked inode cannot be recycled into a raced
 successor with the same device/inode pair. `.active` is
 mode `0700` and the socket is `0600`.
+The private bind path (`.active/.ocb-XXXXXXXX/s`) is never longer than the
+public pathname, so one public-path length check covers both; startup also
+checks the bind path itself before calling `bind()`.
 If that absolute pathname exceeds Darwin's `sockaddr_un` limit, startup and
 clients fail closed with guidance to choose a shorter data directory; neither
 side changes the process-wide working directory to shorten the address.

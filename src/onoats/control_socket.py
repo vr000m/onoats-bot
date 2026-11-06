@@ -44,6 +44,14 @@ _XUCRED = struct.Struct("@IIh16I")
 _UCRED = struct.Struct("=iII")
 _SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
 _DARWIN_SUN_PATH_BYTES = 104
+# Private bind location: ``<.active>/<mkdtemp(prefix)>/<filename>``. Contract:
+# the path passed to ``bind()`` is never longer than the validated public path
+# ``<.active>/onoats-control.sock``. ``.ocb-`` + mkdtemp's random suffix plus
+# ``/`` + a one-byte filename stays well under the public leaf's length, and
+# ``ControlServer.start`` still validates the bind path itself so a future
+# naming change fails as a ``ControlError``, never a raw ``AF_UNIX`` OSError.
+_BIND_DIR_PREFIX = ".ocb-"
+_BIND_FILENAME = "s"
 CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS = 0.25
 
 
@@ -327,10 +335,11 @@ class ControlServer:
         captured: _EndpointIdentity | None = None
         try:
             private_dir = Path(
-                tempfile.mkdtemp(prefix=".onoats-control-bind-", dir=self.path.parent)
+                tempfile.mkdtemp(prefix=_BIND_DIR_PREFIX, dir=self.path.parent)
             )
             os.chmod(private_dir, 0o700)
-            private_path = private_dir / CONTROL_SOCKET_FILENAME
+            private_path = private_dir / _BIND_FILENAME
+            _validate_socket_path(private_path)
             listener.bind(str(private_path))
             os.chmod(private_path, 0o600)
             opened = private_path.lstat()
