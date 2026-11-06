@@ -101,10 +101,17 @@ registry dep, not a git pin).
   a step finishes, whose result is kept — and a start failure, non-zero rc, or
   surviving capturer group is never masked as a clean stop. A step's OWN
   exception or self-cancellation is handled by one owner (`cli._run_teardown_step`,
-  whose docstring holds the step × outcome contract table): it is logged with
-  redacted text and never skips a later step, the socket-dir removal and env
-  restore always run, a failed capturer stop counts as a surviving group, and a
-  failed stderr-reader retirement is logged only. The app waits for owned child
+  whose docstring holds the step × outcome contract table): an exception is
+  logged with redacted text, a self-cancellation is logged as `cancelled`, and
+  neither skips a later step; within that `finally` the socket-dir removal and
+  env restore always run, a failed capturer stop counts as a surviving group,
+  and a failed stderr-reader retirement is logged only. One path never reaches
+  that `finally`: if a startup cancellation finds the recorder still running
+  past its drain grace, `_run_recorder_with_capturer` stamps
+  `recorder-drain-timeout`, stops the capturer group, then hard-exits (rc=1).
+  The process environment dies with it, and the leftover socket dir is a
+  private `0700` temp dir whose sockets are nonce-gated to that dead
+  generation (every Start mints a new dir and nonce), so it is harmless. The app waits for owned child
   exit on Quit; its bounded timeout keeps the app alive with an error rather
   than killing the supervisor before capturer cleanup.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →
@@ -180,7 +187,9 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
   socket supervisor both delegate pending-task cancellation plus async-generator
   and default-executor finalization to `onoats._event_loop.run_bounded_event_loop`.
   A zero cancel timeout means no grace for pending work; it does not erase the
-  separate positive finalizer budget or turn a clean result into rc=1.
+  separate positive finalizer budget or turn a clean result into rc=1. Both
+  finalizers are attempted even when pending-task cancellation failed; any
+  failed stage still forces rc=1.
 
 Single-instance + pid-file ownership (`runtime.py`, pinned by
 `tests/test_status_file.py` + `tests/test_socket_supervisor.py`):
