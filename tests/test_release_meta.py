@@ -231,8 +231,8 @@ def test_native_app_recreates_bundle_and_copies_each_resource_explicitly():
     makefile = NATIVE_MAKEFILE.read_text(encoding="utf-8")
     _, app = _make_target(makefile, "app")
 
-    remove = app.find("rm -rf $(APP)")
-    create = app.find("mkdir -p $(APP)/Contents/MacOS")
+    remove = app.find('rm -rf -- "$(APP)"')
+    create = app.find('mkdir -p "$(APP)/Contents/MacOS"')
     assert -1 not in (remove, create) and remove < create, (
         "app assembly must remove the entire staging bundle before recreating it"
     )
@@ -244,6 +244,20 @@ def test_native_app_recreates_bundle_and_copies_each_resource_explicitly():
     assert not re.search(r"(?m)^\tcp\s+[^\n]*Resources/[^\s]*[*?]", app), (
         "resource assembly must not use a wildcard copy"
     )
+
+
+def test_native_app_path_cannot_be_overridden_from_make_command_line(tmp_path):
+    hostile = tmp_path / "must-not-be-an-app-target"
+    result = subprocess.run(
+        ["make", "-n", "app", f"APP={hostile}"],
+        cwd=NATIVE_MAKEFILE.parent,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "APP is fixed" in result.stderr
+    assert not hostile.exists()
 
 
 def test_native_build_and_model_harness_include_phase6_panel_sources():

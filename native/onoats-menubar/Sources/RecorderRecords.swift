@@ -29,13 +29,17 @@ enum StatusRecordRead {
     case record(StatusRecord)
 }
 
+private let recorderAuthorityRecordMaxBytes = 65_536
+
 @MainActor
 enum RecorderRecordReader {
     static func status(
         under directory: URL, expectedSchema: Int, using ops: SystemOps
     ) -> StatusRecordRead {
         let url = directory.appendingPathComponent(".active/onoats.status.json")
-        guard let data = ops.readData(at: url) else { return .missingOrInvalid }
+        guard let data = ops.readData(
+            at: url, maxBytes: recorderAuthorityRecordMaxBytes
+        ) else { return .missingOrInvalid }
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let schema = object["schema"] as? Int,
            schema != expectedSchema {
@@ -49,7 +53,9 @@ enum RecorderRecordReader {
 
     static func pid(under directory: URL, using ops: SystemOps) -> RecorderPidRecord? {
         let url = directory.appendingPathComponent(".active/onoats.pid")
-        guard let data = ops.readData(at: url, maxBytes: 65_536),
+        guard let data = ops.readData(
+            at: url, maxBytes: recorderAuthorityRecordMaxBytes
+        ),
               let text = String(data: data, encoding: .utf8) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
             .components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }

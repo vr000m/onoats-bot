@@ -61,6 +61,9 @@ RESOURCE_NAMES  := Onoats.icns \
 	OnoatsMenuBarTemplateFailed.png OnoatsMenuBarTemplateFailed@2x.png
 
 BUILD := build
+ifneq ($(filter command line environment environment override,$(origin APP)),)
+$(error APP is fixed to the repository-local Onoats.app staging path)
+endif
 APP   := Onoats.app
 APP_NAME := $(notdir $(APP))
 # Phase 5b bundle shape: the menu-bar app is the main executable
@@ -100,24 +103,24 @@ $(BUILD)/Onoats: $(MENUBAR_SOURCES)
 	@echo "✓ compiled $@ (menu-bar app)"
 
 app: build
-	rm -rf $(APP)
-	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	cp $(BUILD)/Onoats $(MAIN_BIN)
-	cp $(BUILD)/onoats-capturer $(BIN)
-	cp $(PLIST) $(APP)/Contents/Info.plist
-	cp $(RESOURCE_DIR)/Onoats.icns $(APP)/Contents/Resources/Onoats.icns
-	cp $(RESOURCE_DIR)/OnoatsHeader.png $(APP)/Contents/Resources/OnoatsHeader.png
-	cp $(RESOURCE_DIR)/OnoatsHeader@2x.png $(APP)/Contents/Resources/OnoatsHeader@2x.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle@2x.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording@2x.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning@2x.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy@2x.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed.png
-	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed@2x.png
+	rm -rf -- "$(APP)"
+	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
+	cp "$(BUILD)/Onoats" "$(MAIN_BIN)"
+	cp "$(BUILD)/onoats-capturer" "$(BIN)"
+	cp "$(PLIST)" "$(APP)/Contents/Info.plist"
+	cp "$(RESOURCE_DIR)/Onoats.icns" "$(APP)/Contents/Resources/Onoats.icns"
+	cp "$(RESOURCE_DIR)/OnoatsHeader.png" "$(APP)/Contents/Resources/OnoatsHeader.png"
+	cp "$(RESOURCE_DIR)/OnoatsHeader@2x.png" "$(APP)/Contents/Resources/OnoatsHeader@2x.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle@2x.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle@2x.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording@2x.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording@2x.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning@2x.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning@2x.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy@2x.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy@2x.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed.png"
+	cp "$(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed@2x.png" "$(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed@2x.png"
 	@echo "✓ assembled $(APP)"
 
 # The resource directory is an equality-checked allowlist. This catches both a

@@ -889,6 +889,21 @@ private func testNativeBoundedReadStateSpace(_ root: URL) throws {
 }
 
 @MainActor
+private func testStatusRecordsUseTheBoundedAuthorityReader(_ root: URL) throws {
+    let directory = root.appendingPathComponent("bounded-status-record")
+    let ops = FakeSystemOps()
+    try ops.putJSON(status(pid: 42, epoch: 84), active(directory, "onoats.status.json"))
+    ops.boundedReadLimits.removeAll()
+    guard case .record = RecorderRecordReader.status(
+        under: directory, expectedSchema: 2, using: ops
+    ) else {
+        throw HarnessFailure(description: "bounded status reader rejected a valid record")
+    }
+    try require(ops.boundedReadLimits.last == 65_536,
+                "status polling bypassed the bounded authority reader")
+}
+
+@MainActor
 private func testSchemaDriftClearsOnlyWhenEvidenceDisappears(_ root: URL) throws {
     let first = root.appendingPathComponent("schema-first")
     let second = root.appendingPathComponent("schema-second")
@@ -1277,6 +1292,7 @@ struct RecorderModelHarness {
         try testActiveRunLogSurvivesClockRollback(home)
         try testReservationFailureClearsPriorRunAuthority(home)
         try testNativeBoundedReadStateSpace(home)
+        try testStatusRecordsUseTheBoundedAuthorityReader(home)
         try testSchemaDriftClearsOnlyWhenEvidenceDisappears(home)
         try testNativeAppendIsAtomicAcrossSeparateWriters(home)
         try testOpenLogResolution(home)
