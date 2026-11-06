@@ -66,8 +66,8 @@ from onoats.runtime import (  # noqa: E402
     BOT_NAME,
     PIPELINE_SAMPLE_RATE,
     SHUTDOWN_CANCEL_TIMEOUT_SEC,
-    RecorderSessionConfig,
     RecorderAlreadyRunningError,
+    RecorderSessionConfig,
     SttPreflightError,
     _acquire_instance_lock,
     _build_pid_record,
@@ -357,6 +357,9 @@ async def run_onoats(
     except BaseException:
         await control_server.close(force_exit_event=force_exit_event)
         raise
+    # Same ordering contract as dual.py (bind control socket, then pid file, then
+    # status), pinned for both entrypoints by
+    # tests/test_status_file.py::test_recorder_entrypoints_publish_and_teardown_control_generation_in_order.
     status_published = _write_status_running(
         data_dir,
         audio_source="portaudio",
