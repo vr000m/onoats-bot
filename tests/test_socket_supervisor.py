@@ -3179,6 +3179,107 @@ def test_supervisor_process_exit_is_bounded_after_cancellation_resistance(tmp_pa
     assert "forcing process exit" in result.stderr
 
 
+@pytest.mark.parametrize("stalled_phase", ["async-generator", "default-executor"])
+def test_supervisor_loop_cleanup_deadline_is_process_bounded(tmp_path, stalled_phase):
+    """Every post-resource loop cleanup cell shares the hard exit deadline."""
+    cleanup_marker = tmp_path / f"{stalled_phase}-owned-cleanup"
+    setup = (
+        "held = stalled_generator(); await held.__anext__(); retained.append(held)"
+        if stalled_phase == "async-generator"
+        else "asyncio.get_running_loop().run_in_executor(None, threading.Event().wait)"
+    )
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import threading
+        from pathlib import Path
+        from onoats import cli
+
+        cli._RECORDER_DRAIN_GRACE_SEC = 0.02
+        retained = []
+
+        async def stalled_generator():
+            try:
+                yield None
+            finally:
+                await asyncio.Event().wait()
+
+        async def fake_supervisor(_rest, *, config=None):
+            {setup}
+            try:
+                return 0
+            finally:
+                Path({str(cleanup_marker)!r}).write_text("done", encoding="utf-8")
+
+        cli._supervise_socket_session = fake_supervisor
+        raise SystemExit(cli._run_socket_supervisor([]))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert cleanup_marker.read_text(encoding="utf-8") == "done"
+    assert "event-loop cleanup exceeded its absolute deadline" in result.stderr
+
+
+def test_supervisor_normal_loop_cleanup_completes_before_return(tmp_path):
+    """The non-stalled async-generator and executor cells both finish normally."""
+    asyncgen_marker = tmp_path / "asyncgen-clean"
+    executor_marker = tmp_path / "executor-clean"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        from pathlib import Path
+        from onoats import cli
+
+        async def cleaned_generator():
+            try:
+                yield None
+            finally:
+                Path({str(asyncgen_marker)!r}).write_text("done", encoding="utf-8")
+
+        async def fake_supervisor(_rest, *, config=None):
+            held = cleaned_generator()
+            await held.__anext__()
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                Path({str(executor_marker)!r}).write_text,
+                "done",
+                "utf-8",
+            )
+            return 0
+
+        cli._supervise_socket_session = fake_supervisor
+        raise SystemExit(cli._run_socket_supervisor([]))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert asyncgen_marker.read_text(encoding="utf-8") == "done"
+    assert executor_marker.read_text(encoding="utf-8") == "done"
+
+
 def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(
     tmp_path, monkeypatch
 ):

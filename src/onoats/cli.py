@@ -524,7 +524,8 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
 
     loop = _asyncio.new_event_loop()
     _asyncio.set_event_loop(loop)
-    cancellation_survivors = False
+    cleanup_failed = False
+    cleanup_deadline: float | None = None
     try:
         rc = loop.run_until_complete(_supervise_socket_session(rest, config=config))
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
@@ -542,27 +543,49 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
         )
         rc = 1
     finally:
+        # One absolute deadline covers every loop-owned cleanup phase.  In
+        # particular, shutdown_default_executor() has no timeout on Python 3.12
+        # and may otherwise outlive the supervisor's capturer/socket/env cleanup
+        # forever.  A missed deadline is handled below with a process boundary;
+        # returning normally would let non-daemon executor workers hang Python's
+        # interpreter shutdown.
+        cleanup_deadline = loop.time() + _RECORDER_DRAIN_GRACE_SEC
+
+        def run_cleanup(awaitable) -> bool:
+            remaining = cleanup_deadline - loop.time()
+            if remaining <= 0:
+                if inspect.iscoroutine(awaitable):
+                    awaitable.close()
+                return False
+            try:
+                loop.run_until_complete(_asyncio.wait_for(awaitable, remaining))
+                return True
+            except BaseException:
+                return False
+
         pending = _asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
         if pending:
+            remaining = max(0.0, cleanup_deadline - loop.time())
             _done, survivors = loop.run_until_complete(
-                _asyncio.wait(pending, timeout=_RECORDER_DRAIN_GRACE_SEC)
+                _asyncio.wait(pending, timeout=remaining)
             )
-            cancellation_survivors = bool(survivors)
-        if not cancellation_survivors:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.run_until_complete(loop.shutdown_default_executor())
+            cleanup_failed = bool(survivors)
+        if not cleanup_failed:
+            cleanup_failed = not run_cleanup(loop.shutdown_asyncgens())
+        if not cleanup_failed:
+            cleanup_failed = not run_cleanup(loop.shutdown_default_executor())
         _asyncio.set_event_loop(None)
         loop.close()
-    if cancellation_survivors:
+    if cleanup_failed:
         # The async supervisor has already completed its authoritative capturer,
         # socket-directory, and environment cleanup.  Do not return through the
         # interpreter with a cancellation-resistant recorder task: Python's
         # normal asyncio.run shutdown would await it without a deadline.
         logger.error(
-            "Socket supervisor: recorder task survived bounded cancellation "
-            "after owned-resource cleanup; forcing process exit."
+            "Socket supervisor: event-loop cleanup exceeded its absolute "
+            "deadline after owned-resource cleanup; forcing process exit."
         )
         _SUPERVISOR_HARD_EXIT(1)
         return 1  # only reachable under a test double for os._exit
