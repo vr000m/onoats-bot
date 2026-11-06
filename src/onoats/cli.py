@@ -28,7 +28,10 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from onoats._closing import CancellationLedger
 
 PID_FILENAME = "onoats.pid"
 
@@ -621,6 +624,7 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
 
     from loguru import logger
 
+    from onoats._closing import CancellationLedger
     from onoats.runtime import _acquire_instance_lock
 
     # 0. One canonical data-dir resolution per session. Every status write in
@@ -675,6 +679,7 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
     permission_event = asyncio.Event()
     rc = 0
     startup_cancelled = False
+    body_failed = False
     teardown_failed = False
     sock_dir = tempfile.mkdtemp(prefix="onoats-sock-")
     try:
@@ -765,7 +770,8 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
                 "AUDIO_SOURCE=socket cannot capture without it. "
                 "See docs/audio-socket-contract.md."
             )
-            return 1
+            rc = 1
+            return rc
 
         # 3c. Start the always-drain stderr reader IMMEDIATELY — before any
         # bounded wait — so a chatty capturer can never block on a full pipe
@@ -830,7 +836,8 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
                 exit_reason=exit_reason,
                 last_error=last_error,
             )
-            return 1
+            rc = 1
+            return rc
 
         # 5. Run the recorder against the sockets, watching the capturer
         # concurrently so its death tears the session down.
@@ -845,9 +852,20 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
     except asyncio.CancelledError:
         startup_cancelled = True
         raise
+    except BaseException:
+        body_failed = True
+        raise
     finally:
+        # Every awaited teardown step is bounded on its own, so a cancellation
+        # that lands here (a startup signal arriving after the body already
+        # finished or failed) is deferred until every step has run: it must
+        # neither skip SIGKILL escalation / socket-dir / env cleanup nor
+        # replace the body's own outcome.
+        teardown_ledger = CancellationLedger()
         if capturer_proc is not None:
-            teardown_ok = await _stop_capturer(capturer_proc, logger)
+            teardown_ok = await _run_teardown_step(
+                _stop_capturer(capturer_proc, logger), teardown_ledger
+            )
             if not teardown_ok:
                 teardown_failed = True
                 rc = 1
@@ -856,11 +874,7 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
             # the reader a bounded grace to consume it (flushing any final
             # lines to the log), then cancel. Bounded so a leaked fd can never
             # hang teardown; cancellation is safe (readline is the only await).
-            try:
-                # wait_for cancels (and awaits) the task itself on timeout.
-                await asyncio.wait_for(stderr_task, timeout=_STDERR_READER_GRACE_SEC)
-            except TimeoutError:
-                pass
+            await _run_teardown_step(_await_stderr_reader(stderr_task), teardown_ledger)
         # Remove the private socket dir. Best-effort: a leftover here is harmless
         # (next generation mints a new one), but tidy up so private dirs don't
         # accumulate under the system temp root across restarts.
@@ -882,8 +896,43 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
             raise CapturerTeardownError(
                 "capturer process group survived bounded teardown"
             )
+        if not startup_cancelled and not body_failed and rc == 0:
+            # A deferred cancellation surfaces only when the body produced no
+            # stronger outcome. A start failure (exception) or a non-zero rc
+            # stays authoritative and is never masked as a clean stop.
+            teardown_ledger.raise_if_cancelled()
 
     return rc
+
+
+async def _await_stderr_reader(stderr_task) -> None:
+    """Bounded retirement of the capturer stderr reader."""
+    import asyncio
+
+    try:
+        # wait_for cancels (and awaits) the task itself on timeout.
+        await asyncio.wait_for(stderr_task, timeout=_STDERR_READER_GRACE_SEC)
+    except TimeoutError:
+        pass
+
+
+async def _run_teardown_step(awaitable, ledger: CancellationLedger):
+    """Run one self-bounded teardown step to completion despite cancellation.
+
+    A cancellation of the caller is remembered in ``ledger`` (re-raised by the
+    caller once every step has run) instead of abandoning the step. Only a
+    cancellation of the step itself propagates.
+    """
+    import asyncio
+
+    step = asyncio.ensure_future(awaitable)
+    while True:
+        try:
+            return await asyncio.shield(step)
+        except asyncio.CancelledError as exc:
+            if step.done():
+                raise
+            ledger.remember(exc)
 
 
 async def _wait_for_sockets(

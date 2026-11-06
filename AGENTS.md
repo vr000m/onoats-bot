@@ -94,7 +94,10 @@ registry dep, not a git pin).
 - **Startup signals are owned before spawn.** Until the recorder installs its
   normal drain handlers, SIGINT/SIGTERM cancel startup through the supervisor's
   authoritative `finally`. Cancellation during spawn first retains the child
-  handle, so the capturer group is still reaped. The app waits for owned child
+  handle, so the capturer group is still reaped. A signal that lands while that
+  `finally` is already tearing down is deferred (`_run_teardown_step` +
+  `CancellationLedger`): every teardown step still runs, and a start failure or
+  non-zero rc is never masked as a clean stop. The app waits for owned child
   exit on Quit; its bounded timeout keeps the app alive with an error rather
   than killing the supervisor before capturer cleanup.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →

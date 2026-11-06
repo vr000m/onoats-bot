@@ -2987,6 +2987,109 @@ def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monke
     assert {key: os.environ.get(key) for key in socket_keys} == prior
 
 
+@pytest.mark.parametrize("teardown_ok", [True, False])
+@pytest.mark.parametrize("signal_in_teardown", [False, True])
+@pytest.mark.parametrize("body", ["rc0", "rc1", "start-failure", "startup-signal"])
+def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
+    sup_env, monkeypatch, body, signal_in_teardown, teardown_ok
+):
+    """A startup signal during teardown can neither skip a step nor mask rc.
+
+    The startup handler stays installed until the recorder installs its own.
+    A signal arriving while the authoritative ``finally`` is already tearing
+    down (after a clean rc, a non-zero rc, or a start failure) must let every
+    teardown step finish and must not turn a failure into rc=0.
+    """
+    import tempfile as _tempfile
+
+    from onoats import runtime
+
+    socket_keys = (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    )
+    prior = {key: os.environ.get(key) for key in socket_keys}
+    minted: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def mint(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        minted.append(path)
+        return path
+
+    class EmptyStderr:
+        async def readline(self):
+            await asyncio.sleep(0.01)
+            return b""
+
+    class Capturer:
+        pid = 43212
+        returncode = None
+        stderr = EmptyStderr()
+
+    events: list[str] = []
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        real_add = loop.add_signal_handler
+        handlers = {}
+
+        def add(sig, callback, *args):
+            handlers[sig] = lambda: callback(*args)
+            real_add(sig, callback, *args)
+
+        monkeypatch.setattr(loop, "add_signal_handler", add)
+
+        async def spawn(*_args, **_kwargs):
+            return Capturer()
+
+        async def sockets(*_args, **_kwargs):
+            return True
+
+        async def recorder(*_args, **_kwargs):
+            if body == "rc0":
+                return 0
+            if body == "rc1":
+                return 1
+            if body == "start-failure":
+                raise runtime.SttPreflightError("stt unreachable")
+            handlers[signal.SIGTERM]()
+            await asyncio.sleep(1)
+            raise AssertionError("startup signal did not cancel the body")
+
+        async def stop(*_args, **_kwargs):
+            events.append("stop-start")
+            if signal_in_teardown:
+                handlers[signal.SIGTERM]()
+            await asyncio.sleep(0.01)
+            events.append("stop-done")
+            return teardown_ok
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+        monkeypatch.setattr(cli, "_run_recorder_with_capturer", recorder)
+        monkeypatch.setattr(cli, "_stop_capturer", stop)
+        return await asyncio.wait_for(
+            cli._supervise_socket_session([]), timeout=SUP_TIMEOUT
+        )
+
+    monkeypatch.setattr(_tempfile, "mkdtemp", mint)
+    if body == "start-failure":
+        with pytest.raises(runtime.SttPreflightError):
+            asyncio.run(run())
+    elif body == "startup-signal" and not teardown_ok:
+        with pytest.raises(cli.CapturerTeardownError):
+            asyncio.run(run())
+    else:
+        expected = 0 if body in ("rc0", "startup-signal") and teardown_ok else 1
+        assert asyncio.run(run()) == expected
+
+    assert events == ["stop-start", "stop-done"]
+    assert minted and all(not Path(path).exists() for path in minted)
+    assert {key: os.environ.get(key) for key in socket_keys} == prior
+
+
 def test_diarization_flag_off_never_calls_preflight_in_supervisor(sup_env, monkeypatch):
     import asyncio as _asyncio
 
