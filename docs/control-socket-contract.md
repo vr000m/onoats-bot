@@ -17,7 +17,9 @@ The recorder binds a socket inside a private mode-`0700` directory under
 `<data_dir>/.active`, captures that unpublished socket's device/inode, and
 atomically publishes it as `.active/onoats-control.sock` with an exclusive
 no-replace rename before publishing its PID and attempting the best-effort
-running-status write. `.active` is
+running-status write. On Linux, an `O_PATH` descriptor pins the captured node
+until cleanup completes so an unlinked inode cannot be recycled into a raced
+successor with the same device/inode pair. `.active` is
 mode `0700` and the socket is `0600`.
 If that absolute pathname exceeds Darwin's `sockaddr_un` limit, startup and
 clients fail closed with guidance to choose a shorter data directory; neither
@@ -25,9 +27,10 @@ side changes the process-wide working directory to shorten the address.
 The server never derives ownership from a later read of the public pathname.
 Python 3.13's automatic `cleanup_socket` behavior is explicitly disabled;
 Python 3.12 retains its no-keyword call shape. Cleanup atomically moves the
-public entry into a private same-directory quarantine, verifies the moved inode,
-and removes only that socket; a raced foreign entry is restored by the same
-exclusive rename without overwriting a successor, or retained in quarantine.
+public entry into a private same-directory quarantine, verifies the moved node
+against the captured (and, on Linux, pinned) identity, and removes only that
+socket; a raced foreign entry is restored by the same exclusive rename without
+overwriting a successor, or retained in quarantine.
 Shutdown stops acceptance and settles accepted commands before removing the
 socket, attempting stopped status when status publication is enabled, and
 performing exact-record PID teardown. Failure of the initial running-status

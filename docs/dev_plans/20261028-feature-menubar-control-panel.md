@@ -916,6 +916,20 @@ sequenceDiagram
   backend even if the config changes during startup; direct helper calls retain
   the deliberate load-on-call boundary.
 
+### 2026-11-05: Linux endpoint-identity correction
+
+- Hosted CI exposed that Linux can immediately recycle an unlinked Unix-socket
+  inode. Device/inode comparison alone could therefore mistake a raced successor
+  for the recorder-owned endpoint and remove it during quarantine cleanup.
+- Linux now retains an `O_PATH` descriptor from the private bind through final
+  cleanup, pinning the original inode while the quarantined entry is verified.
+  Darwin retains the existing device/inode path because it cannot open socket
+  nodes through an equivalent descriptor. The no-replace restore and
+  newer-successor preservation rules are unchanged.
+- The two replacement-at-final-boundary regressions now exercise the corrected
+  invariant on Linux; the control-socket contract and its source-parity gate
+  explicitly require the pinned identity.
+
 ## Final Results
 
 ### Summary

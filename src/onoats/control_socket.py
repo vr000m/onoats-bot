@@ -53,6 +53,31 @@ class ControlResponse:
     message: str
 
 
+@dataclass
+class _EndpointIdentity:
+    """A socket-node identity, pinned by an ``O_PATH`` fd when available."""
+
+    device: int
+    inode: int
+    descriptor: int | None = None
+
+    def matches(self, candidate: os.stat_result) -> bool:
+        if self.descriptor is None:
+            expected = (self.device, self.inode)
+        else:
+            try:
+                held = os.fstat(self.descriptor)
+            except OSError:
+                return False
+            expected = (held.st_dev, held.st_ino)
+        return (candidate.st_dev, candidate.st_ino) == expected
+
+    def close(self) -> None:
+        descriptor, self.descriptor = self.descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def control_socket_path(data_dir: Path) -> Path:
     return data_dir / ".active" / CONTROL_SOCKET_FILENAME
 
@@ -64,6 +89,36 @@ def _validate_socket_path(path: Path) -> None:
             "control socket path exceeds Darwin's sockaddr_un limit; "
             "configure a shorter ONOATS_DATA_DIR"
         )
+
+
+def _capture_endpoint_identity(path: Path, opened: os.stat_result) -> _EndpointIdentity:
+    """Capture a socket node without allowing Linux to recycle its inode.
+
+    Linux may immediately reuse a socket node's inode after unlink. Holding an
+    ``O_PATH`` descriptor pins that inode until cleanup has quarantined and
+    verified the public entry. Darwin cannot open a socket node this way, so it
+    retains the existing device/inode comparison.
+    """
+    o_path = getattr(os, "O_PATH", None)
+    if o_path is None:
+        return _EndpointIdentity(opened.st_dev, opened.st_ino)
+
+    flags = o_path | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    identity = _EndpointIdentity(opened.st_dev, opened.st_ino, descriptor)
+    try:
+        held = os.fstat(descriptor)
+        current = path.lstat()
+        expected = (opened.st_dev, opened.st_ino)
+        if (held.st_dev, held.st_ino) != expected or (
+            current.st_dev,
+            current.st_ino,
+        ) != expected:
+            raise ControlError(f"control endpoint changed while capturing {path}")
+    except BaseException:
+        identity.close()
+        raise
+    return identity
 
 
 async def _start_owned_unix_server(
@@ -121,7 +176,7 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         raise OSError(error, os.strerror(error), destination)
 
 
-def _quarantine_and_remove(path: Path, expected: tuple[int, int]) -> bool:
+def _quarantine_and_remove(path: Path, expected: _EndpointIdentity) -> bool:
     """Move the public entry aside, verify it, then remove only that inode.
 
     If a different entry wins the race, restore it with an exclusive rename.
@@ -148,7 +203,7 @@ def _quarantine_and_remove(path: Path, expected: tuple[int, int]) -> bool:
 
     try:
         moved = quarantine_path.lstat()
-        if (moved.st_dev, moved.st_ino) != expected:
+        if not expected.matches(moved):
             try:
                 _rename_noreplace(quarantine_path, path)
             except OSError:
@@ -220,7 +275,7 @@ class ControlServer:
         self._server: asyncio.AbstractServer | None = None
         self._closing = False
         self._handlers: set[asyncio.Task[Any]] = set()
-        self._owned_identity: tuple[int, int] | None = None
+        self._owned_identity: _EndpointIdentity | None = None
 
     async def start(self) -> None:
         if self._server is not None:
@@ -237,15 +292,24 @@ class ControlServer:
                 raise ControlError(
                     f"refusing to replace non-socket control path {self.path}"
                 )
-            if not _quarantine_and_remove(
-                self.path, (existing.st_dev, existing.st_ino)
-            ):
+            try:
+                stale_identity = _capture_endpoint_identity(self.path, existing)
+            except (FileNotFoundError, OSError) as exc:
                 raise ControlError(
                     f"control endpoint changed while removing stale socket {self.path}"
-                )
+                ) from exc
+            try:
+                if not _quarantine_and_remove(self.path, stale_identity):
+                    raise ControlError(
+                        "control endpoint changed while removing stale socket "
+                        f"{self.path}"
+                    )
+            finally:
+                stale_identity.close()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         private_dir: Path | None = None
         private_path: Path | None = None
+        captured: _EndpointIdentity | None = None
         try:
             private_dir = Path(
                 tempfile.mkdtemp(prefix=".onoats-control-bind-", dir=self.path.parent)
@@ -257,7 +321,7 @@ class ControlServer:
             opened = private_path.lstat()
             if not stat.S_ISSOCK(opened.st_mode):
                 raise ControlError("bound control endpoint is not a socket")
-            owned = (opened.st_dev, opened.st_ino)
+            captured = _capture_endpoint_identity(private_path, opened)
             listener.setblocking(False)
             listener.listen(socket.SOMAXCONN)
             try:
@@ -266,7 +330,8 @@ class ControlServer:
                 raise ControlError(
                     f"control endpoint appeared while publishing {self.path}"
                 ) from exc
-            self._owned_identity = owned
+            self._owned_identity = captured
+            captured = None
             self._closing = False
             self._server = await _start_owned_unix_server(self._accept, listener)
         except BaseException:
@@ -274,9 +339,14 @@ class ControlServer:
             owned = self._owned_identity
             self._owned_identity = None
             if owned is not None:
-                _quarantine_and_remove(self.path, owned)
+                try:
+                    _quarantine_and_remove(self.path, owned)
+                finally:
+                    owned.close()
             raise
         finally:
+            if captured is not None:
+                captured.close()
             if private_path is not None:
                 try:
                     private_path.unlink()
@@ -426,7 +496,10 @@ class ControlServer:
         self._owned_identity = None
         if owned is None:
             return
-        _quarantine_and_remove(self.path, owned)
+        try:
+            _quarantine_and_remove(self.path, owned)
+        finally:
+            owned.close()
 
 
 def send_control_command(

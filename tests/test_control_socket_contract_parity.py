@@ -104,7 +104,11 @@ def test_contract_pins_owned_endpoint_cleanup_and_successor_safety() -> None:
     assert "successor" in doc or "replacement" in doc
     close_source = inspect.getsource(control.ControlServer.close)
     cleanup_source = inspect.getsource(control._quarantine_and_remove)
-    assert "st_ino" in cleanup_source and "st_dev" in cleanup_source
+    identity_source = inspect.getsource(control._EndpointIdentity.matches)
+    capture_source = inspect.getsource(control._capture_endpoint_identity)
+    assert "st_ino" in identity_source and "st_dev" in identity_source
+    assert "O_PATH" in capture_source and "os.open" in capture_source
+    assert "pins the captured node" in doc
     assert cleanup_source.index("os.rename") < cleanup_source.index(
         "quarantine_path.unlink"
     )
