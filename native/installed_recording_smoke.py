@@ -688,6 +688,25 @@ def _owned_descendant_groups(
     )
 
 
+def _merge_owned_groups(
+    *snapshots: tuple[OwnedProcessGroup, ...],
+) -> tuple[OwnedProcessGroup, ...]:
+    """Union independently verified group-member generations."""
+    grouped: dict[int, dict[ProcessIdentity, None]] = {}
+    for snapshot in snapshots:
+        for group in snapshot:
+            members = grouped.setdefault(group.pgid, {})
+            for member in group.members:
+                members[member] = None
+    return tuple(
+        OwnedProcessGroup(
+            pgid,
+            tuple(sorted(members, key=lambda item: (item.pid, item.process_birth))),
+        )
+        for pgid, members in sorted(grouped.items())
+    )
+
+
 def _signal_owned_group(group: OwnedProcessGroup, sig: signal.Signals) -> bool:
     """Signal only exact captured members; the PGID grants no extra authority."""
     signalled = False
@@ -1056,7 +1075,6 @@ def run(args: argparse.Namespace) -> None:
     app_identity: ProcessIdentity | None = None
     recorder: RecorderIdentity | None = None
     groups: tuple[OwnedProcessGroup, ...] = ()
-    groups_captured = False
     primary_error: BaseException | None = None
     try:
         subprocess.run(["/usr/bin/open", str(app)], check=True, timeout=10)
@@ -1087,7 +1105,6 @@ def run(args: argparse.Namespace) -> None:
         )
         recorder_pid, epoch = recorder.pid, recorder.start_epoch
         groups = _owned_descendant_groups(app_pid, recorder_pid)
-        groups_captured = True
 
         def nonzero_me() -> str | None:
             telemetry = _json(telemetry_path)
@@ -1185,10 +1202,11 @@ def run(args: argparse.Namespace) -> None:
                 )
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
-        if recorder is not None and app_pid is not None and not groups_captured:
+        if recorder is not None and app_pid is not None:
             try:
-                groups = _owned_descendant_groups(app_pid, recorder.pid)
-                groups_captured = True
+                groups = _merge_owned_groups(
+                    groups, _owned_descendant_groups(app_pid, recorder.pid)
+                )
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
         try:

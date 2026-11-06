@@ -436,7 +436,23 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
         lambda: {1234: SMOKE.ProcessRow(1, 1234, "app-start", app_command)},
     )
     monkeypatch.setattr(SMOKE, "_process_birth", lambda _pid: _birth(10, 20))
-    monkeypatch.setattr(SMOKE, "_owned_descendant_groups", lambda *_args: ())
+    first_member = SMOKE.ProcessIdentity(
+        5002, 5001, "first", "/capturer/first", _birth(50, 1)
+    )
+    late_member = SMOKE.ProcessIdentity(
+        5003, 5001, "late", "/capturer/late", _birth(50, 2)
+    )
+    snapshots = [
+        (SMOKE.OwnedProcessGroup(5001, (first_member,)),),
+        (SMOKE.OwnedProcessGroup(5001, (first_member, late_member)),),
+    ]
+    captures = []
+
+    def capture_groups(*_args):
+        captures.append(True)
+        return snapshots[min(len(captures) - 1, len(snapshots) - 1)]
+
+    monkeypatch.setattr(SMOKE, "_owned_descendant_groups", capture_groups)
     monkeypatch.setattr(
         SMOKE, "_cleanup_after_failure", lambda *args, **kwargs: cleaned.append(kwargs)
     )
@@ -462,9 +478,10 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
             "recorder": recorder,
             "status_path": tmp_path / "data/.active/onoats.status.json",
             "pid_path": tmp_path / "data/.active/onoats.pid",
-            "groups": (),
+            "groups": snapshots[-1],
         }
     ]
+    assert len(captures) == 2
     assert receipt_events == ["published"]
 
 
