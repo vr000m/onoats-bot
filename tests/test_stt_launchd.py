@@ -219,6 +219,51 @@ def test_kickstart_refuses_unsafe_unloaded_launch_agent(monkeypatch, tmp_path, u
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<?xml version="1.0"?><plist><dict><key>Label</key>',
+        b"<plist><dict><key>Label</key><date>not-a-date</date></dict></plist>",
+        b"<plist><dict><key>Label</key><integer>x</integer></dict></plist>",
+        b"<plist><dict><string>Label</string></dict></plist>",
+        b"bplist00" + b"\x00" * 40,
+        b"",
+        b"<plist><array><string>x</string></array></plist>",
+    ],
+    ids=[
+        "truncated-xml",
+        "bad-date",
+        "bad-integer",
+        "unexpected-element",
+        "bad-binary",
+        "empty",
+        "not-a-dict",
+    ],
+)
+def test_kickstart_treats_every_unparseable_launch_agent_as_invalid(
+    monkeypatch, tmp_path, payload
+):
+    """No plist parse failure escapes the never-raises kickstart contract."""
+    label = "pipecat.stt-server.nemotron"
+    uid = os.getuid()
+    plist = tmp_path / f"{label}.plist"
+    plist.write_bytes(payload)
+    plist.chmod(0o600)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+    monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: uid)
+
+    assert launchd._validated_launch_agent_bytes(label, uid) is None
+    assert launchd.kickstart_stt_server(label) is False
+    assert [call[1] for call in calls] == ["kickstart"]
+
+
 def test_kickstart_refuses_wrong_owner_or_oversized_launch_agent(monkeypatch, tmp_path):
     label = "pipecat.stt-server.nemotron"
     uid = os.getuid()

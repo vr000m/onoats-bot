@@ -205,7 +205,15 @@ def _validated_launch_agent_bytes(label: str, uid: int) -> bytes | None:
         data = b"".join(chunks)
         if len(data) > _LAUNCH_AGENT_PLIST_MAX_BYTES:
             raise ValueError("plist exceeds 64 KiB")
-        payload = plistlib.loads(data)
+        try:
+            payload = plistlib.loads(data)
+        except Exception as exc:  # noqa: BLE001 - parse of untrusted bytes
+            # plistlib has no closed failure set: malformed XML raises
+            # expat's ExpatError, a bad <date> AttributeError, binary
+            # offsets IndexError/OverflowError. Every parse failure is the
+            # same verdict -- not a valid plist -- and must stay inside this
+            # function's ValueError path (kickstart never raises).
+            raise ValueError(f"plist does not parse: {type(exc).__name__}") from exc
         if not isinstance(payload, dict) or payload.get("Label") != label:
             raise ValueError("plist Label does not match configured label")
         if payload.get("RunAtLoad") is not True:
