@@ -230,8 +230,9 @@ a later status record or make rich status a prerequisite for recording.
   generation, spawn floor, and active data directory.
 - **One mandatory release identity.** Staged installation and signed-app smoke
   consume the same immutable `ReleaseIdentity`: canonical bundle identifier,
-  designated requirement, cdhash, app-tree hash, main-executable hash, and an
-  independently verified CLI git identity. Smoke verifies the static identity
+  designated requirement, cdhash, app-tree hash, main-executable hash, canonical
+  CLI path, CLI entrypoint hash, interpreter path/hash, and an independently
+  verified clean CLI git identity. Smoke verifies the static identity
   before and after recording and uses Security.framework to verify the running
   app PID's designated requirement and cdhash. The smoke invalidates any prior
   receipt before launch and atomically publishes an identity-digest receipt only

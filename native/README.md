@@ -223,7 +223,8 @@ internals behind that surface:
 
   Pass that same immutable record to smoke. It contains the canonical bundle
   identifier, designated requirement, cdhash, tree hash, main-executable hash,
-  and CLI git identity. The smoke re-derives it before and after recording and
+  canonical CLI path, CLI entrypoint hash, interpreter path/hash, and clean CLI
+  git identity. The smoke re-derives it before and after recording and
   verifies the running app PID's designated requirement and cdhash through
   Security.framework; static path/signature checks alone are insufficient.
 

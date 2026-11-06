@@ -956,6 +956,23 @@ sequenceDiagram
   and process-level cancellation resistance. Reverting each production guard
   made its focused mutation fail before the exact fix was restored.
 
+### 2026-11-05: Round 6 authority-boundary correction
+
+- PortAudio now captures its one immutable `RecorderSessionConfig` only after
+  the single-instance lock; the socket supervisor retains its later boundary
+  after minting the generation socket paths and nonce. PID readers reject every
+  non-positive or non-`pid_t` value before any liveness or signal call.
+- Native PID authority uses one bounded, nonblocking, no-follow, owner/mode
+  checked regular-file descriptor with post-read pathname identity validation.
+  A second termination signal independently sets both shutdown and force-exit
+  events, so a shielded continuation cannot indefinitely hide forced shutdown.
+- Installed-smoke failure cleanup can recover a recorder and capturer identity
+  from the stable PID authority, process birth, app ancestry, command, and
+  approved interpreter even when status/telemetry never validate. It never
+  signals an identity that fails any generation check. Native schema-drift state
+  clears when the status evidence disappears or the selected data directory
+  changes, while a current unsupported schema remains visible.
+
 ## Final Results
 
 ### Summary
