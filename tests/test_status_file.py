@@ -788,9 +788,12 @@ def test_both_recorder_entrypoints_classify_returns_and_exceptions_before_cleanu
         assert run_body.count("_pipeline_ended_by_error(") == 2
         assert "except BaseException as exc:" in run_body
         assert "exception=exc" in run_body
-    single = (root / "src/onoats/__main__.py").read_text()
-    assert "return 1 if ended_by_error else 0" in single
-    assert "return asyncio.run(" in single
+    for relative in ("src/onoats/__main__.py", "src/onoats/dual.py"):
+        source = (root / relative).read_text()
+        assert "return 1 if ended_by_error else 0" in source
+        main = source.split("def main(", 1)[1]
+        assert "run_recorder_event_loop(" in main
+        assert "asyncio.run(" not in main
 
 
 @pytest.mark.parametrize("entrypoint", ["src/onoats/__main__.py", "src/onoats/dual.py"])

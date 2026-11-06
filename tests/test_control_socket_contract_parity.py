@@ -101,7 +101,8 @@ def test_contract_and_code_pin_peer_policy_and_acknowledgement_points() -> None:
     assert "xucred" in doc
     assert "cr_uid" in doc
     assert "so_peercred" in doc
-    assert "kernel-enforced acl" in doc
+    assert "windows" in doc and "fail closed" in doc
+    assert "chmod" in doc and "does not establish" in doc
     assert "fail closed" in doc
 
     assert "flush" in doc and "rotation" in doc and "acknowledg" in doc

@@ -11,7 +11,11 @@ import asyncio
 import ast
 import functools
 import inspect
+import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -207,6 +211,101 @@ async def test_force_exit_cancels_stuck_rotation_after_adapter_cancellation() ->
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(flush, timeout=0.5)
     assert cancelled.is_set(), "force exit must cancel the abandoned rotation"
+
+
+@pytest.mark.parametrize("operation", ["flush", "terminal"])
+@_async_test
+async def test_force_exit_does_not_await_cancellation_resistant_rotation(
+    operation: str,
+) -> None:
+    """Both lifecycle rotation modes leave resistant work after the force bound."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def resistant(_reason: str, _continue_session: bool) -> bool:
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+        return True
+
+    controller = RecorderLifecycleController(resistant)
+    if operation == "flush":
+        action = asyncio.create_task(controller.flush("resistant continuation"))
+        await started.wait()
+        action.cancel()
+    else:
+        action = asyncio.create_task(controller.terminal_rotation("resistant terminal"))
+        await started.wait()
+
+    controller.force_exit_event.set()
+    done, _pending = await asyncio.wait({action}, timeout=0.5)
+    bounded = action in done
+    release.set()
+    await asyncio.gather(action, return_exceptions=True)
+
+    assert bounded, f"forced {operation} waited past its cancellation deadline"
+    assert cancelled.is_set()
+    if operation == "terminal":
+        assert controller.state == "stopped"
+
+
+def test_direct_recorder_process_exit_is_bounded_after_resistant_rotation() -> None:
+    """The PortAudio runner must not let asyncio shutdown re-await abandoned work."""
+    script = textwrap.dedent(
+        """
+        import asyncio
+        from onoats import recorder_lifecycle, runtime
+
+        recorder_lifecycle.LIFECYCLE_FORCE_SETTLE_TIMEOUT_SECONDS = 0.01
+        runtime.RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS = 0.01
+
+        async def resistant(_reason, _continue_session):
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    continue
+
+        async def run():
+            controller = recorder_lifecycle.RecorderLifecycleController(resistant)
+            terminal = asyncio.create_task(controller.terminal_rotation("shutdown"))
+            await asyncio.sleep(0)
+            controller.force_exit_event.set()
+            await terminal
+            return 0
+
+        raise SystemExit(runtime.run_recorder_event_loop(run()))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "forcing process exit" in result.stderr
+
+
+def test_direct_recorder_runner_preserves_normal_result_and_exception() -> None:
+    from onoats import runtime
+
+    assert runtime.run_recorder_event_loop(asyncio.sleep(0, result=7)) == 7
+
+    async def fail() -> None:
+        raise RuntimeError("recorder failed")
+
+    with pytest.raises(RuntimeError, match="recorder failed"):
+        runtime.run_recorder_event_loop(fail())
 
 
 @_async_test
@@ -456,3 +555,15 @@ def test_both_entrypoints_delegate_lifecycle_serialization(relative_path: str) -
     )[0]
     assert "return await lifecycle.flush" in control_flush
     assert "except LifecycleStoppingError" in control_flush
+
+
+@pytest.mark.parametrize(
+    "relative_path", ["src/onoats/dual.py", "src/onoats/__main__.py"]
+)
+def test_both_direct_entrypoints_use_bounded_event_loop_runner(
+    relative_path: str,
+) -> None:
+    source = (ROOT / relative_path).read_text(encoding="utf-8")
+    main = source.split("def main(", 1)[1]
+    assert "run_recorder_event_loop(" in main
+    assert "asyncio.run(" not in main

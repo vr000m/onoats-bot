@@ -27,6 +27,20 @@ class LifecycleRotationError(RuntimeError):
     """Raised when an admitted continuation could not complete its rotation."""
 
 
+LIFECYCLE_FORCE_SETTLE_TIMEOUT_SECONDS = 0.25
+
+
+async def _cancel_with_deadline(task: asyncio.Task[bool]) -> bool:
+    """Request cancellation without ever joining resistant work past the bound."""
+    if task.done():
+        return True
+    task.cancel()
+    done, _pending = await asyncio.wait(
+        {task}, timeout=LIFECYCLE_FORCE_SETTLE_TIMEOUT_SECONDS
+    )
+    return task in done
+
+
 class RecorderLifecycleController:
     """The sole ordering authority for one recorder session.
 
@@ -80,13 +94,11 @@ class RecorderLifecycleController:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if force_wait in done:
-                        rotation.cancel()
-                        await asyncio.gather(rotation, return_exceptions=True)
+                        await _cancel_with_deadline(rotation)
                     else:
                         await asyncio.shield(rotation)
                 finally:
                     force_wait.cancel()
-                    await asyncio.gather(force_wait, return_exceptions=True)
                 raise
             if not completed:
                 raise LifecycleRotationError("continuation rotation failed")
@@ -111,11 +123,20 @@ class RecorderLifecycleController:
                 return False
             self._state = LifecycleState.STOPPING
             self.shutdown_event.set()
+            rotation = asyncio.create_task(self._rotate(reason, False))
+            force_wait = asyncio.create_task(self.force_exit_event.wait())
             try:
-                completed = await self._rotate(reason, False)
+                done, _pending = await asyncio.wait(
+                    (rotation, force_wait), return_when=asyncio.FIRST_COMPLETED
+                )
+                if rotation not in done:
+                    await _cancel_with_deadline(rotation)
+                    return False
+                completed = rotation.result()
                 if not completed:
                     raise LifecycleRotationError("terminal rotation failed")
             finally:
+                force_wait.cancel()
                 self._state = LifecycleState.STOPPED
             return True
 

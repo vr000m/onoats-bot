@@ -252,6 +252,82 @@ SHUTDOWN_DRAIN_TIMEOUT_SEC = _env_float(
 SHUTDOWN_CANCEL_TIMEOUT_SEC = _env_float(
     "SHUTDOWN_CANCEL_TIMEOUT_SEC", 2.0, min_value=0.0
 )
+RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS = SHUTDOWN_CANCEL_TIMEOUT_SEC
+_RECORDER_HARD_EXIT = os._exit
+
+
+def run_recorder_event_loop(awaitable):
+    """Run a direct recorder with a hard bound on cancellation-resistant tasks.
+
+    ``asyncio.run`` cancels and then unconditionally joins every remaining task.
+    A forced rotation is allowed to survive cancellation only until this process
+    boundary; otherwise one malicious or broken callback can defeat force exit.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = None
+    failure: tuple[BaseException, object] | None = None
+    cleanup_failed = False
+    try:
+        result = loop.run_until_complete(awaitable)
+    except BaseException as exc:
+        failure = (exc, exc.__traceback__)
+    finally:
+        deadline = loop.time() + RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS
+
+        def run_cleanup(cleanup_awaitable) -> bool:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if asyncio.iscoroutine(cleanup_awaitable):
+                    cleanup_awaitable.close()
+                return False
+            task = loop.create_task(cleanup_awaitable)
+            try:
+                done, _pending = loop.run_until_complete(
+                    asyncio.wait({task}, timeout=remaining)
+                )
+            except BaseException:
+                return False
+            if task not in done:
+                task.cancel()
+                return False
+            try:
+                task.result()
+            except BaseException:
+                return False
+            return True
+
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            remaining = max(0.0, deadline - loop.time())
+            try:
+                _done, survivors = loop.run_until_complete(
+                    asyncio.wait(pending, timeout=remaining)
+                )
+            except BaseException:
+                cleanup_failed = True
+            else:
+                cleanup_failed = bool(survivors)
+        if not cleanup_failed:
+            cleanup_failed = not run_cleanup(loop.shutdown_asyncgens())
+        if not cleanup_failed:
+            cleanup_failed = not run_cleanup(loop.shutdown_default_executor())
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    if cleanup_failed:
+        logger.error(
+            "Recorder event-loop cleanup exceeded its force-exit deadline; "
+            "forcing process exit."
+        )
+        _RECORDER_HARD_EXIT(1)
+        return 1
+    if failure is not None:
+        exc, traceback = failure
+        raise exc.with_traceback(traceback)  # type: ignore[arg-type]
+    return result
 
 
 async def wait_or_force(coro_or_future, label: str, *, force_exit_event) -> None:

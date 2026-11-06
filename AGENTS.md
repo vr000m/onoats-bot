@@ -128,8 +128,10 @@ registry dep, not a git pin).
 Normal CLI control uses `.active/onoats-control.sock`; it never sends a PID
 signal. Every bounded v1 JSON request carries the complete expected
 PID/start-epoch generation, and the server requires same-UID Darwin
-`LOCAL_PEERCRED`, Linux `SO_PEERCRED`, or the host's equivalent kernel
-authority (Windows AF_UNIX pathname ACL). Direct SIGUSR1/SIGTERM remain
+`LOCAL_PEERCRED`, Linux `SO_PEERCRED`, or another proved kernel credential.
+Windows AF_UNIX exposes no peer credential through Python, and `chmod` does not
+establish a restrictive Windows DACL, so Windows control requests fail closed.
+Direct SIGUSR1/SIGTERM remain
 compatibility inputs for terminals and service managers. See
 `docs/control-socket-contract.md`.
 
@@ -157,9 +159,11 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
   "stopped" from the process actually exiting, never from the CLI exit code.
 - **Force exit bounds admitted work.** Ordinary client cancellation cannot revoke
   a Flush after lifecycle admission, but a second SIGINT/SIGTERM cancels its
-  stuck rotation and bounds accepted-handler/server settlement before exact
-  endpoint cleanup. Internal callback exceptions retain server-side diagnostics
-  while clients receive only a generic error.
+  stuck continuation or terminal rotation and bounds accepted-handler/server
+  settlement before exact endpoint cleanup. Deadline expiry never joins a
+  cancellation-resistant task again; direct recorders and the socket supervisor
+  enforce a final hard process boundary. Internal callback exceptions retain
+  server-side diagnostics while clients receive only a generic error.
 - **`onoats stop --help` resolves without booting a service** (local argparse +
   lazy resolver import), like `flush`.
 

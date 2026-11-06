@@ -528,6 +528,7 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
     _asyncio.set_event_loop(loop)
     cleanup_failed = False
     cleanup_deadline: float | None = None
+    unexpected_failure: tuple[BaseException, object] | None = None
     try:
         rc = loop.run_until_complete(_supervise_socket_session(rest, config=config))
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
@@ -544,6 +545,10 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
             f"Socket supervisor: recorder failed to start ({exc!r}); exiting non-zero."
         )
         rc = 1
+    except BaseException as exc:
+        # Preserve unexpected failures, but defer propagation until the same
+        # bounded cleanup and hard-exit boundary used by handled outcomes.
+        unexpected_failure = (exc, exc.__traceback__)
     finally:
         # One absolute deadline covers every loop-owned cleanup phase.  In
         # particular, shutdown_default_executor() has no timeout on Python 3.12
@@ -559,11 +564,21 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
                 if inspect.iscoroutine(awaitable):
                     awaitable.close()
                 return False
+            cleanup_task = loop.create_task(awaitable)
             try:
-                loop.run_until_complete(_asyncio.wait_for(awaitable, remaining))
-                return True
+                done, _pending = loop.run_until_complete(
+                    _asyncio.wait({cleanup_task}, timeout=remaining)
+                )
             except BaseException:
                 return False
+            if cleanup_task not in done:
+                cleanup_task.cancel()
+                return False
+            try:
+                cleanup_task.result()
+            except BaseException:
+                return False
+            return True
 
         pending = _asyncio.all_tasks(loop)
         for task in pending:
@@ -591,6 +606,9 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
         )
         _SUPERVISOR_HARD_EXIT(1)
         return 1  # only reachable under a test double for os._exit
+    if unexpected_failure is not None:
+        exc, traceback = unexpected_failure
+        raise exc.with_traceback(traceback)  # type: ignore[arg-type]
     return rc
 
 

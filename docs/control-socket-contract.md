@@ -36,6 +36,9 @@ socket, attempting stopped status when status publication is enabled, and
 performing exact-record PID teardown. A second termination signal bounds this
 settlement: it cancels accepted handlers and their admitted continuation work,
 then performs a short bounded close before removing only the captured endpoint.
+Deadline expiry abandons cancellation-resistant work instead of awaiting it a
+second time. Direct recorder event loops and the socket supervisor apply a final
+hard process boundary if abandoned tasks survive owned-resource cleanup.
 Failure of the initial running-status write disables status and UI telemetry for
 that run but does not revoke the already-published PID/control authority or stop
 recording.
@@ -46,10 +49,11 @@ the server requires a complete `xucred` with
 `cr_version == XUCRED_VERSION`, a valid group count, and
 `cr_uid == geteuid()`. Linux uses kernel `SO_PEERCRED` and requires its uid to
 equal `geteuid()`; other POSIX hosts may use `getpeereid()`. Missing, malformed,
-unsupported, or wrong-UID credentials are rejected. Windows AF_UNIX does not
-expose peer credentials, so its kernel-enforced ACL on the owner-only pathname
-socket and parent directory is the connection authority there; an injected or
-unexpected missing credential is never accepted as that sentinel.
+unsupported, or wrong-UID credentials are rejected. Linux decodes the kernel's
+signed `pid_t` and unsigned `uid_t`/`gid_t` fields without narrowing the uid.
+Windows AF_UNIX does not expose peer credentials through Python. A `chmod` call does not establish
+or prove a restrictive Windows DACL, so Windows requests fail
+closed until a verified ACL, ownership, and anti-rebind authority exists.
 
 ## Wire format
 

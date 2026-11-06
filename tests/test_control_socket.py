@@ -600,6 +600,49 @@ async def test_force_exit_bounds_close_with_stuck_accepted_flush(
 
 
 @_async_test
+async def test_force_exit_does_not_await_cancellation_resistant_handler(
+    control_data_dir: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    force_exit = asyncio.Event()
+
+    async def resistant_flush() -> bool:
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+        return True
+
+    server = ControlServer(
+        control_data_dir,
+        RECORD,
+        on_flush=resistant_flush,
+        on_stop=lambda: None,
+        peer_uid_getter=lambda _sock: os.geteuid(),
+    )
+    await server.start()
+    path = control_data_dir / ".active" / CONTROL_SOCKET_FILENAME
+    request = asyncio.create_task(_send(path, _request("flush")))
+    await entered.wait()
+    close = asyncio.create_task(server.close(force_exit_event=force_exit))
+    force_exit.set()
+
+    done, _pending = await asyncio.wait({close}, timeout=0.5)
+    bounded = close in done
+    endpoint_removed = not path.exists()
+    release.set()
+    await asyncio.gather(close, request, return_exceptions=True)
+
+    assert bounded, "forced close waited past its handler-settlement deadline"
+    assert endpoint_removed, "forced close did not reach exact endpoint cleanup"
+    assert cancelled.is_set()
+
+
+@_async_test
 @pytest.mark.parametrize(
     ("signal_stop_requested", "command", "accepted", "expected_actions"),
     [
@@ -1106,6 +1149,19 @@ def test_linux_peercred_uses_kernel_uid(monkeypatch) -> None:
     assert control._platform_peer_uid(Peer()) == os.geteuid()
 
 
+def test_linux_peercred_decodes_unsigned_uid_and_gid(monkeypatch) -> None:
+    import onoats.control_socket as control
+
+    monkeypatch.setattr(control.sys, "platform", "linux")
+    high_uid = 0xF0000001
+
+    class Peer:
+        def getsockopt(self, _level, _option, _size):
+            return control._UCRED.pack(123, high_uid, 0xFFFFFFFF)
+
+    assert control._platform_peer_uid(Peer()) == high_uid
+
+
 def test_default_peer_authority_remains_darwin_fail_closed(monkeypatch) -> None:
     import onoats.control_socket as control
 
@@ -1119,15 +1175,16 @@ def test_default_peer_authority_remains_darwin_fail_closed(monkeypatch) -> None:
         control._platform_peer_uid(Peer())
 
 
-def test_windows_peer_authority_is_the_kernel_enforced_socket_acl(monkeypatch) -> None:
+def test_windows_peer_authority_fails_closed_without_proved_acl(monkeypatch) -> None:
     import onoats.control_socket as control
 
     monkeypatch.setattr(control.sys, "platform", "win32")
-    assert control._platform_peer_uid(object()) is None
+    with pytest.raises(control.ControlError, match="unavailable"):
+        control._platform_peer_uid(object())
     server = ControlServer(
         Path("data"), RECORD, on_flush=lambda: True, on_stop=lambda: None
     )
-    assert server._filesystem_peer_authority is True
+    assert not hasattr(server, "_filesystem_peer_authority")
 
 
 @pytest.mark.parametrize("start_epoch", [0.0, -1.0, float("nan"), float("inf")])

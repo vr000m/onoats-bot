@@ -41,7 +41,7 @@ _SOL_LOCAL = 0
 _LOCAL_PEERCRED = 1
 _XUCRED_VERSION = 0
 _XUCRED = struct.Struct("@IIh16I")
-_UCRED = struct.Struct("=iii")
+_UCRED = struct.Struct("=iII")
 _SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
 _DARWIN_SUN_PATH_BYTES = 104
 CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS = 0.25
@@ -217,22 +217,21 @@ def _linux_peer_uid(peer: socket.socket) -> int:
     if len(raw) != _UCRED.size:
         raise ControlError("SO_PEERCRED returned malformed credentials")
     _pid, uid, _gid = _UCRED.unpack(raw)
-    if uid < 0:
-        raise ControlError("SO_PEERCRED returned an invalid uid")
     return uid
 
 
-def _platform_peer_uid(peer: socket.socket) -> int | None:
-    """Return a kernel uid, or Windows' filesystem-authority sentinel."""
+def _platform_peer_uid(peer: socket.socket) -> int:
+    """Return a kernel-authenticated uid, failing closed when unavailable."""
     if sys.platform == "darwin":
         return _darwin_peer_uid(peer)
     if sys.platform.startswith("linux"):
         return _linux_peer_uid(peer)
     if sys.platform == "win32":
-        # Windows AF_UNIX exposes no peer credentials. Its kernel instead
-        # enforces access to pathname sockets through the socket/directory ACL.
-        # Returning None is accepted only for this non-injected default path.
-        return None
+        # Windows AF_UNIX exposes no peer credentials. Python's chmod does not
+        # establish or verify a restrictive DACL, so no same-user authority is
+        # proved here. Keep the endpoint fail-closed until a real ACL contract
+        # with ownership and anti-rebind verification is implemented.
+        raise ControlError("peer credentials are unavailable on Windows")
     getpeereid = getattr(peer, "getpeereid", None)
     if getpeereid is not None:
         uid, _gid = getpeereid()
@@ -279,9 +278,6 @@ class ControlServer:
         self._on_flush = on_flush
         self._on_stop = on_stop
         self._peer_uid_getter = peer_uid_getter or _platform_peer_uid
-        self._filesystem_peer_authority = (
-            peer_uid_getter is None and sys.platform == "win32"
-        )
         self._rename_noreplace = rename_noreplace or _rename_noreplace
         self._server: asyncio.AbstractServer | None = None
         self._closing = False
@@ -438,12 +434,7 @@ class ControlServer:
             return ControlResponse(
                 False, "unauthorized", "peer credentials unavailable"
             )
-        if uid is None:
-            if not self._filesystem_peer_authority:
-                return ControlResponse(
-                    False, "unauthorized", "peer credentials unavailable"
-                )
-        elif uid != os.geteuid():
+        if uid is None or uid != os.geteuid():
             return ControlResponse(
                 False, "unauthorized", "peer uid does not own recorder"
             )
@@ -507,6 +498,7 @@ class ControlServer:
         if server is not None:
             server.close()
         current = asyncio.current_task()
+        force_deadline: float | None = None
         await asyncio.sleep(0)
         while True:
             pending = [task for task in self._handlers if task is not current]
@@ -515,42 +507,46 @@ class ControlServer:
             if force_exit_event is None:
                 await asyncio.gather(*pending, return_exceptions=True)
             else:
-                settled = asyncio.gather(*pending, return_exceptions=True)
                 force_wait = asyncio.create_task(force_exit_event.wait())
                 done, _ = await asyncio.wait(
-                    (settled, force_wait), return_when=asyncio.FIRST_COMPLETED
+                    (*pending, force_wait), return_when=asyncio.FIRST_COMPLETED
                 )
                 if force_wait in done:
+                    force_deadline = (
+                        asyncio.get_running_loop().time()
+                        + CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS
+                    )
                     for task in pending:
                         task.cancel()
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*pending, return_exceptions=True),
-                            timeout=CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS,
-                        )
-                    except TimeoutError:
+                    _done, resistant = await asyncio.wait(
+                        pending,
+                        timeout=max(
+                            0.0,
+                            force_deadline - asyncio.get_running_loop().time(),
+                        ),
+                    )
+                    if resistant:
                         logger.error(
                             "Forced control shutdown left %d handler(s) pending",
-                            sum(not task.done() for task in pending),
+                            len(resistant),
                         )
-                    settled.cancel()
-                    await asyncio.gather(settled, return_exceptions=True)
                     force_wait.cancel()
-                    await asyncio.gather(force_wait, return_exceptions=True)
                     break
                 force_wait.cancel()
-                await asyncio.gather(force_wait, return_exceptions=True)
             await asyncio.sleep(0)
         if server is not None:
             if force_exit_event is None or not force_exit_event.is_set():
                 await server.wait_closed()
             else:
-                try:
-                    await asyncio.wait_for(
-                        server.wait_closed(),
-                        timeout=CONTROL_FORCE_CLOSE_TIMEOUT_SECONDS,
-                    )
-                except TimeoutError:
+                close_wait = asyncio.create_task(server.wait_closed())
+                remaining = max(
+                    0.0,
+                    (force_deadline or asyncio.get_running_loop().time())
+                    - asyncio.get_running_loop().time(),
+                )
+                done, _pending = await asyncio.wait({close_wait}, timeout=remaining)
+                if close_wait not in done:
+                    close_wait.cancel()
                     logger.error("Forced control shutdown left server clients open")
         owned = self._owned_identity
         self._owned_identity = None

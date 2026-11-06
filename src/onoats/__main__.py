@@ -85,6 +85,7 @@ from onoats.runtime import (  # noqa: E402
     _write_status_stopped,
     flush_and_rotate,
     run_crash_recovery,
+    run_recorder_event_loop,
     stop_pipeline_for_shutdown,
     stt_banner,
     wait_or_force,
@@ -552,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
     try:
-        return asyncio.run(
+        return run_recorder_event_loop(
             run_onoats(interactive=args.interactive, locked_category=args.category)
         )
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:

@@ -3133,12 +3133,26 @@ def test_recorder_drain_deadline_does_not_wait_for_suppressed_cancellation(
     asyncio.run(run())
 
 
-def test_supervisor_process_exit_is_bounded_after_cancellation_resistance(tmp_path):
+@pytest.mark.parametrize("supervisor_outcome", ["return", "raise"])
+def test_supervisor_process_exit_is_bounded_after_cancellation_resistance(
+    tmp_path, supervisor_outcome
+):
     """Owned cleanup completes before the explicit hard process boundary."""
-    cleanup_marker = tmp_path / "cleanup-complete"
+    cleanup_marker = tmp_path / f"cleanup-complete-{supervisor_outcome}"
+    outcome = (
+        'raise RuntimeError("unexpected supervisor failure")'
+        if supervisor_outcome == "raise"
+        else "return 0"
+    )
+    resistance = (
+        "asyncio.get_running_loop().run_in_executor(None, threading.Event().wait)"
+        if supervisor_outcome == "raise"
+        else "asyncio.create_task(resist_forever())"
+    )
     script = textwrap.dedent(
         f"""
         import asyncio
+        import threading
         from pathlib import Path
         from onoats import cli
 
@@ -3152,9 +3166,9 @@ def test_supervisor_process_exit_is_bounded_after_cancellation_resistance(tmp_pa
                     continue
 
         async def fake_supervisor(_rest, *, config=None):
-            asyncio.create_task(resist_forever())
+            {resistance}
             try:
-                return 0
+                {outcome}
             finally:
                 Path({str(cleanup_marker)!r}).write_text("done", encoding="utf-8")
 

@@ -71,6 +71,7 @@ from onoats.runtime import (  # noqa: E402
     flush_and_rotate,
     log_stt_server_rss,
     run_crash_recovery,
+    run_recorder_event_loop,
     stop_pipeline_for_shutdown,
     stt_banner,
     wait_or_force,
@@ -1031,7 +1032,7 @@ def main(argv: list[str] | None = None, *, session_config=None, config=None) -> 
     if rc is not None:
         return rc
     try:
-        rc = asyncio.run(
+        rc = run_recorder_event_loop(
             run_onoats_dual(
                 live_terminal=args.live_terminal,
                 locked_category=args.category,
