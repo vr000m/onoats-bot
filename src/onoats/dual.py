@@ -845,6 +845,7 @@ async def run_onoats_dual(
             shutdown_complete.set()
 
     async def _run_shutdown() -> None:
+        nonlocal ended_by_error
         logger.info(
             "Shutdown: graceful dual-input shutdown started. Press Ctrl+C again to force."
         )
@@ -866,6 +867,7 @@ async def run_onoats_dual(
             try:
                 await lifecycle.terminal_rotation("Shutdown")
             except Exception as exc:
+                ended_by_error = True
                 logger.error(
                     f"Shutdown: flush rotation failed ({exc}). "
                     "Session file preserved in .active/ for crash recovery."

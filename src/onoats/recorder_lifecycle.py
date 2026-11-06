@@ -97,7 +97,9 @@ class RecorderLifecycleController:
             self._state = LifecycleState.STOPPING
             self.shutdown_event.set()
             try:
-                await self._rotate(reason, False)
+                completed = await self._rotate(reason, False)
+                if not completed:
+                    raise LifecycleRotationError("terminal rotation failed")
             finally:
                 self._state = LifecycleState.STOPPED
             return True

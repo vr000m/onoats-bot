@@ -266,6 +266,42 @@ async def test_failed_terminal_rotation_never_reopens_continuations() -> None:
     assert calls == [("terminal error", False)]
 
 
+@pytest.mark.parametrize("outcome", [True, False, "raise"])
+@pytest.mark.parametrize("admit_stop_first", [False, True])
+@_async_test
+async def test_terminal_rotation_outcome_whole_state_space(
+    outcome: bool | str, admit_stop_first: bool
+) -> None:
+    """Callback outcome controls success without reopening terminal admission."""
+    calls: list[tuple[str, bool]] = []
+
+    async def rotate(reason: str, continue_session: bool) -> bool:
+        calls.append((reason, continue_session))
+        if outcome == "raise":
+            raise OSError("rotation callback raised")
+        return outcome
+
+    controller = RecorderLifecycleController(rotate)
+    if admit_stop_first:
+        assert await controller.stop("stop") is True
+
+    if outcome is True:
+        assert await controller.terminal_rotation("terminal") is True
+    elif outcome is False:
+        with pytest.raises(LifecycleRotationError, match="terminal rotation failed"):
+            await controller.terminal_rotation("terminal")
+    else:
+        with pytest.raises(OSError, match="rotation callback raised"):
+            await controller.terminal_rotation("terminal")
+
+    assert controller.state == "stopped"
+    assert controller.shutdown_event.is_set()
+    assert calls == [("terminal", False)]
+    assert await controller.terminal_rotation("duplicate") is False
+    with pytest.raises(LifecycleStoppingError):
+        await controller.flush("late continuation")
+
+
 @_async_test
 async def test_failed_continuation_rotation_is_reported_without_stopping_session() -> (
     None
@@ -295,6 +331,38 @@ def test_lifecycle_controller_is_a_stdlib_only_leaf() -> None:
             name for name in names if name == "onoats" or name.startswith("onoats.")
         )
     assert forbidden == []
+
+
+@pytest.mark.parametrize("entrypoint", ["src/onoats/__main__.py", "src/onoats/dual.py"])
+def test_recorder_entrypoints_mark_terminal_rotation_failure(entrypoint: str) -> None:
+    """Both recorder return-code owners convert rotation failure to rc=1 state."""
+    tree = ast.parse((ROOT / entrypoint).read_text(encoding="utf-8"))
+    shutdown = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_shutdown"
+    )
+    terminal_try = next(
+        node
+        for node in ast.walk(shutdown)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(child, ast.Attribute)
+            and child.attr == "terminal_rotation"
+            for child in ast.walk(node)
+        )
+    )
+    assert any(
+        isinstance(child, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "ended_by_error"
+            for target in child.targets
+        )
+        and isinstance(child.value, ast.Constant)
+        and child.value.value is True
+        for handler in terminal_try.handlers
+        for child in ast.walk(handler)
+    )
 
 
 def test_control_server_has_no_second_lifecycle_lock_or_stopping_event_owner() -> None:
