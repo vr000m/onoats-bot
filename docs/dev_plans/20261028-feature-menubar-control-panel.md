@@ -683,6 +683,21 @@ sequenceDiagram
 
 ## Findings
 
+- 2026-11-05 — Round 8 makes force exit a complete process contract. Lifecycle
+  continuation and terminal rotations, accepted control handlers, direct
+  recorder event loops, and the socket supervisor all share bounded settlement;
+  no deadline path re-awaits cancellation-resistant work. Unexpected supervisor
+  exceptions now cross the same cleanup and hard-exit boundary before they are
+  re-raised. The pre-fix mutation failed all resistant-work and exception cells;
+  the focused 331-test lifecycle/control/supervisor matrix and 194 adjacent CLI
+  tests pass after restoration. Linux decodes `struct ucred` as signed PID plus
+  unsigned UID/GID. Windows control requests fail closed because Python exposes
+  no peer UID and `chmod` proves no restrictive DACL. The reusable native guide
+  now describes rollback as a run-scoped preflight decision; this plan retains
+  this release's clean-install restriction. Sibling-plan search found no
+  materially superseded decision. Full verification: 7,801 passed, 13 skipped;
+  Ruff format/check, review markers, whitespace, and native build pass.
+
 - 2026-11-05 — Round 5 boundary remediation keeps `control_socket.py` and
   `ui_telemetry.py` as package-independent stdlib leaves. Recorder entrypoints
   now inject the sole `_atomic_fs` no-replace implementation, while the shared
