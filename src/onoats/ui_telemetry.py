@@ -46,6 +46,7 @@ DETAIL_LIMIT = 256
 MAX_SNAPSHOT_BYTES = 64 * 1024
 _AT_FDCWD = -2
 _RENAME_EXCL = 0x00000004
+_RENAME_NOREPLACE = 0x00000001
 
 STT_STATES = frozenset({"failed", "recovering", "starting", "unknown", "ready"})
 STT_PRECEDENCE = ("failed", "recovering", "starting", "unknown", "ready")
@@ -645,27 +646,30 @@ def _restore_quarantined(quarantined: Path, public_path: Path) -> None:
 def _rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically rename any entry type without replacing ``destination``.
 
-    macOS exposes this contract as ``renameatx_np(RENAME_EXCL)``.  Keeping the
-    operation in one syscall is essential: a pathname check followed by plain
-    rename could overwrite a publisher that wins the intervening race.
+    macOS exposes this contract as ``renameatx_np(RENAME_EXCL)`` and Linux as
+    ``renameat2(RENAME_NOREPLACE)``.  Keeping the operation in one syscall is
+    essential: a pathname check followed by plain rename could overwrite a
+    publisher that wins the intervening race.
     """
     renameatx_np = _rename_noreplace_symbol()
-    if renameatx_np is None:
+    renameat2 = _renameat2_symbol() if renameatx_np is None else None
+    operation = renameatx_np or renameat2
+    if operation is None:
         raise NotImplementedError("atomic no-replace rename is unavailable")
-    renameatx_np.argtypes = [
+    operation.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_uint,
     ]
-    renameatx_np.restype = ctypes.c_int
-    result = renameatx_np(
+    operation.restype = ctypes.c_int
+    result = operation(
         _AT_FDCWD,
         os.fsencode(source),
         _AT_FDCWD,
         os.fsencode(destination),
-        _RENAME_EXCL,
+        _RENAME_EXCL if renameatx_np is not None else _RENAME_NOREPLACE,
     )
     if result == 0:
         return
@@ -679,5 +683,9 @@ def _rename_noreplace_symbol() -> Any | None:
     return getattr(ctypes.CDLL(None, use_errno=True), "renameatx_np", None)
 
 
+def _renameat2_symbol() -> Any | None:
+    return getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+
+
 def _rename_noreplace_available() -> bool:
-    return _rename_noreplace_symbol() is not None
+    return _rename_noreplace_symbol() is not None or _renameat2_symbol() is not None

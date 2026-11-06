@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -43,7 +44,10 @@ def _async_test(function):
 @pytest.fixture
 def control_data_dir():
     """Keep the AF_UNIX path below macOS's short sockaddr_un limit."""
-    path = Path("/private/tmp") / f"oc{uuid.uuid4().hex[:8]}"
+    short_root = Path("/private/tmp")
+    if not short_root.is_dir():
+        short_root = Path(tempfile.gettempdir())
+    path = short_root / f"oc{uuid.uuid4().hex[:8]}"
     path.mkdir()
     try:
         yield path

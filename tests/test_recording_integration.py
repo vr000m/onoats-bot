@@ -205,7 +205,10 @@ def test_full_supervisor_socket_pipeline_requires_durable_me_speech(
     speech = struct.pack("<320h", *([sample] * 320))
     chunks = [speech] * 20 + [bytes(640)] * 25
     capturer = _write_capturer_fixture(tmp_path, chunks)
-    short_root = Path(tempfile.mkdtemp(prefix="onoats-ri-", dir="/private/tmp"))
+    system_short_root = Path("/private/tmp")
+    if not system_short_root.is_dir():
+        system_short_root = Path(tempfile.gettempdir())
+    short_root = Path(tempfile.mkdtemp(prefix="onoats-ri-", dir=system_short_root))
     request.addfinalizer(lambda: shutil.rmtree(short_root, ignore_errors=True))
     data_dir = short_root / "data"
     monkeypatch.setenv("AUDIO_SOURCE", "socket")
