@@ -95,9 +95,11 @@ registry dep, not a git pin).
   normal drain handlers, SIGINT/SIGTERM cancel startup through the supervisor's
   authoritative `finally`. Cancellation during spawn first retains the child
   handle, so the capturer group is still reaped. A signal that lands while that
-  `finally` is already tearing down is deferred (`_run_teardown_step` +
-  `CancellationLedger`): every teardown step still runs, and a start failure or
-  non-zero rc is never masked as a clean stop. The app waits for owned child
+  `finally` is already tearing down is deferred
+  (`CancellationLedger.run_to_completion` in `onoats._closing`): every teardown
+  step still runs — including when the signal lands in the same event-loop turn
+  a step finishes, whose result is kept — and a start failure, non-zero rc, or
+  surviving capturer group is never masked as a clean stop. The app waits for owned child
   exit on Quit; its bounded timeout keeps the app alive with an error rather
   than killing the supervisor before capturer cleanup.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →
@@ -578,9 +580,13 @@ its scope; this list is a pointer, not the contract itself.
   a hung server's closing handshake can never block a caller forever, plus
   `CancellationLedger` — the one implementation of the "attempt every step,
   remember a cancellation, re-raise it once" invariant, composed by
-  `close_quietly` and by `_graceful_close` (which cannot use
+  `close_quietly`, by `_graceful_close` (which cannot use
   `close_quietly` for its whole sequence because it must join the reader
-  task *between* the two closers).
+  task *between* the two closers), and by the socket supervisor's
+  authoritative teardown `finally` through `run_to_completion` (a shielded
+  step runner that returns each step's outcome; only a cancellation of the
+  step itself propagates, never a caller cancellation that lands in the same
+  turn the step finishes). Do not hand-roll another shield-and-remember loop.
 - `src/onoats/_event_loop.py` — the one bounded loop teardown for direct recorder
   and supervisor process boundaries. Pending-task cancellation uses the caller's
   grace; loop finalizers use a separate positive deadline so zero remains a valid

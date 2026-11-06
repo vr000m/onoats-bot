@@ -2988,7 +2988,7 @@ def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monke
 
 
 @pytest.mark.parametrize("teardown_ok", [True, False])
-@pytest.mark.parametrize("signal_in_teardown", [False, True])
+@pytest.mark.parametrize("signal_in_teardown", ["none", "mid-step", "same-turn"])
 @pytest.mark.parametrize("body", ["rc0", "rc1", "start-failure", "startup-signal"])
 def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
     sup_env, monkeypatch, body, signal_in_teardown, teardown_ok
@@ -2998,7 +2998,10 @@ def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
     The startup handler stays installed until the recorder installs its own.
     A signal arriving while the authoritative ``finally`` is already tearing
     down (after a clean rc, a non-zero rc, or a start failure) must let every
-    teardown step finish and must not turn a failure into rc=0.
+    teardown step finish and must not turn a failure into rc=0. ``same-turn``
+    lands the signal in the event-loop turn ``_stop_capturer`` finishes, before
+    the shield wakes the supervisor: the step's result (``teardown_ok``) must
+    still be honoured, not discarded by a re-raised cancellation.
     """
     import tempfile as _tempfile
 
@@ -3060,16 +3063,27 @@ def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
 
         async def stop(*_args, **_kwargs):
             events.append("stop-start")
-            if signal_in_teardown:
+            if signal_in_teardown == "mid-step":
                 handlers[signal.SIGTERM]()
             await asyncio.sleep(0.01)
+            if signal_in_teardown == "same-turn":
+                # Runs before the step task's done callbacks (the shield's
+                # wake-up), i.e. in the same loop turn the step finishes.
+                asyncio.get_running_loop().call_soon(handlers[signal.SIGTERM])
             events.append("stop-done")
             return teardown_ok
+
+        real_await_stderr = cli._await_stderr_reader
+
+        async def await_stderr(stderr_task):
+            await real_await_stderr(stderr_task)
+            events.append("stderr-joined")
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
         monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
         monkeypatch.setattr(cli, "_run_recorder_with_capturer", recorder)
         monkeypatch.setattr(cli, "_stop_capturer", stop)
+        monkeypatch.setattr(cli, "_await_stderr_reader", await_stderr)
         return await asyncio.wait_for(
             cli._supervise_socket_session([]), timeout=SUP_TIMEOUT
         )
@@ -3085,7 +3099,7 @@ def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
         expected = 0 if body in ("rc0", "startup-signal") and teardown_ok else 1
         assert asyncio.run(run()) == expected
 
-    assert events == ["stop-start", "stop-done"]
+    assert events == ["stop-start", "stop-done", "stderr-joined"]
     assert minted and all(not Path(path).exists() for path in minted)
     assert {key: os.environ.get(key) for key in socket_keys} == prior
 

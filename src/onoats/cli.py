@@ -28,10 +28,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
-
-if TYPE_CHECKING:
-    from onoats._closing import CancellationLedger
+from typing import NamedTuple
 
 PID_FILENAME = "onoats.pid"
 
@@ -863,8 +860,8 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
         # replace the body's own outcome.
         teardown_ledger = CancellationLedger()
         if capturer_proc is not None:
-            teardown_ok = await _run_teardown_step(
-                _stop_capturer(capturer_proc, logger), teardown_ledger
+            teardown_ok = await teardown_ledger.run_to_completion(
+                _stop_capturer(capturer_proc, logger)
             )
             if not teardown_ok:
                 teardown_failed = True
@@ -874,7 +871,7 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
             # the reader a bounded grace to consume it (flushing any final
             # lines to the log), then cancel. Bounded so a leaked fd can never
             # hang teardown; cancellation is safe (readline is the only await).
-            await _run_teardown_step(_await_stderr_reader(stderr_task), teardown_ledger)
+            await teardown_ledger.run_to_completion(_await_stderr_reader(stderr_task))
         # Remove the private socket dir. Best-effort: a leftover here is harmless
         # (next generation mints a new one), but tidy up so private dirs don't
         # accumulate under the system temp root across restarts.
@@ -914,25 +911,6 @@ async def _await_stderr_reader(stderr_task) -> None:
         await asyncio.wait_for(stderr_task, timeout=_STDERR_READER_GRACE_SEC)
     except TimeoutError:
         pass
-
-
-async def _run_teardown_step(awaitable, ledger: CancellationLedger):
-    """Run one self-bounded teardown step to completion despite cancellation.
-
-    A cancellation of the caller is remembered in ``ledger`` (re-raised by the
-    caller once every step has run) instead of abandoning the step. Only a
-    cancellation of the step itself propagates.
-    """
-    import asyncio
-
-    step = asyncio.ensure_future(awaitable)
-    while True:
-        try:
-            return await asyncio.shield(step)
-        except asyncio.CancelledError as exc:
-            if step.done():
-                raise
-            ledger.remember(exc)
 
 
 async def _wait_for_sockets(

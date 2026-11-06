@@ -70,8 +70,10 @@ class CancellationLedger:
     """The "attempt every step, remember a cancellation, re-raise it once"
     invariant, as a composable object.
 
-    :func:`close_quietly` is built on this, and so is
-    ``WebSocketSTTService._graceful_close`` — which cannot use
+    :func:`close_quietly` is built on this, and so is the socket
+    supervisor's authoritative teardown ``finally``
+    (``cli._supervise_socket_session_inner``, via :meth:`run_to_completion`),
+    and so is ``WebSocketSTTService._graceful_close`` — which cannot use
     ``close_quietly`` for its whole sequence because it must join the reader
     task *between* the two closers, and so used to hand-roll this same
     invariant in parallel. Two independent implementations of a rule whose
@@ -106,6 +108,42 @@ class CancellationLedger:
         a step that needs side effects this class cannot run for it (the
         reader join's ``reader.cancel()``)."""
         self._cancelled = exc
+
+    async def run_to_completion(self, awaitable):
+        """Drive one self-bounded step to completion despite caller cancellation.
+
+        Unlike :meth:`attempt`, the step's result (or its own exception) is
+        returned to the caller, and the step is never abandoned: it runs as a
+        task behind :func:`asyncio.shield`, so cancelling the caller cannot
+        reach it. Used where a teardown sequence needs each step's outcome —
+        the socket supervisor's authoritative ``finally``.
+
+        Contract (``step`` x caller-cancellation):
+
+        * The caller is cancelled while the step is still pending: remember
+          the cancellation and keep waiting for the step.
+        * The caller is cancelled in the same event-loop turn the step
+          finishes (the shield's outer future is cancelled, but the step
+          already holds its outcome): remember the cancellation and return the
+          step's result, or raise the step's own exception. ``step.done()``
+          alone is NOT evidence that the step itself was cancelled.
+        * Only a cancellation *of the step itself* (``step.cancelled()``)
+          propagates from here.
+
+        The caller re-raises any remembered cancellation via
+        :meth:`raise_if_cancelled` once every step has run. The step must be
+        bounded on its own; this method adds no deadline.
+        """
+        step = asyncio.ensure_future(awaitable)
+        while True:
+            try:
+                return await asyncio.shield(step)
+            except asyncio.CancelledError as exc:
+                if step.done() and step.cancelled():
+                    raise
+                self._cancelled = exc
+                if step.done():
+                    return step.result()
 
     def raise_if_cancelled(self) -> None:
         """Re-raise the remembered cancellation, if any. Call last."""
