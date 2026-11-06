@@ -552,7 +552,7 @@ def _pending_files(pending_dir: Path) -> list[Path]:
     return sorted(pending_dir.glob("*.jsonl"))
 
 
-def _run_supervisor_bounded(rest=None) -> int:
+def _run_supervisor_bounded(rest=None, **supervisor_kwargs) -> int:
     """Run the synchronous supervisor in a worker thread, bounded by SUP_TIMEOUT.
 
     The supervisor runs its own ``asyncio.run`` loop, so it must NOT be called
@@ -565,7 +565,7 @@ def _run_supervisor_bounded(rest=None) -> int:
 
     def _target() -> None:
         try:
-            box["rc"] = cli._run_socket_supervisor(rest or [])
+            box["rc"] = cli._run_socket_supervisor(rest or [], **supervisor_kwargs)
         except BaseException as exc:  # noqa: BLE001 - surfaced to the test
             box["exc"] = exc
 
@@ -748,8 +748,8 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
     """
     from onoats.transports.socket_audio import SocketHandshakeError
 
-    async def _raise_handshake(rest, *, session_config=None):
-        del session_config
+    async def _raise_handshake(rest, *, config=None):
+        del config
         raise SocketHandshakeError("stale/foreign capturer: handshake nonce mismatch")
 
     monkeypatch.setattr(cli, "_supervise_socket_session", _raise_handshake)
@@ -2838,6 +2838,52 @@ def test_supervisor_startup_failure_cleanup_whole_state_space(
     assert _run_supervisor_bounded([]) == 1
     assert minted and all(not Path(path).exists() for path in minted)
     assert {key: os.environ.get(key) for key in keys} == expected
+
+
+@pytest.mark.parametrize("prior_identity", [None, "stale-generation"])
+def test_supervisor_snapshot_uses_exact_minted_generation_identity(
+    sup_env, monkeypatch, prior_identity
+):
+    """Empty and stale caller identities are replaced before snapshot capture."""
+    import secrets as _secrets
+
+    from onoats import runtime
+    from onoats.config import load_config
+
+    for key in (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    ):
+        if prior_identity is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, prior_identity)
+    config = load_config()
+    monkeypatch.setattr(_secrets, "token_hex", lambda _size: "a" * 32)
+    captured: list[tuple[str | None, str | None, str | None]] = []
+
+    def capture(_cls, supplied_config=None):
+        captured.append(
+            (
+                supplied_config.mic_socket,
+                supplied_config.system_socket,
+                supplied_config.capturer_nonce,
+            )
+        )
+        raise ValueError("stop after generation capture")
+
+    monkeypatch.setattr(
+        runtime.RecorderSessionConfig, "capture", classmethod(capture)
+    )
+
+    assert _run_supervisor_bounded([], config=config) == 1
+    assert len(captured) == 1
+    mic_socket, system_socket, nonce = captured[0]
+    assert mic_socket is not None and mic_socket.endswith("/mic.sock")
+    assert system_socket is not None and system_socket.endswith("/system.sock")
+    assert Path(mic_socket).parent == Path(system_socket).parent
+    assert nonce == "a" * 32
 
 
 @pytest.mark.parametrize("ready", [False, True], ids=["startup", "running"])

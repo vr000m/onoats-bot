@@ -114,6 +114,7 @@ def _cmd_bot(rest: list[str]) -> int:
     The branch is read here (and only here) so the PortAudio path never imports
     or touches the supervisor / socket machinery.
     """
+    from onoats.config import load_config
     from onoats.dual import _parse_args
     from onoats.runtime import RecorderSessionConfig
 
@@ -135,12 +136,15 @@ def _cmd_bot(rest: list[str]) -> int:
     if args.source:
         os.environ["AUDIO_SOURCE"] = args.source
 
-    session_config = RecorderSessionConfig.capture()
-    if session_config.audio_source == "socket":
-        return _run_socket_supervisor(rest, session_config=session_config)
+    config = load_config()
+    if config.audio_source == "socket":
+        # The supervisor must capture the immutable recorder snapshot only after
+        # it has minted and exported this generation's socket paths + nonce.
+        return _run_socket_supervisor(rest, config=config)
 
     from onoats.dual import main as dual_main
 
+    session_config = RecorderSessionConfig.capture(config)
     return dual_main(rest, session_config=session_config)
 
 
@@ -504,7 +508,7 @@ class CapturerTeardownError(RuntimeError):
     """The supervisor could not retire its owned capturer process group."""
 
 
-def _run_socket_supervisor(rest: list[str], *, session_config=None) -> int:
+def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
     """Synchronous entry: drive the async socket session, mirror dual.main's rc.
 
     Returns 0 on a clean recorder shutdown, non-zero on any fail-loud path
@@ -520,7 +524,7 @@ def _run_socket_supervisor(rest: list[str], *, session_config=None) -> int:
 
     try:
         return _asyncio.run(
-            _supervise_socket_session(rest, session_config=session_config)
+            _supervise_socket_session(rest, config=config)
         )
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         # Mirror dual.main: actionable hint, not a traceback.
@@ -538,7 +542,7 @@ def _run_socket_supervisor(rest: list[str], *, session_config=None) -> int:
         return 1
 
 
-async def _supervise_socket_session(rest: list[str], *, session_config=None) -> int:
+async def _supervise_socket_session(rest: list[str], *, config=None) -> int:
     """Own startup signals until the recorder installs its drain handlers."""
     import asyncio
     import signal
@@ -566,9 +570,7 @@ async def _supervise_socket_session(rest: list[str], *, session_config=None) -> 
             previous[sig] = signal.getsignal(sig)
             loop.add_signal_handler(sig, stop_startup)
     try:
-        return await _supervise_socket_session_inner(
-            rest, session_config=session_config
-        )
+        return await _supervise_socket_session_inner(rest, config=config)
     except asyncio.CancelledError:
         if not requested:
             raise
@@ -579,9 +581,7 @@ async def _supervise_socket_session(rest: list[str], *, session_config=None) -> 
             signal.signal(sig, handler)
 
 
-async def _supervise_socket_session_inner(
-    rest: list[str], *, session_config=None
-) -> int:
+async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> int:
     """Mint sockets + nonce, spawn the capturer, run the recorder, tear down.
 
     Runs the recorder and a capturer-exit watcher concurrently in one event
@@ -678,8 +678,7 @@ async def _supervise_socket_session_inner(
         # same object crosses supervisor preflight and the recorder entrypoint.
         from onoats.runtime import RecorderSessionConfig, _preflight_diarization
 
-        if session_config is None:
-            session_config = RecorderSessionConfig.capture()
+        session_config = RecorderSessionConfig.capture(config)
         if session_config.diarization:
             _preflight_diarization(session_config)
 

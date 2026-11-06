@@ -67,7 +67,7 @@ def test_bot_routes_to_dual(monkeypatch):
         return 0
 
     monkeypatch.setattr(
-        "onoats.runtime.RecorderSessionConfig.capture", lambda: snapshot
+        "onoats.runtime.RecorderSessionConfig.capture", lambda _config: snapshot
     )
     monkeypatch.setattr("onoats.dual.main", fake_main)
     rc = cli.main(["bot", "--live-terminal"])
@@ -103,16 +103,16 @@ def test_bot_source_socket_flag_enters_supervisor(monkeypatch):
     monkeypatch.setenv("AUDIO_SOURCE", "portaudio")
     called = {}
 
-    def fake_supervisor(rest, *, session_config=None):
+    def fake_supervisor(rest, *, config=None):
         called["rest"] = rest
-        called["session_config"] = session_config
+        called["config"] = config
         return 0
 
     monkeypatch.setattr(cli, "_run_socket_supervisor", fake_supervisor)
     rc = cli.main(["bot", "--source", "socket"])
     assert rc == 0
     assert called["rest"] == ["--source", "socket"]
-    assert called["session_config"].audio_source == "socket"
+    assert called["config"].audio_source == "socket"
 
 
 def test_bot_source_portaudio_flag_overrides_socket_env(monkeypatch):
@@ -138,14 +138,12 @@ def test_bot_source_rejects_unknown_backend(capsys):
 
 
 @pytest.mark.parametrize("source", ["portaudio", "socket"])
-def test_bot_captures_once_and_threads_exact_snapshot_to_selected_backend(
-    monkeypatch, source
-):
+def test_bot_captures_snapshot_at_backend_ownership_boundary(monkeypatch, source):
     snapshot = SimpleNamespace(audio_source=source)
     captures: list[object] = []
     received: list[object] = []
 
-    def capture():
+    def capture(_config=None):
         captures.append(snapshot)
         return snapshot
 
@@ -153,8 +151,8 @@ def test_bot_captures_once_and_threads_exact_snapshot_to_selected_backend(
         received.append(session_config)
         return 0
 
-    def supervisor(_rest, *, session_config=None):
-        received.append(session_config)
+    def supervisor(_rest, *, config=None):
+        received.append(config)
         return 0
 
     monkeypatch.setattr("onoats.runtime.RecorderSessionConfig.capture", capture)
@@ -162,8 +160,13 @@ def test_bot_captures_once_and_threads_exact_snapshot_to_selected_backend(
     monkeypatch.setattr(cli, "_run_socket_supervisor", supervisor)
 
     assert cli.main(["bot", "--source", source]) == 0
-    assert captures == [snapshot]
-    assert received == [snapshot]
+    if source == "portaudio":
+        assert captures == [snapshot]
+        assert received == [snapshot]
+    else:
+        assert captures == []
+        assert len(received) == 1
+        assert received[0].audio_source == "socket"
 
 
 def _recorder(called):
