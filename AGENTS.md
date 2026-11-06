@@ -597,6 +597,14 @@ its scope; this list is a pointer, not the contract itself.
   any `onoats` module or grow a second syscall implementation.
   Audio levels must be finite and inside `[0.0, 1.0]`; invalid values are rejected
   without advancing the branch observation time, never clamped.
+- `src/onoats_contracts/` — a separate, stdlib-only top-level package (shipped
+  in the wheel next to `onoats`) holding schema constants shared across process
+  boundaries. Today it is `ui_telemetry.py`: schema version, snapshot/audio
+  expiry, level bounds, transcript run-id pattern. `onoats.ui_telemetry` imports
+  only it (keeping that leaf free of `onoats` imports), and
+  `native/installed_recording_smoke.py` loads the same file by checkout path.
+  It must never import `onoats` or any third-party module; Swift mirrors are
+  pinned by `tests/test_native_contract_parity.py`.
 
 ## Wire-format contract
 
