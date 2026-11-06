@@ -64,6 +64,10 @@ The data directory is also fixed for the run. If the configured path changes
 while recording, the panel shows both **Recording to** and **Next recording**
 until the current session ends.
 
+Choose a data directory whose path is at most 75 bytes: a longer one makes
+Start fail because the recorder's control-socket path would exceed macOS's
+Unix-socket limit (see [configuration](configuration.md#data-location)).
+
 ## Status and activity
 
 The lifecycle status file is authoritative for recorder identity, liveness,

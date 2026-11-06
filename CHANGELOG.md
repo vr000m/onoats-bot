@@ -51,6 +51,9 @@ Annotated tags exist from `v0.9.0` forward.
   requests fail closed. Direct SIGUSR1/SIGTERM remain supported for terminals
   and service managers. See
   [docs/control-socket-contract.md](docs/control-socket-contract.md).
+  The data directory path must now be at most 75 bytes: longer paths push the
+  socket past macOS's 103-byte Unix-socket limit, and Start fails with
+  "configure a shorter ONOATS_DATA_DIR".
 - One lifecycle controller orders every Flush, Stop, signal and terminal
   rotation: a Stop admitted first rejects later Flushes; a Flush admitted
   first completes before Stop.

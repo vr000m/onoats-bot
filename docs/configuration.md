@@ -258,6 +258,13 @@ Set `[storage] data_dir`, `ONOATS_DATA_DIR`, or:
 onoats init --data-dir ~/some/other/root
 ~~~
 
+Keep the data directory path at most **75 bytes** (UTF-8, after `~`
+expansion). The recorder's control socket lives at
+`<data_dir>/.active/onoats-control.sock`, and macOS limits a Unix-socket path to
+103 bytes; with a longer data directory, Start fails (non-zero exit) with
+"control socket path exceeds Darwin's sockaddr_un limit; configure a shorter
+ONOATS_DATA_DIR", and `onoats flush`/`onoats stop` fail the same way.
+
 ### Sharing a queue
 
 Point `data_dir` at another worker's queue root:
