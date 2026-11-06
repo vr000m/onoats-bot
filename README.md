@@ -2,162 +2,20 @@
 
 **Always-on Organized Audio Transcript System** — [onoats.dev](https://onoats.dev)
 
-onoats is a standalone, local-first voice **recorder** plus a self-contained
-**converter** that turns recordings into readable markdown transcripts. It
-captures your microphone (*you*) and system/loopback audio (*them*) on separate
-streams, transcribes each, and writes one chronological transcript per session.
+onoats is a local-first voice recorder and transcript converter. It captures
+your microphone (**me**) and system audio (**them**) as separate streams,
+transcribes both, and writes chronological sessions as plain JSONL and Markdown.
 
-No API keys are required for the converter, and **no database** is ever opened —
-onoats emits plain JSONL session files to a filesystem queue and renders them to
-markdown. A downstream consumer can subscribe to the same filesystem queue for
-analysis; onoats itself stays files-only.
-
-## Quickstart
-
-The Onoats CLI is published on PyPI. The native macOS menu-bar app and capturer
-are source-built and are not distributed through PyPI. Choose an install path by
-platform and how you want to drive it:
-
-| Path | One command (after clone) | Works on |
-|------|---------------------------|----------|
-| **Menu bar + native capture** (recommended) | `make -C native setup` | macOS 14.4+ |
-| **CLI + native capture** | `make -C native setup-cli` | macOS 14.4+ |
-| **CLI + PortAudio** | `uv tool install onoats` then `onoats init` | everywhere else (Linux / Windows / Intel mac / macOS ≤ 14.3) — no native toolchain |
-
-### macOS 14.4+ — menu bar + native capture (recommended)
-
-Prerequisites on a fresh machine (everything else is handled by `setup`):
-
-```bash
-xcode-select --install    # Xcode Command Line Tools (swiftc, git, codesign)
-curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (installs the CLI)
-# then open a new shell (or follow the installer's PATH note) so `uv` resolves
-```
-
-```bash
-git clone https://github.com/vr000m/onoats-bot.git
-cd onoats-bot
-make -C native setup     # cert + build + sign Onoats.app → ~/Applications,
-                         # CLI → ~/.local/bin/onoats, then guided `onoats init`
-```
-
-`setup` walks you through configuration (`onoats init`: data dir, STT
-service, secrets — see [Configuration](#configuration)) and ends with
-**Onoats.app** installed. Launch it from `~/Applications` and record from
-the [menu bar](#menu-bar-macos); the first Start triggers the macOS
-permission prompts (microphone + system audio) — see the menu-bar section.
-`setup` is safe to re-run at every step (it never regenerates the signing
-cert or touches an existing config); reconfigure any time with `onoats init`
-or the menu bar's Settings, and update after a `git pull` with
-`make -C native install`. Details in [`native/README.md`](native/README.md).
-
-### macOS 14.4+ — CLI + native capture (no menu bar)
-
-Same prerequisites (Xcode CLT + uv), same native system-audio capture —
-without installing the app bundle:
-
-```bash
-git clone https://github.com/vr000m/onoats-bot.git
-cd onoats-bot
-make -C native setup-cli   # cert + build/sign the capturer,
-                           # CLI → ~/.local/bin/onoats, then guided `onoats init`
-```
-
-`setup-cli` ends by printing the exact run line — sessions need
-`AUDIO_SOURCE=socket` plus `ONOATS_CAPTURER_BIN` pointing at the signed
-capturer:
-
-```bash
-AUDIO_SOURCE=socket \
-ONOATS_CAPTURER_BIN=/path/to/onoats-bot/native/build/onoats-capturer \
-onoats bot
-```
-
-Like `setup`, it never regenerates the signing cert and never touches an
-existing `config.toml`. One caveat versus the menu-bar path: launched from a
-terminal, the macOS permission grants (microphone, system audio) attribute to
-the **terminal app**, not to onoats — see
-[`native/README.md`](native/README.md) for the TCC details.
-
-### Other platforms (and macOS below 14.4) — CLI + PortAudio
-
-```bash
-# Linux: PortAudio dev headers are needed to build pyaudio
-#   sudo apt-get install -y portaudio19-dev   # (macOS Homebrew ships them)
-
-# From PyPI (v1.1.0+) — no clone needed:
-uv tool install onoats            # baseline (PortAudio + Deepgram/TCP STT)
-# uv tool install 'onoats[macos]' # Apple Silicon: adds Whisper-MLX + Kokoro
-
-# Or from a checkout (development):
-git clone https://github.com/vr000m/onoats-bot.git
-cd onoats-bot
-uv tool install --editable .            # baseline
-# uv tool install --editable '.[macos]' # Apple Silicon extras
-
-onoats init                       # guided setup → config.toml + 0600 secrets.env
-onoats bot                        # dual-input recorder (mic + system loopback)
-onoats convert                    # render pending sessions → markdown transcripts
-```
-
-No native toolchain (no `make`, `swiftc`, or `codesign`) is needed on this
-path. Capturing system audio ("them") needs a loopback driver — install and
-routing in [docs/blackhole-fallback.md](docs/blackhole-fallback.md).
-
-Other subcommands:
-
-```bash
-onoats bot-single   # legacy mic-only recorder
-onoats flush        # generation-authenticated continuation rotation
-onoats stop         # generation-authenticated graceful drain + final flush
-onoats devices      # list audio input/output devices (PortAudio's view; under
-                    # the socket path it adds a note — the native capturer binds
-                    # the system default input / default-output tap instead)
-onoats status       # recorder pid / running state + data dir; names the capture
-                    # devices (socket: what the running session bound; PortAudio:
-                    # the configured [devices] names) and any live capture warning
-```
-
-## Cross-platform matrix
-
-| Capability                        | Linux / Windows / Intel mac | Apple Silicon mac |
-|-----------------------------------|-----------------------------|-------------------|
-| Audio capture (PortAudio)         | ✅ baseline                  | ✅ baseline        |
-| Hosted STT (Deepgram)             | ✅ baseline                  | ✅ baseline        |
-| Local STT over TCP (stt_server)   | ✅ baseline                  | ✅ baseline        |
-| Local Whisper-MLX (on-device)     | —                           | ✅ `[macos]` extra |
-| Kokoro TTS                        | —                           | ✅ `[macos]` extra |
-| System audio ("them") capture     | loopback driver-dependent   | ✅ native capturer ⁺ |
-| Speaker diarization (opt-in)      | —                           | ✅ `diarization` extra |
-
-⁺ On **macOS 14.4+** the default system-audio story is the **native capturer**
-(`AUDIO_SOURCE=socket` — Core Audio process tap, no virtual-audio driver; see
-[Menu bar (macOS)](#menu-bar-macos) and [Audio source](#audio-source) below).
-On macOS 13.x–14.3 (below the Core Audio tap API floor) and on other
-platforms, the fallback is a loopback driver on the default PortAudio path —
-setup in [docs/blackhole-fallback.md](docs/blackhole-fallback.md).
-
-The baseline ships **MLX-free**: `mlx-whisper` is only in the `[macos]` extra
-and its imports are lazy, so `onoats bot` runs off-mac with PortAudio plus
-either Deepgram or a TCP-reachable `pipecat-local-stt-server`.
-
-## Menu bar (macOS)
-
-`make -C native install` puts **Onoats.app** in `~/Applications`. Launch it
-from there — GUI launch matters: LaunchServices makes the app its own TCC
-permission subject (a terminal launch would attribute the permission grants to
-the terminal instead). It lives in the menu bar with no Dock icon. Clicking its
-stateful icon opens a compact window panel: Start or Stop is the dominant
-action, Seminar is immediately beside that workflow, and the gear opens the
-less-frequent settings and diagnostics without leaving the panel.
+There is no database. The converter needs no API keys, and downstream tools can
+consume the same filesystem queue without depending on onoats internals.
 
 <table>
   <tr>
     <td width="69%" valign="top">
-      <img src="assets/screenshots/onoats-menu-bar-panel.png" alt="Onoats menu-bar panel ready to record">
+      <img src="https://raw.githubusercontent.com/vr000m/onoats-bot/main/assets/screenshots/onoats-menu-bar-panel.png" alt="Onoats menu-bar panel ready to record">
     </td>
     <td width="31%" valign="top">
-      <img src="assets/screenshots/onoats-settings-panel.png" alt="Onoats settings panel">
+      <img src="https://raw.githubusercontent.com/vr000m/onoats-bot/main/assets/screenshots/onoats-settings-panel.png" alt="Onoats settings panel">
     </td>
   </tr>
   <tr>
@@ -166,302 +24,171 @@ less-frequent settings and diagnostics without leaving the panel.
   </tr>
 </table>
 
-- **Start / Stop / Flush** — Start runs the recorder (`onoats bot` with the
-  native capturer); Stop ends the session gracefully (the recorder drains
-  in-flight audio before rotating the buffer into the queue); Flush rotates
-  the current buffer into the queue mid-session. App-owned Stop terminates the
-  retained supervisor; a verified external session uses the identity-checked
-  `onoats stop` path instead.
-- External Stop and Flush use a recorder-owned Unix control socket, never a
-  normal-path PID signal. Each request includes the complete PID/start-epoch
-  generation and is accepted only from the same macOS uid; missing or legacy
-  recorder endpoints fail closed. Direct SIGUSR1/SIGTERM remain compatibility
-  inputs for terminal and service-manager control. All control and signal
-  requests enter the same recorder lifecycle controller: Flush admitted first
-  finishes its continuation rotation, while Stop admitted first rejects later
-  Flush requests.
-- **Seminar** — before Start, the toggle adds `--category seminars` to that next
-  recording only (other categories are classified downstream). It becomes a
-  read-only lock badge during the app-owned session and resets when the session
-  ends. Add `seminars` to `[categories] set` in `config.toml` first; otherwise
-  the failed-Start panel explains the configuration error and offers Open Config.
-- **Settings** — the gear opens the mic picker, STT service picker, data-directory
-  chooser, transcript-preview preference, config access, and Diagnostics. The
-  mic picker lists input devices; selecting one sets
-  the macOS **default input device** (system-wide — disclosed in the submenu),
-  because the capturer binds the system default at Start. A running session
-  keeps its device; recorder-setting changes apply on the next Start. Diagnostics
-  reports CLI availability and provides Open Log and Show Logs Folder. These
-  settings edit the same `~/.config/onoats/config.toml` the CLI reads — one
-  source of truth — except the UI-only transcript-preview preference.
-- **Devices** — Settings shows the current system default input/output,
-  i.e. the devices the capturer will actually bind (a guard against silently
-  recording the wrong device).
-- **Status and activity** — the lifecycle status file remains authoritative for
-  recorder identity, liveness, warnings, and failures. A separate display-only
-  telemetry snapshot supplies fresh Me/Them levels, per-branch STT health, the
-  locked category, and (when enabled) a bounded latest-transcript preview.
-  `Signal` means the branch has a fresh positive audio level, `Silent` means
-  its fresh level is zero, and `No signal` means that branch has not published
-  a fresh audio observation;
-  `Unavailable` means telemetry is missing, stale, malformed, unsupported, or
-  belongs to another run. STT is ready only when both websocket branches report
-  ready; whisper and deepgram show neutral `status not reported`. Telemetry
-  failure never stops recording or transcript persistence. The richer running
-  status is also fail-open after recorder PID/control ownership exists: if its
-  first write fails, recording and CLI control continue, telemetry stays off,
-  and the app uses the owned process exit plus its run log for the outcome.
-- **Session settings** — each Start captures one immutable STT/session snapshot.
-  Both transcription arms, status label, recovery policy, telemetry, diarization,
-  and shutdown diagnostics use those same values even if `config.toml` changes
-  mid-run; edits apply to the next Start.
-- **Transcript privacy** — the latest-transcript preview is off by default and
-  can be enabled in Settings. It is bounded and display-only; complete utterances
-  remain in the session JSONL.
-- **Active data directory** — the configured directory is snapshotted at Start
-  and stays authoritative for that run. If it changes while recording, the panel
-  shows both `Recording to:` and `Next recording:` until the next Start adopts it.
-- **Capture warning** — if a stream delivers only silence for ~30 s (e.g. the
-  system-audio permission was denied, or the mic is hardware-muted), the icon
-  gains a warning badge and the menu shows a hint naming the likely cause.
-  The session keeps recording; the warning clears on its own once real audio
-  arrives.
-- **Login item warning** — if `[app].launch_at_login` is set to something
-  other than `true`/`false`, or the `SMAppService` register/unregister call
-  fails, the menu shows a `⚠` hint naming the problem (e.g. an unrecognized
-  config value, or the register/unregister error). Syncing is best-effort on
-  every launch; the warning does not block Start/Stop.
-- **Logs** — each app-owned Start creates
-  `~/Library/Logs/Onoats/onoats-bot-<spawnEpoch>.log`; the newest ten are kept.
-  Warning/failure surfaces can Open Log, while Settings ▸ Diagnostics can also
-  reveal the folder. External sessions are labelled as not captured by the menu
-  bar, and log content is never rendered in the panel.
-- **First run (TCC prompts)** — the first Start prompts for **Microphone**
-  and records a **Screen & System Audio Recording** grant ("Onoats" appears
-  in both panes of System Settings ▸ Privacy & Security). The system-audio
-  prompt fires before the capture session starts streaming: the supervisor
-  extends its startup wait (+120 s) while the dialog is unanswered and the
-  menu bar shows "waiting for the system-audio permission prompt" — answer
-  at human speed and the session proceeds, no restart needed.
-  Grants persist across rebuilds and reinstalls (they key on the
-  signing identity, not the binary — see
-  [`native/README.md`](native/README.md)).
+## Quickstart
 
-The canonical grain-wave mark and wordmark live in [`assets/brand`](assets/brand),
-with the palette, spacing, and export rules in its README. The native header,
-app icon, and state-specific monochrome template icons are explicit exports in
-`native/onoats-menubar/Resources`; website work should reuse the canonical SVGs,
-not upscale those native raster files.
+### macOS 14.4+ — menu bar + native capture (recommended)
+
+Install the Xcode Command Line Tools and [uv](https://docs.astral.sh/uv/), then:
+
+~~~bash
+git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+make -C native setup
+~~~
+
+The setup command builds and signs **Onoats.app**, installs it in
+`~/Applications`, installs the CLI, and runs the guided configuration. Open
+the app and select **Start Recording**. The first run asks for microphone and
+system-audio permission.
+
+### macOS 14.4+ — CLI + native capture (no menu bar)
+
+~~~bash
+git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+make -C native setup-cli
+~~~
+
+This installs the CLI and signed native capturer without the app. The command
+prints the exact environment needed to start a socket-capture session.
+
+### Other platforms (and macOS below 14.4) — CLI + PortAudio
+
+~~~bash
+uv tool install onoats
+onoats init
+onoats bot
+~~~
+
+System-audio capture needs a loopback device on this path. See the
+[complete installation guide](https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md)
+for prerequisites,
+platform support, extras, native CLI usage, and the BlackHole fallback.
+
+## Everyday commands
+
+~~~bash
+onoats init         # configure storage, audio, and speech-to-text
+onoats bot          # record microphone + system audio
+onoats status       # inspect recorder state, devices, and warnings
+onoats flush        # rotate the current buffer without stopping
+onoats stop         # drain, rotate, and stop the recorder
+onoats convert      # render pending JSONL sessions as Markdown
+onoats devices      # list PortAudio devices
+~~~
+
+`onoats bot-single` remains available for legacy microphone-only recording.
+
+## How it works
+
+1. The recorder keeps microphone and system audio on separate branches.
+2. Each branch has its own STT session and produces canonical `me` or `them`
+   utterances.
+3. A completed or flushed session moves atomically into
+   `sessions/pending/`.
+4. `onoats convert`, or another queue consumer, claims the JSONL and renders
+   the result.
+
+The recorder never reconnects a failed native audio stream itself. Failures are
+bounded and loud; the supervisor owns restart, while partial transcripts still
+rotate into the queue.
+
+## Cross-platform matrix
+
+| Capability | Linux / Windows / Intel Mac | Apple Silicon Mac |
+|---|---|---|
+| CLI + PortAudio capture | ✅ | ✅ |
+| Hosted or local TCP STT | ✅ | ✅ |
+| Native system-audio capture | — | ✅ macOS 14.4+ |
+| Menu-bar app | — | ✅ macOS 14.4+ |
+| Local Whisper-MLX | — | ✅ `[macos]` extra |
+| Speaker diarization | — | ✅ opt-in extra |
+
+The baseline install is MLX-free. Native capture uses a Core Audio process tap
+and does not need a virtual loopback device.
+
+## Menu bar (macOS)
+
+The menu-bar app puts the common actions first:
+
+- **Start / Stop / Flush** control the current recorder generation.
+- **Seminar** locks that category for the next app-owned recording.
+- **Settings** manages the microphone, STT service, data directory, transcript
+  preview, configuration file, and diagnostics.
+- Live, display-only telemetry shows audio activity and STT health without
+  becoming an authority for capture or persistence.
+
+The app and CLI read the same `config.toml`. A running session snapshots its
+configuration and data directory, so edits apply to the next Start.
+
+See the [menu-bar guide](https://github.com/vr000m/onoats-bot/blob/main/docs/menu-bar.md)
+for permissions, status meanings,
+privacy controls, logs, warnings, login-item behaviour, and generation-bound
+Stop/Flush semantics.
 
 ## Configuration
 
-`onoats init` writes:
+`onoats init` writes `config.toml`, `secrets.env`, and `dictionary.txt`
+under `$XDG_CONFIG_HOME/onoats`. Process environment values override config
+files, which override built-in defaults.
 
-- `$XDG_CONFIG_HOME/onoats/config.toml` — `[storage]` (`data_dir`), `[devices]`
-  (by name), `[stt]` (`service`, `model`, `language` — `"en"` default, `"auto"`
-  = detect; whisper + websocket backends only; `ws_socket` or `ws_host` +
-  `ws_port` — the websocket STT endpoint, a Unix socket path or loopback TCP
-  (`ws_socket` outranks the pair; the `STT_WS_*` env vars outrank both; unset =
-  a live legacy `~/Library/Caches/pipecat-stt/stt.sock`, else `127.0.0.1:9565`);
-  `launchd_label` — optional
-  (overridable via the `STT_LAUNCHD_LABEL` env var, which takes precedence
-  over the config.toml value), the `launchctl` label to kickstart when the
-  websocket STT server is unreachable at startup or drops mid-session;
-  absent by default, in which case self-healing is skipped and today's
-  plain-failure behavior is unchanged. A configured label also authorises
-  Onoats to bootstrap an unloaded matching user launch agent at
-  `~/Library/LaunchAgents/<launchd_label>.plist`; the plist must be a regular,
-  user-owned file, must not be group/world-writable, and its `Label` must match.
-  It must also set `RunAtLoad=true`, so a successful bootstrap is the bounded
-  launch request and Onoats does not restart a server that is already booting.
-  Onoats never infers a launch agent from the endpoint port and never accepts an
-  arbitrary plist path. The label must match
-  `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` — any other value is logged and treated
-  as absent; `diarization` — true/false, default off, overridable via the
-  `ONOATS_DIARIZATION` env var, see
-  [Speaker diarization](#speaker-diarization-opt-in)), `[speakers]`
-  (render-only display labels), `[categories]`, `[tuning]`.
-- `[app].launch_at_login` (Onoats.app only — Python never reads this key) —
-  bare TOML `true`/`false` (a quoted `"true"`/`"false"` normalizes to the
-  same value, since `ConfigStore`'s reader strips surrounding quotes; any
-  other spelling, e.g. Python-style `True`, is treated the same as absent).
-  Checked once at every Onoats.app launch: absent means **no action at
-  all** — it will never silently opt you in, and it will never touch a
-  login item you registered out-of-band (e.g. directly in System Settings
-  ▸ Login Items). Explicit `false` unregisters. There is no menu toggle for
-  this — edit `config.toml` directly, then relaunch Onoats.app (or approve
-  it in System Settings ▸ Login Items if macOS holds it in
-  `.requiresApproval`) for the change to take effect.
-- `$XDG_CONFIG_HOME/onoats/secrets.env` — `0600`, STT secrets only
-  (`DEEPGRAM_API_KEY` / `STT_WS_TOKEN`). **No LLM keys.**
-- `$XDG_CONFIG_HOME/onoats/dictionary.txt` — `wrong: correct` substitutions
-  (applied by `convert`) + vocabulary terms (fed to STT as recognition bias).
-
-Precedence: **process env var > config.toml / secrets.env > built-in default**.
-So an automation driver can env-inject `ONOATS_DATA_DIR`, `STT_SERVICE`, etc.
-without editing the file. A few runtime-only knobs are env-only (no `config.toml`
-key) — notably the shutdown timers: on Ctrl+C the recorder drains the pipeline
-(up to `SHUTDOWN_DRAIN_TIMEOUT_SEC`, default `8.0`) so a final in-flight
-transcript lands before the flush, then hard-cancels (capped at
-`SHUTDOWN_CANCEL_TIMEOUT_SEC`, default `2.0`) if the drain stalls.
+The [configuration guide](https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md)
+documents every file, STT
+backend and endpoint, launchd self-healing, shutdown timing, and storage option.
 
 ### Speaker diarization (opt-in)
 
-Off by default. When on, onoats labels who is speaking on the **"them"**
-(system-audio) channel: lines render as `**Them (S1):**`, `**Them (S2):**`, …
-(speakers are numbered in order of first speech in the recorder run), and a window
-with two clearly active speakers renders as `Them (S1 / S2, overlapping)`, the
-more active speaker in that utterance first (so the order can differ between lines). The
-suffix is appended to your configured `[speakers]` label for `them`. The `me`
-channel is never labelled. `S1`/`S2` are per-run slots, not identities, and
-can be wrong (a speaker may be split across slots, or a quiet or overlapped
-stretch left unlabelled). A number is never reused within a run: a model slot
-that has been silent for more than 20 minutes gets a fresh number (`S9`, `S10`,
-… are possible) when it next speaks, so a label cannot silently move to a
-different person, at the cost of splitting someone who was quiet that long
-(tune it with `[stt].diarization_idle_remint_sec` or
-`ONOATS_DIARIZATION_IDLE_REMINT_SEC`, in seconds; a bad value falls back to the
-default with a warning). Names
-are not assigned by onoats; a consumer maps labels to names.
+Diarization labels speakers only on the **them** channel and requires websocket
+STT plus the `diarization` extra and locally cached model weights. It fails
+open during a session: transcription continues without labels.
 
-- **Enable:** `[stt].diarization = true` in `config.toml`, or
-  `ONOATS_DIARIZATION=1` (the env var wins). Accepted values (case-insensitive):
-  `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; a blank env value falls
-  through to `config.toml`. Any other value logs one warning and disables
-  diarization — a non-empty env value wins even when unrecognised, so
-  `ONOATS_DIARIZATION=maybe` turns off a `config.toml` `diarization = true`.
-- **Websocket STT only** (`STT_SERVICE=websocket`); any other backend exits
-  non-zero at startup. `onoats bot-single` ignores the flag with a warning.
-- **Install the extra** (Apple Silicon / macOS): from a checkout
-  `uv sync --extra diarization`; for a tool install
-  `uv tool install 'onoats[macos,diarization]'` (repeat any extras you already
-  have); with the native install, `make -C native install EXTRAS=macos,diarization`
-  (a plain `make -C native install` resets the extras to `macos`).
-- **Download the weights yourself** — they are never fetched automatically:
-  `uvx --from huggingface_hub hf download mlx-community/Nemotron-3-Diarization`
-  (or plain `hf download ...` if you already have `hf` on PATH). If the extra or the
-  weights are missing, `onoats bot` exits non-zero at startup with the exact
-  command to run (before any audio is captured). It also exits non-zero at
-  startup on a pipecat version whose STT segment ordering it cannot verify
-  (diarization labels depend on segments reaching the STT in order).
-- **Fails open.** If the diarizer fails mid-session, onoats logs one warning and
-  keeps recording; `them` lines continue unlabelled. A label can delay a `them`
-  line by up to about 1.5 s while the diarizer catches up.
-- **Known limitation:** a continuation flush (`Ctrl+T` / `onoats flush` /
-  SIGUSR1) can leave a `them` line that was still waiting for its label to land
-  in the next session file.
+See [speaker diarization](https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md#speaker-diarization-opt-in)
+for
+installation, model download, label semantics, and limitations.
 
 ### Audio source
 
-Two capture backends:
+`socket` is the recommended native macOS path; `portaudio` is the default
+cross-platform path. Select one with `AUDIO_SOURCE`, `config.toml`, or
+`onoats bot --source`.
 
-- **`socket`** — the recommended macOS (14.4+) path: framed PCM16 from two
-  per-branch unix sockets (mic → `me`, system → `them`) written by the native
-  capturer. No loopback driver, no PortAudio device enumeration.
-- **`portaudio`** (default) — PortAudio devices; system audio needs a loopback
-  driver. This is the path for other platforms and for macOS below 14.4 —
-  driver install and device selection in
-  [docs/blackhole-fallback.md](docs/blackhole-fallback.md).
-
-Select via env `AUDIO_SOURCE` or `config.toml`:
-
-```toml
-[audio]
-source = "socket"                 # "portaudio" (default) | "socket"
-mic_socket = "~/onoats/mic.sock"      # or env ONOATS_MIC_SOCKET
-system_socket = "~/onoats/system.sock"  # or env ONOATS_SYSTEM_SOCKET
-capturer_nonce = ""                # or env ONOATS_CAPTURER_NONCE (usually supervisor-set)
-```
-
-When `AUDIO_SOURCE=socket`, `onoats bot` runs a supervisor that mints a private
-socket directory + generation nonce and spawns the capturer named by
-`ONOATS_CAPTURER_BIN`. The capturer↔recorder wire format (framing, handshake,
-endianness, backpressure, versioning) is pinned in
-[`docs/audio-socket-contract.md`](docs/audio-socket-contract.md).
-
-A one-off override is available on the command line — `onoats bot --source
-socket` (or `--source portaudio`) — which sits at the top of the usual
-precedence (CLI flag > env `AUDIO_SOURCE` > `config.toml` > default).
-
-> **Status:** runnable end-to-end on macOS 14.4+. The native capturer +
-> menu-bar app build from source — see [`native/README.md`](native/README.md)
-> for the `make -C native setup` flow (one command: signing cert, app + CLI
-> install, guided init; the app wires `ONOATS_CAPTURER_BIN`). On other
-> platforms, or below macOS 14.4, keep the default `portaudio` source — a
-> loopback driver remains the system-audio fallback there
-> ([docs/blackhole-fallback.md](docs/blackhole-fallback.md)).
-
-Release publication keeps Python 3.12 as the full-suite lane and independently
-runs the recorder/control contracts on Python 3.13; PyPI publishing waits for
-both. Signed-app staging additionally uses one release-identity record shared by
-installation and smoke, including the bundle/signing/tree/executable identity
-and an independently verified CLI git revision. See
-[`native/README.md`](native/README.md) for the exact workflow.
+See [audio sources](https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md#audio-source)
+and the versioned
+[capturer wire contract](https://github.com/vr000m/onoats-bot/blob/main/docs/audio-socket-contract.md).
 
 ### Data location
 
-By default onoats stores everything under `$XDG_DATA_HOME/onoats`
-(`~/.local/share/onoats`): `sessions/{pending,claimed,done,failed}/` (the queue),
-`.active/` (live recording), `transcripts/{category}/{date}/` (converter output).
+The default data root is `$XDG_DATA_HOME/onoats`
+(`~/.local/share/onoats`). Change it with `[storage] data_dir`,
+`ONOATS_DATA_DIR`, or `onoats init --data-dir`.
 
-Point it elsewhere with `[storage] data_dir` (or `ONOATS_DATA_DIR`):
-
-```bash
-onoats init --data-dir ~/some/other/root
-```
-
-**Feeding another worker the same queue.** Because the queue layout is shared,
-setting `data_dir` to a tree another tool drains makes onoats a drop-in
-recorder for it:
-
-```bash
-onoats init --data-dir ~/koda-data   # write into the consumer's queue root
-onoats bot                           # record → ~/koda-data/sessions/pending/
-```
-
-In this mode, let the **downstream worker** drain and render the queue — do
-**not** also run `onoats convert` against the same root (the two would race for
-the same `pending/` files). Run only one recorder against a given root at a time.
+See [data location and queue ownership](https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md#data-location)
+before sharing a queue with another worker.
 
 ## The queue contract
 
-onoats writes one type-discriminated JSONL file per session under
-`queue/pending/{session_id}.jsonl`. This is the versioned inter-repo interface
-a consumer drains.
+Every session is a type-discriminated JSONL file under
+`sessions/pending/`. The first line is `session_meta`; later lines are
+`utterance` or `silence_gap`. Queue publication uses an atomic rename.
 
-| Line type      | Shape                                                              |
-|----------------|--------------------------------------------------------------------|
-| `session_meta` | `{"type":"session_meta","run_id":"<hex>"}` plus optional `category` / `diarization` — FIRST line of every file |
-| `utterance`    | `{"type":"utterance","time":...,"text":...,"source":"me"\|"them"}` plus optional `speakers` / `overlap` (below) |
-| `silence_gap`  | `{"type":"silence_gap","time":...,"duration_seconds":N}`           |
+The versioned [queue contract](https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md)
+defines fields,
+categories, run IDs, diarization metadata, and consumer ownership.
 
-- The `source` field is the **canonical `me`/`them` enum** — the frozen wire
-  contract. Configurable speaker display labels (`[speakers]`) are applied
-  **only at render time**, never written into the queue.
-- With [speaker diarization](#speaker-diarization-opt-in) on, a labelled
-  `them` utterance also carries two optional keys: `speakers` (a non-empty
-  list of canonical labels such as `["S1"]`, or `["S1","S2"]` for overlap, the more
-  active speaker first) and
-  `overlap` (a bool). Both are **omitted** when diarization is off or the
-  utterance was left unlabelled, and `me` utterances never carry them. Treat
-  absence as unlabelled. Display strings like `Them (S1)` are composed at
-  render time and are not stored.
-- The chosen `--category` rides on the `session_meta` first line (not the
-  filename); the `{session_id}` stem stays load-bearing for a consumer's
-  back-fill keying. `category` is written **only when `--category` locks one**:
-  a consumer reads any non-blank category as a hard lock, so it is never
-  defaulted. `run_id` is an opaque random token minted once per `onoats bot`
-  process, identical in every file that run rotates through (silence timeout,
-  Ctrl+T, menu bar) and new on each start; missing means unknown. With
-  diarization configured on, `diarization` is `{"model","version"}` (model repo
-  id and cached snapshot revision) - provenance of what the run was configured
-  with, not proof a line was labelled; per-utterance `speakers` is the truth.
-  The header never lists speakers: they are not known at file creation. Labels
-  are unique within a run, so `(run_id, label)` identifies a speaker across the
-  files of one run.
-- `active → pending` is an atomic `rename(2)`; a partial file is never visible
-  in `pending/`.
+## Documentation
+
+| Guide | Covers |
+|---|---|
+| [Installation](https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md) | platform choices, prerequisites, extras, and updates |
+| [Menu bar](https://github.com/vr000m/onoats-bot/blob/main/docs/menu-bar.md) | controls, permissions, telemetry, privacy, warnings, and logs |
+| [Configuration](https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md) | config files, STT, diarization, audio, storage, and precedence |
+| [Queue contract](https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md) | canonical JSONL interface for downstream consumers |
+| [Native build and release](https://github.com/vr000m/onoats-bot/blob/main/native/README.md) | signing, staged installation, smoke, rollback, and TCC |
+| [Recorder control socket](https://github.com/vr000m/onoats-bot/blob/main/docs/control-socket-contract.md) | generation-authenticated Flush and Stop protocol |
+| [Audio socket contract](https://github.com/vr000m/onoats-bot/blob/main/docs/audio-socket-contract.md) | native capturer framing, handshake, and backpressure |
+| [BlackHole fallback](https://github.com/vr000m/onoats-bot/blob/main/docs/blackhole-fallback.md) | loopback setup for the PortAudio path |
 
 ## License
 
-BSD-2-Clause — see [LICENSE](LICENSE).
+BSD-2-Clause — see
+[LICENSE](https://github.com/vr000m/onoats-bot/blob/main/LICENSE).
