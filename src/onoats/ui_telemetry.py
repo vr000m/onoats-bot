@@ -10,8 +10,6 @@ liveness authority -- the PID and lifecycle status files retain that role.
 from __future__ import annotations
 
 import asyncio
-import ctypes
-import errno
 import json
 import logging
 import math
@@ -25,6 +23,11 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+from onoats._atomic_fs import (
+    rename_noreplace as _rename_noreplace,
+    rename_noreplace_available as _rename_noreplace_available,
+)
 
 from onoats.ui_telemetry_contract import (
     AUDIO_OBSERVATION_EXPIRY_SECONDS as AUDIO_OBSERVATION_EXPIRY_SECONDS,
@@ -44,9 +47,6 @@ SEMINAR_CATEGORY = "seminars"
 TRANSCRIPT_LIMIT = 240
 DETAIL_LIMIT = 256
 MAX_SNAPSHOT_BYTES = 64 * 1024
-_AT_FDCWD = -2
-_RENAME_EXCL = 0x00000004
-_RENAME_NOREPLACE = 0x00000001
 
 STT_STATES = frozenset({"failed", "recovering", "starting", "unknown", "ready"})
 STT_PRECEDENCE = ("failed", "recovering", "starting", "unknown", "ready")
@@ -412,17 +412,54 @@ class UITelemetryPublisher:
                 except OSError:
                     pass
 
-    async def stop(self, timeout: float = 0.5) -> None:
+    async def stop(
+        self,
+        timeout: float = 0.5,
+        *,
+        cancel_timeout: float = 0.1,
+        force_exit_event: asyncio.Event | None = None,
+        cleanup: bool = True,
+    ) -> None:
+        """Bound the publisher's one owned task and initiate owned cleanup."""
         task = self.request_stop()
         if task is None or task is asyncio.current_task():
+            if cleanup:
+                self.cleanup()
             return
+        force_waiter = (
+            asyncio.create_task(force_exit_event.wait())
+            if force_exit_event is not None
+            else None
+        )
         try:
-            await asyncio.wait_for(task, timeout=timeout)
-        except TimeoutError:
+            waiters = {task}
+            if force_waiter is not None:
+                waiters.add(force_waiter)
+            done, _pending = await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                task.result()
+                return
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            done, _pending = await asyncio.wait({task}, timeout=cancel_timeout)
+            if task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+            else:
+                task.add_done_callback(
+                    lambda finished: (
+                        finished.exception() if not finished.cancelled() else None
+                    )
+                )
         finally:
-            self.cleanup()
+            if force_waiter is not None and not force_waiter.done():
+                force_waiter.cancel()
+                await asyncio.gather(force_waiter, return_exceptions=True)
+            if cleanup:
+                self.cleanup()
 
     def cleanup(self) -> bool:
         if self._task is not None:
@@ -641,51 +678,3 @@ def _restore_quarantined(quarantined: Path, public_path: Path) -> None:
         # Cleanup is fail-open if the platform cannot provide an atomic
         # no-replace rename.  Never emulate it with a racy exists+rename pair.
         return
-
-
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    """Atomically rename any entry type without replacing ``destination``.
-
-    macOS exposes this contract as ``renameatx_np(RENAME_EXCL)`` and Linux as
-    ``renameat2(RENAME_NOREPLACE)``.  Keeping the operation in one syscall is
-    essential: a pathname check followed by plain rename could overwrite a
-    publisher that wins the intervening race.
-    """
-    renameatx_np = _rename_noreplace_symbol()
-    renameat2 = _renameat2_symbol() if renameatx_np is None else None
-    operation = renameatx_np or renameat2
-    if operation is None:
-        raise NotImplementedError("atomic no-replace rename is unavailable")
-    operation.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    operation.restype = ctypes.c_int
-    result = operation(
-        _AT_FDCWD,
-        os.fsencode(source),
-        _AT_FDCWD,
-        os.fsencode(destination),
-        _RENAME_EXCL if renameatx_np is not None else _RENAME_NOREPLACE,
-    )
-    if result == 0:
-        return
-    error = ctypes.get_errno()
-    if error == errno.EEXIST:
-        raise FileExistsError(error, os.strerror(error), destination)
-    raise OSError(error, os.strerror(error), source)
-
-
-def _rename_noreplace_symbol() -> Any | None:
-    return getattr(ctypes.CDLL(None, use_errno=True), "renameatx_np", None)
-
-
-def _renameat2_symbol() -> Any | None:
-    return getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
-
-
-def _rename_noreplace_available() -> bool:
-    return _rename_noreplace_symbol() is not None or _renameat2_symbol() is not None

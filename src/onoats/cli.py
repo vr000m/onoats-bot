@@ -969,20 +969,21 @@ async def _drain_recorder_bounded(recorder_task, logger, cause: str) -> bool:
     """
     import asyncio
 
-    try:
-        await asyncio.wait_for(recorder_task, timeout=_RECORDER_DRAIN_GRACE_SEC)
+    done, _pending = await asyncio.wait(
+        {recorder_task}, timeout=_RECORDER_DRAIN_GRACE_SEC
+    )
+    if recorder_task in done:
+        recorder_task.result()  # propagate a recorder failure
         return True
-    except TimeoutError:
-        logger.warning(
-            "Socket supervisor: recorder did not finish draining within "
-            f"{_RECORDER_DRAIN_GRACE_SEC}s {cause} — force-cancelling."
-        )
-        recorder_task.cancel()
-        try:
-            await recorder_task
-        except asyncio.CancelledError:
-            pass
-        return False
+    logger.warning(
+        "Socket supervisor: recorder did not finish draining within "
+        f"{_RECORDER_DRAIN_GRACE_SEC}s {cause} — force-cancelling."
+    )
+    # Cancellation is a request, not a deadline: a coroutine may catch and
+    # suppress CancelledError.  Do not await it here or the bounded supervisor
+    # path would become unbounded again.
+    recorder_task.cancel()
+    return False
 
 
 def _settle_recorder_rc(rc, logger, data_dir) -> int:
@@ -1092,7 +1093,7 @@ async def _run_recorder_with_capturer(
             {recorder_task, capturer_task}, return_when=asyncio.FIRST_COMPLETED
         )
 
-        if recorder_task in done:
+        if recorder_task in done and capturer_task not in done:
             # The recorder coroutine finished. Re-await to surface any exception
             # (the caller maps SttPreflightError to rc=1), then honour its return
             # code: run_onoats_dual returns non-zero when the pipeline ended via a

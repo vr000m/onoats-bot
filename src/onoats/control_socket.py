@@ -8,8 +8,6 @@ representation of a recorder identity; callers may pass any object exposing
 from __future__ import annotations
 
 import asyncio
-import ctypes
-import errno
 import inspect
 import json
 import math
@@ -22,6 +20,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from onoats._atomic_fs import rename_noreplace as _rename_noreplace
 
 CONTROL_SOCKET_FILENAME = "onoats-control.sock"
 CONTROL_PROTOCOL_VERSION = 1
@@ -37,9 +37,6 @@ _LOCAL_PEERCRED = 1
 _XUCRED_VERSION = 0
 _XUCRED = struct.Struct("@IIh16I")
 _DARWIN_SUN_PATH_BYTES = 104
-_AT_FDCWD = -100
-_RENAME_EXCL = 0x00000004
-_RENAME_NOREPLACE = 0x00000001
 
 
 class ControlError(RuntimeError):
@@ -140,40 +137,6 @@ async def _start_owned_unix_server(
 
 def _record_generation(record: Any) -> tuple[int, float]:
     return int(record.pid), float(record.start_epoch)
-
-
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    """Atomically publish one filesystem entry without replacing another."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
-        renamex_np = getattr(libc, "renamex_np", None)
-        if renamex_np is None:
-            raise OSError(errno.ENOSYS, "exclusive rename is unavailable")
-        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        renamex_np.restype = ctypes.c_int
-        result = renamex_np(os.fsencode(source), os.fsencode(destination), _RENAME_EXCL)
-    else:
-        renameat2 = getattr(libc, "renameat2", None)
-        if renameat2 is None:
-            raise OSError(errno.ENOSYS, "exclusive rename is unavailable")
-        renameat2.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        renameat2.restype = ctypes.c_int
-        result = renameat2(
-            _AT_FDCWD,
-            os.fsencode(source),
-            _AT_FDCWD,
-            os.fsencode(destination),
-            _RENAME_NOREPLACE,
-        )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination)
 
 
 def _quarantine_and_remove(path: Path, expected: _EndpointIdentity) -> bool:

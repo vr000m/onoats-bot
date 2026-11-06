@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-import onoats.ui_telemetry as ui_telemetry
+import onoats._atomic_fs as atomic_fs
 from onoats.ui_telemetry import (
     AUDIO_FIELDS,
     AUDIO_OBSERVATION_EXPIRY_SECONDS,
@@ -666,21 +666,24 @@ def test_linux_renameat2_provides_atomic_noreplace_fallback(monkeypatch):
             return 0
 
     renameat2 = RenameAt2()
-    monkeypatch.setattr(ui_telemetry, "_rename_noreplace_symbol", lambda: None)
-    monkeypatch.setattr(ui_telemetry, "_renameat2_symbol", lambda: renameat2)
+    monkeypatch.setattr(
+        atomic_fs,
+        "_libc_symbol",
+        lambda name: renameat2 if name == "renameat2" else None,
+    )
 
-    ui_telemetry._rename_noreplace(Path("source"), Path("destination"))
+    atomic_fs.rename_noreplace(Path("source"), Path("destination"))
 
     assert calls == [
         (
-            ui_telemetry._AT_FDCWD,
+            atomic_fs._AT_FDCWD,
             b"source",
-            ui_telemetry._AT_FDCWD,
+            atomic_fs._AT_FDCWD,
             b"destination",
-            ui_telemetry._RENAME_NOREPLACE,
+            atomic_fs._RENAME_NOREPLACE,
         )
     ]
-    assert ui_telemetry._rename_noreplace_available() is True
+    assert atomic_fs.rename_noreplace_available() is True
 
 
 def test_cleanup_fails_open_before_move_without_atomic_noreplace(tmp_path, monkeypatch):

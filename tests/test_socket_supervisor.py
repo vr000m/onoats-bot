@@ -2496,10 +2496,8 @@ def test_shutdown_tail_default_has_no_telemetry_side_effect(tmp_path, monkeypatc
     assert events == ["stopped", "terminal", "pid-removed"]
 
 
-def test_telemetry_shutdown_uses_synchronous_request_and_owned_task(
-    tmp_path, monkeypatch
-):
-    """Never wrap an arbitrary cancellation-resistant ``publisher.stop``."""
+def test_telemetry_shutdown_uses_publisher_lifecycle_api(tmp_path, monkeypatch):
+    """Production delegates request/wait/cancel/cleanup to the sole owner."""
     import asyncio
 
     from onoats import dual
@@ -2522,13 +2520,12 @@ def test_telemetry_shutdown_uses_synchronous_request_and_owned_task(
             self.stop_requested.set()
             return self.task
 
-        async def stop(self, *, timeout):
+        async def stop(self, *, timeout, force_exit_event, cleanup):
             events.append(f"publisher-stop-called:{timeout}")
-            while True:
-                try:
-                    await asyncio.Future()
-                except asyncio.CancelledError:
-                    events.append("publisher-stop-resisted-cancel")
+            task = self.request_stop()
+            await task
+            if cleanup:
+                self.cleanup()
 
         def cleanup(self):
             events.append("telemetry-cleanup")
@@ -2564,9 +2561,8 @@ def test_telemetry_shutdown_uses_synchronous_request_and_owned_task(
 
     pending_tasks = asyncio.run(scenario())
 
-    assert "publisher-stop-called:0.5" not in events
-    assert "publisher-stop-resisted-cancel" not in events
-    assert events[:2] == [
+    assert "publisher-stop-called:0.5" in events
+    assert events[1:3] == [
         "publisher-request-stop",
         "publisher-owned-task-stopped",
     ]
@@ -2595,8 +2591,11 @@ def test_late_force_exit_interrupts_normal_telemetry_wait_promptly():
             self.requested.set()
             return self.task
 
-        async def stop(self, *, timeout):
-            pytest.fail("shutdown must use request_stop(), not publisher.stop()")
+        async def stop(self, *, timeout, force_exit_event, cleanup):
+            self.request_stop()
+            await force_exit_event.wait()
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
     async def scenario():
         force_exit_event = asyncio.Event()
@@ -2663,6 +2662,15 @@ def test_cancellation_resistant_telemetry_cannot_block_shutdown_finalization(
 
         def cleanup(self):
             events.append("telemetry-cleanup")
+
+        async def stop(self, *, timeout, force_exit_event, cleanup):
+            self.request_stop()
+            done, _ = await asyncio.wait({self.task}, timeout=timeout)
+            if self.task not in done:
+                self.task.cancel()
+                await asyncio.wait({self.task}, timeout=0.1)
+            if cleanup:
+                self.cleanup()
 
     monkeypatch.setattr(
         dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
@@ -3092,6 +3100,69 @@ def test_diarization_flag_off_never_preflights(
 
     assert "preflight" not in calls
     assert "spawn" in calls
+
+
+def test_recorder_drain_deadline_does_not_wait_for_suppressed_cancellation(
+    monkeypatch,
+):
+    """Deadline x cancellation handling stays bounded for both task outcomes."""
+
+    class Logger:
+        def warning(self, _message):
+            pass
+
+    async def run():
+        monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 0.01)
+
+        async def resists_once():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.15)
+
+        task = asyncio.create_task(resists_once())
+        started = asyncio.get_running_loop().time()
+        drained = await cli._drain_recorder_bounded(task, Logger(), "in test")
+        elapsed = asyncio.get_running_loop().time() - started
+        assert drained is False
+        assert elapsed < 0.08
+        await task
+
+    asyncio.run(run())
+
+
+def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(
+    tmp_path, monkeypatch
+):
+    """The complete 2x2 race space gives capturer completion failure priority."""
+    from onoats import runtime
+
+    class Capturer:
+        async def wait(self):
+            return 23
+
+    class Logger:
+        def __init__(self):
+            self.records = []
+
+        def error(self, message):
+            self.records.append(message)
+
+        def warning(self, message):
+            self.records.append(message)
+
+        def info(self, message):
+            self.records.append(message)
+
+    async def recorder(**_kwargs):
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    logger = Logger()
+    rc = asyncio.run(cli._run_recorder_with_capturer([], Capturer(), logger, tmp_path))
+    assert rc == 1
+    assert any("capturer exited mid-session" in record for record in logger.records)
 
 
 @pytest.mark.parametrize("stage", ["spawn", "sockets", "preflight", "running"])

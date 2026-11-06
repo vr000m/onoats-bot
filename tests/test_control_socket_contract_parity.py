@@ -9,6 +9,16 @@ from pathlib import Path
 import onoats.control_socket as control
 
 
+def test_atomic_noreplace_has_one_production_owner() -> None:
+    import onoats._atomic_fs as atomic_fs
+    import onoats.ui_telemetry as ui_telemetry
+
+    owner = inspect.getsource(atomic_fs)
+    assert "renameat2" in owner and "renameatx_np" in owner
+    assert "ctypes.CDLL" not in inspect.getsource(control)
+    assert "ctypes.CDLL" not in inspect.getsource(ui_telemetry)
+
+
 DOC = Path(__file__).resolve().parents[1] / "docs" / "control-socket-contract.md"
 
 

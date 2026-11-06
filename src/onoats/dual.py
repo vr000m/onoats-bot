@@ -33,10 +33,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 
-# Load STT secrets before importing onoats.runtime — runtime reads STT_SERVICE,
-# STT_MODEL, and BOT_NAME at module load. onoats's consolidated config
-# (config.toml + secrets.env) is the source of truth; this dotenv load is a
-# convenience for a project-local .env in dev. Env vars still override.
+# Load project-local development values before capturing RecorderSessionConfig.
+# onoats's consolidated config (config.toml + secrets.env) remains the source of
+# truth and environment values still override it.
 load_dotenv(
     os.path.join(os.path.dirname(__file__), "..", ".env"),
     override=False,
@@ -165,50 +164,13 @@ async def _shutdown_stt_service(stt_service, label: str) -> None:
 
 
 async def _stop_telemetry_publisher(publisher, *, force_exit_event) -> None:
-    """Bound both graceful and cancellation waits for the publisher task."""
-
-    def _consume_task_result(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.warning(f"Could not stop UI telemetry publisher: {exc}")
-
-    publisher_task = publisher.request_stop()
-    if publisher_task is None or publisher_task is asyncio.current_task():
-        return
-    if publisher_task.done():
-        _consume_task_result(publisher_task)
-        return
-
-    force_waiter = asyncio.create_task(
-        force_exit_event.wait(), name="ui_telemetry_force_exit_waiter"
-    )
+    """Use the publisher's sole lifecycle policy at the production boundary."""
     try:
-        done, _pending = await asyncio.wait(
-            {publisher_task, force_waiter},
-            timeout=0.5,
-            return_when=asyncio.FIRST_COMPLETED,
+        await publisher.stop(
+            timeout=0.5, force_exit_event=force_exit_event, cleanup=False
         )
-        if publisher_task in done:
-            _consume_task_result(publisher_task)
-            return
-
-        publisher_task.cancel()
-        cancelled, _still_pending = await asyncio.wait({publisher_task}, timeout=0.1)
-        if publisher_task in cancelled:
-            _consume_task_result(publisher_task)
-        else:
-            publisher_task.add_done_callback(_consume_task_result)
-        if force_waiter not in done or publisher_task not in cancelled:
-            logger.warning(
-                "UI telemetry publisher did not stop within the shutdown bound"
-            )
-    finally:
-        if not force_waiter.done():
-            force_waiter.cancel()
-        await asyncio.gather(force_waiter, return_exceptions=True)
+    except Exception as exc:
+        logger.warning(f"Could not stop UI telemetry publisher: {exc}")
 
 
 def _generate_call_id() -> str:
