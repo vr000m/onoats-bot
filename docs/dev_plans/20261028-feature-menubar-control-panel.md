@@ -683,6 +683,15 @@ sequenceDiagram
 
 ## Findings
 
+- 2026-11-05 — Round 5 boundary remediation keeps `control_socket.py` and
+  `ui_telemetry.py` as package-independent stdlib leaves. Recorder entrypoints
+  now inject the sole `_atomic_fs` no-replace implementation, while the shared
+  telemetry literals live in the separately packaged dependency-free
+  `onoats_contracts.ui_telemetry` module. PID authority reads are bounded,
+  no-follow, non-blocking, owned regular-file reads, and supervisor task,
+  async-generator, and default-executor cleanup share one absolute deadline
+  followed by a fail-loud process boundary.
+
 - 2026-11-02 — Phase 9 completed the recorder-attested schema-v2 run-ID flow,
   descriptor-bound JSONL proof, kernel-birth process identity, and captured
   teardown matrix. The canonical focused gate passed 226 tests with one opt-in

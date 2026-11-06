@@ -530,7 +530,9 @@ its scope; this list is a pointer, not the contract itself.
   publisher task coalesces immutable snapshots into one dedicated daemon I/O
   worker for a run; callbacks update memory only. Filesystem writes and cleanup
   never execute on the recorder event loop, and shutdown never joins a stalled
-  I/O thread. The one-slot queue prevents an update backlog.
+  I/O thread. The one-slot queue prevents an update backlog. Recorder entrypoints
+  inject the neutral `_atomic_fs` no-replace operations; this leaf must not import
+  any `onoats` module or grow a second syscall implementation.
   Audio levels must be finite and inside `[0.0, 1.0]`; invalid values are rejected
   without advancing the branch observation time, never clamped.
 

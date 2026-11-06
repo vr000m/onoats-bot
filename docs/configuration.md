@@ -34,8 +34,10 @@ Onoats does not need or store LLM keys.
 
 ### `dictionary.txt`
 
-Each `wrong: correct` line defines a conversion substitution. Other terms
-become STT vocabulary hints.
+Each `wrong: correct` line defines a conversion substitution applied when
+rendering transcripts, regardless of STT backend. Other terms become live
+recognition hints only with the Deepgram backend; Whisper and websocket STT
+currently ignore vocabulary-only entries.
 
 ## Precedence
 
