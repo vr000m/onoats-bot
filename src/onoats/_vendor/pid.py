@@ -189,6 +189,20 @@ def _quarantine_verified_pid_file(pid_path: Path, descriptor: int) -> bool:
     The caller holds ``descriptor`` open for the whole call, which pins the
     verified inode: the comparison below is against that live file, never a
     remembered number that a successor could have reused.
+
+    Twin of ``onoats.control_socket._quarantine_and_remove``: one quarantine
+    contract, two implementations. This module is vendored (stdlib + loguru,
+    no ``onoats`` imports) and ``control_socket`` is a leaf that must not
+    import application modules, so neither can import a shared helper. The
+    contract: remove the entry only after moving it into a private
+    same-directory quarantine and proving the moved inode is the pinned one;
+    an entry not so proven (identity mismatch OR identity unprovable) is
+    restored with a no-replace primitive or, when the public name is occupied,
+    retained in quarantine — never deleted; an empty quarantine dir is
+    removed. Only the identity source and restore primitive differ (``os.link``
+    here; a regular file can be hard-linked, which also leaves the quarantine
+    name as an extra link). ``tests/test_quarantine_contract_parity.py`` drives
+    both through the same state space; change them together.
     """
     try:
         quarantine_dir = Path(
@@ -207,9 +221,14 @@ def _quarantine_verified_pid_file(pid_path: Path, descriptor: int) -> bool:
         return False
 
     try:
-        held = os.fstat(descriptor)
         moved = quarantine_path.lstat()
-        if (moved.st_dev, moved.st_ino) != (held.st_dev, held.st_ino):
+        try:
+            held = os.fstat(descriptor)
+            proven = (moved.st_dev, moved.st_ino) == (held.st_dev, held.st_ino)
+        except OSError:
+            # An identity that cannot be established is not a match: restore.
+            proven = False
+        if not proven:
             # A successor won the open-to-rename race. Restore it atomically
             # without replacing any newer entry that reached the public name.
             try:

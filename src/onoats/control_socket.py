@@ -159,6 +159,12 @@ def _quarantine_and_remove(
     quarantine rather than deleting either one. Unix sockets cannot be hard
     linked on Darwin, so restoration must use the same no-replace primitive as
     endpoint publication.
+
+    Twin of ``onoats._vendor.pid._quarantine_verified_pid_file`` (same
+    quarantine contract; see its docstring). Neither module may import a
+    shared helper (this is an application-import-free leaf; ``pid`` is
+    vendored), so ``tests/test_quarantine_contract_parity.py`` drives both
+    through one state space. Change them together.
     """
     try:
         quarantine_dir = Path(

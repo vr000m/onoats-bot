@@ -222,7 +222,12 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   the captured PID, cmdline, and start epoch. It atomically moves the public
   entry to a private same-directory quarantine and verifies the moved inode
   before removal, so a check-to-unlink successor race cannot delete the new
-  record. If it reads back as `None` (unreadable/foreign/already
+  record; an inode it cannot prove (mismatch or unprovable identity) is
+  restored with a no-replace primitive or retained in quarantine, never
+  deleted. `control_socket._quarantine_and_remove` is the twin of this policy
+  (neither may import a shared helper: `pid` is vendored, `control_socket` is
+  an import-free leaf); `tests/test_quarantine_contract_parity.py` drives both
+  through one state space, so change them together. If it reads back as `None` (unreadable/foreign/already
   gone) it is left in place — it must never be assumed to be our own benign
   mid-write. Because `stop` returns on command acceptance (not exit), a
   `stop`-then-immediate-`bot` could otherwise let a draining recorder delete a
