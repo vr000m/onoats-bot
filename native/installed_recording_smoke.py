@@ -1056,6 +1056,7 @@ def run(args: argparse.Namespace) -> None:
     app_identity: ProcessIdentity | None = None
     recorder: RecorderIdentity | None = None
     groups: tuple[OwnedProcessGroup, ...] = ()
+    groups_captured = False
     primary_error: BaseException | None = None
     try:
         subprocess.run(["/usr/bin/open", str(app)], check=True, timeout=10)
@@ -1086,6 +1087,7 @@ def run(args: argparse.Namespace) -> None:
         )
         recorder_pid, epoch = recorder.pid, recorder.start_epoch
         groups = _owned_descendant_groups(app_pid, recorder_pid)
+        groups_captured = True
 
         def nonzero_me() -> str | None:
             telemetry = _json(telemetry_path)
@@ -1169,6 +1171,10 @@ def run(args: argparse.Namespace) -> None:
         primary_error = exc
         raise
     finally:
+        cleanup_errors: list[BaseException] = []
+        # Discovery is best-effort at this point. It may race process exit or
+        # topology changes, but no such race may skip cleanup of identities
+        # that were already captured and independently remain authoritative.
         try:
             if recorder is None and app_pid is not None:
                 recorder = _cleanup_recording_identity(
@@ -1177,23 +1183,35 @@ def run(args: argparse.Namespace) -> None:
                     app_identity=app_identity,
                     expected_release=expected_release,
                 )
-                if recorder is not None:
-                    groups = _owned_descendant_groups(app_pid, recorder.pid)
-            cleanup_kwargs = {
-                "app_identity": app_identity,
-                "recorder": recorder,
-                "status_path": status_path,
-                "pid_path": pid_path,
-                "groups": groups,
-            }
-            _cleanup_after_failure(app, **cleanup_kwargs)
         except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if recorder is not None and app_pid is not None and not groups_captured:
+            try:
+                groups = _owned_descendant_groups(app_pid, recorder.pid)
+                groups_captured = True
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        try:
+            _cleanup_after_failure(
+                app,
+                app_identity=app_identity,
+                recorder=recorder,
+                status_path=status_path,
+                pid_path=pid_path,
+                groups=groups,
+            )
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
             print(
-                f"installed recording smoke cleanup failed: {cleanup_error}",
+                "installed recording smoke cleanup failed: "
+                + "; ".join(
+                    f"{type(error).__name__}: {error}" for error in cleanup_errors
+                ),
                 file=sys.stderr,
             )
             if primary_error is None:
-                raise
+                raise cleanup_errors[0]
     try:
         _publish_receipt(receipt_path, expected_release)
     except (OSError, ValueError, RuntimeError) as exc:

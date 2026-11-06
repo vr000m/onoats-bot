@@ -74,6 +74,7 @@ def _stub_release_identity(monkeypatch):
     monkeypatch.setattr(SMOKE, "_verify_dynamic_release_identity", lambda *_args: None)
     monkeypatch.setattr(SMOKE, "_invalidate_receipt", lambda *_args: None)
     monkeypatch.setattr(SMOKE, "_publish_receipt", lambda *_args: None)
+    monkeypatch.setattr(SMOKE, "_preserve_final_component", lambda path: path)
     monkeypatch.setattr(
         SMOKE, "_verify_effective_cli_authority", lambda *_args: Path("/bin/python3")
     )
@@ -480,7 +481,6 @@ def test_recording_identity_timeout_recovers_verified_cleanup_targets(
     command = "/bin/python3 /opt/onoats bot"
     pid_path.write_text(f"4321\nonoats-bot\n{command}\n900.25\n", encoding="utf-8")
     _stub_release_identity(monkeypatch)
-    monkeypatch.setattr(SMOKE, "_preserve_final_component", lambda path: path)
     monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
     monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
     monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
@@ -527,6 +527,77 @@ def test_recording_identity_timeout_recovers_verified_cleanup_targets(
     assert len(cleaned) == 1
     assert cleaned[0]["recorder"].pid == 4321
     assert cleaned[0]["groups"] == groups
+
+
+@pytest.mark.parametrize("failure_site", ["group-capture", "recorder-discovery"])
+def test_installed_smoke_cleanup_survives_late_topology_failures(
+    tmp_path, monkeypatch, failure_site
+):
+    """Every already-verified identity is cleaned despite later discovery races."""
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    data_dir = tmp_path / "data"
+    recorder = _recorder_identity()
+    app_identity = _app_identity(app)
+    cleaned = []
+
+    _stub_release_identity(monkeypatch)
+    monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
+    monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(SMOKE, "_capture_process_identity", lambda _pid: app_identity)
+    monkeypatch.setattr(
+        SMOKE, "_cleanup_after_failure", lambda *_args, **kwargs: cleaned.append(kwargs)
+    )
+
+    def wait(stage, _timeout, _probe):
+        if stage == "signed app launch":
+            return app_identity.pid
+        if stage == "app-owned recorder identity":
+            if failure_site == "recorder-discovery":
+                raise SMOKE.SmokeFailure("recorder discovery raced")
+            return recorder
+        return True
+
+    monkeypatch.setattr(SMOKE, "wait_for", wait)
+
+    def groups(*_args):
+        raise SMOKE.SmokeFailure("group topology raced")
+
+    monkeypatch.setattr(SMOKE, "_owned_descendant_groups", groups)
+    if failure_site == "recorder-discovery":
+        monkeypatch.setattr(
+            SMOKE,
+            "_cleanup_recording_identity",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                SMOKE.SmokeFailure("cleanup discovery raced")
+            ),
+        )
+
+    with pytest.raises(SMOKE.SmokeFailure):
+        SMOKE.run(
+            SimpleNamespace(
+                app=app,
+                data_dir=data_dir,
+                release_identity=tmp_path / "release-identity.json",
+                smoke_receipt=tmp_path / "receipt.json",
+                app_timeout=1,
+                recording_timeout=1,
+                activity_timeout=1,
+                stop_timeout=1,
+                transcript_timeout=1,
+                me_floor=0.01,
+            )
+        )
+
+    assert len(cleaned) == 1
+    assert cleaned[0]["app_identity"] == app_identity
+    assert cleaned[0]["recorder"] == (
+        recorder if failure_site == "group-capture" else None
+    )
+    assert cleaned[0]["groups"] == ()
 
 
 def test_installed_smoke_app_cleanup_preserves_argument_bearing_identity(
