@@ -2873,9 +2873,7 @@ def test_supervisor_snapshot_uses_exact_minted_generation_identity(
         )
         raise ValueError("stop after generation capture")
 
-    monkeypatch.setattr(
-        runtime.RecorderSessionConfig, "capture", classmethod(capture)
-    )
+    monkeypatch.setattr(runtime.RecorderSessionConfig, "capture", classmethod(capture))
 
     assert _run_supervisor_bounded([], config=config) == 1
     assert len(captured) == 1

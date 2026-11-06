@@ -523,9 +523,7 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
     from onoats.transports import SocketHandshakeError
 
     try:
-        return _asyncio.run(
-            _supervise_socket_session(rest, config=config)
-        )
+        return _asyncio.run(_supervise_socket_session(rest, config=config))
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)

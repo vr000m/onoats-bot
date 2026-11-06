@@ -1067,7 +1067,14 @@ def test_installed_smoke_header_and_utterances_share_one_descriptor(
             "timeout",
         ),
     ],
-    ids=["unbounded", "future-early", "future-late", "future-absent", "expired", "mid-scan"],
+    ids=[
+        "unbounded",
+        "future-early",
+        "future-late",
+        "future-absent",
+        "expired",
+        "mid-scan",
+    ],
 )
 def test_installed_smoke_transcript_deadline_whole_state_space(
     tmp_path, deadline, ticks, entries, expected
@@ -1089,14 +1096,10 @@ def test_installed_smoke_transcript_deadline_whole_state_space(
 
     if expected == "timeout":
         with pytest.raises(SMOKE.SmokeFailure, match="timed out"):
-            SMOKE._new_me_utterance(
-                tmp_path, RUN_ID, deadline=deadline, clock=clock
-            )
+            SMOKE._new_me_utterance(tmp_path, RUN_ID, deadline=deadline, clock=clock)
     else:
         assert (
-            SMOKE._new_me_utterance(
-                tmp_path, RUN_ID, deadline=deadline, clock=clock
-            )
+            SMOKE._new_me_utterance(tmp_path, RUN_ID, deadline=deadline, clock=clock)
             is expected
         )
 

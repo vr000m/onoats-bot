@@ -347,8 +347,7 @@ def test_recorder_entrypoints_mark_terminal_rotation_failure(entrypoint: str) ->
         for node in ast.walk(shutdown)
         if isinstance(node, ast.Try)
         and any(
-            isinstance(child, ast.Attribute)
-            and child.attr == "terminal_rotation"
+            isinstance(child, ast.Attribute) and child.attr == "terminal_rotation"
             for child in ast.walk(node)
         )
     )
