@@ -495,9 +495,7 @@ final class RecorderModel: ObservableObject {
         let command: String
         let startEpoch: Double
     }
-    private var fingerprintCache: [RecorderGeneration: (match: Bool, at: Date)] = [:]
     private var ownedRecorderGeneration: RecorderGeneration?
-    private let fingerprintTTL: TimeInterval = 30
 
     private struct TelemetryAuthority: Equatable {
         let directory: URL
@@ -602,17 +600,11 @@ final class RecorderModel: ObservableObject {
         guard !storedCmdline.isEmpty, startEpoch.isFinite, startEpoch > 0 else {
             return false
         }
-        let generation = RecorderGeneration(
-            pid: pid, command: storedCmdline, startEpoch: startEpoch)
-        guard ops.processIsAlive(pid) else {
-            fingerprintCache[generation] = nil
-            return false
-        }
-        if let cached = fingerprintCache[generation],
-           ops.now().timeIntervalSince(cached.at) < fingerprintTTL { return cached.match }
-        let match = ops.commandLine(pid) == storedCmdline
-        fingerprintCache[generation] = (match, ops.now())
-        return match
+        guard ops.processIsAlive(pid) else { return false }
+        // A PID may be recycled while a cached fingerprint is still fresh.
+        // Revalidate the live command on every lifecycle refresh; the PID file's
+        // positive epoch still keys downstream status and telemetry authority.
+        return ops.commandLine(pid) == storedCmdline
     }
 
     private func setTelemetryAuthority(_ authority: TelemetryAuthority?) {

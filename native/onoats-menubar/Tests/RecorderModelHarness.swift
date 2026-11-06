@@ -420,14 +420,23 @@ private func testGenerationCacheRequiresPidCommandAndPositiveEpoch(_ root: URL) 
     let firstReads = ops.commandLineCount
     try require(model.state == .running(ours: false), "complete generation was rejected")
 
-    putPid(ops, directory: directory, pid: 88, epoch: 40, command: "onoats bot --two")
+    // A live PID can be recycled to a different process inside the former
+    // cache TTL. Every lifecycle refresh must revalidate the live command.
+    ops.commands[88] = "unrelated successor"
     model.refresh()
     try require(ops.commandLineCount == firstReads + 1,
+                "same-PID successor bypassed live command revalidation")
+    try require(model.state == .stopped, "recycled PID authenticated from cache")
+    ops.commands[88] = "onoats bot --one"
+
+    putPid(ops, directory: directory, pid: 88, epoch: 40, command: "onoats bot --two")
+    model.refresh()
+    try require(ops.commandLineCount == firstReads + 2,
                 "same-PID new-command generation reused a stale cache entry")
 
     putPid(ops, directory: directory, pid: 88, epoch: 41, command: "onoats bot --two")
     model.refresh()
-    try require(ops.commandLineCount == firstReads + 2,
+    try require(ops.commandLineCount == firstReads + 3,
                 "same-PID new-epoch generation reused a stale cache entry")
 
     putPid(ops, directory: directory, pid: 88, epoch: 0, command: "onoats bot --two")
