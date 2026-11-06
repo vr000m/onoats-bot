@@ -117,8 +117,8 @@ launch agent from the endpoint port and never accepts an arbitrary plist path.
 A successful bootstrap is the launch request; onoats does not immediately
 kickstart a job that is already booting.
 
-Recovery is confirmed only after a successful STT handshake and transcript
-event. The kickstart cooldown is process-wide and label-keyed.
+Recovery is reported after a successful STT handshake. The process-wide,
+label-keyed kickstart cooldown resets only after a confirmed transcript event.
 
 ## Speaker diarization (opt-in)
 

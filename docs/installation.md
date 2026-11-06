@@ -52,11 +52,19 @@ sockets and extends the startup wait while the prompt is visible.
 
 ### Update
 
-After `git pull`, rebuild and reinstall:
+After `git pull`, rebuild and reinstall with the same extras selected for the
+current installation:
 
 ~~~bash
-make -C native install
+# Standard native installation
+make -C native install EXTRAS=macos
+
+# Native installation with speaker diarization
+make -C native install EXTRAS=macos,diarization
 ~~~
+
+`install-cli` replaces the managed tool environment, so omitting a previously
+selected extra removes it.
 
 The setup and install targets reuse the signing identity and preserve an
 existing configuration. See the [native build and release guide](../native/README.md)
