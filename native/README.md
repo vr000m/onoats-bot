@@ -281,9 +281,11 @@ descriptor-backed archive snapshot and verifies it before atomically publishing
 the canonical `~/Applications/Onoats.app`. Restore verification uses the
 archive's recorded tree hash, designated-requirement hash, cdhash, and archive
 hash rather than the current checkout's resource allowlist, so an approved older
-bundle remains restorable after the allowlist changes. The current release is a clean-install
-run because its pre-change CLI baseline was incomplete, so it must use
-`ONOATS_INSTALL_ROLLBACK_APPROVED=0` and must not invoke rollback.
+bundle remains restorable after the allowlist changes. Rollback eligibility is
+run-specific: use it only when that release's pre-change record contains every
+required app and CLI baseline field and passes preflight. When the release plan
+records an incomplete baseline, use `ONOATS_INSTALL_ROLLBACK_APPROVED=0` and do
+not invoke rollback for that run.
 
 All staged-installer operator input is environment-only data read directly by
 `install_staged.py`: `ONOATS_INSTALL_APP`, `ONOATS_INSTALL_DIR`,
