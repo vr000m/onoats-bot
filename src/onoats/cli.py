@@ -382,10 +382,16 @@ async def _drain_capturer_stderr(
        Unknown event types are tee'd and otherwise ignored
        (forward-compatible).
 
-    Returns on EOF. Never raises out (a status write failing must not kill the
-    drain — job 1 outranks job 3).
+    Returns on EOF. Never raises out (cancellation aside): a status write
+    failing must not kill the drain — job 1 outranks job 3 — and a pipe that
+    fails to read (e.g. ``ConnectionResetError``) ends the drain with a
+    WARNING, since there is nothing left to drain. This reader owns "survive a
+    bad line / status write; end quietly on a dead pipe"; the supervisor's
+    teardown separately owns "complete every step whatever the reader task's
+    outcome" (``_run_teardown_step``), so neither layer relies on the other.
     """
     from onoats import status as status_file
+    from onoats._redact import safe_exc_text
 
     while True:
         try:
@@ -397,6 +403,14 @@ async def _drain_capturer_stderr(
                 "(>64 KiB) — dropped from the log tee, continuing to drain."
             )
             continue
+        except Exception as exc:
+            # The pipe itself failed: retrying would spin on the same error.
+            logger.warning(
+                "Socket supervisor: capturer stderr pipe failed "
+                f"({type(exc).__name__}: {safe_exc_text(exc)}); "
+                "stopping the stderr drain."
+            )
+            return
         if not line:
             return  # EOF: capturer (and any child holding the fd) is gone
         try:
@@ -459,10 +473,11 @@ async def _drain_capturer_stderr(
                 # prompt only if its base budget actually expires.
                 if permission_event is not None:
                     permission_event.set()
-        except OSError as exc:
+        except Exception as exc:
             logger.warning(
                 f"Socket supervisor: could not update status fields for a "
-                f"{event_type} event ({exc}); continuing to drain capturer stderr."
+                f"{event_type} event ({safe_exc_text(exc)}); continuing to drain "
+                "capturer stderr."
             )
 
 
@@ -853,39 +868,56 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
         body_failed = True
         raise
     finally:
-        # Every awaited teardown step is bounded on its own, so a cancellation
-        # that lands here (a startup signal arriving after the body already
-        # finished or failed) is deferred until every step has run: it must
-        # neither skip SIGKILL escalation / socket-dir / env cleanup nor
-        # replace the body's own outcome.
+        # Authoritative teardown. Contract: see _run_teardown_step. Every
+        # awaited step is bounded on its own and run through that one helper,
+        # so neither a step's own failure nor a cancellation landing here (a
+        # startup signal arriving after the body already finished or failed)
+        # can skip a later step or replace the body's own outcome; the socket
+        # dir and env restore sit in an inner `finally` so they run even if
+        # something unforeseen escapes the awaited steps.
         teardown_ledger = CancellationLedger()
-        if capturer_proc is not None:
-            teardown_ok = await teardown_ledger.run_to_completion(
-                _stop_capturer(capturer_proc, logger)
-            )
-            if not teardown_ok:
-                teardown_failed = True
-                rc = 1
-        if stderr_task is not None:
-            # The capturer group is gone, so the pipe's EOF is imminent — give
-            # the reader a bounded grace to consume it (flushing any final
-            # lines to the log), then cancel. Bounded so a leaked fd can never
-            # hang teardown; cancellation is safe (readline is the only await).
-            await teardown_ledger.run_to_completion(_await_stderr_reader(stderr_task))
-        # Remove the private socket dir. Best-effort: a leftover here is harmless
-        # (next generation mints a new one), but tidy up so private dirs don't
-        # accumulate under the system temp root across restarts.
         try:
-            shutil.rmtree(sock_dir, ignore_errors=True)
-        except OSError:
-            pass
-        # Restore the socket env vars to their prior state so we don't leak our
-        # private-dir paths into a subsequent in-process caller.
-        for key, prior in _prior_socket_env.items():
-            if prior is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = prior
+            if capturer_proc is not None:
+                completed, teardown_ok = await _run_teardown_step(
+                    teardown_ledger,
+                    _stop_capturer(capturer_proc, logger),
+                    logger,
+                    "stopping the capturer process group",
+                    affects_rc=True,
+                )
+                if not (completed and teardown_ok):
+                    # A raised/cancelled stop proves nothing about the group:
+                    # it may still be alive, exactly like a reported survivor.
+                    teardown_failed = True
+                    rc = 1
+            if stderr_task is not None:
+                # The capturer group is gone, so the pipe's EOF is imminent —
+                # give the reader a bounded grace to consume it (flushing any
+                # final lines to the log), then cancel. Bounded so a leaked fd
+                # can never hang teardown. A failed reader is logged only: the
+                # capturer group is already retired, so it cannot change rc.
+                await _run_teardown_step(
+                    teardown_ledger,
+                    _await_stderr_reader(stderr_task),
+                    logger,
+                    "retiring the capturer stderr reader",
+                    affects_rc=False,
+                )
+        finally:
+            # Remove the private socket dir. Best-effort: a leftover here is
+            # harmless (next generation mints a new one), but tidy up so private
+            # dirs don't accumulate under the system temp root across restarts.
+            try:
+                shutil.rmtree(sock_dir, ignore_errors=True)
+            except OSError:
+                pass
+            # Restore the socket env vars to their prior state so we don't leak
+            # our private-dir paths into a subsequent in-process caller.
+            for key, prior in _prior_socket_env.items():
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
         if startup_cancelled and teardown_failed:
             # The outer startup-signal owner normally maps cancellation to rc=0.
             # A surviving capturer group is stronger evidence, but report it only
@@ -900,6 +932,61 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
             teardown_ledger.raise_if_cancelled()
 
     return rc
+
+
+async def _run_teardown_step(ledger, awaitable, logger, label, *, affects_rc):
+    """Run one supervisor teardown step; return ``(completed, value)``.
+
+    The single owner of step-outcome handling for the authoritative teardown
+    ``finally`` in ``_supervise_socket_session_inner``. It never raises
+    ``Exception`` or a step's own cancellation, so a later step can never be
+    skipped by an earlier one.
+
+    Contract — steps are (1) stop capturer group, (2) retire stderr reader,
+    then, in an inner ``finally`` that always runs, (3) rmtree the socket dir
+    and (4) restore the socket env vars:
+
+    ================  =====================  ================================
+    step outcome      this helper            supervisor
+    ================  =====================  ================================
+    ok                ``(True, value)``      step (1): ``value`` False is a
+                                             surviving group →
+                                             ``teardown_failed``
+    raises Exception  ERROR (1) / WARNING    (1): ``teardown_failed`` (group
+                      (2), redacted text;    may be alive); (2): logged only,
+                      ``(False, None)``      rc unchanged
+    cancelled by the  ``ledger.remember``;   as "raises"; the cancellation is
+    step itself       logged;                replayed per the rule below
+                      ``(False, None)``
+    ================  =====================  ================================
+
+    Caller cancellation (none / lands while a step runs / lands in the same
+    turn a step finishes) is remembered by ``ledger.run_to_completion`` and
+    never abandons the step nor discards its outcome. Then, for every body
+    outcome: all later steps run; (3) and (4) ALWAYS run;
+    ``teardown_failed`` forces rc=1 (``rc==0`` / ``rc!=0`` bodies) or raises
+    ``CapturerTeardownError`` (startup-cancelled body); a body exception or a
+    non-zero rc stays authoritative; a remembered cancellation is replayed
+    only when the body was not cancelled, did not raise, and rc is still 0.
+    """
+    import asyncio
+
+    from onoats._redact import safe_exc_text
+
+    log = logger.error if affects_rc else logger.warning
+    try:
+        return True, await ledger.run_to_completion(awaitable)
+    except asyncio.CancelledError as exc:
+        # run_to_completion propagates only a cancellation of the step itself
+        # (possibly coinciding with a caller cancellation): never swallow it.
+        ledger.remember(exc)
+        log(f"Socket supervisor: teardown step failed ({label}): cancelled")
+    except Exception as exc:
+        log(
+            f"Socket supervisor: teardown step failed ({label}): "
+            f"{type(exc).__name__}: {safe_exc_text(exc)}"
+        )
+    return False, None
 
 
 async def _await_stderr_reader(stderr_task) -> None:

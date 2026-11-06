@@ -99,7 +99,12 @@ registry dep, not a git pin).
   (`CancellationLedger.run_to_completion` in `onoats._closing`): every teardown
   step still runs — including when the signal lands in the same event-loop turn
   a step finishes, whose result is kept — and a start failure, non-zero rc, or
-  surviving capturer group is never masked as a clean stop. The app waits for owned child
+  surviving capturer group is never masked as a clean stop. A step's OWN
+  exception or self-cancellation is handled by one owner (`cli._run_teardown_step`,
+  whose docstring holds the step × outcome contract table): it is logged with
+  redacted text and never skips a later step, the socket-dir removal and env
+  restore always run, a failed capturer stop counts as a surviving group, and a
+  failed stderr-reader retirement is logged only. The app waits for owned child
   exit on Quit; its bounded timeout keeps the app alive with an error rather
   than killing the supervisor before capturer cleanup.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →

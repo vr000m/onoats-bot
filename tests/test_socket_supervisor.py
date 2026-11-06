@@ -1966,6 +1966,52 @@ async def test_stderr_reader_survives_overlong_line(short_root, log_sink):
     assert any("overlong" in r for r in log_sink.records)
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure",
+    [ConnectionResetError("reset by peer"), OSError("EIO"), RuntimeError("boom")],
+    ids=["connection-reset", "oserror", "runtime-error"],
+)
+async def test_stderr_reader_never_raises_on_a_failed_pipe(
+    short_root, log_sink, failure
+):
+    """A pipe read failure other than the overlong-line ValueError ends the
+    drain with a WARNING instead of escaping (the docstring's "never raises
+    out"); a status write raising a non-OSError does not stop the drain."""
+
+    class FailingReader:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            raise failure
+
+    reader = FailingReader()
+    await cli._drain_capturer_stderr(reader, short_root, logger)
+    assert reader.calls == 1
+    assert any("stderr pipe failed" in r for r in log_sink.records)
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_survives_a_non_oserror_status_write(
+    short_root, log_sink, monkeypatch
+):
+    from onoats import status as status_file
+
+    def explode(*_args, **_kwargs):
+        raise ValueError("bad status value")
+
+    monkeypatch.setattr(status_file, "set_warning_branch", explode)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"ONOATS-EVENT zero-run-warning branch=mic hint=x\n")
+    reader.feed_data(b"tail line\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, short_root, logger)
+    assert reader.at_eof()
+    assert any("could not update status fields" in r for r in log_sink.records)
+
+
 def test_capturer_stderr_tee_and_flood_cannot_block(
     sup_env, log_sink, monkeypatch, set_capturer_behaviour, capfd
 ):
@@ -2987,21 +3033,32 @@ def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monke
     assert {key: os.environ.get(key) for key in socket_keys} == prior
 
 
-@pytest.mark.parametrize("teardown_ok", [True, False])
+@pytest.mark.parametrize("reader_outcome", ["ok", "raises", "step-cancelled"])
+@pytest.mark.parametrize("stop_outcome", ["ok", "survivor", "raises", "step-cancelled"])
 @pytest.mark.parametrize("signal_in_teardown", ["none", "mid-step", "same-turn"])
 @pytest.mark.parametrize("body", ["rc0", "rc1", "start-failure", "startup-signal"])
 def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
-    sup_env, monkeypatch, body, signal_in_teardown, teardown_ok
+    sup_env,
+    monkeypatch,
+    log_sink,
+    body,
+    signal_in_teardown,
+    stop_outcome,
+    reader_outcome,
 ):
-    """A startup signal during teardown can neither skip a step nor mask rc.
+    """Neither a signal nor a failing step during teardown can skip a step or
+    mask rc — the ``cli._run_teardown_step`` contract, cell by cell.
 
     The startup handler stays installed until the recorder installs its own.
     A signal arriving while the authoritative ``finally`` is already tearing
     down (after a clean rc, a non-zero rc, or a start failure) must let every
     teardown step finish and must not turn a failure into rc=0. ``same-turn``
     lands the signal in the event-loop turn ``_stop_capturer`` finishes, before
-    the shield wakes the supervisor: the step's result (``teardown_ok``) must
-    still be honoured, not discarded by a re-raised cancellation.
+    the shield wakes the supervisor: the step's result must still be honoured,
+    not discarded by a re-raised cancellation. A step that raises or cancels
+    itself must not skip the later steps (stderr join, socket-dir removal, env
+    restore); a failed stop counts as a surviving capturer group, a failed
+    reader is logged only.
     """
     import tempfile as _tempfile
 
@@ -3071,13 +3128,21 @@ def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
                 # wake-up), i.e. in the same loop turn the step finishes.
                 asyncio.get_running_loop().call_soon(handlers[signal.SIGTERM])
             events.append("stop-done")
-            return teardown_ok
+            if stop_outcome == "raises":
+                raise PermissionError("kill denied")
+            if stop_outcome == "step-cancelled":
+                raise asyncio.CancelledError
+            return stop_outcome == "ok"
 
         real_await_stderr = cli._await_stderr_reader
 
         async def await_stderr(stderr_task):
             await real_await_stderr(stderr_task)
             events.append("stderr-joined")
+            if reader_outcome == "raises":
+                raise ConnectionResetError("stderr pipe reset")
+            if reader_outcome == "step-cancelled":
+                raise asyncio.CancelledError
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
         monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
@@ -3088,6 +3153,13 @@ def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
             cli._supervise_socket_session([]), timeout=SUP_TIMEOUT
         )
 
+    teardown_ok = stop_outcome == "ok"
+    # A signal in teardown runs the startup handler (requested=True), so its
+    # replayed cancellation maps to rc=0; a step's own cancellation is
+    # remembered too but, with no signal, propagates as a cancellation.
+    unrequested_cancel = signal_in_teardown == "none" and (
+        reader_outcome == "step-cancelled"
+    )
     monkeypatch.setattr(_tempfile, "mkdtemp", mint)
     if body == "start-failure":
         with pytest.raises(runtime.SttPreflightError):
@@ -3095,11 +3167,23 @@ def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
     elif body == "startup-signal" and not teardown_ok:
         with pytest.raises(cli.CapturerTeardownError):
             asyncio.run(run())
+    elif body == "rc0" and teardown_ok and unrequested_cancel:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run())
     else:
         expected = 0 if body in ("rc0", "startup-signal") and teardown_ok else 1
         assert asyncio.run(run()) == expected
 
     assert events == ["stop-start", "stop-done", "stderr-joined"]
+    if stop_outcome in ("raises", "step-cancelled"):
+        assert any(
+            "teardown step failed (stopping the capturer" in r for r in log_sink.records
+        )
+    if reader_outcome in ("raises", "step-cancelled"):
+        assert any(
+            "teardown step failed (retiring the capturer stderr" in r
+            for r in log_sink.records
+        )
     assert minted and all(not Path(path).exists() for path in minted)
     assert {key: os.environ.get(key) for key in socket_keys} == prior
 
