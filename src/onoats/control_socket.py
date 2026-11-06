@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from onoats._atomic_fs import rename_noreplace as _rename_noreplace
+# The recorder owner injects the neutral atomic primitive.  This leaf owns only
+# control protocol and endpoint semantics, never application-package imports.
+_rename_noreplace: Callable[[Path, Path], None] | None = None
 
 CONTROL_SOCKET_FILENAME = "onoats-control.sock"
 CONTROL_PROTOCOL_VERSION = 1
@@ -139,7 +141,11 @@ def _record_generation(record: Any) -> tuple[int, float]:
     return int(record.pid), float(record.start_epoch)
 
 
-def _quarantine_and_remove(path: Path, expected: _EndpointIdentity) -> bool:
+def _quarantine_and_remove(
+    path: Path,
+    expected: _EndpointIdentity,
+    rename_noreplace: Callable[[Path, Path], None] | None,
+) -> bool:
     """Move the public entry aside, verify it, then remove only that inode.
 
     If a different entry wins the race, restore it with an exclusive rename.
@@ -168,7 +174,9 @@ def _quarantine_and_remove(path: Path, expected: _EndpointIdentity) -> bool:
         moved = quarantine_path.lstat()
         if not expected.matches(moved):
             try:
-                _rename_noreplace(quarantine_path, path)
+                if rename_noreplace is None:
+                    return False
+                rename_noreplace(quarantine_path, path)
             except OSError:
                 return False
             return False
@@ -229,12 +237,14 @@ class ControlServer:
         on_flush: Callable[[], Awaitable[None] | None],
         on_stop: Callable[[], Awaitable[None] | None],
         peer_uid_getter: Callable[[socket.socket], int] | None = None,
+        rename_noreplace: Callable[[Path, Path], None] | None = None,
     ) -> None:
         self.path = control_socket_path(data_dir)
         self._pid, self._start_epoch = _record_generation(record)
         self._on_flush = on_flush
         self._on_stop = on_stop
         self._peer_uid_getter = peer_uid_getter or _darwin_peer_uid
+        self._rename_noreplace = rename_noreplace or _rename_noreplace
         self._server: asyncio.AbstractServer | None = None
         self._closing = False
         self._handlers: set[asyncio.Task[Any]] = set()
@@ -262,7 +272,9 @@ class ControlServer:
                     f"control endpoint changed while removing stale socket {self.path}"
                 ) from exc
             try:
-                if not _quarantine_and_remove(self.path, stale_identity):
+                if not _quarantine_and_remove(
+                    self.path, stale_identity, self._rename_noreplace
+                ):
                     raise ControlError(
                         "control endpoint changed while removing stale socket "
                         f"{self.path}"
@@ -288,7 +300,9 @@ class ControlServer:
             listener.setblocking(False)
             listener.listen(socket.SOMAXCONN)
             try:
-                _rename_noreplace(private_path, self.path)
+                if self._rename_noreplace is None:
+                    raise ControlError("atomic endpoint publication is unavailable")
+                self._rename_noreplace(private_path, self.path)
             except FileExistsError as exc:
                 raise ControlError(
                     f"control endpoint appeared while publishing {self.path}"
@@ -303,7 +317,7 @@ class ControlServer:
             self._owned_identity = None
             if owned is not None:
                 try:
-                    _quarantine_and_remove(self.path, owned)
+                    _quarantine_and_remove(self.path, owned, self._rename_noreplace)
                 finally:
                     owned.close()
             raise
@@ -460,7 +474,7 @@ class ControlServer:
         if owned is None:
             return
         try:
-            _quarantine_and_remove(self.path, owned)
+            _quarantine_and_remove(self.path, owned, self._rename_noreplace)
         finally:
             owned.close()
 

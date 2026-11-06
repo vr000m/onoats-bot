@@ -699,6 +699,9 @@ def test_dual_wires_producers_at_start_rotation_stop():
     publisher_idx = src.index("UITelemetryPublisher(")
     assert start_idx < publisher_idx
     assert "if telemetry_state is not None and status_published:" in src
+    publisher_call = src[publisher_idx : src.index(")\n", publisher_idx)]
+    assert "rename_noreplace=rename_noreplace" in publisher_call
+    assert "rename_noreplace_available=rename_noreplace_available" in publisher_call
 
 
 @pytest.mark.parametrize("relative", ["src/onoats/dual.py", "src/onoats/__main__.py"])
@@ -707,6 +710,8 @@ def test_recorder_entrypoints_publish_and_teardown_control_generation_in_order(
 ):
     source = (Path(__file__).resolve().parents[1] / relative).read_text()
     server = source.index("ControlServer(")
+    constructor = source[server : source.index(")\n", server)]
+    assert "rename_noreplace=rename_noreplace" in constructor
     bind = source.index("await control_server.start()", server)
     pid_publish = source.index("_write_pid_file(", bind)
     running_publish = source.index("_write_status_running(", pid_publish)

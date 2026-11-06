@@ -24,12 +24,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from onoats._atomic_fs import (
-    rename_noreplace as _rename_noreplace,
-    rename_noreplace_available as _rename_noreplace_available,
-)
-
-from onoats.ui_telemetry_contract import (
+from onoats_contracts.ui_telemetry import (
     AUDIO_OBSERVATION_EXPIRY_SECONDS as AUDIO_OBSERVATION_EXPIRY_SECONDS,
     LEVEL_MAX,
     LEVEL_MIN,
@@ -37,6 +32,12 @@ from onoats.ui_telemetry_contract import (
     TRANSCRIPT_RUN_ID_PATTERN,
     UI_TELEMETRY_SCHEMA_VERSION,
 )
+
+# Filesystem mutation is injected by the recorder owner.  Keeping these seams
+# here lets this display-only leaf stay independent of the application package
+# while the neutral implementation remains single-owned in ``_atomic_fs``.
+_rename_noreplace: Callable[[Path, Path], None] | None = None
+_rename_noreplace_available: Callable[[], bool] | None = None
 
 UI_TELEMETRY_FILENAME = "onoats.ui.json"
 UI_TELEMETRY_MODE = 0o600
@@ -249,6 +250,8 @@ class UITelemetryPublisher:
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        rename_noreplace: Callable[[Path, Path], None] | None = None,
+        rename_noreplace_available: Callable[[], bool] | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.state = state
@@ -256,6 +259,10 @@ class UITelemetryPublisher:
         self._clock = clock
         self._monotonic_clock = monotonic_clock
         self._sleep = sleep
+        self._rename_noreplace = rename_noreplace or _rename_noreplace
+        self._rename_noreplace_available = (
+            rename_noreplace_available or _rename_noreplace_available
+        )
         self._wake = asyncio.Event()
         self._stopping = False
         self._task: asyncio.Task[None] | None = None
@@ -479,7 +486,11 @@ class UITelemetryPublisher:
     def _cleanup_sync(self) -> bool:
         try:
             removed = _cleanup_owned_snapshot(
-                self.path, pid=self.state.pid, start_epoch=self.state.start_epoch
+                self.path,
+                pid=self.state.pid,
+                start_epoch=self.state.start_epoch,
+                rename_noreplace=self._rename_noreplace,
+                rename_noreplace_available=self._rename_noreplace_available,
             )
             if not removed:
                 return False
@@ -565,11 +576,26 @@ def read_snapshot(
         return None
 
 
-def cleanup_snapshot(data_dir: Path, *, pid: int, start_epoch: float) -> bool:
+def cleanup_snapshot(
+    data_dir: Path,
+    *,
+    pid: int,
+    start_epoch: float,
+    rename_noreplace: Callable[[Path, Path], None] | None = None,
+    rename_noreplace_available: Callable[[], bool] | None = None,
+) -> bool:
     """Unlink the ephemeral file only when it still belongs to this run."""
     path = Path(data_dir) / ".active" / UI_TELEMETRY_FILENAME
     try:
-        return _cleanup_owned_snapshot(path, pid=pid, start_epoch=start_epoch)
+        return _cleanup_owned_snapshot(
+            path,
+            pid=pid,
+            start_epoch=start_epoch,
+            rename_noreplace=rename_noreplace or _rename_noreplace,
+            rename_noreplace_available=(
+                rename_noreplace_available or _rename_noreplace_available
+            ),
+        )
     except FileNotFoundError:
         return False
     except Exception as exc:
@@ -577,7 +603,14 @@ def cleanup_snapshot(data_dir: Path, *, pid: int, start_epoch: float) -> bool:
         return False
 
 
-def _cleanup_owned_snapshot(path: Path, *, pid: int, start_epoch: float) -> bool:
+def _cleanup_owned_snapshot(
+    path: Path,
+    *,
+    pid: int,
+    start_epoch: float,
+    rename_noreplace: Callable[[Path, Path], None] | None,
+    rename_noreplace_available: Callable[[], bool] | None,
+) -> bool:
     """Quarantine and remove only the descriptor-owned ephemeral snapshot.
 
     Reads are non-blocking, no-follow, and bounded.  A private sibling
@@ -600,7 +633,7 @@ def _cleanup_owned_snapshot(path: Path, *, pid: int, start_epoch: float) -> bool
             descriptor, opened, pid=pid, start_epoch=start_epoch
         ):
             return False
-        if not _rename_noreplace_available():
+        if rename_noreplace_available is None or not rename_noreplace_available():
             return False
 
         # This is advisory only: the subsequent rename and quarantine inode
@@ -616,7 +649,7 @@ def _cleanup_owned_snapshot(path: Path, *, pid: int, start_epoch: float) -> bool
 
         moved = os.lstat(quarantined)
         if (opened.st_dev, opened.st_ino) != (moved.st_dev, moved.st_ino):
-            _restore_quarantined(quarantined, path)
+            _restore_quarantined(quarantined, path, rename_noreplace)
             return False
 
         # Ownership may have changed while the public name was live.  Re-read
@@ -624,13 +657,13 @@ def _cleanup_owned_snapshot(path: Path, *, pid: int, start_epoch: float) -> bool
         if not _descriptor_has_owner(
             descriptor, os.fstat(descriptor), pid=pid, start_epoch=start_epoch
         ):
-            _restore_quarantined(quarantined, path)
+            _restore_quarantined(quarantined, path, rename_noreplace)
             return False
 
         try:
             os.unlink(quarantined)
         except Exception:
-            _restore_quarantined(quarantined, path)
+            _restore_quarantined(quarantined, path, rename_noreplace)
             raise
         quarantined = None
         return True
@@ -666,10 +699,17 @@ def _descriptor_has_owner(
     )
 
 
-def _restore_quarantined(quarantined: Path, public_path: Path) -> None:
+def _restore_quarantined(
+    quarantined: Path,
+    public_path: Path,
+    rename_noreplace: Callable[[Path, Path], None] | None = None,
+) -> None:
     """Restore a moved replacement without overwriting a newer publication."""
     try:
-        _rename_noreplace(quarantined, public_path)
+        operation = rename_noreplace or _rename_noreplace
+        if operation is None:
+            return
+        operation(quarantined, public_path)
     except FileExistsError:
         # A newer public-path replacement wins; preserve the moved entry in its
         # private quarantine rather than deleting either replacement.

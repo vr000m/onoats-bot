@@ -15,8 +15,15 @@ def test_atomic_noreplace_has_one_production_owner() -> None:
 
     owner = inspect.getsource(atomic_fs)
     assert "renameat2" in owner and "renameatx_np" in owner
-    assert "ctypes.CDLL" not in inspect.getsource(control)
-    assert "ctypes.CDLL" not in inspect.getsource(ui_telemetry)
+    control_source = inspect.getsource(control)
+    telemetry_source = inspect.getsource(ui_telemetry)
+    assert "ctypes.CDLL" not in control_source
+    assert "ctypes.CDLL" not in telemetry_source
+    package_import = re.compile(
+        r"(?m)^\s*(?:from\s+onoats(?:\.|\s)|import\s+onoats(?:\.|\s|$))"
+    )
+    assert package_import.search(control_source) is None
+    assert package_import.search(telemetry_source) is None
 
 
 DOC = Path(__file__).resolve().parents[1] / "docs" / "control-socket-contract.md"

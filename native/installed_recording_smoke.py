@@ -35,7 +35,7 @@ TIMEOUT_DEFAULTS = {
 
 def _load_telemetry_contract():
     """Load constants from this checkout, never from an installed package."""
-    path = Path(__file__).resolve().parents[1] / "src/onoats/ui_telemetry_contract.py"
+    path = Path(__file__).resolve().parents[1] / "src/onoats_contracts/ui_telemetry.py"
     spec = importlib.util.spec_from_file_location(
         "onoats_smoke_telemetry_contract", path
     )

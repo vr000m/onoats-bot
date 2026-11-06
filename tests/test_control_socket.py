@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+import onoats._atomic_fs as atomic_fs
+import onoats.control_socket as control_socket
 from onoats._vendor.pid import PidRecord
 from onoats.control_socket import (
     CONTROL_MAX_REQUEST_BYTES,
@@ -31,6 +33,11 @@ from onoats.recorder_lifecycle import (
 
 
 RECORD = PidRecord(pid=4100, cmdline="onoats bot", start_epoch=1234.5)
+
+
+@pytest.fixture(autouse=True)
+def _inject_atomic_rename(monkeypatch):
+    monkeypatch.setattr(control_socket, "_rename_noreplace", atomic_fs.rename_noreplace)
 
 
 def _async_test(function):

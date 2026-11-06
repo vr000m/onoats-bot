@@ -1443,7 +1443,7 @@ def test_installed_smoke_consumes_shared_telemetry_freshness_authority(
 def test_native_smoke_loads_contract_from_exact_checkout_source():
     source = SMOKE_PATH.read_text(encoding="utf-8")
     assert (
-        'Path(__file__).resolve().parents[1] / "src/onoats/ui_telemetry_contract.py"'
+        'Path(__file__).resolve().parents[1] / "src/onoats_contracts/ui_telemetry.py"'
         in source
     )
     probe = source.split("def nonzero_me()", 1)[1].split(

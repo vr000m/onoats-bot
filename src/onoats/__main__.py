@@ -329,6 +329,7 @@ async def run_onoats(
     # Step 9: Write PID file for control-client generation discovery.
     # ----------------------------------------------------------------
     start_epoch = _mint_start_epoch()
+    from onoats._atomic_fs import rename_noreplace
     from onoats.control_socket import ControlServer
 
     pid_record = _build_pid_record(start_epoch=start_epoch)
@@ -347,6 +348,7 @@ async def run_onoats(
         pid_record,
         on_flush=_control_flush,
         on_stop=_control_stop,
+        rename_noreplace=rename_noreplace,
     )
     await control_server.start()
     try:

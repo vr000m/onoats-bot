@@ -735,6 +735,10 @@ async def run_onoats_dual(
         loop,
         lifecycle_controller=lifecycle,
     )
+    from onoats._atomic_fs import (
+        rename_noreplace,
+        rename_noreplace_available,
+    )
     from onoats.control_socket import ControlServer
 
     pid_record = _build_pid_record(start_epoch=start_epoch)
@@ -753,6 +757,7 @@ async def run_onoats_dual(
         pid_record,
         on_flush=_control_flush,
         on_stop=_control_stop,
+        rename_noreplace=rename_noreplace,
     )
     await control_server.start()
     try:
@@ -775,7 +780,12 @@ async def run_onoats_dual(
     if telemetry_state is not None and status_published:
         from onoats.ui_telemetry import UITelemetryPublisher
 
-        telemetry_publisher = UITelemetryPublisher(data_dir, telemetry_state)
+        telemetry_publisher = UITelemetryPublisher(
+            data_dir,
+            telemetry_state,
+            rename_noreplace=rename_noreplace,
+            rename_noreplace_available=rename_noreplace_available,
+        )
         telemetry_publisher.start()
 
     shutdown_started = False

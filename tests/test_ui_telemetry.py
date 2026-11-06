@@ -44,6 +44,17 @@ from onoats.ui_telemetry import (
 RUN_ID = "0123456789abcdef0123456789abcdef"
 
 
+@pytest.fixture(autouse=True)
+def _inject_atomic_operations(monkeypatch):
+    monkeypatch.setattr(
+        "onoats.ui_telemetry._rename_noreplace", atomic_fs.rename_noreplace
+    )
+    monkeypatch.setattr(
+        "onoats.ui_telemetry._rename_noreplace_available",
+        atomic_fs.rename_noreplace_available,
+    )
+
+
 class FakeClock:
     def __init__(self, now: float = 1000.0):
         self.now = now
@@ -617,7 +628,11 @@ def test_publisher_cleanup_delegates_to_one_cleanup_primitive(tmp_path, monkeypa
     publisher = UITelemetryPublisher(tmp_path, state)
     calls = []
 
-    def cleanup(path, *, pid, start_epoch):
+    def cleanup(
+        path, *, pid, start_epoch, rename_noreplace, rename_noreplace_available
+    ):
+        assert rename_noreplace is atomic_fs.rename_noreplace
+        assert rename_noreplace_available is atomic_fs.rename_noreplace_available
         calls.append((Path(path), pid, start_epoch))
         return True
 

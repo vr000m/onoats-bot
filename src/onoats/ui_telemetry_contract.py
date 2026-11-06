@@ -1,13 +1,15 @@
 """Shared schema and freshness constants for UI telemetry consumers.
 
-This module is deliberately dependency-free.  The native smoke loads this exact
-repository file by path, so it cannot accidentally trust an installed Onoats
-package from another checkout.
+The neutral ``onoats_contracts`` package is the sole literal owner.  This module
+preserves the historical import surface for Python callers; the native smoke
+loads the neutral source file by exact checkout path.
 """
 
-UI_TELEMETRY_SCHEMA_VERSION = 2
-SNAPSHOT_EXPIRY_SECONDS = 5.0
-AUDIO_OBSERVATION_EXPIRY_SECONDS = 1.0
-LEVEL_MIN = 0.0
-LEVEL_MAX = 1.0
-TRANSCRIPT_RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
+from onoats_contracts.ui_telemetry import (  # noqa: F401
+    AUDIO_OBSERVATION_EXPIRY_SECONDS,
+    LEVEL_MAX,
+    LEVEL_MIN,
+    SNAPSHOT_EXPIRY_SECONDS,
+    TRANSCRIPT_RUN_ID_PATTERN,
+    UI_TELEMETRY_SCHEMA_VERSION,
+)
