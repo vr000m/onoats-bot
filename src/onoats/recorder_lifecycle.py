@@ -119,7 +119,15 @@ class RecorderLifecycleController:
             if not force:
                 self._first_signal_latched = True
         if force:
-            loop.call_soon_threadsafe(self.force_exit_event.set)
+            # Forced shutdown is deliberately outside the lifecycle lock.  An
+            # admitted continuation owns that lock until its shielded rotation
+            # completes, but a second signal must still wake the shutdown
+            # watcher and bound process exit when that rotation is stuck.
+            def force_shutdown() -> None:
+                self.shutdown_event.set()
+                self.force_exit_event.set()
+
+            loop.call_soon_threadsafe(force_shutdown)
             return True
         self.schedule_stop(loop)
         return False

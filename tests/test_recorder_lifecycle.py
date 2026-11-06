@@ -239,8 +239,53 @@ async def test_back_to_back_signals_latch_first_synchronously_before_admission()
     await asyncio.sleep(0)
 
     assert force.is_set()
+    assert shutdown.is_set()
     assert marks == []
     assert rotation.calls == []
+
+
+@pytest.mark.parametrize("outcome", ["done", "stuck", "fails"])
+@pytest.mark.parametrize("force_before_stop_task", [False, True])
+@_async_test
+async def test_flush_stop_force_whole_state_space(
+    outcome: str, force_before_stop_task: bool
+) -> None:
+    """A second signal bounds exit without changing first-Stop flush ordering."""
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def rotate(_reason: str, _continue_session: bool) -> bool:
+        started.set()
+        await release.wait()
+        if outcome == "fails":
+            raise OSError("flush failed")
+        return True
+
+    controller = RecorderLifecycleController(rotate)
+    flush = asyncio.create_task(controller.flush("admitted"))
+    await started.wait()
+    loop = asyncio.get_running_loop()
+    assert controller.signal(loop) is False
+    if force_before_stop_task:
+        assert controller.signal(loop) is True
+    else:
+        await asyncio.sleep(0)
+        assert controller.signal(loop) is True
+    await asyncio.sleep(0)
+
+    assert controller.force_exit_event.is_set()
+    assert controller.shutdown_event.is_set()
+    assert not flush.done()
+    release.set()
+    if outcome == "fails":
+        with pytest.raises(OSError, match="flush failed"):
+            await flush
+    else:
+        assert await flush is True
+    # The first signal's queued Stop retains admission order and completes
+    # after the already-admitted continuation releases the lifecycle lock.
+    await asyncio.sleep(0)
+    assert controller.stopping
 
 
 @_async_test
