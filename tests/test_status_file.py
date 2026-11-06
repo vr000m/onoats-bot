@@ -1693,3 +1693,82 @@ def test_login_item_sync_is_owned_by_app_lifecycle_not_the_recorder_model():
     assert "@MainActor\nfinal class LaunchState" in app
     assert "Task.detached" in app
     assert "private func applyLoginItemHint(" in app
+
+
+def _pid_payload(pid: int = 4321, epoch: float = 10.5) -> str:
+    return f"{pid}\nonoats-bot\nonoats bot\n{epoch}\n"
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind",
+    ["fifo", "symlink", "oversized", "group-writable", "foreign-owner"],
+)
+def test_pid_authority_readers_reject_the_full_unsafe_file_space(
+    tmp_path, monkeypatch, unsafe_kind
+):
+    """All public identity parsers share bounded no-follow authority reads."""
+    from onoats._vendor import pid as pid_module
+
+    path = tmp_path / "onoats.pid"
+    if unsafe_kind == "fifo":
+        os.mkfifo(path)
+    elif unsafe_kind == "symlink":
+        target = tmp_path / "target.pid"
+        target.write_text(_pid_payload(), encoding="utf-8")
+        path.symlink_to(target)
+    elif unsafe_kind == "oversized":
+        path.write_bytes(_pid_payload().encode() + b"x" * pid_module.PID_MAX_BYTES)
+    else:
+        path.write_text(_pid_payload(), encoding="utf-8")
+        if unsafe_kind == "group-writable":
+            path.chmod(0o660)
+        else:
+            monkeypatch.setattr(
+                pid_module.os,
+                "geteuid",
+                lambda: path.stat().st_uid + 1,
+            )
+
+    expected = pid_module.PidRecord(4321, "onoats bot", 10.5)
+    assert pid_module.read_pid_file(path) is None
+    assert pid_module.read_pid_record(path) is None
+    target = pid_module.resolve_flush_target(path)
+    assert target.pid is None and target.record is None
+    assert pid_module.compare_and_unlink_pid_record(path, expected) is False
+    assert path.exists() or path.is_symlink()
+
+
+@pytest.mark.parametrize("reader_name", ["read_pid_file", "read_pid_record"])
+def test_pid_authority_read_rejects_path_replacement_and_preserves_successor(
+    tmp_path, monkeypatch, reader_name
+):
+    from onoats._vendor import pid as pid_module
+
+    path = tmp_path / "onoats.pid"
+    path.write_text(_pid_payload(4321, 10.5), encoding="utf-8")
+    successor = tmp_path / "successor.pid"
+    successor.write_text(_pid_payload(9876, 11.5), encoding="utf-8")
+    real_read = pid_module.os.read
+    replaced = False
+
+    def replace_after_read(descriptor, count):
+        nonlocal replaced
+        data = real_read(descriptor, count)
+        if not replaced:
+            replaced = True
+            os.replace(successor, path)
+        return data
+
+    monkeypatch.setattr(pid_module.os, "read", replace_after_read)
+    assert getattr(pid_module, reader_name)(path) is None
+    assert path.read_text(encoding="utf-8") == _pid_payload(9876, 11.5)
+
+
+def test_pid_authority_read_accepts_safe_bounded_owned_regular_file(tmp_path):
+    from onoats._vendor.pid import PidRecord, read_pid_file, read_pid_record
+
+    path = tmp_path / "onoats.pid"
+    path.write_text(_pid_payload(), encoding="utf-8")
+    path.chmod(0o600)
+    assert read_pid_file(path) == 4321
+    assert read_pid_record(path) == PidRecord(4321, "onoats bot", 10.5)

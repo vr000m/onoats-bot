@@ -85,12 +85,43 @@ def _parse_pid_text(text: str, *, source: Path) -> PidRecord | None:
 
 
 def _parse_pid_file(pid_path: Path) -> PidRecord | None:
-    if not pid_path.exists():
+    """Read one PID authority record through a bounded, no-follow descriptor.
+
+    PID records authorize lifecycle control, so pathname convenience APIs are
+    inappropriate here: they follow symlinks, block on FIFOs, and have no byte
+    bound.  The opened inode must be a safe, caller-owned regular file and must
+    still occupy the public pathname after the bounded read.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(pid_path, flags)
+    except OSError:
         return None
     try:
-        return _parse_pid_text(pid_path.read_text(encoding="utf-8"), source=pid_path)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != getattr(os, "geteuid", lambda: opened.st_uid)()
+            or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or opened.st_size > PID_MAX_BYTES
+        ):
+            return None
+        data = os.read(descriptor, PID_MAX_BYTES + 1)
+        if len(data) > PID_MAX_BYTES:
+            return None
+        current = os.lstat(pid_path)
+        if not stat.S_ISREG(current.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (current.st_dev, current.st_ino):
+            return None
+        return _parse_pid_text(data.decode("utf-8"), source=pid_path)
     except (UnicodeError, OSError):
         return None
+    finally:
+        os.close(descriptor)
 
 
 def read_pid_file(pid_path: Path) -> int | None:
@@ -115,14 +146,20 @@ def compare_and_unlink_pid_record(pid_path: Path, expected: PidRecord) -> bool:
     record.  Unreadable, malformed, absent, foreign, or replaced records are
     preserved (and report ``False``).
     """
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(pid_path, flags)
     except OSError:
         return False
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size > PID_MAX_BYTES:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != getattr(os, "geteuid", lambda: opened.st_uid)()
+            or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or opened.st_size > PID_MAX_BYTES
+        ):
             return False
         data = os.read(descriptor, PID_MAX_BYTES + 1)
         if len(data) > PID_MAX_BYTES:
