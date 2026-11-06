@@ -36,6 +36,15 @@ assert _INSTALL_SPEC is not None and _INSTALL_SPEC.loader is not None
 INSTALL_STAGED = importlib.util.module_from_spec(_INSTALL_SPEC)
 _INSTALL_SPEC.loader.exec_module(INSTALL_STAGED)
 
+
+def test_installed_smoke_imports_release_contract_from_neutral_module():
+    source = (REPO_ROOT / "native" / "installed_recording_smoke.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from install_staged import" not in source
+    assert "from release_identity import" in source
+
+
 NATIVE_RESOURCES = (
     "Onoats.icns",
     "OnoatsHeader.png",

@@ -60,13 +60,13 @@ class SmokeFailure(RuntimeError):
 
 
 def _invalidate_receipt(path: Path) -> None:
-    from install_staged import invalidate_smoke_receipt
+    from release_identity import invalidate_smoke_receipt
 
     invalidate_smoke_receipt(path)
 
 
 def _publish_receipt(path: Path, identity) -> None:
-    from install_staged import write_smoke_receipt
+    from release_identity import write_smoke_receipt
 
     write_smoke_receipt(path, identity)
 
@@ -93,15 +93,14 @@ def _validate_timeout_arguments(args: argparse.Namespace) -> None:
 def _verify_release_identity(app: Path, identity_path: Path):
     """Re-derive the immutable staged identity before and after recording."""
     try:
-        from install_staged import (
+        from release_identity import (
             InstallError,
-            _read_release_identity,
-            observed_cli_git_identity,
-            release_identity,
+            observe_and_derive_release_identity,
+            read_release_identity,
         )
 
-        expected = _read_release_identity(identity_path)
-        observed = release_identity(app, cli_git_identity=observed_cli_git_identity())
+        expected = read_release_identity(identity_path)
+        observed = observe_and_derive_release_identity(app)
     except (OSError, ValueError, InstallError) as exc:
         raise SmokeFailure("release identity could not be verified") from exc
     if observed != expected:
