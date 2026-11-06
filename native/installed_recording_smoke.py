@@ -71,6 +71,33 @@ def _publish_receipt(path: Path, identity) -> None:
     write_smoke_receipt(path, identity)
 
 
+def _preserve_final_component(path: Path) -> Path:
+    from release_identity import preserve_final_component
+
+    return preserve_final_component(path)
+
+
+def _effective_app_cli_path(expected) -> Path:
+    """Read the launch configuration without resolving its final component."""
+    result = subprocess.run(
+        ["/usr/bin/defaults", "read", expected.bundle_id, "cliPath"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    configured = result.stdout.strip() if result.returncode == 0 else ""
+    return Path(configured or expected.cli_path).expanduser()
+
+
+def _verify_effective_cli_authority(expected) -> Path:
+    try:
+        from release_identity import InstallError, verify_cli_authority
+
+        return verify_cli_authority(expected, _effective_app_cli_path(expected))
+    except (OSError, ValueError, InstallError) as exc:
+        raise SmokeFailure("effective app CLI authority could not be verified") from exc
+
+
 def _positive_finite_float(raw: str) -> float:
     try:
         value = float(raw)
@@ -446,7 +473,11 @@ def _pid_file_matches(
 
 
 def _recording_identity(
-    status_path: Path, pid_path: Path, *, app_pid: int
+    status_path: Path,
+    pid_path: Path,
+    *,
+    app_pid: int,
+    expected_release=None,
 ) -> RecorderIdentity | None:
     status = _json(status_path)
     if not status or status.get("running") is not True:
@@ -474,6 +505,12 @@ def _recording_identity(
         return None
     if not _descends_from(recorder_pid, app_pid, processes):
         raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
+    if expected_release is not None:
+        interpreter = _verify_effective_cli_authority(expected_release)
+        if _process_executable(recorder_pid) != str(interpreter):
+            raise SmokeFailure(
+                "recorder executable lineage is not the approved CLI interpreter"
+            )
     if not _pid_file_matches(
         pid_path,
         pid=recorder_pid,
@@ -922,23 +959,21 @@ def run(args: argparse.Namespace) -> None:
         raise SmokeFailure("--me-floor must be finite and inside [0.0, 1.0]")
     app = Path(args.app).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser().resolve()
-    identity_path = Path(args.release_identity).expanduser().resolve()
-    receipt_path = (
-        Path(
-            getattr(
-                args,
-                "smoke_receipt",
-                identity_path.with_name(f"{identity_path.name}.smoke-receipt.json"),
-            )
+    identity_path = _preserve_final_component(Path(args.release_identity))
+    receipt_path = Path(
+        getattr(
+            args,
+            "smoke_receipt",
+            identity_path.with_name(f"{identity_path.name}.smoke-receipt.json"),
         )
-        .expanduser()
-        .resolve()
-    )
+    ).expanduser()
+    receipt_path = _preserve_final_component(receipt_path)
     try:
         _invalidate_receipt(receipt_path)
     except (OSError, ValueError, RuntimeError) as exc:
         raise SmokeFailure("smoke receipt could not be invalidated") from exc
     expected_release = _verify_release_identity(app, identity_path)
+    _verify_effective_cli_authority(expected_release)
     _verify_signed_app(app)
     executable = (app / "Contents/MacOS/Onoats").resolve()
     verified_executable = executable.stat()
@@ -976,7 +1011,12 @@ def run(args: argparse.Namespace) -> None:
         recorder = wait_for(
             "app-owned recorder identity",
             args.recording_timeout,
-            lambda: _recording_identity(status_path, pid_path, app_pid=app_pid),
+            lambda: _recording_identity(
+                status_path,
+                pid_path,
+                app_pid=app_pid,
+                expected_release=expected_release,
+            ),
         )
         recorder_pid, epoch = recorder.pid, recorder.start_epoch
         groups = _owned_descendant_groups(app_pid, recorder_pid)
@@ -1058,6 +1098,7 @@ def run(args: argparse.Namespace) -> None:
         )
         _verify_dynamic_release_identity(app_pid, expected_release)
         _verify_release_identity(app, identity_path)
+        _verify_effective_cli_authority(expected_release)
     except BaseException as exc:
         primary_error = exc
         raise

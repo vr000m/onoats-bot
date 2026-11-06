@@ -26,8 +26,17 @@ from packaging.requirements import Requirement
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NATIVE_MAKEFILE = REPO_ROOT / "native" / "Makefile"
 NATIVE_INSTALL_SCRIPT = REPO_ROOT / "native" / "install_staged.py"
+NATIVE_RELEASE_IDENTITY = REPO_ROOT / "native" / "release_identity.py"
 MENUBAR_PLIST = REPO_ROOT / "native" / "onoats-menubar" / "Info.plist"
 RECORDER_HARNESS_SCRIPT = REPO_ROOT / "native" / "test_recorder_model.sh"
+
+_RELEASE_SPEC = importlib.util.spec_from_file_location(
+    "release_identity", NATIVE_RELEASE_IDENTITY
+)
+assert _RELEASE_SPEC is not None and _RELEASE_SPEC.loader is not None
+RELEASE_IDENTITY = importlib.util.module_from_spec(_RELEASE_SPEC)
+sys.modules["release_identity"] = RELEASE_IDENTITY
+_RELEASE_SPEC.loader.exec_module(RELEASE_IDENTITY)
 
 _INSTALL_SPEC = importlib.util.spec_from_file_location(
     "onoats_native_install_staged", NATIVE_INSTALL_SCRIPT
@@ -43,6 +52,18 @@ def test_installed_smoke_imports_release_contract_from_neutral_module():
     )
     assert "from install_staged import" not in source
     assert "from release_identity import" in source
+
+
+def test_release_contract_has_one_neutral_owner():
+    installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    neutral = NATIVE_RELEASE_IDENTITY.read_text(encoding="utf-8")
+    assert "class ReleaseIdentity" not in installer
+    assert "class SmokeReceipt" not in installer
+    assert "def release_identity_digest" not in installer
+    assert "def write_smoke_receipt" not in installer
+    assert "class ReleaseIdentity" in neutral
+    assert "class SmokeReceipt" in neutral
+    assert "from install_staged import" not in neutral
 
 
 NATIVE_RESOURCES = (
@@ -849,7 +870,8 @@ def _configure_test_cli_authority(work: Path) -> str:
         "/approved-rollback.txt\n"
         "/backups/\n"
         "/home/\n"
-        "/installed/\n"
+        "/installed*/\n"
+        "/native/__pycache__/\n"
         "/release-identity*.json\n"
         "/smoke-receipt*.json\n",
         encoding="utf-8",
@@ -864,6 +886,7 @@ def _configure_test_cli_authority(work: Path) -> str:
             "install_staged.py",
             "native/Makefile",
             "native/install_staged.py",
+            "native/release_identity.py",
             "src/onoats/__init__.py",
             "test-authority/onoats",
             "test-authority/python",
@@ -925,6 +948,7 @@ def staged_install_workflow(tmp_path: Path) -> Path:
     (tmp_path / "Makefile").symlink_to("native/Makefile")
     installer = native / "install_staged.py"
     shutil.copy2(NATIVE_INSTALL_SCRIPT, installer)
+    shutil.copy2(NATIVE_RELEASE_IDENTITY, native / "release_identity.py")
     (tmp_path / "install_staged.py").symlink_to(installer.relative_to(tmp_path))
     source = installer.read_text(encoding="utf-8")
     source = source.replace(
@@ -936,9 +960,12 @@ def staged_install_workflow(tmp_path: Path) -> Path:
     )
     installer.write_text(source, encoding="utf-8")
     _make_adhoc_app(tmp_path / "Onoats.app")
-    cli_git_identity = _configure_test_cli_authority(tmp_path)
+    _configure_test_cli_authority(tmp_path)
+    cli_authority = RELEASE_IDENTITY.observed_cli_authority(
+        checkout=tmp_path, shim=tmp_path / "home/.local/bin/onoats"
+    )
     identity = INSTALL_STAGED.release_identity(
-        tmp_path / "Onoats.app", cli_git_identity=cli_git_identity
+        tmp_path / "Onoats.app", cli_authority=cli_authority
     )
     (tmp_path / "release-identity.json").write_text(
         identity.to_json() + "\n", encoding="utf-8"
@@ -1068,6 +1095,10 @@ def test_smoke_receipt_state_space_is_atomic_and_identity_bound(
         "a" * 40,
         "b" * 64,
         "c" * 64,
+        "/tmp/onoats-test-cli",
+        "d" * 64,
+        "/tmp/onoats-test-python",
+        "e" * 64,
         "d" * 40,
     )
     other = identity._replace(tree_hash="e" * 64)
@@ -1103,14 +1134,103 @@ def test_smoke_receipt_state_space_is_atomic_and_identity_bound(
         INSTALL_STAGED._read_smoke_receipt(receipt_path)
 
 
+@pytest.mark.parametrize(
+    ("state", "accepted"),
+    [("absent", True), ("regular", True), ("symlink", False), ("replacement", False)],
+)
+def test_smoke_receipt_output_leaf_state_space(
+    tmp_path: Path, state: str, accepted: bool
+):
+    receipt = tmp_path / "shared-smoke-receipt.json"
+    target = tmp_path / "attacker-target"
+    target.write_text("unchanged", encoding="utf-8")
+    if state in {"regular", "replacement"}:
+        receipt.write_text("old", encoding="utf-8")
+    if state == "replacement":
+        receipt.unlink()
+    if state in {"symlink", "replacement"}:
+        receipt.symlink_to(target)
+
+    if accepted:
+        RELEASE_IDENTITY.invalidate_smoke_receipt(receipt)
+        assert receipt.is_file() and not receipt.is_symlink()
+    else:
+        with pytest.raises(RELEASE_IDENTITY.InstallError, match="non-symlink"):
+            RELEASE_IDENTITY.invalidate_smoke_receipt(receipt)
+        assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_smoke_receipt_path_resolution_preserves_hostile_final_symlink(tmp_path: Path):
+    target = tmp_path / "attacker-target"
+    target.write_text("unchanged", encoding="utf-8")
+    planted = tmp_path / "receipt.json"
+    planted.symlink_to(target)
+
+    safe = RELEASE_IDENTITY.preserve_final_component(planted)
+
+    assert safe == planted
+    assert safe.is_symlink()
+    with pytest.raises(RELEASE_IDENTITY.InstallError, match="non-symlink"):
+        RELEASE_IDENTITY.invalidate_smoke_receipt(safe)
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.parametrize(
+    ("cell", "accepted"),
+    [
+        ("canonical", True),
+        ("override", False),
+        ("wrapper", False),
+        ("replacement", False),
+    ],
+)
+def test_release_cli_authority_state_space(tmp_path: Path, cell: str, accepted: bool):
+    interpreter = tmp_path / "python"
+    interpreter.write_bytes(b"verified interpreter")
+    interpreter.chmod(0o755)
+    entrypoint = tmp_path / "onoats-entry"
+    entrypoint.write_text(f"#!{interpreter}\n", encoding="utf-8")
+    entrypoint.chmod(0o755)
+    shim = tmp_path / "onoats"
+    shim.symlink_to(entrypoint)
+    identity = RELEASE_IDENTITY.ReleaseIdentity(
+        RELEASE_IDENTITY.BUNDLE_ID,
+        "identifier net.varunsingh.onoats",
+        "a" * 40,
+        "b" * 64,
+        "c" * 64,
+        str(shim),
+        hashlib.sha256(entrypoint.read_bytes()).hexdigest(),
+        str(interpreter),
+        hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "d" * 40,
+    )
+    selected = shim
+    if cell == "override":
+        selected = tmp_path / "override"
+        selected.symlink_to(entrypoint)
+    elif cell == "wrapper":
+        shim.unlink()
+        shim.write_text(f"#!{interpreter}\n", encoding="utf-8")
+    elif cell == "replacement":
+        entrypoint.write_text(f"#!{interpreter}\n# replaced\n", encoding="utf-8")
+
+    if accepted:
+        assert RELEASE_IDENTITY.verify_cli_authority(identity, selected) == interpreter
+    else:
+        with pytest.raises(RELEASE_IDENTITY.InstallError):
+            RELEASE_IDENTITY.verify_cli_authority(identity, selected)
+
+
 def test_designated_requirement_extraction_is_path_independent_and_fail_closed():
-    installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
-    assert 'line.startswith("designated => ")' in installer, (
+    contract = NATIVE_RELEASE_IDENTITY.read_text(encoding="utf-8")
+    assert 'line.startswith("designated => ")' in contract, (
         "codesign output must be reduced to the designated requirement line"
     )
-    assert "len(lines) != 1" in installer, (
+    assert "len(lines) != 1" in contract, (
         "designated-requirement extraction must reject zero or multiple matches"
     )
+    installer = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "hashlib.sha256(requirement.encode())" in installer
 
 
@@ -1533,6 +1653,10 @@ def test_complete_explicit_approval_creates_verified_rollback_record(
         "cdhash",
         "tree_hash",
         "executable_hash",
+        "cli_path",
+        "cli_executable_hash",
+        "cli_interpreter_path",
+        "cli_interpreter_hash",
         "cli_git_identity",
     ],
 )
@@ -1548,6 +1672,10 @@ def test_install_requires_every_release_identity_field_before_mutation(
         "cdhash": "f" * 40,
         "tree_hash": "f" * 64,
         "executable_hash": "f" * 64,
+        "cli_path": "/tmp/impostor-onoats",
+        "cli_executable_hash": "f" * 64,
+        "cli_interpreter_path": "/tmp/impostor-python",
+        "cli_interpreter_hash": "f" * 64,
         "cli_git_identity": "f" * 40,
     }[field]
     mismatch = work / f"release-identity-{field}.json"
@@ -1587,11 +1715,21 @@ def test_release_identity_is_portable_across_a_distinct_bundle_copy(
     copied.parent.mkdir()
     shutil.copytree(source, copied, copy_function=_copy_file_without_flags)
 
+    approved = INSTALL_STAGED._read_release_identity(
+        staged_install_workflow / "release-identity.json"
+    )
+    cli_authority = (
+        approved.cli_path,
+        approved.cli_executable_hash,
+        approved.cli_interpreter_path,
+        approved.cli_interpreter_hash,
+        approved.cli_git_identity,
+    )
     source_identity = INSTALL_STAGED.release_identity(
-        source, cli_git_identity="test-head"
+        source, cli_authority=cli_authority
     )
     copied_identity = INSTALL_STAGED.release_identity(
-        copied, cli_git_identity="test-head"
+        copied, cli_authority=cli_authority
     )
 
     assert copied_identity == source_identity
@@ -1614,12 +1752,29 @@ def test_release_identity_rejects_source_path_replacement_during_snapshot(
         replacement.write_bytes(b"second")
         os.replace(replacement, executable)
 
-    monkeypatch.setattr(INSTALL_STAGED, "_run", replace_during_copy)
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def replace_during_copy_run(argv, **_kwargs):
+        assert argv[0] == INSTALL_STAGED.DITTO
+        replace_during_copy(*argv)
+        return Result()
+
+    monkeypatch.setattr(RELEASE_IDENTITY.subprocess, "run", replace_during_copy_run)
+    cli_authority = (
+        "/tmp/onoats",
+        "a" * 64,
+        "/tmp/python",
+        "b" * 64,
+        "c" * 40,
+    )
 
     with pytest.raises(
         INSTALL_STAGED.InstallError, match="path/inode changed during identity snapshot"
     ):
-        INSTALL_STAGED.release_identity(app, cli_git_identity="test-head")
+        INSTALL_STAGED.release_identity(app, cli_authority=cli_authority)
 
 
 def test_release_publish_waits_for_both_supported_runtime_gates():

@@ -74,6 +74,9 @@ def _stub_release_identity(monkeypatch):
     monkeypatch.setattr(SMOKE, "_verify_dynamic_release_identity", lambda *_args: None)
     monkeypatch.setattr(SMOKE, "_invalidate_receipt", lambda *_args: None)
     monkeypatch.setattr(SMOKE, "_publish_receipt", lambda *_args: None)
+    monkeypatch.setattr(
+        SMOKE, "_verify_effective_cli_authority", lambda *_args: Path("/bin/python3")
+    )
 
 
 @pytest.mark.parametrize(
@@ -99,6 +102,87 @@ def test_installed_smoke_dynamic_pid_identity_is_exact(
     else:
         with pytest.raises(SMOKE.SmokeFailure, match="dynamic code identity"):
             SMOKE._verify_dynamic_release_identity(4242, expected)
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("", "/approved/onoats"), ("/override/wrapper", "/override/wrapper")],
+    ids=["canonical-default", "configured-override"],
+)
+def test_installed_smoke_reads_effective_app_cli_configuration(
+    monkeypatch, configured: str, expected: str
+):
+    monkeypatch.setattr(
+        SMOKE.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0 if configured else 1, stdout=configured
+        ),
+    )
+    release = SimpleNamespace(
+        bundle_id="net.varunsingh.onoats", cli_path="/approved/onoats"
+    )
+    assert str(SMOKE._effective_app_cli_path(release)) == expected
+
+
+def test_installed_smoke_preserves_receipt_leaf_for_no_follow_writer():
+    source = SMOKE_PATH.read_text(encoding="utf-8")
+    run_body = source.split("def run(args:", 1)[1].split("def _parser", 1)[0]
+    assert "receipt_path = _preserve_final_component(receipt_path)" in run_body
+    assert "receipt_path.resolve()" not in run_body
+
+
+@pytest.mark.parametrize("kernel", ["matching", "foreign"])
+def test_installed_smoke_binds_recorder_lineage_to_verified_cli_interpreter(
+    tmp_path, monkeypatch, kernel: str
+):
+    status_path = tmp_path / "onoats.status.json"
+    pid_path = tmp_path / "onoats.pid"
+    status_path.write_text(
+        json.dumps({"running": True, "pid": 4321, "start_time": 900.25}),
+        encoding="utf-8",
+    )
+    command = "/approved/python /approved/onoats bot"
+    pid_path.write_text(f"4321\nonoats-bot\n{command}\n900.25\n", encoding="utf-8")
+    rows = {
+        1234: SMOKE.ProcessRow(1, 1234, "app-start", "/app"),
+        4321: SMOKE.ProcessRow(1234, 4321, "rec-start", command),
+    }
+    monkeypatch.setattr(SMOKE, "_processes", lambda: rows)
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_birth",
+        lambda pid: _birth(10, pid),
+    )
+    monkeypatch.setattr(
+        SMOKE,
+        "_verify_effective_cli_authority",
+        lambda _release: Path("/approved/python"),
+    )
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_executable",
+        lambda _pid: "/approved/python" if kernel == "matching" else "/foreign/python",
+    )
+
+    if kernel == "matching":
+        assert (
+            SMOKE._recording_identity(
+                status_path,
+                pid_path,
+                app_pid=1234,
+                expected_release=object(),
+            )
+            is not None
+        )
+    else:
+        with pytest.raises(SMOKE.SmokeFailure, match="recorder executable lineage"):
+            SMOKE._recording_identity(
+                status_path,
+                pid_path,
+                app_pid=1234,
+                expected_release=object(),
+            )
 
 
 class _IdentityVAD(FrameProcessor):

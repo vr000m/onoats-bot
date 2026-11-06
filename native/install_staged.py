@@ -6,22 +6,35 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
-import json
 import os
 from pathlib import Path
-import plistlib
 import shutil
 import stat
 import subprocess
 import tempfile
 import time
-from urllib.parse import unquote, urlparse
 import warnings
-from typing import Callable, NamedTuple
+
+from release_identity import (
+    BUNDLE_ID,
+    InstallError,
+    ReleaseIdentity,
+    SmokeReceipt,
+    _cdhash,
+    _designated_requirement,
+    app_identity,
+    invalidate_smoke_receipt,
+    observed_cli_authority,
+    read_release_identity as _read_release_identity,
+    read_smoke_receipt as _read_smoke_receipt,
+    release_identity,
+    release_identity_digest,
+    write_smoke_receipt,
+)
+
+__all__ = ("invalidate_smoke_receipt", "write_smoke_receipt")
 
 
-IDENTITY_VERSION = b"onoats-app-identity-v1\0"
-SMOKE_RECEIPT_VERSION = 1
 RENAME_SWAP = 0x00000002
 LSREGISTER = Path(
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -31,152 +44,7 @@ CHMOD = "/bin/chmod"
 CODESIGN = "/usr/bin/codesign"
 DITTO = "/usr/bin/ditto"
 MAKE = "/usr/bin/make"
-BUNDLE_ID = "net.varunsingh.onoats"
 SCRIPT_DIR = Path(__file__).resolve().parent
-
-
-class InstallError(RuntimeError):
-    """A staged install or rollback contract check failed."""
-
-
-class ReleaseIdentity(NamedTuple):
-    """Immutable identity shared by staged installation and signed-app smoke."""
-
-    bundle_id: str
-    designated_requirement: str
-    cdhash: str
-    tree_hash: str
-    executable_hash: str
-    cli_git_identity: str
-
-    def to_json(self) -> str:
-        return json.dumps(self._asdict(), sort_keys=True, separators=(",", ":"))
-
-    @classmethod
-    def from_json(cls, raw: str) -> "ReleaseIdentity":
-        try:
-            value = json.loads(raw)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise InstallError("release identity is not valid JSON") from exc
-        if not isinstance(value, dict) or set(value) != set(cls._fields):
-            raise InstallError("release identity fields do not match v1")
-        if not all(isinstance(value[field], str) for field in cls._fields):
-            raise InstallError("release identity fields must all be strings")
-        identity = cls(**value)
-        for field in ("tree_hash", "executable_hash"):
-            digest = getattr(identity, field)
-            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-                raise InstallError(f"release identity {field} is not sha256")
-        if identity.bundle_id != BUNDLE_ID:
-            raise InstallError("release identity bundle identifier is not canonical")
-        if not identity.designated_requirement or not identity.cdhash:
-            raise InstallError("release identity signing fields are empty")
-        if not identity.cli_git_identity.strip():
-            raise InstallError("release identity CLI git identity is empty")
-        return identity
-
-
-class SmokeReceipt(NamedTuple):
-    """Successful signed-smoke proof bound to one ReleaseIdentity digest."""
-
-    version: int
-    release_identity_sha256: str
-
-    def to_json(self) -> str:
-        return json.dumps(self._asdict(), sort_keys=True, separators=(",", ":"))
-
-    @classmethod
-    def from_json(cls, raw: str) -> "SmokeReceipt":
-        try:
-            value = json.loads(raw)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise InstallError("smoke receipt is not valid JSON") from exc
-        if not isinstance(value, dict) or set(value) != set(cls._fields):
-            raise InstallError("smoke receipt fields do not match v1")
-        if (
-            type(value["version"]) is not int
-            or value["version"] != SMOKE_RECEIPT_VERSION
-        ):
-            raise InstallError("smoke receipt version is unsupported")
-        digest = value["release_identity_sha256"]
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise InstallError("smoke receipt identity digest is not sha256")
-        return cls(value["version"], digest)
-
-
-def release_identity_digest(identity: ReleaseIdentity) -> str:
-    return hashlib.sha256(identity.to_json().encode("utf-8")).hexdigest()
-
-
-def _atomic_write_private(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise InstallError("smoke receipt output must be a regular non-symlink file")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
-            descriptor = -1
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise InstallError(
-                "smoke receipt output changed to an unsafe file before publication"
-            )
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-
-
-def invalidate_smoke_receipt(path: Path) -> None:
-    """Atomically make any prior receipt unusable before a new smoke starts."""
-    _atomic_write_private(path, b'{"status":"in-progress"}\n')
-
-
-def write_smoke_receipt(path: Path, identity: ReleaseIdentity) -> None:
-    receipt = SmokeReceipt(SMOKE_RECEIPT_VERSION, release_identity_digest(identity))
-    _atomic_write_private(path, (receipt.to_json() + "\n").encode("utf-8"))
-
-
-def _read_smoke_receipt(path: Path) -> SmokeReceipt:
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_size > 64 * 1024:
-            raise InstallError("smoke receipt is not a bounded regular file")
-        raw = os.read(descriptor, before.st_size + 1)
-        after = os.fstat(descriptor)
-        current = path.lstat()
-    finally:
-        os.close(descriptor)
-    if (
-        len(raw) != before.st_size
-        or (before.st_dev, before.st_ino, before.st_size)
-        != (after.st_dev, after.st_ino, after.st_size)
-        or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
-    ):
-        raise InstallError("smoke receipt changed while being read")
-    try:
-        return SmokeReceipt.from_json(raw.decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        raise InstallError("smoke receipt is not UTF-8") from exc
 
 
 def _require_smoke_receipt(path: Path, identity: ReleaseIdentity) -> SmokeReceipt:
@@ -184,219 +52,6 @@ def _require_smoke_receipt(path: Path, identity: ReleaseIdentity) -> SmokeReceip
     if receipt.release_identity_sha256 != release_identity_digest(identity):
         raise InstallError("smoke receipt does not match the approved release identity")
     return receipt
-
-
-class SourceExecutableEvidence(NamedTuple):
-    """Non-portable evidence used only while deriving a portable identity."""
-
-    device: int
-    inode: int
-
-
-def observed_cli_git_identity(
-    *,
-    checkout: Path | None = None,
-    shim: Path | None = None,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> str:
-    """Return HEAD only after independently binding the installed CLI to it."""
-    checkout = (checkout or SCRIPT_DIR.parent).resolve()
-    shim = shim or Path.home() / ".local/bin/onoats"
-    try:
-        root = run(
-            ["/usr/bin/git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        head = run(
-            ["/usr/bin/git", "-C", str(checkout), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        dirty = run(
-            ["/usr/bin/git", "-C", str(checkout), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        if Path(root).resolve() != checkout or dirty:
-            raise InstallError("CLI checkout is not the expected clean worktree")
-
-        if not shim.is_symlink():
-            raise InstallError("CLI shim is not the stable ~/.local/bin/onoats link")
-        target = shim.resolve(strict=True)
-        first_line = target.read_bytes().splitlines()[0]
-        if not first_line.startswith(b"#!"):
-            raise InstallError("CLI shim target has no interpreter authority")
-        interpreter = Path(os.fsdecode(first_line[2:]))
-        if not interpreter.is_absolute() or not interpreter.is_file():
-            raise InstallError("CLI shim interpreter is unavailable")
-        probe = (
-            "import importlib.metadata as m,json,onoats,sys;"
-            "d=m.distribution('onoats');"
-            "print(json.dumps({'python':sys.executable,'module':onoats.__file__,"
-            "'direct_url':d.read_text('direct_url.json')}))"
-        )
-        observed = json.loads(
-            run(
-                [str(interpreter), "-I", "-c", probe],
-                check=True,
-                capture_output=True,
-                text=True,
-                cwd="/",
-            ).stdout
-        )
-        direct_url = json.loads(observed["direct_url"])
-        origin = urlparse(direct_url["url"])
-        editable_root = Path(unquote(origin.path)).resolve()
-        module = Path(observed["module"]).resolve()
-        if (
-            Path(observed["python"]).resolve() != interpreter.resolve()
-            or origin.scheme != "file"
-            or direct_url.get("dir_info", {}).get("editable") is not True
-            or editable_root != checkout
-            or not module.is_relative_to(checkout / "src" / "onoats")
-        ):
-            raise InstallError("installed CLI is not owned by the verified checkout")
-    except InstallError:
-        raise
-    except (
-        OSError,
-        KeyError,
-        TypeError,
-        ValueError,
-        json.JSONDecodeError,
-        subprocess.CalledProcessError,
-    ) as exc:
-        raise InstallError(
-            "CLI git identity could not be independently verified"
-        ) from exc
-    if len(head) != 40 or any(
-        character not in "0123456789abcdef" for character in head
-    ):
-        raise InstallError("CLI checkout HEAD is not a canonical git identity")
-    return head
-
-
-def _identity_from_private_snapshot(
-    app: Path, *, cli_git_identity: str
-) -> tuple[ReleaseIdentity, SourceExecutableEvidence]:
-    info_path = app / "Contents/Info.plist"
-    executable = app / "Contents/MacOS/Onoats"
-    try:
-        with executable.open("rb") as opened:
-            before = os.fstat(opened.fileno())
-            executable_hash = hashlib.file_digest(opened, "sha256").hexdigest()
-            after = os.fstat(opened.fileno())
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise InstallError("snapshot executable changed during identity derivation")
-        with info_path.open("rb") as stream:
-            bundle_id = plistlib.load(stream)["CFBundleIdentifier"]
-    except (OSError, KeyError, plistlib.InvalidFileException) as exc:
-        raise InstallError("staged app has no stable canonical identity") from exc
-    if bundle_id != BUNDLE_ID:
-        raise InstallError("staged app bundle identifier is not canonical")
-    return (
-        ReleaseIdentity(
-            bundle_id=bundle_id,
-            designated_requirement=_designated_requirement(app),
-            cdhash=_cdhash(app),
-            tree_hash=app_identity(app),
-            executable_hash=executable_hash,
-            cli_git_identity=cli_git_identity,
-        ),
-        SourceExecutableEvidence(before.st_dev, before.st_ino),
-    )
-
-
-def release_identity(app: Path, *, cli_git_identity: str) -> ReleaseIdentity:
-    """Derive one portable identity from a private bundle snapshot.
-
-    Source inode/device evidence is deliberately not serialized: an installed
-    copy must have different inode identity.  It is used only to reject a
-    source-path replacement while the private snapshot is being made.
-    """
-    app = app.resolve()
-    executable = app / "Contents/MacOS/Onoats"
-    try:
-        source_before = executable.stat()
-        app_before = app.stat()
-    except OSError as exc:
-        raise InstallError("staged app identity source is unavailable") from exc
-    with tempfile.TemporaryDirectory(prefix="onoats-release-identity-") as directory:
-        snapshot = Path(directory) / "snapshot"
-        _run(DITTO, str(app), str(snapshot))
-        try:
-            source_after = executable.stat()
-            app_after = app.stat()
-        except OSError as exc:
-            raise InstallError("staged app changed during identity snapshot") from exc
-        if (source_before.st_dev, source_before.st_ino) != (
-            source_after.st_dev,
-            source_after.st_ino,
-        ) or (app_before.st_dev, app_before.st_ino) != (
-            app_after.st_dev,
-            app_after.st_ino,
-        ):
-            raise InstallError("staged app path/inode changed during identity snapshot")
-        identity, _evidence = _identity_from_private_snapshot(
-            snapshot, cli_git_identity=cli_git_identity
-        )
-        return identity
-
-
-def _read_release_identity(path: Path) -> ReleaseIdentity:
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
-            raise InstallError("release identity is not a bounded regular file")
-        raw = os.read(descriptor, info.st_size + 1)
-    finally:
-        os.close(descriptor)
-    if len(raw) != info.st_size:
-        raise InstallError("release identity changed while being read")
-    try:
-        return ReleaseIdentity.from_json(raw.decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        raise InstallError("release identity is not UTF-8") from exc
-
-
-def _field(digest: "hashlib._Hash", value: bytes) -> None:
-    digest.update(len(value).to_bytes(8, "big"))
-    digest.update(value)
-
-
-def app_identity(app: Path) -> str:
-    """Hash bundle topology, types, permission modes, bytes, and link targets."""
-    if not app.is_dir() or app.is_symlink():
-        raise InstallError(f"app bundle is not a real directory: {app}")
-    digest = hashlib.sha256(IDENTITY_VERSION)
-    entries = [app, *app.rglob("*")]
-    entries.sort(
-        key=lambda path: os.fsencode("." if path == app else path.relative_to(app))
-    )
-    for path in entries:
-        relative = b"." if path == app else os.fsencode(path.relative_to(app))
-        info = path.lstat()
-        mode = stat.S_IMODE(info.st_mode)
-        if stat.S_ISDIR(info.st_mode):
-            kind, payload = b"directory", b""
-        elif stat.S_ISREG(info.st_mode):
-            kind = b"file"
-            payload = hashlib.sha256(path.read_bytes()).digest()
-        elif stat.S_ISLNK(info.st_mode):
-            kind = b"symlink"
-            payload = os.fsencode(os.readlink(path))
-        else:
-            raise InstallError(f"unsupported bundle entry type: {path}")
-        for value in (relative, kind, f"{mode:04o}".encode(), payload):
-            _field(digest, value)
-    return digest.hexdigest()
 
 
 def _normalise_private_tree(app: Path) -> None:
@@ -431,28 +86,6 @@ def _run(
         detail = (result.stdout + result.stderr).strip()
         raise InstallError(f"command failed ({' '.join(argv)}): {detail}")
     return result
-
-
-def _designated_requirement(app: Path) -> str:
-    result = _run(CODESIGN, "-dr", "-", str(app))
-    lines = []
-    for line in (result.stdout + result.stderr).splitlines():
-        if line.startswith("designated => "):
-            lines.append(line.removeprefix("designated => "))
-        elif line.startswith("# designated => "):
-            lines.append(line.removeprefix("# designated => "))
-    if len(lines) != 1:
-        raise InstallError(f"expected exactly one designated requirement: {app}")
-    return lines[0]
-
-
-def _cdhash(app: Path) -> str:
-    result = _run(CODESIGN, "-dvvv", str(app))
-    for line in (result.stdout + result.stderr).splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.lower() == "cdhash" and value:
-            return value.lower()
-    raise InstallError(f"app bundle has no cdhash: {app}")
 
 
 def _make_verifier_env(
@@ -752,6 +385,7 @@ def install(args: argparse.Namespace) -> None:
     staged = Path(args.app)
     release_identity_path = getattr(args, "release_identity", None)
     expected_release = None
+    approved_cli_authority = None
     if release_identity_path is not None:
         if not release_identity_path:
             raise InstallError("installation requires an approved release identity")
@@ -760,9 +394,9 @@ def install(args: argparse.Namespace) -> None:
         if not receipt_path:
             raise InstallError("installation requires a successful smoke receipt")
         _require_smoke_receipt(Path(receipt_path), expected_release)
-        observed_cli_identity = observed_cli_git_identity()
+        approved_cli_authority = observed_cli_authority()
         observed_release = release_identity(
-            staged, cli_git_identity=observed_cli_identity
+            staged, cli_authority=approved_cli_authority
         )
         if observed_release != expected_release:
             raise InstallError(
@@ -801,8 +435,9 @@ def install(args: argparse.Namespace) -> None:
             candidate, expected_identity=expected
         )
         if expected_release is not None:
+            assert approved_cli_authority is not None
             candidate_release = release_identity(
-                candidate, cli_git_identity=observed_cli_identity
+                candidate, cli_authority=approved_cli_authority
             )
             if candidate_release != expected_release:
                 raise InstallError("installed copy candidate changed release identity")
@@ -829,8 +464,9 @@ def install(args: argparse.Namespace) -> None:
                 makefile_dir=Path(args.makefile_dir),
             )
             if expected_release is not None:
+                assert approved_cli_authority is not None
                 installed_release = release_identity(
-                    path, cli_git_identity=observed_cli_identity
+                    path, cli_authority=approved_cli_authority
                 )
                 if installed_release != expected_release:
                     raise InstallError("installed app changed release identity")
