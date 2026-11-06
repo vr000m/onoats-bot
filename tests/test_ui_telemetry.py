@@ -485,7 +485,9 @@ def test_real_publisher_task_recovers_after_write_failure(tmp_path, monkeypatch)
     asyncio.run(_run())
 
 
-def test_read_snapshot_rejects_stale_foreign_schema_and_bad_aggregate(tmp_path):
+def test_read_snapshot_rejects_stale_foreign_schema_and_bad_aggregate(
+    tmp_path, monkeypatch
+):
     state = _state()
     publisher = UITelemetryPublisher(tmp_path, state)
     assert publisher.write_once(now=1000.0)
@@ -501,10 +503,19 @@ def test_read_snapshot_rejects_stale_foreign_schema_and_bad_aggregate(tmp_path):
     path.write_text(json.dumps(raw), encoding="utf-8")
     assert read_snapshot(path, pid=4321, start_epoch=900.25, now=1000.0) is None
 
-    raw["schema"] = 1
+    raw["schema"] = UI_TELEMETRY_SCHEMA_VERSION
     raw["stt"]["aggregate"] = "ready"
+    aggregate_checks = []
+    real_aggregate = aggregate_stt_state
+
+    def checked_aggregate(me, them):
+        aggregate_checks.append((me, them))
+        return real_aggregate(me, them)
+
+    monkeypatch.setattr("onoats.ui_telemetry.aggregate_stt_state", checked_aggregate)
     path.write_text(json.dumps(raw), encoding="utf-8")
     assert read_snapshot(path, pid=4321, start_epoch=900.25, now=1000.0) is None
+    assert aggregate_checks == [("unknown", "unknown")]
 
 
 @pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
