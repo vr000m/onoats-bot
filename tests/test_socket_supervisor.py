@@ -3524,7 +3524,11 @@ def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(
     monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
     monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
     logger = Logger()
-    rc = asyncio.run(cli._run_recorder_with_capturer([], Capturer(), logger, tmp_path))
+    rc = asyncio.run(
+        cli._run_recorder_with_capturer(
+            [], Capturer(), logger, tmp_path, session_config=object()
+        )
+    )
     assert rc == 1
     assert any("capturer exited mid-session" in record for record in logger.records)
 
@@ -3564,6 +3568,35 @@ def test_supervisor_passes_the_per_start_snapshot_unconditionally(
     )
     assert rc == 0
     assert seen == [snapshot]
+
+
+@pytest.mark.parametrize("variant", ["omitted", "none"])
+def test_supervisor_recorder_runner_requires_the_snapshot(
+    tmp_path, monkeypatch, variant
+):
+    """Omitting the snapshot (or passing None, the recorder's re-load trigger)
+    is a TypeError before the recorder starts, never a silent config re-load."""
+    import logging
+
+    calls = []
+
+    async def recorder(**_kwargs):
+        calls.append(True)
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    kwargs = {} if variant == "omitted" else {"session_config": None}
+    with pytest.raises(TypeError, match="session_config"):
+        asyncio.run(
+            cli._run_recorder_with_capturer(
+                [],
+                _NeverExitingCapturer(),
+                logging.getLogger("test"),
+                tmp_path,
+                **kwargs,
+            )
+        )
+    assert calls == []
 
 
 @pytest.mark.parametrize("variant", ["missing", "renamed"])

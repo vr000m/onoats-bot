@@ -1156,9 +1156,14 @@ async def _run_recorder_with_capturer(
     data_dir,
     device_state=None,
     *,
-    session_config=None,
+    session_config,
 ) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
+
+    ``session_config`` is the supervisor's per-Start ``RecorderSessionConfig``
+    and is required: ``run_onoats_dual`` re-loads configuration when handed
+    ``None``, so a missing snapshot is a ``TypeError`` here, never a silent
+    second configuration read.
 
     The recorder (``run_onoats_dual``) installs its own signal handlers and runs
     the pipeline; on capturer death the socket transport surfaces an
@@ -1168,6 +1173,10 @@ async def _run_recorder_with_capturer(
     non-zero supervisor exit and force-cancels the recorder if it overruns the
     drain grace.
     """
+    if session_config is None:
+        raise TypeError(
+            "_run_recorder_with_capturer() requires a per-Start session_config"
+        )
     import asyncio
     import time
 
@@ -1190,9 +1199,10 @@ async def _run_recorder_with_capturer(
     # Any write_running at/after this instant belongs to THIS session — the
     # deferred device-apply task keys on it so it never stamps a stale record.
     session_floor = time.time()
-    # The per-Start snapshot is passed unconditionally: a recorder that cannot
-    # accept it fails loudly (TypeError) rather than silently re-loading config
-    # ("One immutable recorder configuration per Start").
+    # The per-Start snapshot is required (keyword-only, no default, never None)
+    # and passed unconditionally: a caller that omits it, or a recorder that
+    # cannot accept it, fails loudly (TypeError) rather than silently
+    # re-loading config ("One immutable recorder configuration per Start").
     recorder_task = asyncio.create_task(
         run_onoats_dual(
             live_terminal=args.live_terminal,
