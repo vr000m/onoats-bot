@@ -18,11 +18,7 @@ enum UiTelemetryContract {
     static let maxSnapshotBytes = 65536
     static let levelMin = 0.0
     static let levelMax = 1.0
-    static let levelMinimum = levelMin
-    static let levelMaximum = levelMax
-    static let seminarCategory = "seminars"
     static let transcriptRunIDPattern = "^[0-9a-f]{32}$"
-    static let sttStates = ["failed", "recovering", "starting", "unknown", "ready"]
     static let sttPrecedence = ["failed", "recovering", "starting", "unknown", "ready"]
     static let rootRequiredFields: Set<String> = [
         "schema", "pid", "start_epoch", "transcript_run_id", "updated_at", "audio", "stt",

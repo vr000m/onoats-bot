@@ -170,8 +170,8 @@ private func runLevelVerdicts(_ root: URL) throws {
               let value = Double(input)
         else { throw HarnessFailure(description: "invalid level verdict metadata") }
         let accepted = value.isFinite
-            && value >= UiTelemetryContract.levelMinimum
-            && value <= UiTelemetryContract.levelMaximum
+            && value >= UiTelemetryContract.levelMin
+            && value <= UiTelemetryContract.levelMax
         try require(accepted == expected, "\(input): producer verdict mismatch")
         if accepted && value == 0 {
             let published = (item["published"] as? NSNumber)?.doubleValue

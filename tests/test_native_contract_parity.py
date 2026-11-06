@@ -625,6 +625,43 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
         validate_category(category.group(1), config=OnoatsConfig(raw={}))
 
 
+def _swift_string_enum_raw_values(swift: str, name: str) -> set[str]:
+    """Raw values of a ``String``-backed Swift enum (implicit or explicit)."""
+    body = re.search(
+        rf"enum\s+{name}\s*:\s*String[^{{]*\{{(.*?)\n\}}", swift, re.DOTALL
+    )
+    assert body, f"Swift enum {name} not found"
+    values: set[str] = set()
+    for declaration in re.findall(r"^\s*case\s+([^\n]+)$", body.group(1), re.MULTILINE):
+        for item in declaration.split(","):
+            case_name, _, raw = item.partition("=")
+            literal = re.search(r'"([^"]*)"', raw)
+            values.add(literal.group(1) if literal else case_name.strip())
+    return values
+
+
+def test_swift_string_enum_raw_value_parser():
+    swift = 'enum S: String, Decodable {\n    case a, b\n    case c = "see"\n}\n'
+    assert _swift_string_enum_raw_values(swift, "S") == {"a", "b", "see"}
+
+
+def test_telemetry_constants_have_one_swift_owner():
+    """No alias or unread duplicate of a parity-checked Swift constant."""
+    sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in UI_TELEMETRY.parent.glob("*.swift")
+    }
+    declared = [
+        name
+        for name, text in sources.items()
+        if re.search(r"static\s+let\s+seminarCategory\b", text)
+    ]
+    assert declared == ["RecorderModel.swift"]
+    telemetry = sources[UI_TELEMETRY.name]
+    for alias in ("levelMinimum", "levelMaximum"):
+        assert alias not in telemetry
+
+
 def test_ui_telemetry_contract_matches_swift():
     """Every consumer-side telemetry literal mirrors the Python leaf module."""
     from onoats import ui_telemetry as py
@@ -655,13 +692,16 @@ def test_ui_telemetry_contract_matches_swift():
     )
     assert filename and filename.group(1) == py.UI_TELEMETRY_FILENAME
 
-    state_array = re.search(r"sttStates\s*(?::[^=]+)?=\s*\[([^\]]+)\]", swift)
-    assert state_array, "UiTelemetry.swift missing sttStates literal"
-    assert set(re.findall(r'"([^"]+)"', state_array.group(1))) == set(py.STT_STATES)
+    # The decoder validates through `UiSttState(rawValue:)`, so the enum's case
+    # list IS the Swift state contract; pin it, not a parallel array.
+    swift_states = _swift_string_enum_raw_values(swift, "UiSttState")
+    assert swift_states == set(py.STT_STATES)
+    assert "sttStates" not in swift, "UiSttState is the one Swift state owner"
 
     precedence = re.search(r"sttPrecedence\s*(?::[^=]+)?=\s*\[([^\]]+)\]", swift)
     assert precedence, "UiTelemetry.swift missing sttPrecedence literal"
     assert tuple(re.findall(r'"([^"]+)"', precedence.group(1))) == py.STT_PRECEDENCE
+    assert set(py.STT_PRECEDENCE) == swift_states
 
     assert py.UI_TELEMETRY_SCHEMA_VERSION == 2
     assert re.search(r"let\s+transcriptRunID:\s*String", swift)
