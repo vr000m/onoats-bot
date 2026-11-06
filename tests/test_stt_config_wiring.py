@@ -652,7 +652,9 @@ def test_create_stt_service_never_derives_stamp_from_config(monkeypatch):
     assert svc._stamp_segment_samples is False
 
 
-def test_create_stt_service_threads_ui_state_callbacks(monkeypatch):
+def test_create_stt_service_adapts_ui_callbacks_to_neutral_connection_events(
+    monkeypatch,
+):
     raw = {"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
 
     def ready():
@@ -672,11 +674,31 @@ def test_create_stt_service_threads_ui_state_callbacks(monkeypatch):
         on_failed=failed,
     )
 
-    assert svc._on_ready is ready
-    assert svc._on_recovering is recovering
-    assert svc._on_failed is failed
+    assert callable(svc._on_connection_event)
+    from onoats.stt.websocket_stt_service import (
+        SttConnectionEvent,
+        SttConnectionState,
+    )
+
+    svc._on_connection_event(SttConnectionEvent(SttConnectionState.READY))
+    svc._on_connection_event(SttConnectionEvent(SttConnectionState.RECOVERING))
+    svc._on_connection_event(SttConnectionEvent(SttConnectionState.FAILED, "failed"))
     svc = _ws_service(monkeypatch, raw=raw, branch_instance="system")
     assert svc._stamp_segment_samples is False
+
+
+def test_websocket_service_has_no_ui_specific_callback_contract():
+    """Mutation guard: transport exposes one neutral event seam only."""
+    import inspect
+
+    from onoats.stt.websocket_stt_service import WebSocketSTTService
+
+    signature = inspect.signature(WebSocketSTTService.__init__)
+    assert "on_connection_event" in signature.parameters
+    assert not {"on_ready", "on_recovering", "on_failed"} & set(signature.parameters)
+    source = inspect.getsource(WebSocketSTTService)
+    assert "_ui_state" not in source
+    assert "_fire_ui_callback" not in source
 
 
 @pytest.mark.parametrize(("supplied", "expected_loads"), [(False, 1), (True, 0)])

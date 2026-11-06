@@ -22,6 +22,7 @@ import enum
 import os
 import platform
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -263,71 +264,20 @@ def run_recorder_event_loop(awaitable):
     A forced rotation is allowed to survive cancellation only until this process
     boundary; otherwise one malicious or broken callback can defeat force exit.
     """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = None
-    failure: tuple[BaseException, object] | None = None
-    cleanup_failed = False
-    try:
-        result = loop.run_until_complete(awaitable)
-    except BaseException as exc:
-        failure = (exc, exc.__traceback__)
-    finally:
-        deadline = loop.time() + RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS
+    from onoats._event_loop import run_bounded_event_loop
 
-        def run_cleanup(cleanup_awaitable) -> bool:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                if asyncio.iscoroutine(cleanup_awaitable):
-                    cleanup_awaitable.close()
-                return False
-            task = loop.create_task(cleanup_awaitable)
-            try:
-                done, _pending = loop.run_until_complete(
-                    asyncio.wait({task}, timeout=remaining)
-                )
-            except BaseException:
-                return False
-            if task not in done:
-                task.cancel()
-                return False
-            try:
-                task.result()
-            except BaseException:
-                return False
-            return True
-
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            remaining = max(0.0, deadline - loop.time())
-            try:
-                _done, survivors = loop.run_until_complete(
-                    asyncio.wait(pending, timeout=remaining)
-                )
-            except BaseException:
-                cleanup_failed = True
-            else:
-                cleanup_failed = bool(survivors)
-        if not cleanup_failed:
-            cleanup_failed = not run_cleanup(loop.shutdown_asyncgens())
-        if not cleanup_failed:
-            cleanup_failed = not run_cleanup(loop.shutdown_default_executor())
-        asyncio.set_event_loop(None)
-        loop.close()
-
-    if cleanup_failed:
+    def _report_cleanup_failure() -> None:
         logger.error(
             "Recorder event-loop cleanup exceeded its force-exit deadline; "
             "forcing process exit."
         )
-        _RECORDER_HARD_EXIT(1)
-        return 1
-    if failure is not None:
-        exc, traceback = failure
-        raise exc.with_traceback(traceback)  # type: ignore[arg-type]
-    return result
+
+    return run_bounded_event_loop(
+        awaitable,
+        cancel_timeout=RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS,
+        hard_exit=_RECORDER_HARD_EXIT,
+        on_cleanup_failure=_report_cleanup_failure,
+    )
 
 
 async def wait_or_force(coro_or_future, label: str, *, force_exit_event) -> None:
@@ -1569,7 +1519,11 @@ async def _create_stt_service(
         )
     if service == "websocket":
         try:
-            from onoats.stt.websocket_stt_service import WebSocketSTTService
+            from onoats.stt.websocket_stt_service import (
+                SttConnectionEvent,
+                SttConnectionState,
+                WebSocketSTTService,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "STT_SERVICE=websocket requires the 'websockets' package, "
@@ -1666,6 +1620,23 @@ async def _create_stt_service(
         # the SHARED ``stt`` branch: its own first transcript event clears
         # the warning.
         recovered_in_preflight = recovery_holder.get("message") is not None
+
+        # Adapt framework-neutral connection events to the display callbacks at
+        # the runtime/UI boundary. WebSocketSTTService owns transport health;
+        # it does not know which presentation state consumes that health.
+        on_connection_event: Callable[[SttConnectionEvent], None] | None = None
+        if any((on_ready, on_recovering, on_failed)):
+
+            def on_connection_event(event: SttConnectionEvent) -> None:
+                if event.state is SttConnectionState.READY:
+                    if on_ready is not None:
+                        on_ready()
+                elif event.state is SttConnectionState.RECOVERING:
+                    if on_recovering is not None:
+                        on_recovering()
+                elif event.state is SttConnectionState.FAILED and on_failed is not None:
+                    on_failed(event.detail or "STT connection failed")
+
         service = WebSocketSTTService(
             language=language,
             launchd_label=launchd_label,
@@ -1681,9 +1652,7 @@ async def _create_stt_service(
             instance_name=branch_instance,
             stamp_segment_samples=stamp_segment_samples,
             on_recovery=live_on_recovery,
-            on_ready=on_ready,
-            on_recovering=on_recovering,
-            on_failed=on_failed,
+            on_connection_event=on_connection_event,
             on_preflight_confirmed=(
                 on_preflight_confirmed if recovered_in_preflight else None
             ),
@@ -2046,6 +2015,9 @@ def _pid_alive(pid: int) -> bool:
 # or process exit releases the lock. The lock file itself is never unlinked.
 LOCK_FILENAME = "onoats.lock"
 _instance_lock_fd: int | None = None
+_instance_lock_identity: tuple[int, int] | None = None
+_instance_lock_path: Path | None = None
+_INSTANCE_LOCK_OPEN_ATTEMPTS = 8
 
 
 def _refuse_if_live_recorder(pid_path: Path) -> None:
@@ -2185,12 +2157,30 @@ def _acquire_instance_lock(active_dir: Path) -> None:
     unavailable, so the identity preflight is the only guard (onoats is macOS-only
     in practice).
     """
-    global _instance_lock_fd
+    global _instance_lock_fd, _instance_lock_identity, _instance_lock_path
     # Idempotent: one lock per process. A nested acquire (the socket supervisor
     # takes it before spawning the capturer, then the recorder's
     # run_onoats_dual/_write_pid_file call it again) returns without re-acquiring —
     # no release-then-reacquire gap, and the identity preflight runs exactly once.
     if _instance_lock_fd is not None:
+        try:
+            opened = os.fstat(_instance_lock_fd)
+            current = os.lstat(_instance_lock_path)  # type: ignore[arg-type]
+        except OSError as exc:
+            raise RecorderAlreadyRunningError(
+                "The held onoats single-instance lock lost its public identity."
+            ) from exc
+        if (
+            _instance_lock_identity != (opened.st_dev, opened.st_ino)
+            or (
+                current.st_dev,
+                current.st_ino,
+            )
+            != _instance_lock_identity
+        ):
+            raise RecorderAlreadyRunningError(
+                "The held onoats single-instance lock was replaced."
+            )
         return
     active_dir.mkdir(parents=True, exist_ok=True)
     pid_path = active_dir / PID_FILENAME
@@ -2199,29 +2189,78 @@ def _acquire_instance_lock(active_dir: Path) -> None:
         _refuse_if_live_recorder(pid_path)
         return
     lock_path = active_dir / LOCK_FILENAME
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        os.close(fd)
-        # EWOULDBLOCK/EAGAIN → a live SAME-version recorder holds the slot. Read
-        # the pid file (if any) only to name it in the error — never to gate on.
-        from onoats._vendor.pid import read_pid_record
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
 
-        rec = read_pid_record(pid_path)
-        who = f" (pid {rec.pid})" if rec is not None else ""
-        raise RecorderAlreadyRunningError(
-            f"An onoats recorder is already running{who} and holds the "
-            "single-instance lock. Stop it first with `onoats stop`, then retry."
-        ) from exc
-    # We hold the flock. Now refuse a live LEGACY recorder (no flock) before any
-    # capture side effect — releasing the flock we just took if we must refuse.
-    try:
-        _refuse_if_live_recorder(pid_path)
-    except BaseException:
-        os.close(fd)
-        raise
-    _instance_lock_fd = fd
+    def _public_identity(fd: int) -> tuple[int, int] | None:
+        """Return the opened inode only while the public leaf still names it."""
+        try:
+            opened = os.fstat(fd)
+            current = os.lstat(lock_path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode):
+            return None
+        if opened.st_uid != os.geteuid() or current.st_uid != os.geteuid():
+            return None
+        if opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return None
+        opened_identity = (opened.st_dev, opened.st_ino)
+        return (
+            opened_identity
+            if opened_identity == (current.st_dev, current.st_ino)
+            else None
+        )
+
+    # A rename can land between open and flock. Retry only while the descriptor
+    # and public leaf disagree; no process may claim authority over an unlinked
+    # inode while a competitor locks the replacement path.
+    for _attempt in range(_INSTANCE_LOCK_OPEN_ATTEMPTS):
+        try:
+            fd = os.open(str(lock_path), flags, 0o644)
+        except OSError as exc:
+            raise RecorderAlreadyRunningError(
+                "The onoats single-instance lock is not a safe regular file."
+            ) from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            stable = _public_identity(fd)
+            os.close(fd)
+            if stable is None:
+                continue
+            # EWOULDBLOCK/EAGAIN → a live SAME-version recorder holds the slot.
+            # Read the pid file only to name it in the error — never to gate on.
+            from onoats._vendor.pid import read_pid_record
+
+            rec = read_pid_record(pid_path)
+            who = f" (pid {rec.pid})" if rec is not None else ""
+            raise RecorderAlreadyRunningError(
+                f"An onoats recorder is already running{who} and holds the "
+                "single-instance lock. Stop it first with `onoats stop`, then retry."
+            ) from exc
+        identity = _public_identity(fd)
+        if identity is None:
+            os.close(fd)
+            continue
+        # We hold the stable public inode. Refuse a live LEGACY recorder (no
+        # flock) inside it, then recheck pathname identity before publishing the
+        # process-global authority.
+        try:
+            _refuse_if_live_recorder(pid_path)
+        except BaseException:
+            os.close(fd)
+            raise
+        if _public_identity(fd) != identity:
+            os.close(fd)
+            continue
+        _instance_lock_fd = fd
+        _instance_lock_identity = identity
+        _instance_lock_path = lock_path
+        return
+    raise RecorderAlreadyRunningError(
+        "The onoats single-instance lock changed repeatedly while being acquired."
+    )
 
 
 def _release_instance_lock() -> None:
@@ -2235,7 +2274,7 @@ def _release_instance_lock() -> None:
     for explicit lifecycle control in tests (and any future caller that genuinely
     owns the whole start→stop span).
     """
-    global _instance_lock_fd
+    global _instance_lock_fd, _instance_lock_identity, _instance_lock_path
     if _instance_lock_fd is None:
         return
     try:
@@ -2247,6 +2286,8 @@ def _release_instance_lock() -> None:
     except OSError:
         pass
     _instance_lock_fd = None
+    _instance_lock_identity = None
+    _instance_lock_path = None
 
 
 def _mint_start_epoch() -> float:

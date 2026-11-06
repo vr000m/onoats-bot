@@ -139,6 +139,26 @@ def _always_refused():
 
 
 def _make_service(**over) -> WebSocketSTTService:
+    ready = over.pop("on_ready", None)
+    recovering = over.pop("on_recovering", None)
+    failed = over.pop("on_failed", None)
+    if any((ready, recovering, failed)):
+
+        def on_connection_event(event):
+            if event.state is wss_module.SttConnectionState.READY and ready is not None:
+                ready()
+            elif (
+                event.state is wss_module.SttConnectionState.RECOVERING
+                and recovering is not None
+            ):
+                recovering()
+            elif (
+                event.state is wss_module.SttConnectionState.FAILED
+                and failed is not None
+            ):
+                failed(event.detail or "STT connection failed")
+
+        over["on_connection_event"] = on_connection_event
     kwargs = dict(socket_path="/tmp/stt-reconnect-test.sock")
     kwargs.update(over)
     return WebSocketSTTService(**kwargs)
@@ -405,7 +425,11 @@ def test_reader_exit_revokes_only_current_established_readiness(
         # For detached readers this can also represent a newer live connection;
         # their exit must preserve its state regardless of its readiness.
         svc._connected = was_connected
-        svc._ui_state = "ready" if was_connected else "starting"
+        svc._connection_state = (
+            wss_module.SttConnectionState.READY
+            if was_connected
+            else wss_module.SttConnectionState.STARTING
+        )
         owner = svc._client
         await svc._read_events(client)
         # Re-entering teardown cannot publish a second revocation.
@@ -416,8 +440,12 @@ def test_reader_exit_revokes_only_current_established_readiness(
     revoked = ownership == "current" and was_connected
     assert callbacks == (["recovering"] if revoked else [])
     assert svc._connected is (was_connected and ownership != "current")
-    assert svc._ui_state == (
-        "recovering" if revoked else "ready" if was_connected else "starting"
+    assert svc._connection_state is (
+        wss_module.SttConnectionState.RECOVERING
+        if revoked
+        else wss_module.SttConnectionState.READY
+        if was_connected
+        else wss_module.SttConnectionState.STARTING
     )
 
 

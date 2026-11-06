@@ -517,85 +517,34 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
     (missing/failed capturer, sockets that never appeared, capturer death
     mid-session, or an STT preflight failure).
     """
-    import asyncio as _asyncio
-
     from loguru import logger
 
+    from onoats._event_loop import run_bounded_event_loop
     from onoats.runtime import RecorderAlreadyRunningError, SttPreflightError
     from onoats.transports import SocketHandshakeError
 
-    loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(loop)
-    cleanup_failed = False
-    cleanup_deadline: float | None = None
-    unexpected_failure: tuple[BaseException, object] | None = None
-    try:
-        rc = loop.run_until_complete(_supervise_socket_session(rest, config=config))
-    except (SttPreflightError, RecorderAlreadyRunningError) as exc:
-        # Mirror dual.main: actionable hint, not a traceback.
-        print(f"\n{exc}\n", file=sys.stderr)
-        rc = 1
-    except (SocketHandshakeError, CapturerTeardownError, OSError, ValueError) as exc:
-        # A controlled socket-mode launch failure (bad/stale capturer handshake,
-        # socket connect error, or a same-socket / config guard rejection) must
-        # be a clean non-zero exit per the fail-loud contract — not a traceback.
-        # Unexpected errors (programming bugs) still propagate so they are not
-        # silently swallowed.
-        logger.error(
-            f"Socket supervisor: recorder failed to start ({exc!r}); exiting non-zero."
-        )
-        rc = 1
-    except BaseException as exc:
-        # Preserve unexpected failures, but defer propagation until the same
-        # bounded cleanup and hard-exit boundary used by handled outcomes.
-        unexpected_failure = (exc, exc.__traceback__)
-    finally:
-        # One absolute deadline covers every loop-owned cleanup phase.  In
-        # particular, shutdown_default_executor() has no timeout on Python 3.12
-        # and may otherwise outlive the supervisor's capturer/socket/env cleanup
-        # forever.  A missed deadline is handled below with a process boundary;
-        # returning normally would let non-daemon executor workers hang Python's
-        # interpreter shutdown.
-        cleanup_deadline = loop.time() + _RECORDER_DRAIN_GRACE_SEC
-
-        def run_cleanup(awaitable) -> bool:
-            remaining = cleanup_deadline - loop.time()
-            if remaining <= 0:
-                if inspect.iscoroutine(awaitable):
-                    awaitable.close()
-                return False
-            cleanup_task = loop.create_task(awaitable)
-            try:
-                done, _pending = loop.run_until_complete(
-                    _asyncio.wait({cleanup_task}, timeout=remaining)
-                )
-            except BaseException:
-                return False
-            if cleanup_task not in done:
-                cleanup_task.cancel()
-                return False
-            try:
-                cleanup_task.result()
-            except BaseException:
-                return False
-            return True
-
-        pending = _asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            remaining = max(0.0, cleanup_deadline - loop.time())
-            _done, survivors = loop.run_until_complete(
-                _asyncio.wait(pending, timeout=remaining)
+    async def _run_handled() -> int:
+        try:
+            return await _supervise_socket_session(rest, config=config)
+        except (SttPreflightError, RecorderAlreadyRunningError) as exc:
+            # Mirror dual.main: actionable hint, not a traceback.
+            print(f"\n{exc}\n", file=sys.stderr)
+            return 1
+        except (
+            SocketHandshakeError,
+            CapturerTeardownError,
+            OSError,
+            ValueError,
+        ) as exc:
+            # Controlled socket-mode failures are clean non-zero exits. Unknown
+            # programming failures propagate through the shared loop owner.
+            logger.error(
+                f"Socket supervisor: recorder failed to start ({exc!r}); "
+                "exiting non-zero."
             )
-            cleanup_failed = bool(survivors)
-        if not cleanup_failed:
-            cleanup_failed = not run_cleanup(loop.shutdown_asyncgens())
-        if not cleanup_failed:
-            cleanup_failed = not run_cleanup(loop.shutdown_default_executor())
-        _asyncio.set_event_loop(None)
-        loop.close()
-    if cleanup_failed:
+            return 1
+
+    def _report_cleanup_failure() -> None:
         # The async supervisor has already completed its authoritative capturer,
         # socket-directory, and environment cleanup.  Do not return through the
         # interpreter with a cancellation-resistant recorder task: Python's
@@ -604,12 +553,13 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
             "Socket supervisor: event-loop cleanup exceeded its absolute "
             "deadline after owned-resource cleanup; forcing process exit."
         )
-        _SUPERVISOR_HARD_EXIT(1)
-        return 1  # only reachable under a test double for os._exit
-    if unexpected_failure is not None:
-        exc, traceback = unexpected_failure
-        raise exc.with_traceback(traceback)  # type: ignore[arg-type]
-    return rc
+
+    return run_bounded_event_loop(
+        _run_handled(),
+        cancel_timeout=_RECORDER_DRAIN_GRACE_SEC,
+        hard_exit=_SUPERVISOR_HARD_EXIT,
+        on_cleanup_failure=_report_cleanup_failure,
+    )
 
 
 async def _supervise_socket_session(rest: list[str], *, config=None) -> int:

@@ -149,7 +149,8 @@ class TranscriptBuffer(FrameProcessor):
         locked_category: Optional[str] = None,
         run_id: Optional[str] = None,
         diarization_meta: Optional[dict[str, str]] = None,
-        on_transcript: Callable[[str, str | None, str | None], None] | None = None,
+        on_transcript: Callable[[str, str | None, tuple[str, ...], bool], None]
+        | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -379,16 +380,9 @@ class TranscriptBuffer(FrameProcessor):
                 self._persisted_indices.add(idx)
         if persisted and self._on_transcript is not None:
             try:
-                speaker_label = None
-                if source:
-                    from onoats.display_labels import compose_speaker_label
-
-                    speaker_label = compose_speaker_label(
-                        {"me": "Me", "them": "Them"}.get(source, source),
-                        speakers,
-                        bool(overlap),
-                    )
-                self._on_transcript(text, source, speaker_label)
+                # Emit canonical transcript semantics only. Display label
+                # composition belongs to the UI adapter, not persistence.
+                self._on_transcript(text, source, tuple(speakers or ()), bool(overlap))
             except Exception as exc:
                 logger.warning(f"TranscriptBuffer: preview observer failed: {exc}")
         logger.debug(f"TranscriptBuffer: utterance recorded ({len(text)} chars)")

@@ -262,6 +262,8 @@ def test_native_build_and_model_harness_include_phase6_panel_sources():
         "ConfigStore.swift",
         "LoginItemManager.swift",
         "RecorderModel.swift",
+        "RecorderRecords.swift",
+        "RecorderSystemOps.swift",
         "UiTelemetry.swift",
     ):
         assert name in harness
@@ -1866,6 +1868,66 @@ def test_rollback_extracts_one_private_archive_snapshot_not_replaced_path(
         )
     )
     assert len(extraction_sources) == 1
+
+
+def test_rollback_record_replacement_during_descriptor_read_fails_closed(
+    tmp_path, monkeypatch
+):
+    """Approval bytes and the public pathname must remain the same inode."""
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text(
+        "archive="
+        + str(backup_dir / "Onoats-good.zip")
+        + "\n"
+        + "hash="
+        + "1" * 64
+        + "\n"
+        + "tree_hash="
+        + "2" * 64
+        + "\n"
+        + "dr_hash="
+        + "3" * 64
+        + "\n"
+        + "cdhash="
+        + "4" * 40
+        + "\n",
+        encoding="utf-8",
+    )
+    replacement = backup_dir / "replacement"
+    replacement.write_text(record.read_text(encoding="utf-8"), encoding="utf-8")
+    real_read = INSTALL_STAGED.os.read
+    raced = False
+
+    def racing_read(descriptor, count):
+        nonlocal raced
+        if not raced:
+            raced = True
+            replacement.replace(record)
+        return real_read(descriptor, count)
+
+    monkeypatch.setattr(INSTALL_STAGED.os, "read", racing_read)
+    with pytest.raises(INSTALL_STAGED.InstallError, match="changed while being read"):
+        INSTALL_STAGED._read_record(record, backup_dir)
+
+
+def test_rollback_record_rejects_symlink_and_unbounded_file(tmp_path):
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    target = backup_dir / "target"
+    target.write_text("approval", encoding="utf-8")
+    record = backup_dir / "approved-rollback.txt"
+    record.symlink_to(target)
+    with pytest.raises(
+        INSTALL_STAGED.InstallError, match="no approved rollback record"
+    ):
+        INSTALL_STAGED._read_record(record, backup_dir)
+
+    record.unlink()
+    record.write_bytes(b"x" * (INSTALL_STAGED.ROLLBACK_RECORD_MAX_BYTES + 1))
+    with pytest.raises(INSTALL_STAGED.InstallError, match="safe bounded file"):
+        INSTALL_STAGED._read_record(record, backup_dir)
 
 
 def test_rollback_uses_recorded_identity_not_current_resource_manifest(

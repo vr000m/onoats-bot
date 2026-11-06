@@ -45,6 +45,7 @@ CODESIGN = "/usr/bin/codesign"
 DITTO = "/usr/bin/ditto"
 MAKE = "/usr/bin/make"
 SCRIPT_DIR = Path(__file__).resolve().parent
+ROLLBACK_RECORD_MAX_BYTES = 64 * 1024
 
 
 def _require_smoke_receipt(path: Path, identity: ReleaseIdentity) -> SmokeReceipt:
@@ -310,10 +311,42 @@ def _write_record(record: Path, fields: dict[str, str]) -> None:
 
 
 def _read_record(record: Path, backup_dir: Path) -> dict[str, str]:
-    if not record.is_file() or record.is_symlink():
-        raise InstallError(f"no approved rollback record in {backup_dir}")
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(record, flags)
+    except OSError as exc:
+        raise InstallError(f"no approved rollback record in {backup_dir}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_size > ROLLBACK_RECORD_MAX_BYTES
+        ):
+            raise InstallError("approved rollback record is not a safe bounded file")
+        raw = os.read(descriptor, before.st_size + 1)
+        after = os.fstat(descriptor)
+        current = record.lstat()
+    except OSError as exc:
+        raise InstallError("approved rollback record could not be validated") from exc
+    finally:
+        os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or (before.st_dev, before.st_ino, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_size)
+        or not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise InstallError("approved rollback record changed while being read")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InstallError("approved rollback record is not UTF-8") from exc
     fields: dict[str, str] = {}
-    for line in record.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         key, separator, value = line.partition("=")
         if separator:
             fields[key] = value

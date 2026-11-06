@@ -1457,6 +1457,70 @@ def test_instance_lock_blocks_then_frees_on_release(tmp_path):
         _os.close(other)
 
 
+def test_instance_lock_rejects_symlink_leaf(tmp_path):
+    """The authority path is opened no-follow; a symlink can never be locked."""
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    active = tmp_path / ".active"
+    active.mkdir()
+    target = tmp_path / "attacker-lock"
+    target.write_text("", encoding="utf-8")
+    (active / LOCK_FILENAME).symlink_to(target)
+
+    with pytest.raises(RecorderAlreadyRunningError, match="safe regular file"):
+        _acquire_instance_lock(active)
+
+
+def test_instance_lock_retries_replaced_inode_before_claim(tmp_path, monkeypatch):
+    """A replaced open inode is discarded; only the current public inode wins."""
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    import fcntl as _fcntl
+    import os as _os
+
+    from onoats import runtime as _runtime
+
+    active = tmp_path / ".active"
+    active.mkdir()
+    lock_path = active / LOCK_FILENAME
+    lock_path.write_text("", encoding="utf-8")
+    replacement = active / "replacement"
+    replacement.write_text("", encoding="utf-8")
+    real_open = _os.open
+    replaced = False
+
+    def racing_open(path, flags, mode=0o777):
+        nonlocal replaced
+        descriptor = real_open(path, flags, mode)
+        if Path(path) == lock_path and not replaced:
+            replaced = True
+            _os.replace(replacement, lock_path)
+        return descriptor
+
+    monkeypatch.setattr(_runtime.os, "open", racing_open)
+    _acquire_instance_lock(active)
+    assert replaced
+    other = real_open(lock_path, _os.O_RDWR)
+    try:
+        with pytest.raises(OSError):
+            _fcntl.flock(other, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    finally:
+        _os.close(other)
+
+
+def test_nested_instance_lock_detects_public_inode_replacement(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("flock single-instance lock is POSIX-only")
+    active = tmp_path / ".active"
+    _acquire_instance_lock(active)
+    replacement = active / "replacement"
+    replacement.write_text("", encoding="utf-8")
+    replacement.replace(active / LOCK_FILENAME)
+
+    with pytest.raises(RecorderAlreadyRunningError, match="was replaced"):
+        _acquire_instance_lock(active)
+
+
 def test_stt_mic_and_system_branches_do_not_clobber_each_other(tmp_path: Path):
     """Finding 6: `dual.py` constructs two independent WebSocketSTTService
     instances against one server. Sharing a single "stt" branch key let

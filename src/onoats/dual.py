@@ -497,9 +497,18 @@ async def run_onoats_dual(
     telemetry_state = None
 
     def _publish_transcript(
-        text: str, source: str | None, speaker_label: str | None
+        text: str, source: str | None, speakers: tuple[str, ...], overlap: bool
     ) -> None:
         if telemetry_state is not None:
+            from onoats.display_labels import compose_speaker_label
+
+            speaker_label = None
+            if source:
+                speaker_label = compose_speaker_label(
+                    {"me": "Me", "them": "Them"}.get(source, source),
+                    speakers,
+                    overlap,
+                )
             telemetry_state.set_transcript(text, source, speaker_label)
 
     transcript_buffer = TranscriptBuffer(

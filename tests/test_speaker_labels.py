@@ -132,14 +132,14 @@ def test_transcript_preview_callback_observes_final_text_without_changing_jsonl(
 
     from onoats.processors.transcript_buffer import TranscriptBuffer
 
-    observed: list[tuple[str, str | None, str | None]] = []
+    observed: list[tuple[str, str | None, tuple[str, ...], bool]] = []
 
     async def _run() -> None:
         buf = TranscriptBuffer(
             data_dir=tmp_path,
             use_frame_source=True,
-            on_transcript=lambda text, source, label: observed.append(
-                (text, source, label)
+            on_transcript=lambda text, source, speakers, overlap: observed.append(
+                (text, source, speakers, overlap)
             ),
         )
         frame = TranscriptionFrame(text=" final words ", user_id="them", timestamp="t")
@@ -150,7 +150,7 @@ def test_transcript_preview_callback_observes_final_text_without_changing_jsonl(
 
     asyncio.run(_run())
 
-    assert observed == [("final words", "them", "Them (S2)")]
+    assert observed == [("final words", "them", ("S2",), False)]
     (path,) = (tmp_path / ".active").glob("*.jsonl")
     entries = [json.loads(line) for line in path.read_text().splitlines()]
     utterance = next(entry for entry in entries if entry["type"] == "utterance")
@@ -211,10 +211,10 @@ def test_transcript_preview_publication_tracks_jsonl_write_result(
     assert len(observed) == preview_count
 
 
-def test_raising_preview_label_composition_does_not_lose_durable_utterance(
+def test_transcript_buffer_does_not_invoke_preview_label_composition(
     tmp_path, monkeypatch
 ):
-    """All preview preparation is warning-only after the durable JSONL write."""
+    """Persistence emits canonical facts; the UI adapter owns label rendering."""
     import asyncio
     import json
 
@@ -560,4 +560,4 @@ def test_transcript_persistence_does_not_import_presentation_renderer():
 
     source = inspect.getsource(transcript_buffer)
     assert "onoats.render" not in source
-    assert "onoats.display_labels" in source
+    assert "onoats.display_labels" not in source

@@ -308,6 +308,49 @@ def test_direct_recorder_runner_preserves_normal_result_and_exception() -> None:
         runtime.run_recorder_event_loop(fail())
 
 
+def test_zero_cancel_timeout_preserves_clean_recorder_result(monkeypatch) -> None:
+    """Zero is immediate pending-task cancellation, not a zero finalizer budget."""
+    from onoats import runtime
+
+    exits = []
+    monkeypatch.setattr(runtime, "RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(runtime, "_RECORDER_HARD_EXIT", exits.append)
+
+    assert runtime.run_recorder_event_loop(asyncio.sleep(0, result=7)) == 7
+    assert exits == []
+
+
+def test_zero_cancel_timeout_immediately_rejects_abandoned_task(monkeypatch) -> None:
+    from onoats import runtime
+
+    exits = []
+    monkeypatch.setattr(runtime, "RECORDER_LOOP_CLEANUP_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(runtime, "_RECORDER_HARD_EXIT", exits.append)
+
+    async def run() -> int:
+        asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        return 0
+
+    assert runtime.run_recorder_event_loop(run()) == 1
+    assert exits == [1]
+
+
+def test_bounded_event_loop_cleanup_has_one_owner() -> None:
+    """Mutation guard: call sites delegate and cannot drift their own teardown."""
+    import inspect
+
+    from onoats import _event_loop, cli, runtime
+
+    owner = inspect.getsource(_event_loop.run_bounded_event_loop)
+    assert "shutdown_asyncgens" in owner and "shutdown_default_executor" in owner
+    for call_site in (runtime.run_recorder_event_loop, cli._run_socket_supervisor):
+        source = inspect.getsource(call_site)
+        assert "run_bounded_event_loop(" in source
+        assert "shutdown_asyncgens" not in source
+        assert "new_event_loop" not in source
+
+
 @_async_test
 async def test_lock_admission_order_prevents_flush_reopening_after_stop() -> None:
     rotation = RotationSpy()
