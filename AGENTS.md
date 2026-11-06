@@ -274,14 +274,19 @@ grace cannot consume the async-generator/default-executor finalizer budget.
   CLI path, CLI entrypoint hash, interpreter path/hash, and an independently
   verified clean CLI git identity. Smoke verifies the static identity
   before and after recording and uses Security.framework to verify the running
-  app PID's designated requirement and cdhash. The smoke invalidates any prior
+  app PID's designated requirement and cdhash. That dynamic check and recorder
+  discovery are bound to the launched app's kernel birth tuple (read before and
+  after), so a recycled app PID can never supply accepted evidence. The smoke invalidates any prior
   receipt before launch and atomically publishes an identity-digest receipt only
   after success and cleanup; staged installation requires that exact receipt
   before mutation. A static path/signature check is not dynamic running-code
   proof.
 - **Smoke cleanup refreshes owned descendants.** The smoke snapshots verified
   descendants when recording starts and again immediately before cleanup, then
-  unions exact process generations. This reaches helpers created during the
+  unions exact process generations. The cleanup refresh runs only while the
+  captured recorder generation is live (before and after the snapshot): an
+  already-exited recorder — the normal post-Stop state — contributes nothing,
+  and only a live recorder whose ancestry changed fails the smoke. This reaches helpers created during the
   interactive recording window without granting PGID-wide signal authority;
   every member still passes the captured kernel-birth and secondary-identity
   checks before TERM/KILL.

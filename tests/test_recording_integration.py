@@ -171,7 +171,9 @@ def test_installed_smoke_binds_recorder_lineage_to_verified_cli_interpreter(
             SMOKE._recording_identity(
                 status_path,
                 pid_path,
-                app_pid=1234,
+                app_identity=SMOKE.ProcessIdentity(
+                    1234, 1234, "app-start", "/app", _birth(10, 1234)
+                ),
                 expected_release=object(),
             )
             is not None
@@ -181,7 +183,9 @@ def test_installed_smoke_binds_recorder_lineage_to_verified_cli_interpreter(
             SMOKE._recording_identity(
                 status_path,
                 pid_path,
-                app_pid=1234,
+                app_identity=SMOKE.ProcessIdentity(
+                    1234, 1234, "app-start", "/app", _birth(10, 1234)
+                ),
                 expected_release=object(),
             )
 
@@ -433,9 +437,17 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
     monkeypatch.setattr(
         SMOKE,
         "_processes",
-        lambda: {1234: SMOKE.ProcessRow(1, 1234, "app-start", app_command)},
+        lambda: {
+            1234: SMOKE.ProcessRow(1, 1234, "app-start", app_command),
+            # The recorder generation is still live at the cleanup refresh.
+            4321: SMOKE.ProcessRow(1234, 4321, "rec-start", "/onoats bot"),
+        },
     )
-    monkeypatch.setattr(SMOKE, "_process_birth", lambda _pid: _birth(10, 20))
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_birth",
+        {1234: _birth(10, 20), 4321: recorder.process_birth}.get,
+    )
     first_member = SMOKE.ProcessIdentity(
         5002, 5001, "first", "/capturer/first", _birth(50, 1)
     )
@@ -483,6 +495,224 @@ def test_installed_smoke_success_still_cleans_exact_launched_app(tmp_path, monke
     ]
     assert len(captures) == 2
     assert receipt_events == ["published"]
+
+
+def test_installed_smoke_success_after_recorder_exit_publishes_receipt(
+    tmp_path, monkeypatch
+):
+    """The normal graceful-stop state (recorder gone) is not a cleanup error.
+
+    Runs the real descendant snapshot and its cleanup refresh: the recorder and
+    its capturer are live when first captured and have exited by the time the
+    finally block re-snapshots. The earlier capture stays the cleanup authority
+    and the successful smoke still publishes its receipt.
+    """
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    _stub_release_identity(monkeypatch)
+    recorder = _recorder_identity()
+    app_command = str(executable.resolve())
+    live = {
+        1234: SMOKE.ProcessRow(1, 1234, "app-start", app_command),
+        recorder.pid: SMOKE.ProcessRow(
+            1234, recorder.pgid, recorder.process_start, recorder.command
+        ),
+        5002: SMOKE.ProcessRow(recorder.pid, 5002, "cap-start", "/capturer"),
+    }
+    births = {
+        1234: _birth(10, 20),
+        recorder.pid: recorder.process_birth,
+        5002: _birth(50, 1),
+    }
+    state = {"recorder_running": True}
+
+    def processes():
+        if state["recorder_running"]:
+            return dict(live)
+        return {1234: live[1234]}
+
+    def birth(pid):
+        return births[pid] if pid in processes() else None
+
+    def wait(stage, _timeout, _probe):
+        if stage == "signed app launch":
+            return 1234
+        if stage == "app-owned recorder identity":
+            return recorder
+        if stage == "graceful app-owned stop":
+            state["recorder_running"] = False
+        return RUN_ID if stage == "fresh non-zero Me activity" else True
+
+    cleaned = []
+    published = []
+    monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
+    monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(SMOKE, "_processes", processes)
+    monkeypatch.setattr(SMOKE, "_process_birth", birth)
+    monkeypatch.setattr(SMOKE, "wait_for", wait)
+    monkeypatch.setattr(
+        SMOKE, "_cleanup_after_failure", lambda *_args, **kwargs: cleaned.append(kwargs)
+    )
+    monkeypatch.setattr(
+        SMOKE, "_publish_receipt", lambda *_args: published.append("published")
+    )
+
+    SMOKE.run(
+        SimpleNamespace(
+            app=app,
+            data_dir=tmp_path / "data",
+            release_identity=tmp_path / "release-identity.json",
+            app_timeout=1,
+            recording_timeout=1,
+            activity_timeout=1,
+            stop_timeout=1,
+            transcript_timeout=1,
+            me_floor=0.01,
+        )
+    )
+
+    assert published == ["published"]
+    assert len(cleaned) == 1
+    assert cleaned[0]["recorder"] == recorder
+    member_pids = {
+        member.pid for group in cleaned[0]["groups"] for member in group.members
+    }
+    assert member_pids == {recorder.pid, 5002}
+
+
+@pytest.mark.parametrize(
+    ("recorder_state", "expected"),
+    [
+        ("live-owned", "snapshot"),
+        ("gone", "empty"),
+        ("pid-recycled", "empty"),
+        ("exits-during-snapshot", "empty"),
+        ("live-reparented", "error"),
+    ],
+)
+def test_cleanup_refresh_owned_groups_whole_state_space(
+    monkeypatch, recorder_state, expected
+):
+    """Only a live captured recorder with changed ancestry fails the refresh."""
+    recorder = _recorder_identity()
+    app_row = SMOKE.ProcessRow(1, 1234, "app-start", "/app")
+    recorder_row = SMOKE.ProcessRow(
+        1234, recorder.pgid, recorder.process_start, recorder.command
+    )
+    child_row = SMOKE.ProcessRow(recorder.pid, 5002, "cap-start", "/capturer")
+    owned = {1234: app_row, recorder.pid: recorder_row, 5002: child_row}
+    calls = {"ps": 0}
+
+    def processes():
+        calls["ps"] += 1
+        if recorder_state == "gone":
+            return {1234: app_row}
+        if recorder_state == "pid-recycled":
+            return {
+                1234: app_row,
+                recorder.pid: recorder_row._replace(start="other", command="/other"),
+            }
+        if recorder_state == "live-reparented":
+            return {recorder.pid: recorder_row._replace(parent=1), 5002: child_row}
+        if recorder_state == "exits-during-snapshot" and calls["ps"] > 2:
+            return {1234: app_row}
+        return dict(owned)
+
+    births = {1234: _birth(10, 20), recorder.pid: recorder.process_birth}
+    births[5002] = _birth(50, 1)
+
+    def birth(pid):
+        if recorder_state == "pid-recycled" and pid == recorder.pid:
+            return _birth(999, 1)
+        if recorder_state == "gone" and pid != 1234:
+            return None
+        return births.get(pid)
+
+    monkeypatch.setattr(SMOKE, "_processes", processes)
+    monkeypatch.setattr(SMOKE, "_process_birth", birth)
+
+    if expected == "error":
+        with pytest.raises(SMOKE.SmokeFailure, match="recorder ancestry changed"):
+            SMOKE._refresh_owned_descendant_groups(1234, recorder)
+        return
+    groups = SMOKE._refresh_owned_descendant_groups(1234, recorder)
+    if expected == "empty":
+        assert groups == ()
+    else:
+        assert {m.pid for g in groups for m in g.members} == {recorder.pid, 5002}
+    earlier = (
+        SMOKE.OwnedProcessGroup(
+            5002, (SMOKE.ProcessIdentity(5002, 5002, "c", "/c", _birth(50, 1)),)
+        ),
+    )
+    merged = SMOKE._merge_owned_groups(earlier, groups)
+    assert set(earlier[0].members) <= {m for g in merged for m in g.members}
+
+
+@pytest.mark.parametrize(
+    "app_generation", ["launched", "recycled-before", "recycled-during-check"]
+)
+def test_launched_app_code_check_binds_kernel_generation(monkeypatch, app_generation):
+    """Dynamic code evidence must come from the captured launch generation."""
+    launched = SMOKE.ProcessIdentity(1234, 1234, "app-start", "/app", _birth(10, 20))
+    current = {"birth": launched.process_birth}
+    if app_generation == "recycled-before":
+        current["birth"] = _birth(11, 0)
+    checked: list[int] = []
+
+    def dynamic(pid, _expected):
+        checked.append(pid)
+        if app_generation == "recycled-during-check":
+            current["birth"] = _birth(11, 0)
+
+    monkeypatch.setattr(SMOKE, "_process_birth", lambda _pid: current["birth"])
+    monkeypatch.setattr(SMOKE, "_verify_dynamic_release_identity", dynamic)
+
+    if app_generation == "launched":
+        SMOKE._verify_launched_app_code(launched, object())
+        assert checked == [1234]
+    else:
+        with pytest.raises(SMOKE.SmokeFailure, match="launched app generation"):
+            SMOKE._verify_launched_app_code(launched, object())
+        assert checked == ([] if app_generation == "recycled-before" else [1234])
+
+
+@pytest.mark.parametrize("app_birth", ["launched", "recycled"])
+def test_recording_identity_requires_launched_app_generation(
+    tmp_path, monkeypatch, app_birth
+):
+    """A recorder under a recycled app PID is never accepted as app-owned."""
+    status_path = tmp_path / "onoats.status.json"
+    pid_path = tmp_path / "onoats.pid"
+    status_path.write_text(
+        json.dumps({"running": True, "pid": 4321, "start_time": 900.25}),
+        encoding="utf-8",
+    )
+    command = "/onoats bot"
+    pid_path.write_text(f"4321\nonoats-bot\n{command}\n900.25\n", encoding="utf-8")
+    rows = {
+        1234: SMOKE.ProcessRow(1, 1234, "app-start", "/app"),
+        4321: SMOKE.ProcessRow(1234, 4321, "rec-start", command),
+    }
+    births = {
+        1234: _birth(10, 20) if app_birth == "launched" else _birth(77, 7),
+        4321: _birth(100, 200),
+    }
+    monkeypatch.setattr(SMOKE, "_processes", lambda: rows)
+    monkeypatch.setattr(SMOKE, "_process_birth", births.get)
+    launched = SMOKE.ProcessIdentity(1234, 1234, "app-start", "/app", _birth(10, 20))
+
+    if app_birth == "launched":
+        identity = SMOKE._recording_identity(
+            status_path, pid_path, app_identity=launched
+        )
+        assert identity is not None and identity.pid == 4321
+    else:
+        with pytest.raises(SMOKE.SmokeFailure, match="launched app generation"):
+            SMOKE._recording_identity(status_path, pid_path, app_identity=launched)
 
 
 def test_recording_identity_timeout_recovers_verified_cleanup_targets(
@@ -565,6 +795,29 @@ def test_installed_smoke_cleanup_survives_late_topology_failures(
     monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: None)
     monkeypatch.setattr(SMOKE.subprocess, "run", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(SMOKE, "_capture_process_identity", lambda _pid: app_identity)
+    monkeypatch.setattr(
+        SMOKE,
+        "_processes",
+        lambda: {
+            app_identity.pid: SMOKE.ProcessRow(
+                1, app_identity.pgid, app_identity.start, app_identity.command
+            ),
+            recorder.pid: SMOKE.ProcessRow(
+                app_identity.pid,
+                recorder.pgid,
+                recorder.process_start,
+                recorder.command,
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        SMOKE,
+        "_process_birth",
+        {
+            app_identity.pid: app_identity.process_birth,
+            recorder.pid: recorder.process_birth,
+        }.get,
+    )
     monkeypatch.setattr(
         SMOKE, "_cleanup_after_failure", lambda *_args, **kwargs: cleaned.append(kwargs)
     )
@@ -690,7 +943,13 @@ def test_installed_smoke_rejects_birth_collision_around_topology_snapshot(
     monkeypatch.setattr(SMOKE, "_processes", processes)
     monkeypatch.setattr(SMOKE, "_process_birth", birth)
 
-    assert SMOKE._recording_identity(status_path, pid_path, app_pid=1234) is None
+    app_identity = SMOKE.ProcessIdentity(
+        1234, 1234, "same-second", "/app", _birth(10, 100)
+    )
+    assert (
+        SMOKE._recording_identity(status_path, pid_path, app_identity=app_identity)
+        is None
+    )
     ps_positions = [index for index, value in enumerate(calls) if value == "ps"]
     assert len(ps_positions) == 2
     assert calls.index("birth-4321") < ps_positions[1]

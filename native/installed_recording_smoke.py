@@ -266,6 +266,24 @@ def _verify_dynamic_release_identity(pid: int, expected) -> None:
         raise SmokeFailure("running app dynamic code identity does not match release")
 
 
+def _require_launched_app(app_identity: ProcessIdentity, stage: str) -> None:
+    """The app PID must still name the exact launched kernel generation."""
+    if _process_birth(app_identity.pid) != app_identity.process_birth:
+        raise SmokeFailure(f"{stage} failed: launched app generation changed")
+
+
+def _verify_launched_app_code(app_identity: ProcessIdentity, expected) -> None:
+    """Authenticate the launched generation, not whichever process owns its PID.
+
+    The kernel birth tuple is read before and after the dynamic code check; a
+    PID cannot be reused while its process lives, so equal births bracketing
+    the check prove it authenticated the captured launch generation.
+    """
+    _require_launched_app(app_identity, "dynamic code identity")
+    _verify_dynamic_release_identity(app_identity.pid, expected)
+    _require_launched_app(app_identity, "dynamic code identity")
+
+
 class ProcessBirth(NamedTuple):
     seconds: int
     microseconds: int
@@ -484,9 +502,10 @@ def _recording_identity(
     status_path: Path,
     pid_path: Path,
     *,
-    app_pid: int,
+    app_identity: ProcessIdentity,
     expected_release=None,
 ) -> RecorderIdentity | None:
+    app_pid = app_identity.pid
     status = _json(status_path)
     if not status or status.get("running") is not True:
         return None
@@ -511,6 +530,8 @@ def _recording_identity(
     births_after = {pid: _process_birth(pid) for pid in current_chain}
     if births_after != births_before:
         return None
+    if births_after.get(app_pid) != app_identity.process_birth:
+        raise SmokeFailure("recorder ancestry failed: launched app generation changed")
     if not _descends_from(recorder_pid, app_pid, processes):
         raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
     if expected_release is not None:
@@ -686,6 +707,31 @@ def _owned_descendant_groups(
         OwnedProcessGroup(pgid, tuple(members))
         for pgid, members in sorted(grouped.items())
     )
+
+
+def _refresh_owned_descendant_groups(
+    app_pid: int, recorder: RecorderIdentity
+) -> tuple[OwnedProcessGroup, ...]:
+    """Re-snapshot descendants only while the captured recorder generation lives.
+
+    A recorder that has exited (the normal graceful-stop state) or whose PID now
+    names another generation contributes nothing: earlier snapshots stay the
+    cleanup authority, and orphans of an exited recorder are no longer provable
+    by ancestry. Only a still-live captured recorder whose ancestry changed is
+    an error. A snapshot is kept only if that generation is live after it too.
+    """
+    identity = _recorder_process_identity(recorder)
+    if not _identity_matches(identity):
+        return ()
+    try:
+        groups = _owned_descendant_groups(app_pid, recorder.pid)
+    except SmokeFailure:
+        if not _identity_matches(identity):
+            return ()
+        raise
+    if not _identity_matches(identity):
+        return ()
+    return groups
 
 
 def _merge_owned_groups(
@@ -1086,7 +1132,8 @@ def run(args: argparse.Namespace) -> None:
         app_identity = _capture_process_identity(app_pid)
         if app_identity is None:
             raise SmokeFailure("app launch failed: new process vanished")
-        _verify_dynamic_release_identity(app_pid, expected_release)
+        launched_app = app_identity
+        _verify_launched_app_code(launched_app, expected_release)
         current_executable = executable.stat()
         if (verified_executable.st_dev, verified_executable.st_ino) != (
             current_executable.st_dev,
@@ -1099,7 +1146,7 @@ def run(args: argparse.Namespace) -> None:
             lambda: _recording_identity(
                 status_path,
                 pid_path,
-                app_pid=app_pid,
+                app_identity=launched_app,
                 expected_release=expected_release,
             ),
         )
@@ -1181,7 +1228,7 @@ def run(args: argparse.Namespace) -> None:
                 data_dir, transcript_run_id, deadline=transcript_deadline
             ),
         )
-        _verify_dynamic_release_identity(app_pid, expected_release)
+        _verify_launched_app_code(launched_app, expected_release)
         _verify_release_identity(app, identity_path)
         _verify_effective_cli_authority(expected_release)
     except BaseException as exc:
@@ -1205,7 +1252,7 @@ def run(args: argparse.Namespace) -> None:
         if recorder is not None and app_pid is not None:
             try:
                 groups = _merge_owned_groups(
-                    groups, _owned_descendant_groups(app_pid, recorder.pid)
+                    groups, _refresh_owned_descendant_groups(app_pid, recorder)
                 )
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
