@@ -402,7 +402,7 @@ def _install_fake_recorder(
     state: dict = {"rotated_path": None, "frames_read": 0, "connected": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         from onoats._vendor import session_queue
         from onoats._vendor.store import onoats_data_dir
@@ -918,7 +918,7 @@ def test_clean_recorder_exit_returns_zero_and_stops_capturer(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -983,7 +983,7 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         # Healthy streaming capturer; the recorder reads a few frames then
         # returns cleanly (EndFrame-equivalent) while the capturer is STILL
@@ -1058,7 +1058,7 @@ def test_capturer_exit_during_graceful_stop_is_clean_only_for_rc0(
     set_capturer_behaviour("exit-on-peer-close", rc=capturer_rc)
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         from onoats._vendor import session_queue
         from onoats._vendor.store import onoats_data_dir
@@ -1119,7 +1119,7 @@ def test_stop_requested_recorder_drain_overrun_is_force_cancelled_and_stamped(
     set_capturer_behaviour("exit-on-peer-close", rc=0)
 
     async def _hung_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         from onoats._vendor.store import onoats_data_dir
 
@@ -1287,7 +1287,7 @@ def test_capturer_teardown_reaps_group_on_clean_shutdown(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         # Healthy streaming capturer; read a few frames then return cleanly while
         # the capturer (and its child) are still alive — the graceful-shutdown
@@ -1381,7 +1381,7 @@ def test_capturer_env_is_allowlisted_and_excludes_secrets(
     # The recorder reads a few frames then returns cleanly so the supervisor runs
     # to a normal completion (we only need the captured spawn env).
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -1512,7 +1512,7 @@ def test_supervisor_mints_private_0700_socket_dir(
     captured: dict = {}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         captured["mic"] = os.environ.get("ONOATS_MIC_SOCKET")
         captured["system"] = os.environ.get("ONOATS_SYSTEM_SOCKET")
@@ -2285,7 +2285,7 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -3218,7 +3218,7 @@ def _install_clean_recorder(monkeypatch):
     """A recorder that reads a few frames and returns voluntarily (rc=0 path)."""
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -3527,6 +3527,84 @@ def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(
     rc = asyncio.run(cli._run_recorder_with_capturer([], Capturer(), logger, tmp_path))
     assert rc == 1
     assert any("capturer exited mid-session" in record for record in logger.records)
+
+
+class _NeverExitingCapturer:
+    async def wait(self):
+        await asyncio.Event().wait()
+
+
+def test_supervisor_passes_the_per_start_snapshot_unconditionally(
+    tmp_path, monkeypatch
+):
+    """The supervisor hands run_onoats_dual the exact per-Start snapshot."""
+    import logging
+
+    from onoats import runtime
+
+    snapshot = object()
+    seen = []
+
+    async def recorder(
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config
+    ):
+        seen.append(session_config)
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    rc = asyncio.run(
+        cli._run_recorder_with_capturer(
+            [],
+            _NeverExitingCapturer(),
+            logging.getLogger("test"),
+            tmp_path,
+            session_config=snapshot,
+        )
+    )
+    assert rc == 0
+    assert seen == [snapshot]
+
+
+@pytest.mark.parametrize("variant", ["missing", "renamed"])
+def test_recorder_that_cannot_take_the_snapshot_fails_loudly(
+    tmp_path, monkeypatch, variant
+):
+    """A recorder signature without ``session_config`` is a TypeError, never a
+    silently dropped snapshot that would make the recorder re-load config."""
+    import logging
+
+    from onoats import runtime
+
+    calls = []
+
+    if variant == "missing":
+
+        async def recorder(*, live_terminal=False, locked_category=None, data_dir=None):
+            calls.append(True)
+            return 0
+
+    else:
+
+        async def recorder(
+            *, live_terminal=False, locked_category=None, data_dir=None, snapshot=None
+        ):
+            calls.append(True)
+            return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    with pytest.raises(TypeError, match="session_config"):
+        asyncio.run(
+            cli._run_recorder_with_capturer(
+                [],
+                _NeverExitingCapturer(),
+                logging.getLogger("test"),
+                tmp_path,
+                session_config=object(),
+            )
+        )
+    assert calls == []
 
 
 @pytest.mark.parametrize("stage", ["spawn", "sockets", "preflight", "running"])

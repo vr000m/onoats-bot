@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import inspect
 import math
 import os
 import signal
@@ -1191,20 +1190,16 @@ async def _run_recorder_with_capturer(
     # Any write_running at/after this instant belongs to THIS session — the
     # deferred device-apply task keys on it so it never stamps a stale record.
     session_floor = time.time()
-    recorder_kwargs = {
-        "live_terminal": args.live_terminal,
-        "locked_category": args.category,
-        "data_dir": data_dir,
-    }
-    recorder_parameters = inspect.signature(run_onoats_dual).parameters.values()
-    if any(
-        parameter.name == "session_config"
-        or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in recorder_parameters
-    ):
-        recorder_kwargs["session_config"] = session_config
+    # The per-Start snapshot is passed unconditionally: a recorder that cannot
+    # accept it fails loudly (TypeError) rather than silently re-loading config
+    # ("One immutable recorder configuration per Start").
     recorder_task = asyncio.create_task(
-        run_onoats_dual(**recorder_kwargs),
+        run_onoats_dual(
+            live_terminal=args.live_terminal,
+            locked_category=args.category,
+            data_dir=data_dir,
+            session_config=session_config,
+        ),
         name="socket_supervisor_recorder",
     )
     capturer_task = asyncio.create_task(
