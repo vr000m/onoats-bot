@@ -305,6 +305,9 @@ Python owns defaults and derives the app name. The former Make-variable names
 are rejected for `app-tree-hash`, `install-staged`, and `rollback`; staged
 inputs must use the `NAME=value make ...` environment-prefix form shown above.
 Their values are never expanded by Make.
+The build-local `APP` staging path is also fixed to `native/Onoats.app` and
+cannot be overridden from the Make command line or environment; `app` removes
+only that quoted repository-local path before assembly.
 
 Release CI runs the full suite on Python 3.12 and a separate recorder-contract
 lane on Python 3.13. PyPI publication depends on both jobs.

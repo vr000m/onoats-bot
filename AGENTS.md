@@ -234,6 +234,17 @@ creates no UI telemetry publisher for that run, and continues capture, STT,
 control, transcript persistence, and cleanup with unchanged return semantics.
 The owned process exit and run log are then the failure authority; do not invent
 a later status record or make rich status a prerequisite for recording.
+Native status and PID polling are display consumers of recorder authority, so
+both use the same bounded, no-follow, owner-only regular-file reader with a
+pathname/inode recheck. Never reintroduce an unbounded `Data(contentsOf:)` read
+on the menu bar's main actor.
+
+Direct-recorder shutdown has two separate bounds. `wait_or_force` propagates a
+normally completed task's exception, but after a force event it cancels and
+waits only for `SHUTDOWN_CANCEL_TIMEOUT_SEC`; resistant work is left to the
+process boundary. `_event_loop.run_bounded_event_loop` then gives pending-task
+cancellation and loop-owned finalizers separate deadlines, so cancellation
+grace cannot consume the async-generator/default-executor finalizer budget.
 
 ## Per-run configuration and native/release identity
 
@@ -265,6 +276,12 @@ a later status record or make rich status a prerequisite for recording.
   after success and cleanup; staged installation requires that exact receipt
   before mutation. A static path/signature check is not dynamic running-code
   proof.
+- **Smoke cleanup refreshes owned descendants.** The smoke snapshots verified
+  descendants when recording starts and again immediately before cleanup, then
+  unions exact process generations. This reaches helpers created during the
+  interactive recording window without granting PGID-wide signal authority;
+  every member still passes the captured kernel-birth and secondary-identity
+  checks before TERM/KILL.
 - **Rollback approval is one immutable read.** `approved-rollback.txt` is read
   through one bounded, no-follow, owner/mode-checked regular-file descriptor;
   the bytes, descriptor metadata, and final pathname identity must agree before
