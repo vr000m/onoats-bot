@@ -30,6 +30,20 @@ def run_bounded_event_loop(
     ``cancel_timeout=0`` cancels pending tasks without granting them another
     loop turn. Finalizers use their own small positive deadline, so a successful
     coroutine with no abandoned tasks still returns its successful result.
+
+    Contract (stages run in order; each is always attempted):
+
+    1. Pending-task cancellation, bounded by ``cancel_timeout``. It fails when a
+       task survives the wait, the wait itself raises, or tasks are pending
+       with ``cancel_timeout == 0``.
+    2. ``shutdown_asyncgens`` then ``shutdown_default_executor``, sharing one
+       ``FINALIZER_TIMEOUT_SECONDS`` deadline that starts after stage 1. Both
+       are attempted even if stage 1 or the async-generator shutdown failed.
+
+    If any stage failed, ``on_cleanup_failure()`` and ``hard_exit(1)`` run and
+    1 is returned (the awaitable's own result or exception is superseded).
+    Otherwise the awaitable's exception is re-raised or its result returned;
+    a clean run is never converted into rc=1.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -85,10 +99,13 @@ def run_bounded_event_loop(
                 return False
             return True
 
-        if not cleanup_failed:
-            cleanup_failed = not run_finalizer(loop.shutdown_asyncgens())
-        if not cleanup_failed:
-            cleanup_failed = not run_finalizer(loop.shutdown_default_executor())
+        # Every finalizer is attempted whatever the earlier stages did: a
+        # surviving task or a failed async-generator shutdown must not leave the
+        # executor (or open generators) unfinalized. Any failed stage still
+        # fails the process hard below.
+        asyncgens_ok = run_finalizer(loop.shutdown_asyncgens())
+        executor_ok = run_finalizer(loop.shutdown_default_executor())
+        cleanup_failed = cleanup_failed or not (asyncgens_ok and executor_ok)
         asyncio.set_event_loop(None)
         loop.close()
 
