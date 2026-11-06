@@ -1033,9 +1033,9 @@ def test_installed_smoke_header_and_utterances_share_one_descriptor(
     original_reader = SMOKE._bounded_jsonl_lines
     replaced = False
 
-    def replacing_reader(candidate):
+    def replacing_reader(candidate, **kwargs):
         nonlocal replaced
-        for entry in original_reader(candidate):
+        for entry in original_reader(candidate, **kwargs):
             if not replaced:
                 replaced = True
                 os.replace(replacement, path)
@@ -1045,6 +1045,60 @@ def test_installed_smoke_header_and_utterances_share_one_descriptor(
 
     assert SMOKE._new_me_utterance(tmp_path, RUN_ID) is None
     assert replaced is True
+
+
+@pytest.mark.parametrize(
+    ("deadline", "ticks", "entries", "expected"),
+    [
+        (None, [], [{"source": "me", "text": "early"}], True),
+        (1.0, [0.0, 0.0, 0.0], [{"source": "me", "text": "early"}], True),
+        (
+            1.0,
+            [0.0, 0.0, 0.0, 0.0],
+            [{"source": "them", "text": "first"}, {"source": "me", "text": "late"}],
+            True,
+        ),
+        (1.0, [0.0, 0.0, 0.0, 0.0], [{"source": "them", "text": "none"}], None),
+        (1.0, [1.0], [{"source": "me", "text": "unread"}], "timeout"),
+        (
+            1.0,
+            [0.0, 0.0, 0.0, 1.0],
+            [{"source": "them", "text": "first"}, {"source": "me", "text": "late"}],
+            "timeout",
+        ),
+    ],
+    ids=["unbounded", "future-early", "future-late", "future-absent", "expired", "mid-scan"],
+)
+def test_installed_smoke_transcript_deadline_whole_state_space(
+    tmp_path, deadline, ticks, entries, expected
+):
+    path = tmp_path / "pending/session.jsonl"
+    _write_run_file(
+        path,
+        RUN_ID,
+        *(
+            {"type": "utterance", "source": entry["source"], "text": entry["text"]}
+            for entry in entries
+        ),
+    )
+    values = iter(ticks)
+    last = ticks[-1] if ticks else 0.0
+
+    def clock():
+        return next(values, last)
+
+    if expected == "timeout":
+        with pytest.raises(SMOKE.SmokeFailure, match="timed out"):
+            SMOKE._new_me_utterance(
+                tmp_path, RUN_ID, deadline=deadline, clock=clock
+            )
+    else:
+        assert (
+            SMOKE._new_me_utterance(
+                tmp_path, RUN_ID, deadline=deadline, clock=clock
+            )
+            is expected
+        )
 
 
 def _sized_utterance_line(size: int) -> bytes:

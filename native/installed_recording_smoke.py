@@ -759,7 +759,19 @@ def _capture_related_pids(
     return ancestry | descendants
 
 
-def _bounded_jsonl_lines(path: Path):
+def _check_transcript_deadline(
+    deadline: float | None, clock: Callable[[], float]
+) -> None:
+    if deadline is not None and clock() >= deadline:
+        raise SmokeFailure("transcript proof timed out while scanning JSONL")
+
+
+def _bounded_jsonl_lines(
+    path: Path,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+):
     """Open once, no-follow, then yield JSON objects from one regular-file fd."""
     flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
@@ -772,6 +784,7 @@ def _bounded_jsonl_lines(path: Path):
         fd = -1
         with handle:
             while True:
+                _check_transcript_deadline(deadline, clock)
                 raw = handle.readline(JSONL_LINE_LIMIT + 2)
                 if not raw:
                     return
@@ -802,9 +815,15 @@ def _header_run_id(path: Path) -> str | None:
     return run_id
 
 
-def _attested_file_has_me(path: Path, transcript_run_id: str) -> bool:
+def _attested_file_has_me(
+    path: Path,
+    transcript_run_id: str,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
     """Validate header and utterances through the same opened descriptor."""
-    lines = _bounded_jsonl_lines(path)
+    lines = _bounded_jsonl_lines(path, deadline=deadline, clock=clock)
     first = next(lines, None)
     if not isinstance(first, dict) or first.get("type") != "session_meta":
         return False
@@ -840,11 +859,20 @@ def _prelaunch_run_ids(data_dir: Path) -> set[str]:
     return run_ids
 
 
-def _new_me_utterance(data_dir: Path, transcript_run_id: str) -> bool | None:
+def _new_me_utterance(
+    data_dir: Path,
+    transcript_run_id: str,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool | None:
     """Accept only a canonical Me utterance from the telemetry-attested run."""
     for path in data_dir.rglob("*.jsonl") if data_dir.exists() else ():
+        _check_transcript_deadline(deadline, clock)
         try:
-            if _attested_file_has_me(path, transcript_run_id):
+            if _attested_file_has_me(
+                path, transcript_run_id, deadline=deadline, clock=clock
+            ):
                 return True
         except OSError:
             continue
@@ -1021,10 +1049,13 @@ def run(args: argparse.Namespace) -> None:
                 else None
             ),
         )
+        transcript_deadline = time.monotonic() + args.transcript_timeout
         wait_for(
             "durable Me utterance",
             args.transcript_timeout,
-            lambda: _new_me_utterance(data_dir, transcript_run_id),
+            lambda: _new_me_utterance(
+                data_dir, transcript_run_id, deadline=transcript_deadline
+            ),
         )
         _verify_dynamic_release_identity(app_pid, expected_release)
         _verify_release_identity(app, identity_path)
