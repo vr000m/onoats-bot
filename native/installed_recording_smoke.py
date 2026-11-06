@@ -48,6 +48,7 @@ def _load_telemetry_contract():
 
 _TELEMETRY_CONTRACT = _load_telemetry_contract()
 UI_TELEMETRY_SCHEMA_VERSION = _TELEMETRY_CONTRACT.UI_TELEMETRY_SCHEMA_VERSION
+UI_TELEMETRY_FILENAME = _TELEMETRY_CONTRACT.UI_TELEMETRY_FILENAME
 SNAPSHOT_EXPIRY_SECONDS = _TELEMETRY_CONTRACT.SNAPSHOT_EXPIRY_SECONDS
 AUDIO_OBSERVATION_EXPIRY_SECONDS = _TELEMETRY_CONTRACT.AUDIO_OBSERVATION_EXPIRY_SECONDS
 LEVEL_MIN = _TELEMETRY_CONTRACT.LEVEL_MIN
@@ -1116,7 +1117,7 @@ def run(args: argparse.Namespace) -> None:
     prelaunch_run_ids = _prelaunch_run_ids(data_dir)
     status_path = data_dir / ".active/onoats.status.json"
     pid_path = data_dir / ".active/onoats.pid"
-    telemetry_path = data_dir / ".active/onoats.ui.json"
+    telemetry_path = data_dir / ".active" / UI_TELEMETRY_FILENAME
     app_pid: int | None = None
     app_identity: ProcessIdentity | None = None
     recorder: RecorderIdentity | None = None

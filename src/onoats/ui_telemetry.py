@@ -32,6 +32,9 @@ from onoats_contracts.ui_telemetry import (
     TRANSCRIPT_RUN_ID_PATTERN,
     UI_TELEMETRY_SCHEMA_VERSION,
 )
+from onoats_contracts.ui_telemetry import (
+    UI_TELEMETRY_FILENAME as UI_TELEMETRY_FILENAME,
+)
 
 # Filesystem mutation is injected by the recorder owner.  Keeping these seams
 # here lets this display-only leaf stay independent of the application package
@@ -39,7 +42,6 @@ from onoats_contracts.ui_telemetry import (
 _rename_noreplace: Callable[[Path, Path], None] | None = None
 _rename_noreplace_available: Callable[[], bool] | None = None
 
-UI_TELEMETRY_FILENAME = "onoats.ui.json"
 UI_TELEMETRY_MODE = 0o600
 MAX_WRITE_HZ = 4.0
 HEARTBEAT_SECONDS = 2.0

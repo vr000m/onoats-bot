@@ -1898,6 +1898,19 @@ def test_native_smoke_loads_contract_from_exact_checkout_source():
     assert "<= 1.0" not in probe
 
 
+def test_native_smoke_telemetry_filename_is_the_contract_constant():
+    """The smoke's telemetry path comes from the shared contract, not a copy."""
+    import onoats_contracts.ui_telemetry as contract
+
+    from onoats import ui_telemetry
+
+    assert SMOKE.UI_TELEMETRY_FILENAME == contract.UI_TELEMETRY_FILENAME
+    assert ui_telemetry.UI_TELEMETRY_FILENAME is contract.UI_TELEMETRY_FILENAME
+    source = SMOKE_PATH.read_text(encoding="utf-8")
+    assert contract.UI_TELEMETRY_FILENAME not in source
+    assert 'telemetry_path = data_dir / ".active" / UI_TELEMETRY_FILENAME' in source
+
+
 def _write_stopped_status(path: Path, **overrides: object) -> None:
     status: dict[str, object] = {
         "running": False,
