@@ -609,11 +609,11 @@ sequenceDiagram
 ### Test Results
 
 - [ ] Focused telemetry and parity tests pass.
-- [ ] `uv run ruff format` and `uv run ruff check` pass.
+- [x] `uv run ruff format` and `uv run ruff check` pass.
 - [ ] Full `uv run pytest` passes.
-- [ ] `make -C native build` passes.
+- [x] `make -C native build` passes.
 - [ ] `native/test_ui_telemetry.sh` passes on macOS.
-- [ ] `native/test_recorder_model.sh` passes on macOS.
+- [x] `native/test_recorder_model.sh` passes on macOS.
 - [ ] Resource-allowlist negative checks (extra file, missing file) fail the verifier.
 - [ ] Signed bundle verification passes (the post-gauntlet staged app; the Phase 5 sign is a throwaway).
 - [ ] Designated-requirement bytes match the verified installed baseline when one exists; clean-install evidence is recorded otherwise.
@@ -665,7 +665,7 @@ sequenceDiagram
 - The active app PID's dynamic code identity matches the same immutable `ReleaseIdentity` used for staged installation; static path/signature checks alone cannot pass smoke.
 - Every conditional telemetry shape and unknown-key nesting level passes Python-producer to Swift-decoder parity coverage.
 
-<!-- reviewed: 2026-11-05 @ 3b6273d0c4624a78012c19e9915a69a4dc9a6bb1 -->
+<!-- reviewed: 2026-11-05 @ 155ec00af30cefac46719876dbec81cbf935dc2f -->
 
 ## Progress
 
