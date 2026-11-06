@@ -591,7 +591,11 @@ its scope; this list is a pointer, not the contract itself.
   authoritative teardown `finally` through `run_to_completion` (a shielded
   step runner that returns each step's outcome; only a cancellation of the
   step itself propagates, never a caller cancellation that lands in the same
-  turn the step finishes). Do not hand-roll another shield-and-remember loop.
+  turn the step finishes). Boundedness and "never raises" belong to
+  `close_quietly` and the client closers only: the ledger adds no deadline
+  (a step given to `attempt`/`run_to_completion` must be bounded by its caller)
+  and `run_to_completion` propagates the step's own exception. Do not
+  hand-roll another shield-and-remember loop.
 - `src/onoats/_event_loop.py` — the one bounded loop teardown for direct recorder
   and supervisor process boundaries. Pending-task cancellation uses the caller's
   grace; loop finalizers use a separate positive deadline so zero remains a valid

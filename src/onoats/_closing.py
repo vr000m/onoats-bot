@@ -1,10 +1,23 @@
-"""Bounded, best-effort teardown of a ``TranscriptionClient``.
+"""Teardown primitives: bounded ``TranscriptionClient`` closing, plus the
+``CancellationLedger`` they and the socket supervisor's teardown share.
 
 Leaf module: imports nothing from ``onoats`` (stdlib-only), for the same
 reason ``onoats._redact`` is one — both ``onoats.runtime`` (the startup /
 preflight path) and ``onoats.stt.websocket_stt_service`` (the live-session
 reconnect path) construct and tear down the *same* client type, and neither
-may import the other at module scope.
+may import the other at module scope. The ledger has a third consumer,
+``onoats.cli`` (the socket supervisor's authoritative teardown ``finally``,
+``_supervise_socket_session_inner``), which needs the same "attempt every
+step, remember a cancellation, re-raise it once" rule for non-client steps.
+
+The module has two layers with DIFFERENT contracts; the invariants below
+state which callable each applies to.
+
+* ``close_quietly`` and the client closers (``FULL_CLOSERS`` /
+  ``TRANSPORT_ONLY``): bounded, best-effort, never raise.
+* ``CancellationLedger``: the cancellation-bookkeeping primitive. By itself it
+  adds no deadline, and ``run_to_completion`` propagates the step's own
+  exception — see the class docstring.
 
 **Why any of this is bounded.** ``TranscriptionClient.close_session()``
 writes a ``session.close`` and then waits for the server's ``session.closed``
@@ -25,10 +38,13 @@ including the handler added specifically to clean up after a connect timeout
 against a wedged server — plus two near-duplicate 5.0 second constants. One
 mechanism, one constant, one set of invariants.
 
-**Invariants every caller gets:**
+**Invariants of ``close_quietly`` (and so of every client-closing caller):**
 
 * Never raises, with the single exception of ``asyncio.CancelledError``,
-  which must always propagate.
+  which must always propagate. (This is a property of ``close_quietly`` and
+  ``CancellationLedger.attempt``, not of the whole module:
+  ``CancellationLedger.run_to_completion`` returns or raises its step's own
+  outcome.)
 * Every closer named is *attempted*, even if an earlier one was cancelled or
   timed out: ``close_session`` and ``close`` tear down different resources,
   and losing ``close`` because ``close_session`` was interrupted mid-await
@@ -86,6 +102,11 @@ class CancellationLedger:
     leaves the socket/FD open — but it must also never be swallowed, so it
     is re-raised by :meth:`raise_if_cancelled` once every step has had its
     turn.
+
+    Boundedness is NOT provided here. :func:`close_quietly` bounds each client
+    closer itself; a step handed to :meth:`attempt` or :meth:`run_to_completion`
+    by any other caller must already be bounded on its own. ``attempt``
+    swallows step exceptions; ``run_to_completion`` propagates them.
     """
 
     __slots__ = ("_cancelled",)
