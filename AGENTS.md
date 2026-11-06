@@ -186,10 +186,16 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
 - **One bounded event-loop cleanup owner.** Direct recorder entrypoints and the
   socket supervisor both delegate pending-task cancellation plus async-generator
   and default-executor finalization to `onoats._event_loop.run_bounded_event_loop`.
-  A zero cancel timeout means no grace for pending work; it does not erase the
-  separate positive finalizer budget or turn a clean result into rc=1. Both
-  finalizers are attempted even when pending-task cancellation failed; any
-  failed stage still forces rc=1.
+  Teardown is ordered stages (pending-task cancellation, then
+  `shutdown_asyncgens`, then `shutdown_default_executor`) and the **first failed
+  stage ends it**: no later finalizer runs and no abandoned task gets another
+  loop turn, then `on_cleanup_failure()` + `hard_exit(1)` (`os._exit` in both
+  callers). A zero cancel timeout means no grace for pending work — a task
+  cancelled under it never runs again. Each finalizer has its **own**
+  `FINALIZER_TIMEOUT_SECONDS` budget, so neither cancellation grace nor a slow
+  async-generator shutdown can starve the executor; a clean run is never turned
+  into rc=1. Worst case to `hard_exit`: grace + 2 × finalizer budget. The
+  contract table is the function docstring; `tests/test_event_loop.py` pins it.
 
 Single-instance + pid-file ownership (`runtime.py`, pinned by
 `tests/test_status_file.py` + `tests/test_socket_supervisor.py`):
@@ -267,8 +273,11 @@ Direct-recorder shutdown has two separate bounds. `wait_or_force` propagates a
 normally completed task's exception, but after a force event it cancels and
 waits only for `SHUTDOWN_CANCEL_TIMEOUT_SEC`; resistant work is left to the
 process boundary. `_event_loop.run_bounded_event_loop` then gives pending-task
-cancellation and loop-owned finalizers separate deadlines, so cancellation
-grace cannot consume the async-generator/default-executor finalizer budget.
+cancellation and each loop-owned finalizer separate deadlines, so cancellation
+grace cannot consume the async-generator/default-executor finalizer budgets.
+Once pending-task cancellation fails (a survivor, a raising wait, or zero grace
+with pending work) no finalizer runs — finalizing needs `run_until_complete`,
+which would hand the abandoned task more turns — and the process hard-exits.
 
 ## Per-run configuration and native/release identity
 
@@ -612,8 +621,9 @@ its scope; this list is a pointer, not the contract itself.
   hand-roll another shield-and-remember loop.
 - `src/onoats/_event_loop.py` — the one bounded loop teardown for direct recorder
   and supervisor process boundaries. Pending-task cancellation uses the caller's
-  grace; loop finalizers use a separate positive deadline so zero remains a valid
-  immediate-cancel configuration.
+  grace; each loop finalizer uses its own positive deadline so zero remains a
+  valid immediate-cancel configuration. The first failed stage ends teardown with
+  no further loop turns (see the recorder-control bullet above).
 - `src/onoats/ui_telemetry.py` — the stdlib-only, display-only live snapshot
   contract and its in-memory state/publisher. Telemetry is fail-open: producer,
   persistence, and cleanup failures may degrade the menu-bar panel but must not
@@ -783,3 +793,6 @@ should NOT re-flag go here, one per line:
   exit 0 in 3-4 s with no degraded WARNING, no traceback and no macOS crash
   report. Not reproducible, so left as is. (2026-10-11)
 - **[Security] won't-fix**: the menu-bar app forwarding its full environment (incl. `PYTHONPATH`/`DYLD_*`) into the recorder (`RecorderModel.swift`) predates this branch, the recorder legitimately needs the user's environment (STT credentials), and env vars are trusted input in this threat model. (2026-11-06)
+- **[Logic] analysis-error**: "loop finalizers are skipped after a surviving task" (round-5) misread the separate-budget rule, which keeps cancellation grace from consuming the finalizer budget when pending-task cancellation *succeeds*. Running a finalizer needs `run_until_complete`, which gives every abandoned task more turns (round 6 measured a zero-grace handler running and delaying `hard_exit` by 2 s), and the process `os._exit`s anyway. `_event_loop` ends teardown at the first failed stage; `tests/test_event_loop.py` pins it. (2026-11-06)
+- **[Architecture] won't-fix**: the installed smoke's `ACTIVE_DIRNAME`/`STATUS_FILENAME`/`PID_FILENAME`/`PID_MARKER` stay local copies pinned by `tests/test_recording_integration.py`, not moved into `onoats_contracts`. That would not give one owner: the vendored, self-contained `onoats._vendor.pid` must keep its own `PID_FILENAME`/`PID_MARKER`, `onoats.status` owns `STATUS_FILENAME`, and Swift holds a parity-tested copy. An earlier round asked for the opposite. (2026-11-06)
+- **[Architecture] won't-fix**: the control-server bind + PID + running-status publication is not extracted into one helper shared by `__main__.py` and `dual.py`. Both sequences are pinned in order by `tests/test_status_file.py::test_recorder_entrypoints_publish_and_teardown_control_generation_in_order` and `__main__.py` points at dual.py's ordering contract; extracting late in the branch would invalidate that evidence. (2026-11-06)
