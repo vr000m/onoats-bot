@@ -885,6 +885,52 @@ def test_dual_diarization_lock_then_preflight_precede_capture(
 
 
 @pytest.mark.parametrize("source", ["portaudio", "socket"])
+@pytest.mark.parametrize("supplied", [False, True], ids=["captured", "supplied"])
+def test_session_snapshot_lock_order_whole_backend_state_space(
+    source, supplied, tmp_path, monkeypatch
+):
+    """Every backend locks before selecting one immutable session snapshot."""
+    import onoats.dual as dual_mod
+    from onoats import runtime
+    from onoats.config import load_config
+
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "0")
+    raw_config = load_config()
+    snapshot = runtime.RecorderSessionConfig.capture(raw_config)
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        dual_mod, "_acquire_instance_lock", lambda *_args: calls.append("lock")
+    )
+
+    def capture(_cls, config):
+        assert calls == ["lock"]
+        assert config is raw_config
+        calls.append("capture")
+        return snapshot
+
+    monkeypatch.setattr(runtime.RecorderSessionConfig, "capture", classmethod(capture))
+
+    def stop(*_args, **_kwargs):
+        calls.append("transport")
+        raise _Stop
+
+    monkeypatch.setattr(dual_mod, f"_build_{source}_transports", stop)
+    if source == "portaudio":
+        monkeypatch.setattr(
+            "onoats.config.audio_devices.select_dual_input_devices", stop
+        )
+
+    kwargs = {"session_config": snapshot} if supplied else {"config": raw_config}
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data", **kwargs))
+
+    expected = ["lock", "transport"] if supplied else ["lock", "capture", "transport"]
+    assert calls == expected
+
+
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
 def test_dual_diarization_flag_off_never_preflights(source, tmp_path, monkeypatch):
     monkeypatch.setenv("AUDIO_SOURCE", source)
     monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)

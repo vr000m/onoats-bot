@@ -448,6 +448,7 @@ async def run_onoats_dual(
     locked_category: str | None = None,
     data_dir: Path | None = None,
     session_config=None,
+    config=None,
 ) -> int:
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.pipeline.runner import PipelineRunner
@@ -477,7 +478,9 @@ async def run_onoats_dual(
     from onoats.runtime import RecorderSessionConfig
 
     if session_config is None:
-        session_config = RecorderSessionConfig.capture(load_config())
+        session_config = RecorderSessionConfig.capture(
+            config if config is not None else load_config()
+        )
     cfg = session_config
     audio_source = cfg.audio_source
     start_epoch = _mint_start_epoch()
@@ -1021,7 +1024,7 @@ def _apply_recorder_args(args: argparse.Namespace) -> int | None:
     return None
 
 
-def main(argv: list[str] | None = None, *, session_config=None) -> int:
+def main(argv: list[str] | None = None, *, session_config=None, config=None) -> int:
     """Console entrypoint for the dual-input recorder (``onoats bot``)."""
     args = _parse_args(argv)
     rc = _apply_recorder_args(args)
@@ -1033,6 +1036,7 @@ def main(argv: list[str] | None = None, *, session_config=None) -> int:
                 live_terminal=args.live_terminal,
                 locked_category=args.category,
                 session_config=session_config,
+                config=config,
             )
         )
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:

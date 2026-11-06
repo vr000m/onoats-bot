@@ -61,9 +61,10 @@ def test_bot_routes_to_dual(monkeypatch):
     called = {}
     snapshot = SimpleNamespace(audio_source="portaudio")
 
-    def fake_main(argv=None, *, session_config=None):
+    def fake_main(argv=None, *, session_config=None, config=None):
         called["argv"] = argv
         called["session_config"] = session_config
+        called["config"] = config
         return 0
 
     monkeypatch.setattr(
@@ -73,7 +74,8 @@ def test_bot_routes_to_dual(monkeypatch):
     rc = cli.main(["bot", "--live-terminal"])
     assert rc == 0
     assert called["argv"] == ["--live-terminal"]
-    assert called["session_config"] is snapshot
+    assert called["session_config"] is None
+    assert called["config"].audio_source == "portaudio"
 
 
 def test_bot_help_under_socket_does_not_enter_supervisor(monkeypatch, capsys):
@@ -147,8 +149,8 @@ def test_bot_captures_snapshot_at_backend_ownership_boundary(monkeypatch, source
         captures.append(snapshot)
         return snapshot
 
-    def dual_main(_rest, *, session_config=None):
-        received.append(session_config)
+    def dual_main(_rest, *, session_config=None, config=None):
+        received.append((session_config, config))
         return 0
 
     def supervisor(_rest, *, config=None):
@@ -161,8 +163,10 @@ def test_bot_captures_snapshot_at_backend_ownership_boundary(monkeypatch, source
 
     assert cli.main(["bot", "--source", source]) == 0
     if source == "portaudio":
-        assert captures == [snapshot]
-        assert received == [snapshot]
+        assert captures == []
+        assert len(received) == 1
+        assert received[0][0] is None
+        assert received[0][1].audio_source == "portaudio"
     else:
         assert captures == []
         assert len(received) == 1

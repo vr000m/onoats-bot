@@ -116,7 +116,6 @@ def _cmd_bot(rest: list[str]) -> int:
     """
     from onoats.config import load_config
     from onoats.dual import _parse_args
-    from onoats.runtime import RecorderSessionConfig
 
     # Resolve --help and argument errors via the bot's own parser BEFORE
     # choosing a backend. argparse prints help / usage and raises SystemExit
@@ -144,8 +143,11 @@ def _cmd_bot(rest: list[str]) -> int:
 
     from onoats.dual import main as dual_main
 
-    session_config = RecorderSessionConfig.capture(config)
-    return dual_main(rest, session_config=session_config)
+    # PortAudio ownership begins inside run_onoats_dual, where the
+    # single-instance lock is acquired.  Pass the selected raw configuration
+    # through so its immutable session snapshot is captured exactly once, only
+    # after that lock has won and before any audio side effect.
+    return dual_main(rest, config=config)
 
 
 # ---------------------------------------------------------------------------
