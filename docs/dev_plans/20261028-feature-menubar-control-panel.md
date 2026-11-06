@@ -930,6 +930,23 @@ sequenceDiagram
   invariant on Linux; the control-socket contract and its source-parity gate
   explicitly require the pinned identity.
 
+### 2026-11-05: Release authority and bounded-exit correction
+
+- `native/release_identity.py` is now the neutral, sole owner of the complete
+  release-identity and smoke-receipt schema, digest, bounded I/O, bundle
+  observation, and CLI authority contract. The immutable identity now binds the
+  canonical CLI path, entrypoint hash, interpreter path/hash, and clean git
+  revision; installed smoke rejects overrides, wrappers, replacements, and a
+  recorder whose kernel executable is not that interpreter.
+- Receipt output resolves only its parent authority and preserves the final
+  component for no-follow rejection. The supervisor uses an explicit event-loop
+  boundary and hard-exits only after its capturer, socket directory, and
+  environment cleanup when a recorder suppresses bounded cancellation.
+- State-table regressions cover receipt absent/regular/symlink/replacement,
+  CLI canonical/override/wrapper/replacement, matching/foreign recorder lineage,
+  and process-level cancellation resistance. Reverting each production guard
+  made its focused mutation fail before the exact fix was restored.
+
 ## Final Results
 
 ### Summary

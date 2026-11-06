@@ -115,9 +115,8 @@ existing TCC grants carry over.
 
 Day-to-day usage (the window panel's Start/Stop/Seminar hierarchy, Flush,
 Settings/Diagnostics, live display telemetry, per-run logs, and first-run TCC
-prompts) lives in the top-level
-[Menu bar (macOS)](../README.md#menu-bar-macos) section. The internals behind
-that surface:
+prompts) lives in the [detailed menu-bar guide](../docs/menu-bar.md). The
+internals behind that surface:
 
 - **Launch from `~/Applications` via the GUI** — that's the point:
   LaunchServices makes `Onoats.app` its own TCC responsible process,
