@@ -988,6 +988,27 @@ sequenceDiagram
   clears when the status evidence disappears or the selected data directory
   changes, while a current unsupported schema remains visible.
 
+### 2026-11-05: Round 9 ownership and pathname-authority correction
+
+- Direct and supervised recorder entrypoints now share one bounded event-loop
+  teardown owner. A zero cancellation grace cancels pending work immediately,
+  while clean loops retain an independent positive finalizer budget and preserve
+  their successful result.
+- Single-instance locking now opens the public leaf no-follow, validates the
+  opened regular-file identity against the pathname after flock and legacy
+  preflight, retries replacements, and rejects a replaced held identity on a
+  nested acquire. Rollback approval similarly comes from one bounded no-follow
+  descriptor snapshot whose metadata and final pathname identity still match.
+- Websocket STT emits neutral connection events that runtime adapts to UI
+  telemetry; `TranscriptBuffer` emits canonical speaker/overlap facts and the
+  UI adapter composes display labels. The unused telemetry compatibility facade
+  was removed.
+- Native helper ownership is split without behavioural changes:
+  `RecorderSystemOps.swift` owns process/filesystem/clock effects and
+  `RecorderRecords.swift` owns status/PID schema parsing, leaving
+  `RecorderModel.swift` to coordinate observable lifecycle and presentation
+  state. Focused regressions cover every structural boundary and its mutation.
+
 ## Final Results
 
 ### Summary

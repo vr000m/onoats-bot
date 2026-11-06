@@ -166,6 +166,11 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
   server-side diagnostics while clients receive only a generic error.
 - **`onoats stop --help` resolves without booting a service** (local argparse +
   lazy resolver import), like `flush`.
+- **One bounded event-loop cleanup owner.** Direct recorder entrypoints and the
+  socket supervisor both delegate pending-task cancellation plus async-generator
+  and default-executor finalization to `onoats._event_loop.run_bounded_event_loop`.
+  A zero cancel timeout means no grace for pending work; it does not erase the
+  separate positive finalizer budget or turn a clean result into rc=1.
 
 Single-instance + pid-file ownership (`runtime.py`, pinned by
 `tests/test_status_file.py` + `tests/test_socket_supervisor.py`):
@@ -186,6 +191,11 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   no stale lock to reclaim and **no teardown release call** (releasing during
   shutdown would free the slot while the supervisor is still tearing down its
   capturer). POSIX-only (no-op on Windows; macOS product).
+- **The lock descriptor and public leaf are one authority.** The lock opens with
+  `O_NOFOLLOW`, must be a safe owner-held regular file, and its device/inode must
+  still match `.active/onoats.lock` after `flock` and after the legacy identity
+  preflight. A pathname replacement discards that descriptor and retries; a
+  nested acquire fails closed if the held public identity was replaced.
 - **Identity preflight is the secondary guard, and it runs INSIDE the lock.**
   `_acquire_instance_lock` calls `_refuse_if_live_recorder` (`resolve_flush_target`
   + the indeterminate-but-live refusal) immediately after taking the `flock`, so
@@ -239,6 +249,11 @@ a later status record or make rich status a prerequisite for recording.
   process exit is clean only at status `0`; a requested Stop never masks a
   non-zero exit, and status diagnostics are accepted only from the matching
   generation, spawn floor, and active data directory.
+- **Native model helpers stay separated by responsibility.** `RecorderModel.swift`
+  coordinates observable lifecycle/UI state; `RecorderSystemOps.swift` owns
+  process, filesystem, clock, and polling effects; `RecorderRecords.swift` owns
+  status/PID schema parsing. Config and audio-device parsing remain in their
+  existing `ConfigStore.swift` and `AudioDevices.swift` owners.
 - **One mandatory release identity.** Staged installation and signed-app smoke
   consume the same immutable `ReleaseIdentity`: canonical bundle identifier,
   designated requirement, cdhash, app-tree hash, main-executable hash, canonical
@@ -250,6 +265,10 @@ a later status record or make rich status a prerequisite for recording.
   after success and cleanup; staged installation requires that exact receipt
   before mutation. A static path/signature check is not dynamic running-code
   proof.
+- **Rollback approval is one immutable read.** `approved-rollback.txt` is read
+  through one bounded, no-follow, owner/mode-checked regular-file descriptor;
+  the bytes, descriptor metadata, and final pathname identity must agree before
+  any recorded archive or identity field is trusted.
 - **Supported release runtimes are jointly gated.** Python 3.12 runs the full
   release suite and Python 3.13 runs the recorder contract lane; PyPI publication
   depends on both jobs.
@@ -456,8 +475,10 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   speaker list in it. Pinned by `tests/test_categories.py`.
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
-  composed at render/live-terminal time by `render.compose_speaker_label`
-  and never persisted (`tests/test_speaker_labels.py`).
+  composed at render/live-terminal/UI-adapter time by
+  `display_labels.compose_speaker_label` and never by `TranscriptBuffer` or
+  persisted (`tests/test_speaker_labels.py`). Websocket STT publishes neutral
+  connection events; runtime/dual adapters translate them to UI telemetry.
 - **Preflight is hoisted, import-free and non-downloading.**
   `runtime._preflight_diarization` runs right after `_acquire_instance_lock` in
   `onoats bot` (supervisor and `run_onoats_dual`), only when the flag is on:
@@ -535,6 +556,10 @@ its scope; this list is a pointer, not the contract itself.
   `close_quietly` and by `_graceful_close` (which cannot use
   `close_quietly` for its whole sequence because it must join the reader
   task *between* the two closers).
+- `src/onoats/_event_loop.py` — the one bounded loop teardown for direct recorder
+  and supervisor process boundaries. Pending-task cancellation uses the caller's
+  grace; loop finalizers use a separate positive deadline so zero remains a valid
+  immediate-cancel configuration.
 - `src/onoats/ui_telemetry.py` — the stdlib-only, display-only live snapshot
   contract and its in-memory state/publisher. Telemetry is fail-open: producer,
   persistence, and cleanup failures may degrade the menu-bar panel but must not
