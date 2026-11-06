@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 256" role="img" aria-labelledby="title desc">
+  <title id="title">Onoats wordmark</title>
+  <desc id="desc">The Onoats oat-grain speech-wave mark beside the name onoats.</desc>
+  <g transform="translate(16 16) scale(.875)">
+    <circle cx="128" cy="128" r="112" fill="#17233A"/>
+    <path d="M76 178 C98 156 116 137 128 110 C140 83 151 66 181 51" fill="none" stroke="#E9B44C" stroke-width="12" stroke-linecap="round"/>
+    <g fill="#FFF8E8">
+      <path d="M64 137 C64 116 78 99 98 96 C103 116 96 136 78 146 C71 147 66 143 64 137Z"/>
+      <path d="M98 104 C99 77 116 56 141 51 C148 77 139 102 116 115 C108 116 101 112 98 104Z"/>
+      <path d="M134 87 C139 65 157 50 178 50 C181 72 169 91 149 100 C142 99 137 95 134 87Z"/>
+    </g>
+    <circle cx="77" cy="179" r="10" fill="#E9B44C"/>
+  </g>
+  <text x="252" y="170" fill="#17233A" font-family="Avenir Next Rounded, Avenir Next, Helvetica Neue, sans-serif" font-size="132" font-weight="600" letter-spacing="-5">onoats</text>
+</svg>

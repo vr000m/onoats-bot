@@ -26,9 +26,10 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     # import annotations` (above) makes every annotation a string, so this
     # import never runs at module load time — only under a type checker.
     from pipecat.services.stt_service import STTService
+    from onoats.config import OnoatsConfig
 
 from loguru import logger
 
@@ -71,6 +73,90 @@ if sys.platform != "win32":
 BOT_NAME = "onoats"
 STT_SERVICE = os.getenv("STT_SERVICE", "whisper").lower().strip()
 STT_MODEL = os.getenv("STT_MODEL", "").strip()
+
+
+@dataclass(frozen=True)
+class RecorderSessionConfig:
+    """Immutable STT/config authority captured once for a recorder run."""
+
+    audio_source: str
+    mic_device: str | None
+    system_device: str | None
+    mic_device_source: str
+    system_device_source: str
+    mic_socket: str | None
+    system_socket: str | None
+    capturer_nonce: str | None
+    stt_service: str
+    stt_model: str
+    stt_language: str
+    stt_endpoint: Mapping[str, object]
+    stt_launchd_label: str | None
+    diarization: bool
+    diarization_idle_remint_sec: float | None
+    display_label: str
+    secrets: Mapping[str, str]
+
+    @classmethod
+    def capture(cls, config: OnoatsConfig | None = None) -> RecorderSessionConfig:
+        if config is None:
+            from onoats.config import load_config
+
+            config = load_config()
+        # Backend-specific validation belongs to the selected backend.  A stale
+        # or malformed websocket-only setting must not abort a whisper or
+        # Deepgram session that will never consume it.
+        endpoint = MappingProxyType(
+            dict(_resolve_stt_ws_target(_ws_env(config), warn_on_cleartext=False))
+            if config.stt_service == "websocket"
+            else {}
+        )
+        secrets = MappingProxyType(
+            {
+                name: value
+                for name in ("DEEPGRAM_API_KEY",)
+                if (value := config.get_secret(name)) is not None
+            }
+        )
+        return cls(
+            audio_source=config.audio_source,
+            mic_device=config.mic_device,
+            system_device=config.system_device,
+            mic_device_source=config.mic_device_source,
+            system_device_source=config.system_device_source,
+            mic_socket=config.mic_socket,
+            system_socket=config.system_socket,
+            capturer_nonce=config.capturer_nonce,
+            stt_service=config.stt_service,
+            stt_model=config.stt_model,
+            stt_language=config.stt_language,
+            stt_endpoint=endpoint,
+            stt_launchd_label=config.stt_launchd_label,
+            diarization=bool(config.diarization),
+            diarization_idle_remint_sec=config.diarization_idle_remint_sec,
+            display_label=_stt_banner_for_config(config),
+            secrets=secrets,
+        )
+
+    def require_secret(
+        self,
+        name: str,
+        *,
+        validate: Callable[[str], bool] | None = None,
+        hint: str | None = None,
+    ) -> str:
+        """Return a secret captured with the rest of the session snapshot."""
+        value = self.secrets.get(name, "").strip()
+        if not value:
+            message = f"Missing required secret: {name}"
+            if hint:
+                message += f" — {hint}"
+            raise RuntimeError(message)
+        if validate is not None and not validate(value):
+            raise RuntimeError(
+                f"Secret {name} is set but looks invalid (failed validation)"
+            )
+        return value
 
 
 class SttPreflightError(RuntimeError):
@@ -399,7 +485,16 @@ def _display_target(kwargs: dict) -> str:
 # public name.
 
 
-def stt_banner() -> str:
+def _stt_banner_for_config(cfg: OnoatsConfig) -> str:
+    if cfg.stt_service == "websocket":
+        target = _display_target(
+            _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
+        )
+        return f"websocket (server={target}, model pinned by server)"
+    return f"{cfg.stt_service} / model={cfg.stt_model or 'default'}"
+
+
+def stt_banner(config: OnoatsConfig | RecorderSessionConfig | None = None) -> str:
     """One-line STT description for the startup banner.
 
     For the websocket backend the model is pinned by the server (via the
@@ -409,15 +504,13 @@ def stt_banner() -> str:
     Show the resolved server target instead; the real backend + model is
     logged on connect by ``WebSocketSTTService._ensure_connected``.
     """
-    from onoats.config import load_config
+    if isinstance(config, RecorderSessionConfig):
+        return config.display_label
+    if config is None:
+        from onoats.config import load_config
 
-    cfg = load_config()
-    if cfg.stt_service == "websocket":
-        target = _display_target(
-            _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
-        )
-        return f"websocket (server={target}, model pinned by server)"
-    return f"{cfg.stt_service} / model={cfg.stt_model or 'default'}"
+        config = load_config()
+    return _stt_banner_for_config(config)
 
 
 def _ws_env(cfg) -> dict[str, str]:
@@ -521,7 +614,9 @@ _preflight_cache: dict[tuple[object, object, object, object], str | None] = {}
 _RSS_PROBE_TIMEOUT_SEC = 2.0
 
 
-async def log_stt_server_rss(phase: str) -> None:
+async def log_stt_server_rss(
+    phase: str, *, config: OnoatsConfig | RecorderSessionConfig | None = None
+) -> None:
     """Log the stt_server's PID + peak RSS at ``phase`` (``startup`` / ``shutdown``).
 
     Queries the running server via the ``server.status`` wire probe
@@ -548,7 +643,11 @@ async def log_stt_server_rss(phase: str) -> None:
         # which the data path (``_create_stt_service``) and banner
         # (``stt_banner``) both layer in. Skipping it lands on the default
         # socket and probes a stale/wrong server (e.g. mlx instead of nemotron).
-        kwargs = _resolve_stt_ws_target(_ws_env(load_config()), warn_on_cleartext=False)
+        if isinstance(config, RecorderSessionConfig):
+            kwargs = dict(config.stt_endpoint)
+        else:
+            cfg = config or load_config()
+            kwargs = _resolve_stt_ws_target(_ws_env(cfg), warn_on_cleartext=False)
         client = TranscriptionClient(
             socket_path=kwargs.get("socket_path"),
             host=kwargs.get("host"),
@@ -1312,9 +1411,14 @@ class SttServiceResult:
 
 async def _create_stt_service(
     *,
+    config: OnoatsConfig | RecorderSessionConfig | None = None,
     data_dir: Path | None = None,
     branch_instance: str | None = None,
     stamp_segment_samples: bool = False,
+    on_ready: Callable[[], None] | None = None,
+    on_recovering: Callable[[], None] | None = None,
+    on_failed: Callable[[str], None] | None = None,
+    status_publication_enabled: Callable[[], bool] | None = None,
 ) -> SttServiceResult:
     """Build the STT service based on STT_SERVICE / STT_MODEL env vars.
 
@@ -1334,6 +1438,10 @@ async def _create_stt_service(
     MLX / Whisper imports are kept lazy (inside the backend branch) so a plain
     ``import onoats.runtime`` with no ``STT_SERVICE`` set never imports
     ``mlx_whisper`` — the off-mac baseline ships MLX-free.
+
+    ``config`` pins backend selection and all related STT settings to a
+    caller-owned session snapshot. ``None`` preserves the dynamic standalone
+    helper boundary by loading the current config for this call.
 
     ``data_dir``, when given, resolves ``cfg.stt_launchd_label`` and builds
     the ``on_recovery`` callbacks wired into the websocket preflight and the
@@ -1369,9 +1477,11 @@ async def _create_stt_service(
     It is passed explicitly by the caller (system arm only) and is never
     derived from config here.
     """
-    from onoats.config import load_config
+    if config is None:
+        from onoats.config import load_config
 
-    cfg = load_config()
+        config = load_config()
+    cfg = config
     service = cfg.stt_service
     model_name = cfg.stt_model
     language = _resolve_stt_language(cfg)
@@ -1412,6 +1522,11 @@ async def _create_stt_service(
                 # path that just recovered — a status-file failure must not
                 # turn a successful self-heal into an uncaught crash, and must
                 # not be misread by `_ensure_connected` as a failed connect.
+                if (
+                    status_publication_enabled is not None
+                    and not status_publication_enabled()
+                ):
+                    return
                 try:
                     _status_mod.set_warning_branch(data_dir, branch, msg)
                 except Exception as exc:
@@ -1447,7 +1562,11 @@ async def _create_stt_service(
             def on_preflight_confirmed() -> None:
                 _clear_preflight(None)
 
-        kwargs = _resolve_stt_ws_target(_ws_env(cfg))
+        kwargs = (
+            dict(cfg.stt_endpoint)
+            if isinstance(cfg, RecorderSessionConfig)
+            else _resolve_stt_ws_target(_ws_env(cfg))
+        )
         target = _display_target(kwargs)
         logger.info(f"STT: websocket (server={target})")
         await _preflight_stt_ws(
@@ -1488,6 +1607,9 @@ async def _create_stt_service(
             instance_name=branch_instance,
             stamp_segment_samples=stamp_segment_samples,
             on_recovery=live_on_recovery,
+            on_ready=on_ready,
+            on_recovering=on_recovering,
+            on_failed=on_failed,
             on_preflight_confirmed=(
                 on_preflight_confirmed if recovered_in_preflight else None
             ),
@@ -1591,7 +1713,7 @@ async def flush_and_rotate(
     continue_session: bool,
     data_dir: Path,
     locked_category: str | None = None,
-) -> None:
+) -> bool:
     """Flush the transcript buffer and rotate its session file into ``pending/``.
 
     The recorder emits files only — no SQLite, no ``processing_jobs`` row. It
@@ -1639,7 +1761,7 @@ async def flush_and_rotate(
             )
         except OSError as exc:
             logger.error(f"Flush: could not pre-mint fresh .active/ session: {exc}")
-            return
+            return False
 
     buffer_contents, session_path = await transcript_buffer.flush(
         next_session_file=next_active_path
@@ -1672,7 +1794,7 @@ async def flush_and_rotate(
                     f"Flush: buffer no longer points at {next_active_path.name} — "
                     "leaving file in place (crash_recovery will rotate as no-op)"
                 )
-        return
+        return True
 
     try:
         session_id = session_queue.rotate_active_to_pending(
@@ -1682,10 +1804,10 @@ async def flush_and_rotate(
         logger.warning(
             f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
         )
-        return
+        return False
     except OSError as exc:
         logger.error(f"Flush: could not rotate {session_path.name} to pending/: {exc}")
-        return
+        return False
 
     # File-only: no DB row. The category travels in the session_meta first
     # line (written by the transcript buffer); a consumer back-fills from the
@@ -1696,6 +1818,7 @@ async def flush_and_rotate(
         logger.debug(
             f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
         )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2052,7 +2175,21 @@ def _release_instance_lock() -> None:
     _instance_lock_fd = None
 
 
-def _write_pid_file(data_dir: Path) -> Path:
+def _mint_start_epoch() -> float:
+    """Mint the one wall-clock run identity shared by PID/status/telemetry."""
+    return time.time()
+
+
+def _build_pid_record(*, start_epoch: float):
+    """Construct the exact recorder identity published after control bind."""
+    from onoats._vendor.pid import PidRecord
+
+    return PidRecord(
+        pid=os.getpid(), cmdline=_own_ps_cmdline(), start_epoch=start_epoch
+    )
+
+
+def _write_pid_file(data_dir: Path, *, start_epoch: float, record=None) -> Path:
     """Write the current process PID, identity marker, and cmdline fingerprint.
 
     Single-instance enforcement lives in ``_acquire_instance_lock`` (the flock +
@@ -2092,12 +2229,15 @@ def _write_pid_file(data_dir: Path) -> Path:
         except PermissionError:
             logger.warning("PID file exists, process may be running as different user")
 
-    cmdline = _own_ps_cmdline()
+    if record is None:
+        record = _build_pid_record(start_epoch=start_epoch)
+    if record.pid != os.getpid() or record.start_epoch != start_epoch:
+        raise ValueError("pid record does not identify this recorder generation")
+    cmdline = record.cmdline
     # Wall-clock start_epoch is included as the 4th line so live-view
     # readers can distinguish a freshly-started bot from one that
     # happens to have inherited a recycled pid (see onoats._vendor.pid).
-    start_epoch = time.time()
-    payload = f"{os.getpid()}\n{PID_MARKER}\n{cmdline}\n{start_epoch}\n"
+    payload = f"{record.pid}\n{PID_MARKER}\n{cmdline}\n{record.start_epoch}\n"
     # Atomic replace (temp + os.replace in the SAME dir) — never truncate the pid
     # file in place. A draining recorder's owner-checked `_remove_pid_file` reads
     # this path concurrently; an in-place write_text would expose an empty/partial
@@ -2127,7 +2267,12 @@ def _write_pid_file(data_dir: Path) -> Path:
     return pid_path
 
 
-def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
+def _remove_pid_file(
+    pid_path: Path,
+    *,
+    owner_record=None,
+    owner_pid: int | None = None,
+) -> None:
     """Remove the PID file on shutdown.
 
     When ``owner_pid`` is given, unlink ONLY if the file still records exactly that
@@ -2142,6 +2287,15 @@ def _remove_pid_file(pid_path: Path, *, owner_pid: int | None = None) -> None:
     is correct. A leftover invalid pid file is self-healing: ``status`` reports no
     valid recorder and the next ``_write_pid_file`` atomically replaces it.
     """
+    if owner_record is not None:
+        from onoats._vendor.pid import compare_and_unlink_pid_record
+
+        if not compare_and_unlink_pid_record(pid_path, owner_record):
+            logger.warning(
+                f"PID file {pid_path} no longer contains this complete recorder "
+                "generation; not removing."
+            )
+        return
     if owner_pid is not None:
         current = _read_pid_file(pid_path)
         if current != owner_pid:
@@ -2181,8 +2335,9 @@ def _write_status_running(
     *,
     audio_source: str,
     stt_label: str,
+    start_epoch: float,
     warning: str | None = None,
-) -> None:
+) -> bool:
     """Write the start-of-session status (``running=true``). Best-effort.
 
     ``warning`` threads a preflight-path kickstart-recovery message straight
@@ -2190,15 +2345,27 @@ def _write_status_running(
     live-path equivalent still goes through ``status.set_warning_branch``.
     """
     try:
-        _status_mod.write_running(
+        result = _status_mod.write_running(
             data_dir,
             pid=os.getpid(),
             audio_source=audio_source,
             stt_label=stt_label,
+            start_time=start_epoch,
             warning=warning,
         )
+        if result is False:
+            logger.warning(
+                "Could not write status file (start): status writer returned false; "
+                "status and UI telemetry disabled for this run"
+            )
+            return False
+        return True
     except OSError as exc:
-        logger.warning(f"Could not write status file (start): {exc}")
+        logger.warning(
+            "Could not write status file (start): "
+            f"{safe_exc_text(exc)}; status and UI telemetry disabled for this run"
+        )
+        return False
 
 
 def _mark_status_rotation(data_dir: Path) -> None:
@@ -2266,22 +2433,52 @@ def graceful_shutdown_requested() -> bool:
     return _graceful_shutdown_requested
 
 
+def _pipeline_ended_by_error(
+    shutdown_event: asyncio.Event,
+    recorder_label: str,
+    *,
+    exception: BaseException | None = None,
+) -> bool:
+    """Classify a runner termination against the recorder's stop authority."""
+    if exception is None and shutdown_event.is_set():
+        return False
+    detail = "returned" if exception is None else f"raised {type(exception).__name__}"
+    logger.error(
+        f"{recorder_label} pipeline {detail} without a shutdown request; "
+        "reporting non-zero exit"
+    )
+    return True
+
+
 def _install_signal_handlers(
     shutdown_event: asyncio.Event,
     force_exit_event: asyncio.Event,
     flush_callback,
     silence_detector,
     loop: asyncio.AbstractEventLoop,
+    *,
+    lifecycle_controller=None,
 ) -> None:
     """Install signal handlers.
 
     - SIGINT (Ctrl+C once): graceful shutdown (flush + drain tasks)
     - SIGINT (Ctrl+C again during shutdown): force exit (cancel pending tasks)
     - SIGTERM: graceful shutdown
-    - SIGUSR1: flush current transcript, keep listening (used by ``onoats flush``)
+    - SIGUSR1: direct compatibility flush for terminals/service managers
     """
 
     def _handle_shutdown(sig):
+        if lifecycle_controller is not None:
+            forced = lifecycle_controller.signal(loop)
+            if forced:
+                logger.warning(
+                    "Received second Ctrl+C — forcing exit (cancelling pending tasks)"
+                )
+            else:
+                logger.info(
+                    f"Received signal {sig.name} — initiating graceful shutdown"
+                )
+            return
         if shutdown_event.is_set():
             logger.warning(
                 "Received second Ctrl+C — forcing exit (cancelling pending tasks)"

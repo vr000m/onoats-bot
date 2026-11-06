@@ -24,6 +24,10 @@ the same change whenever the Swift writer changes.
 from __future__ import annotations
 
 import re
+import json
+import shutil
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -40,6 +44,15 @@ def _swift_escape(value: str) -> str:
 RECORDER_MODEL = REPO / "native" / "onoats-menubar" / "Sources" / "RecorderModel.swift"
 FRAME_WRITER = REPO / "native" / "onoats-capturer" / "Sources" / "FrameWriter.swift"
 SUPPORT = REPO / "native" / "onoats-capturer" / "Sources" / "Support.swift"
+UI_TELEMETRY = REPO / "native" / "onoats-menubar" / "Sources" / "UiTelemetry.swift"
+MENU_BAR_APP = REPO / "native" / "onoats-menubar" / "Sources" / "OnoatsMenuBarApp.swift"
+RECORDING_PANEL = (
+    REPO / "native" / "onoats-menubar" / "Sources" / "RecordingPanelView.swift"
+)
+SETTINGS_PANEL = (
+    REPO / "native" / "onoats-menubar" / "Sources" / "SettingsPanelView.swift"
+)
+UI_FIXTURES = REPO / "tests" / "fixtures" / "ui_telemetry"
 
 
 def _extract(pattern: str, path: Path) -> str:
@@ -87,6 +100,43 @@ def test_status_file_relative_path_matches_swift():
         r'appendingPathComponent\("(\.active/onoats\.status\.json)"\)', RECORDER_MODEL
     )
     assert swift == python_rel
+
+
+def test_recorder_publication_status_is_distinct_from_prestart_status(
+    tmp_path: Path,
+):
+    from onoats.status import (
+        read_status,
+        write_prestart_failure,
+        write_prestart_waiting,
+        write_running,
+    )
+
+    write_prestart_waiting(tmp_path, audio_source="socket", note="waiting")
+    waiting = read_status(tmp_path)
+    assert waiting is not None and waiting.stt_label == ""
+
+    write_prestart_failure(
+        tmp_path,
+        audio_source="socket",
+        exit_reason="capturer-exited",
+        last_error="failed before recorder startup",
+    )
+    failure = read_status(tmp_path)
+    assert failure is not None and failure.stt_label == ""
+
+    write_running(
+        tmp_path,
+        pid=4242,
+        audio_source="socket",
+        stt_label="websocket",
+        start_time=100.0,
+    )
+    recorder = read_status(tmp_path)
+    assert recorder is not None and recorder.stt_label == "websocket"
+
+    swift = RECORDER_MODEL.read_text(encoding="utf-8")
+    assert "&& !status.stt_label.isEmpty" in swift
 
 
 def test_pid_marker_and_path_match_swift():
@@ -542,10 +592,12 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
     """
     from onoats.categories import InvalidCategoryError, validate_category
     from onoats.config import OnoatsConfig
+    from onoats.ui_telemetry import SEMINAR_CATEGORY
 
     swift = RECORDER_MODEL.read_text()
     category = re.search(r'seminarCategory\s*=\s*"([^"]+)"', swift)
     assert category, "RecorderModel.seminarCategory literal not found"
+    assert category.group(1) == SEMINAR_CATEGORY
     assert re.search(
         r'if seminarMode \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
         swift,
@@ -557,3 +609,442 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
     assert validate_category(category.group(1), config=configured) == category.group(1)
     with pytest.raises(InvalidCategoryError):
         validate_category(category.group(1), config=OnoatsConfig(raw={}))
+
+
+def test_ui_telemetry_contract_matches_swift():
+    """Every consumer-side telemetry literal mirrors the Python leaf module."""
+    from onoats import ui_telemetry as py
+
+    swift = UI_TELEMETRY.read_text(encoding="utf-8")
+    numeric = {
+        "schemaVersion": py.UI_TELEMETRY_SCHEMA_VERSION,
+        "maxWriteHz": py.MAX_WRITE_HZ,
+        "heartbeatSeconds": py.HEARTBEAT_SECONDS,
+        "snapshotExpirySeconds": py.SNAPSHOT_EXPIRY_SECONDS,
+        "audioObservationExpirySeconds": py.AUDIO_OBSERVATION_EXPIRY_SECONDS,
+        "audioObservationRefreshSeconds": py.AUDIO_OBSERVATION_REFRESH_SECONDS,
+        "transcriptLimit": py.TRANSCRIPT_LIMIT,
+        "detailLimit": py.DETAIL_LIMIT,
+        "maxSnapshotBytes": py.MAX_SNAPSHOT_BYTES,
+        "levelMin": py.LEVEL_MIN,
+        "levelMax": py.LEVEL_MAX,
+    }
+    for name, expected in numeric.items():
+        match = re.search(
+            rf"(?:static\s+)?let\s+{name}\s*(?::[^=]+)?=\s*([0-9.]+)", swift
+        )
+        assert match, f"UiTelemetry.swift missing {name}"
+        assert float(match.group(1)) == float(expected), name
+
+    filename = re.search(
+        r'(?:static\s+)?let\s+fileName\s*(?::[^=]+)?=\s*"([^"]+)"', swift
+    )
+    assert filename and filename.group(1) == py.UI_TELEMETRY_FILENAME
+
+    state_array = re.search(r"sttStates\s*(?::[^=]+)?=\s*\[([^\]]+)\]", swift)
+    assert state_array, "UiTelemetry.swift missing sttStates literal"
+    assert set(re.findall(r'"([^"]+)"', state_array.group(1))) == set(py.STT_STATES)
+
+    precedence = re.search(r"sttPrecedence\s*(?::[^=]+)?=\s*\[([^\]]+)\]", swift)
+    assert precedence, "UiTelemetry.swift missing sttPrecedence literal"
+    assert tuple(re.findall(r'"([^"]+)"', precedence.group(1))) == py.STT_PRECEDENCE
+
+    assert py.UI_TELEMETRY_SCHEMA_VERSION == 2
+    assert re.search(r"let\s+transcriptRunID:\s*String", swift)
+    field_sets = {
+        "rootRequiredFields": py.ROOT_REQUIRED_FIELDS,
+        "rootOptionalFields": py.ROOT_OPTIONAL_FIELDS,
+        "audioFields": py.AUDIO_FIELDS,
+        "sttFields": py.STT_FIELDS,
+        "sttBranchRequiredFields": py.STT_BRANCH_REQUIRED_FIELDS,
+        "sttBranchOptionalFields": py.STT_BRANCH_OPTIONAL_FIELDS,
+        "transcriptRequiredFields": py.TRANSCRIPT_REQUIRED_FIELDS,
+        "transcriptOptionalFields": py.TRANSCRIPT_OPTIONAL_FIELDS,
+    }
+    for name, expected in field_sets.items():
+        declaration = re.search(
+            rf"(?:static\s+)?let\s+{name}\s*:\s*Set<String>\s*=\s*\[([^\]]*)\]",
+            swift,
+            re.DOTALL,
+        )
+        assert declaration, f"UiTelemetry.swift missing {name}"
+        assert set(re.findall(r'"([^"]+)"', declaration.group(1))) == set(expected)
+        assert swift.count(f"UiTelemetryContract.{name}") >= 1, (
+            f"Swift decoder does not enforce parity-checked {name}"
+        )
+    assert "transcript_run_id" in py.ROOT_REQUIRED_FIELDS
+    assert re.search(r"let\s+transcript_run_id:\s*String", swift)
+    run_id_pattern = re.search(
+        r'(?:static\s+)?let\s+transcriptRunIDPattern\s*(?::[^=]+)?=\s*"([^"]+)"',
+        swift,
+    )
+    assert run_id_pattern, "UiTelemetry.swift missing transcriptRunIDPattern"
+    assert run_id_pattern.group(1) == py.TRANSCRIPT_RUN_ID_PATTERN
+
+
+def test_ui_telemetry_shared_decoder_vectors_match_python_contract(tmp_path: Path):
+    """Keep native fixtures live against the producer-side tolerant reader."""
+    from onoats.ui_telemetry import read_snapshot
+
+    cases = json.loads((UI_FIXTURES / "decoder_cases.json").read_text())
+    assert cases
+    for case in cases:
+        snapshot_path = tmp_path / f"{case['name']}.json"
+        snapshot_path.write_text(json.dumps(case["snapshot"]), encoding="utf-8")
+        result = read_snapshot(
+            snapshot_path,
+            pid=case["owner_pid"],
+            start_epoch=case["owner_start_epoch"],
+            now=case["now"],
+        )
+        # PID liveness is deliberately Swift-only: Python's reader receives an
+        # already-authoritative owner tuple and therefore has no owner_alive arg.
+        expected = case["accepted"] if case["owner_alive"] else True
+        assert (result is not None) is expected, case["name"]
+
+    for name in ("malformed.json", "nonfinite_nan.json", "nonfinite_infinity.json"):
+        path = UI_FIXTURES / name
+        assert (
+            read_snapshot(path, pid=4242, start_epoch=1699999900.0, now=1700000000.0)
+            is None
+        )
+
+
+def test_swift_decoder_validation_consumes_the_parity_checked_run_id_pattern(
+    tmp_path: Path,
+):
+    """Mutating only the shared pattern must change decoder acceptance.
+
+    A source-presence assertion cannot detect a decoder that keeps an unused
+    parity constant beside a hand-written duplicate grammar.
+    """
+    if sys.platform != "darwin" or not shutil.which("swiftc"):
+        pytest.skip("Swift mutation harness requires macOS swiftc")
+    source = UI_TELEMETRY.read_text(encoding="utf-8")
+    needle = 'transcriptRunIDPattern = "^[0-9a-f]{32}$"'
+    assert source.count(needle) == 1
+    mutated = source.replace(needle, 'transcriptRunIDPattern = "^[A-F]{32}$"', 1)
+    mutated_source = tmp_path / "UiTelemetry.swift"
+    mutated_source.write_text(mutated, encoding="utf-8")
+    binary = tmp_path / "ui-telemetry-mutated"
+    compile_result = subprocess.run(
+        [
+            "swiftc",
+            "-parse-as-library",
+            "-module-cache-path",
+            str(tmp_path / "module-cache"),
+            str(mutated_source),
+            str(REPO / "native/onoats-menubar/Tests/UiTelemetryDecoderHarness.swift"),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert compile_result.returncode == 0, compile_result.stderr
+    mutation_result = subprocess.run(
+        [str(binary), str(UI_FIXTURES)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert mutation_result.returncode != 0, (
+        "decoder ignored the mutated transcriptRunIDPattern and kept accepting "
+        "the original lowercase grammar"
+    )
+
+
+def test_ui_telemetry_string_boundary_vectors_cover_unicode_scalars():
+    """The shared vector table pins exact inclusive/exclusive string bounds."""
+    from onoats.ui_telemetry import DETAIL_LIMIT, TRANSCRIPT_LIMIT
+
+    cases = json.loads((UI_FIXTURES / "string_boundaries.json").read_text())
+    assert {(case["field"], case["scalar_count"]) for case in cases} == {
+        ("transcript", TRANSCRIPT_LIMIT - 1),
+        ("transcript", TRANSCRIPT_LIMIT),
+        ("transcript", TRANSCRIPT_LIMIT + 1),
+        ("detail", DETAIL_LIMIT),
+        ("detail", DETAIL_LIMIT + 1),
+        ("speaker_label", DETAIL_LIMIT),
+        ("speaker_label", DETAIL_LIMIT + 1),
+        ("locked_category", DETAIL_LIMIT),
+        ("locked_category", DETAIL_LIMIT + 1),
+    }
+    # Six Unicode scalars per motif: combining mark, astral characters, and
+    # the scalar components of a ZWJ sequence. Swift must count unicodeScalars,
+    # not UTF-16 code units or extended grapheme clusters.
+    motif = "e\u0301🙂👩\u200d💻"
+    for case in cases:
+        text = (motif * ((case["scalar_count"] // len(motif)) + 1))[
+            : case["scalar_count"]
+        ]
+        assert len(text) == case["scalar_count"]
+
+
+def test_level_verdict_vectors_match_python_producer():
+    from onoats.ui_telemetry import UITelemetryState
+
+    cases = json.loads((UI_FIXTURES / "level_verdicts.json").read_text())
+    for case in cases:
+        state = UITelemetryState(
+            4242,
+            1.0,
+            transcript_run_id="0123456789abcdef0123456789abcdef",
+            clock=lambda: 2.0,
+        )
+        accepted = state.observe_level("me", float(case["input"]))
+        assert accepted is case["accepted"], case["input"]
+        if accepted:
+            assert state.snapshot()["audio"]["me"]["level"] == case["published"]
+
+
+def test_swift_model_pins_data_directory_contract():
+    """Start env and identity-checked signals must use the pinned active dir."""
+    store = (REPO / "src" / "onoats" / "_vendor" / "store.py").read_text()
+    cli = (REPO / "src" / "onoats" / "cli.py").read_text()
+    swift = RECORDER_MODEL.read_text(encoding="utf-8")
+
+    assert '"ONOATS_DATA_DIR"' in store
+    environment = _extract(
+        r'dataDirEnvironment\s*(?::[^=]+)?=\s*"([^"]+)"', RECORDER_MODEL
+    )
+    argument = _extract(r'dataDirArgument\s*(?::[^=]+)?=\s*"([^"]+)"', RECORDER_MODEL)
+    assert environment == "ONOATS_DATA_DIR"
+    assert argument == "--data-dir"
+    assert cli.count('"--data-dir"') >= 2
+    assert "environment[Self.dataDirEnvironment]" in swift
+    for command in ("stop", "flush"):
+        assert re.search(
+            rf'"{command}",\s*"--data-dir",\s*directory\.path,\s*'
+            r'"--expected-pid",\s*String\([^)]*\.pid\),\s*'
+            r'"--expected-start-epoch",\s*String\([^)]*\.startEpoch\)',
+            swift,
+        )
+
+
+def test_invalid_category_machine_tag_matches_swift():
+    """The GUI may branch only on the CLI's stable tag, never its prose."""
+    from onoats.categories import INVALID_CATEGORY_ERROR_TAG
+
+    swift = _extract(
+        r'invalidCategoryErrorTag\s*(?::[^=]+)?=\s*"([^"]+)"', RECORDER_MODEL
+    )
+    assert swift == INVALID_CATEGORY_ERROR_TAG
+
+
+def test_swift_telemetry_consumer_has_no_network_probe():
+    for path in (UI_TELEMETRY, RECORDER_MODEL):
+        text = path.read_text(encoding="utf-8")
+        assert "URLSession" not in text, path
+        assert "NWConnection" not in text, path
+
+
+def test_menu_bar_uses_distinct_template_images_for_every_recorder_state():
+    """Template rendering is explicit and state is carried by glyph shape.
+
+    A runtime tint cannot be the only discriminator: macOS discards source
+    colour for template images, and light/dark menu bars need the same mapping.
+    """
+    swift = MENU_BAR_APP.read_text(encoding="utf-8")
+    switch_start = swift.index("private var menuImageName")
+    switch_end = swift.index("private var menuImage: NSImage", switch_start)
+    menu_image_switch = swift[switch_start:switch_end]
+    expected = {
+        "Idle": "OnoatsMenuBarTemplateIdle",
+        "Recording": "OnoatsMenuBarTemplateRecording",
+        "Warning": "OnoatsMenuBarTemplateWarning",
+        "Busy": "OnoatsMenuBarTemplateBusy",
+        "Failed": "OnoatsMenuBarTemplateFailed",
+    }
+    for state, resource in expected.items():
+        assert f'"{resource}"' in swift, f"missing {state.lower()} menu image"
+
+    assert len(set(expected.values())) == len(expected), (
+        "each recorder presentation state must use a distinct pre-rendered image"
+    )
+    assert re.search(r"\.isTemplate\s*=\s*true", swift), (
+        "the custom menu glyph must be marked as an AppKit template image"
+    )
+
+    # The state switch must cover idle, recording, warning, busy
+    # (starting/stopping), and failed rather than selecting one colour asset
+    # and attempting to tint it at runtime.
+    for case in ("stopped", "starting", "running", "stopping", "failed"):
+        assert re.search(rf"case\s+[^:\n]*\.{case}\b", menu_image_switch), case
+    assert "OnoatsHeader" not in swift.split("MenuBarExtra", 1)[1].split("}", 1)[0], (
+        "the full-colour header mark must not be used as the menu-bar glyph"
+    )
+
+
+# --- window-style recording panel contracts (menu-bar Phase 6) ------------
+
+
+def _panel_sources() -> tuple[str, str, str]:
+    assert RECORDING_PANEL.is_file(), "RecordingPanelView.swift is missing"
+    assert SETTINGS_PANEL.is_file(), "SettingsPanelView.swift is missing"
+    return (
+        MENU_BAR_APP.read_text(encoding="utf-8"),
+        RECORDING_PANEL.read_text(encoding="utf-8"),
+        SETTINGS_PANEL.read_text(encoding="utf-8"),
+    )
+
+
+def test_menu_bar_opens_window_style_fixed_width_recording_panel():
+    app, recording, _ = _panel_sources()
+    assert ".menuBarExtraStyle(.window)" in app
+    assert re.search(r"ControlPanelRoot\s*\(", app)
+    assert re.search(r"RecordingPanelView\s*\(", app)
+    width = re.search(r"\.frame\s*\(\s*width:\s*(\d+(?:\.\d+)?)", recording)
+    assert width, "the main panel must declare a stable fixed width"
+    assert 280 <= float(width.group(1)) <= 480
+
+
+def test_recording_panel_keeps_primary_actions_and_live_distinctions_visible():
+    _, recording, _ = _panel_sources()
+    for label in (
+        "Start",
+        "Stop",
+        "Seminar",
+        "Flush",
+        "Me",
+        "Them",
+        "No signal",
+        "STT",
+        "Category unavailable",
+        "started outside the menu bar",
+        "Recording to:",
+        "Next recording:",
+    ):
+        assert label in recording, f"main panel lost {label!r}"
+
+    # Start/Stop are the one prominent, full-width action; Flush remains
+    # secondary. Enablement stays tied to the existing model authorities.
+    assert recording.count(".buttonStyle(.borderedProminent)") >= 1
+    assert ".frame(maxWidth: .infinity)" in recording
+    assert re.search(r"\.disabled\s*\(\s*!model\.canStart\s*\)", recording)
+    assert re.search(r"\.disabled\s*\(\s*model\.stopRequested\s*\)", recording)
+    assert "model.categoryUnavailable" in recording
+    assert "model.activeDataDirDisplay" in recording
+    assert "model.nextDataDirDisplay" in recording
+    assert "model.aggregateStt" in recording
+    assert "model.meStt" in recording and "model.themStt" in recording
+    assert "model.transcriptPreview" in recording
+
+
+def test_phase8_panel_identity_seminar_switch_and_activity_wording_are_explicit():
+    _, recording, _ = _panel_sources()
+    assert 'Text("Oats")' in recording
+    assert 'Text("Organized Transcript System")' in recording
+    assert 'accessibilityLabel("Oats - Organized Transcript System")' in recording
+    assert 'Image("OnoatsHeader"' not in recording, (
+        "transparent bitmap bounds must not determine the panel header layout"
+    )
+
+    assert "Toggle(isOn: $model.seminarMode)" in recording
+    assert 'Text("Applies to the next recording")' in recording
+    assert "RoundedRectangle" in recording
+    assert "systemImage:" in recording
+    assert 'accessibilityHint("Applies to the next recording only")' in recording
+
+    for label in ('"Signal"', '"Silent"', '"No signal"', '"Unavailable"'):
+        assert label in recording
+    assert re.search(r"activity\.level\s*>\s*0", recording), (
+        "fresh zero must render Silent rather than Signal"
+    )
+
+
+def test_settings_panel_preserves_every_existing_control_and_diagnostics():
+    app, _, settings = _panel_sources()
+    assert re.search(r"SettingsPanelView\s*\(", app)
+    for label in (
+        "Microphone",
+        "System output",
+        "Configured service",
+        "Open config.toml",
+        "Data Directory",
+        "transcript preview",
+        "Diagnostics",
+        "Open Log",
+        "Show Logs Folder",
+        "CLI",
+        "Active",
+        "Next recording",
+        "Quit Onoats",
+        "Stop & Quit Onoats",
+        "Changes apply on next Start",
+    ):
+        assert label in settings, f"settings panel lost {label!r}"
+
+    assert "model.openLog" in settings
+    assert "model.showLogsFolder" in settings
+    assert "model.openConfig" in settings
+    assert "model.chooseDataDir" in settings
+    assert "model.setTranscriptPreviewEnabled" in settings
+    assert "model.setSTTService" in settings
+
+    # Configuration shows the selected service only. Endpoint composition and
+    # resolution stay in config.toml/Python; the panel must not grow an editor.
+    forbidden = ("ws_socket", "ws_uri", "ws_host", "ws_port", "endpoint editor")
+    assert not any(value in settings for value in forbidden)
+
+
+def test_next_start_caption_is_scoped_to_deferred_configuration_controls():
+    _, _, settings = _panel_sources()
+    audio = settings.index('GroupBox("Audio")')
+    speech = settings.index('GroupBox("Speech to text")')
+    storage = settings.index('GroupBox("Storage and privacy")')
+    diagnostics = settings.index('Button("Diagnostics')
+
+    # Two call sites plus the shared caption declaration: STT and storage are
+    # deferred recorder configuration, while microphone and preview apply now.
+    assert settings.count("appliesNextStart") == 3
+    assert "appliesNextStart" not in settings[audio:speech]
+    assert settings[speech:storage].count("appliesNextStart") == 1
+    assert settings[storage:diagnostics].count("appliesNextStart") == 1
+    assert "Microphone changes update the macOS system default immediately" in settings
+    assert "Transcript preview visibility updates immediately" in settings
+
+
+def test_panel_keyboard_focus_and_icon_accessibility_contracts_are_explicit():
+    app, recording, settings = _panel_sources()
+    combined = app + recording + settings
+    assert ".onExitCommand" in app
+    assert ".focused(" in combined
+    assert "FocusState" in combined
+    assert ".defaultAction" in recording
+    assert re.search(r"\.accessibilityLabel\s*\(", combined)
+    assert re.search(r"\.help\s*\(", combined)
+    for action in ("Start", "Stop", "Seminar", "Flush", "Settings", "Back"):
+        assert action in combined, f"focusable action {action!r} is absent"
+
+
+def test_warning_region_is_bounded_and_panel_does_not_render_log_contents():
+    _, recording, settings = _panel_sources()
+    assert "hintCaptionLines" in recording
+    assert re.search(r"maxHeight\s*:\s*\d+", recording), (
+        "warning/failure text must have a bounded wrapping region"
+    )
+    assert re.search(r"\.fixedSize\s*\(\s*horizontal:\s*false", recording)
+
+    combined = recording + settings
+    forbidden = (
+        "String(contentsOf:",
+        "readToEnd",
+        "readDataToEndOfFile",
+        "TextEditor(",
+        "logTail",
+        "logContents",
+    )
+    assert not any(token in combined for token in forbidden), (
+        "the panel may open logs but must never read or render their contents"
+    )
+
+
+def test_warning_log_actions_preserve_owned_external_distinction():
+    _, recording, _ = _panel_sources()
+    assert "model.canOpenLogForCurrentSurface" in recording
+    assert "Log not captured (started outside the menu bar)" in recording
+    assert re.search(r"if\s+model\.canOpenLogForCurrentSurface", recording)
+    assert "model.seminarConfigurationFailure" in recording
+    assert "Seminar needs 'seminars' in config.toml [categories]" in recording

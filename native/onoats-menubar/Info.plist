@@ -8,6 +8,8 @@
 	<string>Onoats</string>
 	<key>CFBundleExecutable</key>
 	<string>Onoats</string>
+	<key>CFBundleIconFile</key>
+	<string>Onoats.icns</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

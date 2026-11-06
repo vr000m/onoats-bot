@@ -1180,3 +1180,13 @@ One real multi-speaker call: 47 min recorded (07:33-08:20 local; the owner recal
 ### Review Waivers
 
 (none)
+
+### 2026-11-04 correction: session config ownership
+
+The menu-bar control-panel work in
+`docs/dev_plans/20261028-feature-menubar-control-panel.md` supersedes the earlier
+implementation detail that each `_create_stt_service` call reloads config. Dual
+recording now passes one caller-owned `OnoatsConfig` snapshot to both STT arms,
+so the diarization flag, span stamping, telemetry state, and backend selection
+cannot split during startup. Direct helper calls without a snapshot still load
+the current config, and `bot-single` passes its own one-session snapshot.

@@ -5,7 +5,8 @@ Subcommands::
     onoats init          # guided first-run setup (config.toml + secrets.env)
     onoats bot           # dual-input recorder (mic + system loopback)
     onoats bot-single    # legacy single-input (mic-only) recorder
-    onoats flush         # signal the running recorder to rotate its buffer
+    onoats flush         # ask the running recorder to rotate its buffer
+    onoats stop          # ask the running recorder to drain and stop
     onoats convert       # render pending/*.jsonl -> markdown transcripts
     onoats devices       # list audio input/output devices
     onoats status        # report recorder pid / running state + data dir
@@ -20,6 +21,9 @@ or importing pyaudio / pipecat / MLX. This keeps the import-guard clean: a bare
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
+import math
 import os
 import signal
 import sys
@@ -110,8 +114,8 @@ def _cmd_bot(rest: list[str]) -> int:
     The branch is read here (and only here) so the PortAudio path never imports
     or touches the supervisor / socket machinery.
     """
-    from onoats.config import load_config
     from onoats.dual import _parse_args
+    from onoats.runtime import RecorderSessionConfig
 
     # Resolve --help and argument errors via the bot's own parser BEFORE
     # choosing a backend. argparse prints help / usage and raises SystemExit
@@ -131,12 +135,13 @@ def _cmd_bot(rest: list[str]) -> int:
     if args.source:
         os.environ["AUDIO_SOURCE"] = args.source
 
-    if load_config().audio_source == "socket":
-        return _run_socket_supervisor(rest)
+    session_config = RecorderSessionConfig.capture()
+    if session_config.audio_source == "socket":
+        return _run_socket_supervisor(rest, session_config=session_config)
 
     from onoats.dual import main as dual_main
 
-    return dual_main(rest)
+    return dual_main(rest, session_config=session_config)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +210,7 @@ _CAPTURER_RC_REASONS = {
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +
 # rotate) after the capturer dies, before the supervisor force-cancels it.
 _RECORDER_DRAIN_GRACE_SEC = 30.0
+_SUPERVISOR_HARD_EXIT = os._exit
 
 # Stable prefix for machine-parseable capturer stderr lines (mirrored by
 # Support.swift emitEvent; parity-pinned by tests/test_native_contract_parity.py
@@ -219,6 +225,8 @@ _STDERR_READER_GRACE_SEC = 2.0
 
 # Grace for the capturer to exit on SIGTERM before SIGKILL during teardown.
 _CAPTURER_TERM_GRACE_SEC = 5.0
+# After SIGKILL, bound both leader reaping and process-group survivor probes.
+_CAPTURER_KILL_REAP_GRACE_SEC = 2.0
 
 # Poll cadence for the deferred device-field apply (see
 # _apply_device_fields_when_recorded): the capturer's `device` events fire
@@ -492,7 +500,11 @@ async def _apply_device_fields_when_recorded(
         await asyncio.sleep(_DEVICE_FLUSH_POLL_SEC)
 
 
-def _run_socket_supervisor(rest: list[str]) -> int:
+class CapturerTeardownError(RuntimeError):
+    """The supervisor could not retire its owned capturer process group."""
+
+
+def _run_socket_supervisor(rest: list[str], *, session_config=None) -> int:
     """Synchronous entry: drive the async socket session, mirror dual.main's rc.
 
     Returns 0 on a clean recorder shutdown, non-zero on any fail-loud path
@@ -507,12 +519,14 @@ def _run_socket_supervisor(rest: list[str]) -> int:
     from onoats.transports import SocketHandshakeError
 
     try:
-        return _asyncio.run(_supervise_socket_session(rest))
+        return _asyncio.run(
+            _supervise_socket_session(rest, session_config=session_config)
+        )
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
         return 1
-    except (SocketHandshakeError, OSError, ValueError) as exc:
+    except (SocketHandshakeError, CapturerTeardownError, OSError, ValueError) as exc:
         # A controlled socket-mode launch failure (bad/stale capturer handshake,
         # socket connect error, or a same-socket / config guard rejection) must
         # be a clean non-zero exit per the fail-loud contract — not a traceback.
@@ -524,7 +538,50 @@ def _run_socket_supervisor(rest: list[str]) -> int:
         return 1
 
 
-async def _supervise_socket_session(rest: list[str]) -> int:
+async def _supervise_socket_session(rest: list[str], *, session_config=None) -> int:
+    """Own startup signals until the recorder installs its drain handlers."""
+    import asyncio
+    import signal
+    import threading
+
+    from onoats import runtime
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    requested = False
+    previous = {}
+
+    def stop_startup():
+        nonlocal requested
+        if not requested:
+            requested = True
+            runtime._mark_graceful_shutdown_requested()
+            task.cancel()
+
+    if (
+        sys.platform != "win32"
+        and threading.current_thread() is threading.main_thread()
+    ):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.getsignal(sig)
+            loop.add_signal_handler(sig, stop_startup)
+    try:
+        return await _supervise_socket_session_inner(
+            rest, session_config=session_config
+        )
+    except asyncio.CancelledError:
+        if not requested:
+            raise
+        return 0  # inner finally has reaped the entire capturer group
+    finally:
+        for sig, handler in previous.items():
+            loop.remove_signal_handler(sig)
+            signal.signal(sig, handler)
+
+
+async def _supervise_socket_session_inner(
+    rest: list[str], *, session_config=None
+) -> int:
     """Mint sockets + nonce, spawn the capturer, run the recorder, tear down.
 
     Runs the recorder and a capturer-exit watcher concurrently in one event
@@ -572,51 +629,19 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # on exit (so the slot stays ours through the capturer teardown in `finally`).
     _acquire_instance_lock(data_dir / ".active")
 
-    # Diarization config-time gate: right after the lock, before the capturer
-    # spawn (no TCC prompt / device touch for a doomed start). Import-free and
-    # non-downloading; only when the flag is on. A failure raises
-    # DiarizationPreflightError (an SttPreflightError → rc=1 in
-    # _run_socket_supervisor). run_onoats_dual calls it again: the backend check
-    # re-runs, but the extra/weights probes are memoized (see its docstring).
-    from onoats.config import load_config as _load_config
-    from onoats.runtime import _preflight_diarization
-
-    _diar_cfg = _load_config()
-    if _diar_cfg.diarization:
-        _preflight_diarization(_diar_cfg)
-
     # 1. Private, supervisor-owned socket dir (0700). mkdtemp already creates the
     # dir 0700 and owner-only; a fresh per-generation dir means any stale socket
     # from a prior generation lives at a path the new recorder never references
     # (structurally unreachable — the primary stale-socket defense). The system
     # temp dir keeps the AF_UNIX path well under the macOS ~104-byte sun_path
     # limit (a data-dir-nested path can blow it).
-    sock_dir = tempfile.mkdtemp(prefix="onoats-sock-")
-    os.chmod(sock_dir, 0o700)
-    mic_sock = os.path.join(sock_dir, MIC_SOCKET_NAME)
-    system_sock = os.path.join(sock_dir, SYSTEM_SOCKET_NAME)
-
-    # 2. Fresh generation nonce. A restarted capturer presents a new nonce in its
-    # handshake; combined with the fresh dir this invalidates stale fds.
-    nonce = secrets.token_hex(16)
-
-    # 3. Point the recorder at the private-dir sockets AND the generation nonce.
-    # The recorder resolves these through OnoatsConfig (ONOATS_MIC_SOCKET /
-    # ONOATS_SYSTEM_SOCKET / ONOATS_CAPTURER_NONCE env > [audio] toml), so
-    # exporting them here is all dual._build_socket_transports needs to (a)
-    # connect to the right sockets and (b) gate on the nonce — rejecting a
-    # capturer that handshakes with a missing/stale nonce. Capture any prior
-    # values so the `finally` can restore them — these are process-global, and
-    # leaving them set would leak our private-dir paths / nonce into any
-    # in-process caller (e.g. tests) that runs after us.
+    # Snapshot process-global state and initialize cleanup bookkeeping before
+    # taking ownership of any resource. Once mkdtemp succeeds, every operation
+    # is inside the authoritative cleanup boundary below.
     _prior_socket_env = {
         k: os.environ.get(k)
         for k in ("ONOATS_MIC_SOCKET", "ONOATS_SYSTEM_SOCKET", "ONOATS_CAPTURER_NONCE")
     }
-    os.environ["ONOATS_MIC_SOCKET"] = mic_sock
-    os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
-    os.environ["ONOATS_CAPTURER_NONCE"] = nonce
-
     capturer_proc: asyncio.subprocess.Process | None = None
     stderr_task: asyncio.Task[None] | None = None
     # Latest device description per branch ("mic"/"system"), written by the
@@ -629,7 +654,35 @@ async def _supervise_socket_session(rest: list[str]) -> int:
     # its budget while a TCC prompt is pending (release-plan Phase 7).
     permission_event = asyncio.Event()
     rc = 0
+    startup_cancelled = False
+    teardown_failed = False
+    sock_dir = tempfile.mkdtemp(prefix="onoats-sock-")
     try:
+        os.chmod(sock_dir, 0o700)
+        mic_sock = os.path.join(sock_dir, MIC_SOCKET_NAME)
+        system_sock = os.path.join(sock_dir, SYSTEM_SOCKET_NAME)
+
+        # 2. Fresh generation nonce. A restarted capturer presents a new nonce in
+        # its handshake; combined with the fresh dir this invalidates stale fds.
+        nonce = secrets.token_hex(16)
+
+        # 3. Point the recorder at the private-dir sockets AND the generation
+        # nonce. Capture transports consume these values; the finally restores
+        # the prior process-global state for later in-process callers.
+        os.environ["ONOATS_MIC_SOCKET"] = mic_sock
+        os.environ["ONOATS_SYSTEM_SOCKET"] = system_sock
+        os.environ["ONOATS_CAPTURER_NONCE"] = nonce
+
+        # Capture the one immutable recorder configuration only after the
+        # generation socket values exist, but before any capture side effect. The
+        # same object crosses supervisor preflight and the recorder entrypoint.
+        from onoats.runtime import RecorderSessionConfig, _preflight_diarization
+
+        if session_config is None:
+            session_config = RecorderSessionConfig.capture()
+        if session_config.diarization:
+            _preflight_diarization(session_config)
+
         # 3b. Spawn the capturer pointed at both sockets. Pass the socket paths +
         # nonce via BOTH env and argv (documented in the contract doc) so a
         # capturer can read whichever it prefers.
@@ -646,37 +699,46 @@ async def _supervise_socket_session(rest: list[str]) -> int:
             f"(mic={mic_sock}, system={system_sock}, nonce={nonce[:8]}…)"
         )
         try:
-            capturer_proc = await asyncio.create_subprocess_exec(
-                capturer_bin,
-                "--mic-socket",
-                mic_sock,
-                "--system-socket",
-                system_sock,
-                "--nonce",
-                nonce,
-                env=capturer_env,
-                # Phase 4: pipe stderr through the supervisor instead of
-                # inheriting the fd. The always-drain reader task below tees
-                # every line to our own stderr (so the menu bar's log redirect
-                # is unchanged) and parses ONOATS-EVENT lines into the status
-                # file. Process.wait() is deadlock-prone with a PIPE only if
-                # nothing drains it — the reader starts before any wait.
-                stderr=asyncio.subprocess.PIPE,
-                # Spawn the capturer in its OWN session/process group
-                # (start_new_session=True is the portable subprocess spelling of
-                # setsid). On POSIX a terminal Ctrl+C/SIGTERM is delivered to the
-                # whole foreground process group, so without this it would hit
-                # BOTH onoats and the capturer. Terminal signals must NOT reach
-                # the capturer: the supervisor owns capturer teardown explicitly
-                # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the
-                # whole process group) AFTER the recorder finishes. This
-                # isolation is what keeps a terminal Ctrl+C from killing the
-                # capturer out from under the recorder (which would be
-                # mis-classified as capturer-death, rc=1). The capturer can still
-                # exit first on a graceful stop by seeing its sockets closed; that
-                # rc=0 case is handled in _run_recorder_with_capturer.
-                start_new_session=True,
+            spawn_task = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    capturer_bin,
+                    "--mic-socket",
+                    mic_sock,
+                    "--system-socket",
+                    system_sock,
+                    "--nonce",
+                    nonce,
+                    env=capturer_env,
+                    # Phase 4: pipe stderr through the supervisor instead of
+                    # inheriting the fd. The always-drain reader task below tees
+                    # every line to our own stderr (so the menu bar's log redirect
+                    # is unchanged) and parses ONOATS-EVENT lines into the status
+                    # file. Process.wait() is deadlock-prone with a PIPE only if
+                    # nothing drains it — the reader starts before any wait.
+                    stderr=asyncio.subprocess.PIPE,
+                    # Spawn the capturer in its OWN session/process group
+                    # (start_new_session=True is the portable subprocess spelling of
+                    # setsid). On POSIX a terminal Ctrl+C/SIGTERM is delivered to the
+                    # whole foreground process group, so without this it would hit
+                    # BOTH onoats and the capturer. Terminal signals must NOT reach
+                    # the capturer: the supervisor owns capturer teardown explicitly
+                    # via _stop_capturer (SIGTERM → bounded wait → SIGKILL on the
+                    # whole process group) AFTER the recorder finishes. This
+                    # isolation is what keeps a terminal Ctrl+C from killing the
+                    # capturer out from under the recorder (which would be
+                    # mis-classified as capturer-death, rc=1). The capturer can still
+                    # exit first on a graceful stop by seeing its sockets closed; that
+                    # rc=0 case is handled in _run_recorder_with_capturer.
+                    start_new_session=True,
+                )
             )
+            try:
+                capturer_proc = await asyncio.shield(spawn_task)
+            except asyncio.CancelledError:
+                # Cancellation during OS spawn must not lose the child handle.
+                # Reap via the same authoritative finally as every later stop.
+                capturer_proc = await spawn_task
+                raise
         except OSError as exc:
             # Missing binary / permission denied launching it — fail loud.
             logger.error(
@@ -754,11 +816,22 @@ async def _supervise_socket_session(rest: list[str]) -> int:
         # 5. Run the recorder against the sockets, watching the capturer
         # concurrently so its death tears the session down.
         rc = await _run_recorder_with_capturer(
-            rest, capturer_proc, logger, data_dir, device_state
+            rest,
+            capturer_proc,
+            logger,
+            data_dir,
+            device_state,
+            session_config=session_config,
         )
+    except asyncio.CancelledError:
+        startup_cancelled = True
+        raise
     finally:
         if capturer_proc is not None:
-            await _stop_capturer(capturer_proc, logger)
+            teardown_ok = await _stop_capturer(capturer_proc, logger)
+            if not teardown_ok:
+                teardown_failed = True
+                rc = 1
         if stderr_task is not None:
             # The capturer group is gone, so the pipe's EOF is imminent — give
             # the reader a bounded grace to consume it (flushing any final
@@ -783,6 +856,13 @@ async def _supervise_socket_session(rest: list[str]) -> int:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = prior
+        if startup_cancelled and teardown_failed:
+            # The outer startup-signal owner normally maps cancellation to rc=0.
+            # A surviving capturer group is stronger evidence, but report it only
+            # after every owned resource and process-global override is cleaned.
+            raise CapturerTeardownError(
+                "capturer process group survived bounded teardown"
+            )
 
     return rc
 
@@ -937,7 +1017,13 @@ def _settle_recorder_rc(rc, logger, data_dir) -> int:
 
 
 async def _run_recorder_with_capturer(
-    rest, capturer_proc, logger, data_dir, device_state=None
+    rest,
+    capturer_proc,
+    logger,
+    data_dir,
+    device_state=None,
+    *,
+    session_config=None,
 ) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
 
@@ -971,14 +1057,20 @@ async def _run_recorder_with_capturer(
     # Any write_running at/after this instant belongs to THIS session — the
     # deferred device-apply task keys on it so it never stamps a stale record.
     session_floor = time.time()
+    recorder_kwargs = {
+        "live_terminal": args.live_terminal,
+        "locked_category": args.category,
+        "data_dir": data_dir,
+    }
+    recorder_parameters = inspect.signature(run_onoats_dual).parameters.values()
+    if any(
+        parameter.name == "session_config"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in recorder_parameters
+    ):
+        recorder_kwargs["session_config"] = session_config
     recorder_task = asyncio.create_task(
-        run_onoats_dual(
-            live_terminal=args.live_terminal,
-            locked_category=args.category,
-            # Same resolution the supervisor's own status stamps use — one
-            # canonical data dir per session (see run_onoats_dual).
-            data_dir=data_dir,
-        ),
+        run_onoats_dual(**recorder_kwargs),
         name="socket_supervisor_recorder",
     )
     capturer_task = asyncio.create_task(
@@ -1095,6 +1187,28 @@ async def _run_recorder_with_capturer(
             last_error="capturer exited mid-session; partial recording rotated to pending/",
         )
         return 1
+    except asyncio.CancelledError:
+        # Startup signals cancel the supervisor before the recorder has its
+        # own drain handlers. Retire the preflight/recorder task before the
+        # outer finally tears down capture; do not leave it running orphaned.
+        recorder_task.cancel()
+        capturer_task.cancel()
+        _done, pending = await asyncio.wait(
+            {recorder_task, capturer_task}, timeout=_RECORDER_DRAIN_GRACE_SEC
+        )
+        if recorder_task in pending:
+            status_file.stamp_supervisor_failure(
+                data_dir,
+                exit_reason="recorder-drain-timeout",
+                supervisor_rc=1,
+                last_error=(
+                    "recorder suppressed startup cancellation past its bounded "
+                    "drain grace; supervisor forced process exit"
+                ),
+            )
+            await _stop_capturer(capturer_proc, logger)
+            _SUPERVISOR_HARD_EXIT(1)
+        raise
     finally:
         if device_flush_task is not None:
             device_flush_task.cancel()
@@ -1148,7 +1262,7 @@ def _signal_capturer_group(capturer_proc, sig, logger) -> bool:
         return False
 
 
-async def _stop_capturer(capturer_proc, logger) -> None:
+async def _stop_capturer(capturer_proc, logger) -> bool:
     """Stop the capturer's whole process group: SIGTERM, bounded grace, then
     SIGKILL. Idempotent.
 
@@ -1163,31 +1277,24 @@ async def _stop_capturer(capturer_proc, logger) -> None:
     leader_alive = capturer_proc.returncode is None
     # SIGTERM the whole group. If nothing in the group is left, we're done.
     if not _signal_capturer_group(capturer_proc, signal.SIGTERM, logger):
-        return
+        return True
 
     # Give the group a bounded grace to exit on SIGTERM. When the leader is
     # still alive we await it directly. When it has already been reaped (crash
     # path) we cannot await it, so we poll the group with signal 0 until it
     # drains or the grace elapses.
-    drained = False
-    try:
-        if leader_alive:
+    loop = asyncio.get_running_loop()
+    term_deadline = loop.time() + _CAPTURER_TERM_GRACE_SEC
+    if leader_alive:
+        with contextlib.suppress(TimeoutError, ProcessLookupError):
             await asyncio.wait_for(
-                capturer_proc.wait(), timeout=_CAPTURER_TERM_GRACE_SEC
+                capturer_proc.wait(),
+                timeout=max(0.0, term_deadline - loop.time()),
             )
-            drained = True
-        else:
-            loop = asyncio.get_event_loop()
-            deadline = loop.time() + _CAPTURER_TERM_GRACE_SEC
-            while loop.time() < deadline:
-                if not _signal_capturer_group(capturer_proc, 0, logger):
-                    drained = True
-                    break
-                await asyncio.sleep(0.05)
-    except TimeoutError:
-        pass
-    if drained:
-        return
+    while loop.time() < term_deadline:
+        if not _signal_capturer_group(capturer_proc, 0, logger):
+            return True
+        await asyncio.sleep(min(0.05, max(0.0, term_deadline - loop.time())))
 
     # Stragglers remain (a live leader that ignored SIGTERM, or orphaned
     # children of a dead leader) — SIGKILL the whole group.
@@ -1196,11 +1303,24 @@ async def _stop_capturer(capturer_proc, logger) -> None:
             "Socket supervisor: capturer process group did not exit on SIGTERM "
             f"within {_CAPTURER_TERM_GRACE_SEC}s — sent SIGKILL to the group."
         )
-    if leader_alive:
-        try:
-            await capturer_proc.wait()
-        except ProcessLookupError:
-            pass
+    kill_deadline = loop.time() + _CAPTURER_KILL_REAP_GRACE_SEC
+    if capturer_proc.returncode is None:
+        with contextlib.suppress(TimeoutError, ProcessLookupError):
+            await asyncio.wait_for(
+                capturer_proc.wait(),
+                timeout=max(0.0, kill_deadline - loop.time()),
+            )
+    while loop.time() < kill_deadline:
+        if not _signal_capturer_group(capturer_proc, 0, logger):
+            return True
+        await asyncio.sleep(min(0.05, max(0.0, kill_deadline - loop.time())))
+    survivor = _signal_capturer_group(capturer_proc, 0, logger)
+    if survivor:
+        logger.error(
+            "Socket supervisor: capturer process group survived bounded "
+            f"SIGTERM/SIGKILL teardown (pid/pgid={capturer_proc.pid})"
+        )
+    return not survivor
 
 
 def _cmd_bot_single(rest: list[str]) -> int:
@@ -1221,8 +1341,8 @@ def _cmd_convert(rest: list[str]) -> int:
     return convert_main(rest)
 
 
-def _compare_and_unlink_stale_pid(pid_path: Path, expected_pid: int | None) -> None:
-    """Remove a stale/dead pid file ONLY if it still records ``expected_pid``.
+def _compare_and_unlink_stale_pid(pid_path: Path, expected_record) -> None:
+    """Remove a stale/dead pid file only if its complete record is unchanged.
 
     A blind ``unlink`` during stale cleanup can delete a NEWER recorder's pid
     file: ``stop``/``flush`` resolve an old dead/recycled pid as stale, but in the
@@ -1234,23 +1354,22 @@ def _compare_and_unlink_stale_pid(pid_path: Path, expected_pid: int | None) -> N
     file was unparseable when we resolved it) → skip entirely; a future start
     atomically replaces it (self-healing).
     """
-    if expected_pid is None:
+    if expected_record is None:
         return
-    from onoats.runtime import _remove_pid_file
+    from onoats._vendor.pid import compare_and_unlink_pid_record
 
-    _remove_pid_file(pid_path, owner_pid=expected_pid)
+    compare_and_unlink_pid_record(pid_path, expected_record)
 
 
 def _cmd_flush(rest: list[str]) -> int:
-    """Send SIGUSR1 to the running recorder so it rotates its buffer.
+    """Ask the authenticated recorder generation to rotate its buffer.
 
     This is the seam an integrating consumer's ``flush`` pass-through execs. It
     resolves the pid from ``<data_dir>/.active/onoats.pid`` (marker
     ``onoats-bot``) under the forwarded ``ONOATS_DATA_DIR`` root.
 
-    Near-clone: ``_cmd_stop`` mirrors this verbatim except for the signal
-    (SIGTERM vs SIGUSR1). Keep the two in sync — a new error branch here must be
-    copied there (parity is pinned by tests, not a shared helper).
+    ``_cmd_stop`` follows the same identity and control-channel path with a
+    distinct wire command. Neither command falls back to PID signalling.
     """
     parser = argparse.ArgumentParser(prog="onoats flush")
     parser.add_argument(
@@ -1258,58 +1377,65 @@ def _cmd_flush(rest: list[str]) -> int:
         default=None,
         help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
     )
+    parser.add_argument(
+        "--expected-pid", type=int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--expected-start-epoch", type=float, default=None, help=argparse.SUPPRESS
+    )
     args = parser.parse_args(rest)
+    if (args.expected_pid is None) != (args.expected_start_epoch is None):
+        parser.error(
+            "--expected-pid and --expected-start-epoch must be supplied together"
+        )
+    if args.expected_pid is not None and (
+        args.expected_pid <= 0
+        or not math.isfinite(args.expected_start_epoch)
+        or args.expected_start_epoch <= 0
+    ):
+        parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import read_pid_record, resolve_flush_target
+    from onoats._vendor.pid import resolve_flush_target
+    from onoats.control_socket import ControlError, send_control_command
 
     pid_path = _pid_path(data_dir)
-    # Capture the pid the file records BEFORE resolving, so stale cleanup can
-    # compare-and-unlink (never delete a newer recorder's freshly-written file).
-    prior_rec = read_pid_record(pid_path)
-    target = resolve_flush_target(pid_path)
+    target = resolve_flush_target(
+        pid_path,
+        expected_pid=args.expected_pid,
+        expected_start_epoch=args.expected_start_epoch,
+    )
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so
         # the next run starts clean, but never signal an unverified pid — and only
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
-            _compare_and_unlink_stale_pid(
-                pid_path, prior_rec.pid if prior_rec else None
-            )
+            _compare_and_unlink_stale_pid(pid_path, target.record)
         print(f"onoats flush: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
-    pid = target.pid
+    if target.record is None:
+        print("onoats flush: recorder identity is incomplete", file=sys.stderr)
+        return 1
     try:
-        os.kill(pid, signal.SIGUSR1)
-    except ProcessLookupError:
-        # Raced: the verified recorder exited between the identity check and
-        # the signal. Treat as stale rather than signalling a recycled pid.
-        _compare_and_unlink_stale_pid(pid_path, pid)
-        print(
-            f"onoats flush: recorder pid {pid} is not running (stale pid file)",
-            file=sys.stderr,
+        response = send_control_command(
+            data_dir or _resolve_data_dir(), target.record, "flush"
         )
+    except ControlError as exc:
+        print(f"onoats flush: {exc}", file=sys.stderr)
         return 1
-    except OSError as exc:
-        print(f"onoats flush: could not signal pid {pid}: {exc}", file=sys.stderr)
+    if not response.ok:
+        print(f"onoats flush: {response.message}", file=sys.stderr)
         return 1
-    print(f"onoats flush: sent SIGUSR1 to recorder pid {pid}")
+    print(f"onoats flush: recorder pid {target.record.pid} accepted flush")
     return 0
 
 
 def _cmd_stop(rest: list[str]) -> int:
-    """Send SIGTERM to the running recorder so it shuts down gracefully.
+    """Ask the authenticated recorder generation to shut down gracefully.
 
-    Near-clone of ``_cmd_flush``: the safe identity-checked signalling
-    (``resolve_flush_target`` → marker + cmdline fingerprint) is reused verbatim,
-    so a recycled foreign pid is never signalled. The PID-recycling guard matters
-    *more* here than for flush — SIGTERM's default disposition kills, so
-    signalling an unrelated pid would terminate it. The only behavioural change
-    from flush is the signal: SIGTERM (the graceful-shutdown trigger,
-    ``runtime.py`` — same as a single Ctrl-C / the GUI's owned
-    ``Process.terminate()``) instead of SIGUSR1. The recorder drains and writes a
-    final flush before exiting; the command returns on signal delivery, NOT on
-    confirmed exit.
+    The complete verified PID/start-epoch generation is sent to the recorder's
+    own control socket. The recorder marks graceful shutdown before acknowledging;
+    the command returns on acceptance, not confirmed process exit.
     """
     parser = argparse.ArgumentParser(prog="onoats stop")
     parser.add_argument(
@@ -1317,42 +1443,56 @@ def _cmd_stop(rest: list[str]) -> int:
         default=None,
         help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
     )
+    parser.add_argument(
+        "--expected-pid", type=int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--expected-start-epoch", type=float, default=None, help=argparse.SUPPRESS
+    )
     args = parser.parse_args(rest)
+    if (args.expected_pid is None) != (args.expected_start_epoch is None):
+        parser.error(
+            "--expected-pid and --expected-start-epoch must be supplied together"
+        )
+    if args.expected_pid is not None and (
+        args.expected_pid <= 0
+        or not math.isfinite(args.expected_start_epoch)
+        or args.expected_start_epoch <= 0
+    ):
+        parser.error("expected recorder identity must contain a positive pid and epoch")
     data_dir = Path(args.data_dir) if args.data_dir else None
 
-    from onoats._vendor.pid import read_pid_record, resolve_flush_target
+    from onoats._vendor.pid import resolve_flush_target
+    from onoats.control_socket import ControlError, send_control_command
 
     pid_path = _pid_path(data_dir)
-    # Capture the pid the file records BEFORE resolving, so stale cleanup can
-    # compare-and-unlink (never delete a newer recorder's freshly-written file).
-    prior_rec = read_pid_record(pid_path)
-    target = resolve_flush_target(pid_path)
+    target = resolve_flush_target(
+        pid_path,
+        expected_pid=args.expected_pid,
+        expected_start_epoch=args.expected_start_epoch,
+    )
     if target.pid is None:
         # Identity could not be confirmed. Drop a now-untrustworthy pid file so
         # the next run starts clean, but never signal an unverified pid — and only
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
-            _compare_and_unlink_stale_pid(
-                pid_path, prior_rec.pid if prior_rec else None
-            )
+            _compare_and_unlink_stale_pid(pid_path, target.record)
         print(f"onoats stop: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
-    pid = target.pid
+    if target.record is None:
+        print("onoats stop: recorder identity is incomplete", file=sys.stderr)
+        return 1
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        # Raced: the verified recorder exited between the identity check and
-        # the signal. Treat as stale rather than signalling a recycled pid.
-        _compare_and_unlink_stale_pid(pid_path, pid)
-        print(
-            f"onoats stop: recorder pid {pid} is not running (stale pid file)",
-            file=sys.stderr,
+        response = send_control_command(
+            data_dir or _resolve_data_dir(), target.record, "stop"
         )
+    except ControlError as exc:
+        print(f"onoats stop: {exc}", file=sys.stderr)
         return 1
-    except OSError as exc:
-        print(f"onoats stop: could not signal pid {pid}: {exc}", file=sys.stderr)
+    if not response.ok:
+        print(f"onoats stop: {response.message}", file=sys.stderr)
         return 1
-    print(f"onoats stop: sent SIGTERM to recorder pid {pid} (graceful shutdown)")
+    print(f"onoats stop: recorder pid {target.record.pid} accepted graceful shutdown")
     return 0
 
 
@@ -1511,10 +1651,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Guided first-run setup (config.toml + secrets.env).")
     sub.add_parser("bot", help="Dual-input recorder (mic + system loopback).")
     sub.add_parser("bot-single", help="Legacy single-input (mic-only) recorder.")
-    sub.add_parser("flush", help="Signal the running recorder to rotate its buffer.")
+    sub.add_parser(
+        "flush", help="Ask the running recorder to rotate its current buffer."
+    )
     sub.add_parser(
         "stop",
-        help="Signal the running recorder to stop gracefully (drain + final flush).",
+        help="Ask the running recorder to stop gracefully (drain + final flush).",
     )
     sub.add_parser("convert", help="Render pending/*.jsonl into markdown transcripts.")
     sub.add_parser("devices", help="List audio input/output devices.")

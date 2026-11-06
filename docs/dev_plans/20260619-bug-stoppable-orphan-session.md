@@ -534,6 +534,42 @@ sound flow rather than re-deriving it. Verified against current code
   `_release_instance_lock` / `_write_pid_file`), `src/onoats/dual.py` +
   `src/onoats/__main__.py` (release on teardown).
 
+### 2026-11-03 correction — captured-generation signalling authority
+
+The original `resolve_flush_target`-then-`os.kill` decision is superseded by
+the menu-bar control-panel remediation in
+[`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md).
+Stop and Flush now use one `signal_flush_target` operation: the expected UI
+generation is compared with the same PID record whose marker, liveness, and
+command fingerprint are authenticated; that record is rechecked immediately
+before signal delivery. Swift passes the last displayed generation rather than
+rereading and retargeting to a successor that the panel never displayed. The
+signal numbers and return-on-delivery semantics recorded above are unchanged.
+
+### 2026-11-04 correction — recorder-owned command acceptance
+
+Phase 10 of
+[`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+supersedes the remaining normal-path signal-delivery decision. `onoats stop` and
+`onoats flush` now send the complete verified PID/start-epoch generation over a
+same-UID recorder-owned Unix control socket. The recorder serializes commands and
+acknowledges Flush only after continuation rotation, or Stop only after graceful
+shutdown is marked. There is no PID-signal fallback. Direct SIGTERM/SIGUSR1 remain
+compatibility inputs outside the CLI command path. PID cleanup now compares PID,
+cmdline, and start epoch so a same-PID successor record cannot be removed.
+
+### 2026-11-05 correction — one lifecycle authority behind every adapter
+
+Phase 11 of
+[`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+supersedes the Phase 10 description of a control-server command lock. The
+stdlib-only `RecorderLifecycleController` now owns the one async lock, lifecycle
+state, shutdown event, continuation rotation, and terminal rotation for both
+recorder entrypoints. Control requests and direct SIGUSR1/SIGINT/SIGTERM handlers
+only adapt intent into that controller, so Stop or terminal admission closes
+Flush admission regardless of which boundary delivered it. Generation-authenticated
+control and exact-record cleanup described above remain unchanged.
+
 ## Final Results
 
 [Fill when complete]

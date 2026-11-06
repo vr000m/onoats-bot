@@ -91,6 +91,12 @@ registry dep, not a git pin).
   `ONOATS-EVENT waiting-for-permission`; if the base socket wait expires with
   that event seen, the supervisor extends the wait once (+120 s) and surfaces
   the pending prompt in the status file.
+- **Startup signals are owned before spawn.** Until the recorder installs its
+  normal drain handlers, SIGINT/SIGTERM cancel startup through the supervisor's
+  authoritative `finally`. Cancellation during spawn first retains the child
+  handle, so the capturer group is still reaped. The app waits for owned child
+  exit on Quit; its bounded timeout keeps the app alive with an error rather
+  than killing the supervisor before capturer cleanup.
 - **Nonce gating end-to-end:** supervisor mints → `cfg.capturer_nonce` →
   transport `expected_nonce`. A capturer presenting a missing/stale nonce on the
   supervisor's paths is rejected at handshake. Ungated (None) when socket mode is
@@ -117,32 +123,35 @@ registry dep, not a git pin).
   `dual.main` and the supervisor route through it, so interactive/category
   handling can't drift.
 
-## Identity-checked signalling (`onoats flush` / `onoats stop`)
+## Recorder-owned control (`onoats flush` / `onoats stop`)
 
-Both CLI signal subcommands share **one** identity gate — `resolve_flush_target`
-(`_vendor/pid.py`) — and differ **only** in the signal sent:
-
-- `onoats flush` → **SIGUSR1** (continuation flush: rotate buffer, keep recording).
-- `onoats stop` → **SIGTERM** (graceful shutdown: drain + final flush, then exit;
-  same trigger as a single Ctrl-C and the menu bar's owned `Process.terminate()`).
+Normal CLI control uses `.active/onoats-control.sock`; it never sends a PID
+signal. Every bounded v1 JSON request carries the complete expected
+PID/start-epoch generation, and the server requires same-UID Darwin
+`LOCAL_PEERCRED`. Direct SIGUSR1/SIGTERM remain compatibility inputs for
+terminals and service managers. See `docs/control-socket-contract.md`.
 
 Load-bearing invariants (pinned by `tests/test_cli.py`):
 
-- **Never signal an unverified or recycled pid.** The resolver validates the
-  marker, requires a cmdline fingerprint, probes liveness (`kill(0)`), and
-  compares the live `ps` cmdline against the stored one. Only a fully-verified
-  pid is signalled; unlink **only** when `stale=True`, and even then
-  **compare-and-unlink** (`_compare_and_unlink_stale_pid` → `_remove_pid_file`
-  ownership check) — never blindly, or a fresh recorder that won the lock and wrote
-  its pid in the resolve→cleanup window would be deleted; treat `ProcessLookupError`
-  at signal time (TOCTOU) as stale. This matters **more** for `stop` than `flush`
-  — SIGTERM kills by default, so a blind signal to a recycled foreign pid would
-  terminate an unrelated process. A differential test asserts `stop` sends
-  SIGTERM-not-SIGUSR1 and `flush` sends SIGUSR1-not-SIGTERM, so a copy-paste
-  signal swap fails.
-- **`stop` is a near-clone of `flush`, not a refactor.** Drift is pinned by tests
-  rather than a shared helper, keeping the shipped `flush` path untouched.
-- Both return on **signal delivery**, not confirmed exit — a consumer must derive
+- **One lifecycle owner.** `RecorderLifecycleController` is the sole session
+  state machine for both recorder entrypoints. Control requests, SIGUSR1,
+  SIGINT/SIGTERM, and pipeline-finally paths are adapters into its one async
+  lock; they do not set the shutdown event or rotate buffers independently. A
+  Flush admitted first completes its continuation rotation before Stop; once
+  Stop or terminal rotation is admitted, every later Flush is rejected. The
+  second termination signal retains the force-exit escape without reopening
+  lifecycle admission.
+- **Never target an unverified, replaced, or recycled generation.** The CLI
+  verifies one complete PID record, then sends that record's PID/start epoch to
+  the socket. A missing, legacy, replaced endpoint or dropped acknowledgement
+  fails closed. Stale cleanup compares PID, cmdline, and start epoch, so a
+  same-PID successor survives.
+- **A captured UI action is generation-bound.** The menu bar passes the pid and
+  start epoch it observed as `--expected-pid` / `--expected-start-epoch`; both
+  commands reject the action if the pid file now names another
+  generation. Direct CLI calls without those optional arguments still target
+  the currently verified recorder in the selected data directory.
+- Both return on **command acceptance**, not confirmed exit — a consumer must derive
   "stopped" from the process actually exiting, never from the CLI exit code.
 - **`onoats stop --help` resolves without booting a service** (local argparse +
   lazy resolver import), like `flush`.
@@ -182,17 +191,61 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   place — mirrors `onoats.status.write_status`. A concurrent reader (a draining
   recorder's owner-checked removal) sees either the complete old record or the
   complete new one, never an empty/partial file mid-write.
-- **Pid removal is ownership-checked and fails closed.**
-  `_remove_pid_file(pid_path, owner_pid=…)` unlinks **only** when the file still
-  records exactly that pid. If it reads back as `None` (unreadable/foreign/already
+- **Pid removal is exact-record checked and fails closed.**
+  `compare_and_unlink_pid_record` removes **only** when the file still records
+  the captured PID, cmdline, and start epoch. It atomically moves the public
+  entry to a private same-directory quarantine and verifies the moved inode
+  before removal, so a check-to-unlink successor race cannot delete the new
+  record. If it reads back as `None` (unreadable/foreign/already
   gone) it is left in place — it must never be assumed to be our own benign
-  mid-write. Because `stop` returns on signal delivery (not exit), a
+  mid-write. Because `stop` returns on command acceptance (not exit), a
   `stop`-then-immediate-`bot` could otherwise let a draining recorder delete a
-  NEWER recorder's pid file. Recorder teardown passes `owner_pid=os.getpid()`; the
+  NEWER recorder's pid file. Recorder teardown passes its immutable `PidRecord`; the
   GUI's menu gating (Start only in `.stopped`) already prevents this from the app,
   so the guard protects the CLI/scripted path. A leftover invalid pid file is
   self-healing: `status` reports no valid recorder and the next start atomically
   replaces it.
+
+Running-status publication is a fail-open display boundary after the fail-loud
+PID/control authority has been published. If the initial running-status write
+raises `OSError` or returns false, the recorder logs one redacted warning,
+creates no UI telemetry publisher for that run, and continues capture, STT,
+control, transcript persistence, and cleanup with unchanged return semantics.
+The owned process exit and run log are then the failure authority; do not invent
+a later status record or make rich status a prerequisite for recording.
+
+## Per-run configuration and native/release identity
+
+- **One immutable recorder configuration per Start.** Both entrypoints capture
+  `RecorderSessionConfig` once after the instance lock and initial config read.
+  STT construction for both arms, banner/display text, telemetry, diarization
+  preflight, reconnect/kickstart authority, and shutdown RSS diagnostics consume
+  that same snapshot. Recorder paths must not reload configuration on demand;
+  only explicitly standalone diagnostics may omit the snapshot.
+- **Native caches are generation-complete.** Menu-bar liveness cache keys contain
+  PID, the stored command fingerprint, and a positive start epoch. Missing or
+  malformed epochs and changed commands/epochs invalidate the entry. An owned
+  process exit is clean only at status `0`; a requested Stop never masks a
+  non-zero exit, and status diagnostics are accepted only from the matching
+  generation, spawn floor, and active data directory.
+- **One mandatory release identity.** Staged installation and signed-app smoke
+  consume the same immutable `ReleaseIdentity`: canonical bundle identifier,
+  designated requirement, cdhash, app-tree hash, main-executable hash, and an
+  independently verified CLI git identity. Smoke verifies the static identity
+  before and after recording and uses Security.framework to verify the running
+  app PID's designated requirement and cdhash. The smoke invalidates any prior
+  receipt before launch and atomically publishes an identity-digest receipt only
+  after success and cleanup; staged installation requires that exact receipt
+  before mutation. A static path/signature check is not dynamic running-code
+  proof.
+- **Supported release runtimes are jointly gated.** Python 3.12 runs the full
+  release suite and Python 3.13 runs the recorder contract lane; PyPI publication
+  depends on both jobs.
+- **macOS signal delivery has one accepted residual race.** Installed-smoke
+  cleanup rechecks `proc_pidinfo` birth identity plus secondary evidence
+  immediately before TERM/KILL, but userspace cannot make that check and signal
+  delivery generation-atomic. Do not describe the check-to-signal race as
+  eliminated.
 
 ## Reviewing a subprocess / process-boundary change
 
@@ -231,7 +284,15 @@ teardown: a spawned child PID is gone after stop). The supervisor's tests in
 ## STT self-healing (`launchctl kickstart`) invariants
 
 `[stt].launchd_label` (absent by default) turns on self-healing: when the STT
-server is unreachable, onoats asks `launchd` to restart the *managed* job. These
+server is unreachable, onoats asks `launchd` to start or restart the *managed*
+job. A loaded job is kickstarted. An unloaded job may be bootstrapped only from
+the matching `~/Library/LaunchAgents/<label>.plist`, after a bounded no-follow
+read confirms a regular user-owned file, safe write permissions, and an exact
+`Label`, with `RunAtLoad=true`. Bootstrap consumes an unlinked descriptor-backed
+snapshot of those validated bytes, never the mutable LaunchAgents pathname.
+Successful bootstrap is the launch request; do
+not immediately kickstart the already-booting job. No port inference or
+arbitrary plist path is allowed. These
 invariants are load-bearing — breaking any of them silently degrades the
 feature rather than failing a test you'd notice:
 
@@ -462,6 +523,16 @@ its scope; this list is a pointer, not the contract itself.
   `close_quietly` and by `_graceful_close` (which cannot use
   `close_quietly` for its whole sequence because it must join the reader
   task *between* the two closers).
+- `src/onoats/ui_telemetry.py` — the stdlib-only, display-only live snapshot
+  contract and its in-memory state/publisher. Telemetry is fail-open: producer,
+  persistence, and cleanup failures may degrade the menu-bar panel but must not
+  affect capture, STT, transcript persistence, or shutdown. Exactly one bounded
+  publisher task coalesces immutable snapshots into one dedicated daemon I/O
+  worker for a run; callbacks update memory only. Filesystem writes and cleanup
+  never execute on the recorder event loop, and shutdown never joins a stalled
+  I/O thread. The one-slot queue prevents an update backlog.
+  Audio levels must be finite and inside `[0.0, 1.0]`; invalid values are rejected
+  without advancing the branch observation time, never clamped.
 
 ## Wire-format contract
 

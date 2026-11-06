@@ -13,6 +13,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Optional
 
 from loguru import logger
@@ -148,6 +149,7 @@ class TranscriptBuffer(FrameProcessor):
         locked_category: Optional[str] = None,
         run_id: Optional[str] = None,
         diarization_meta: Optional[dict[str, str]] = None,
+        on_transcript: Callable[[str, str | None, str | None], None] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -173,6 +175,7 @@ class TranscriptBuffer(FrameProcessor):
         # Provenance of the diarizer the run was *configured* with (known at
         # file creation); None when diarization is off.
         self._diarization_meta = dict(diarization_meta) if diarization_meta else None
+        self._on_transcript = on_transcript
         # Session file whose header has been settled (written, or found to need
         # no header). Keeps ``_write_entry`` from re-reading the file's first
         # line on the event loop for every utterance.
@@ -371,8 +374,23 @@ class TranscriptBuffer(FrameProcessor):
             )
             self._buffer.append(entry)
             idx = len(self._buffer) - 1
-            if await self._write_entry(entry):
+            persisted = await self._write_entry(entry)
+            if persisted:
                 self._persisted_indices.add(idx)
+        if persisted and self._on_transcript is not None:
+            try:
+                speaker_label = None
+                if source:
+                    from onoats.render import compose_speaker_label
+
+                    speaker_label = compose_speaker_label(
+                        {"me": "Me", "them": "Them"}.get(source, source),
+                        speakers,
+                        bool(overlap),
+                    )
+                self._on_transcript(text, source, speaker_label)
+            except Exception as exc:
+                logger.warning(f"TranscriptBuffer: preview observer failed: {exc}")
         logger.debug(f"TranscriptBuffer: utterance recorded ({len(text)} chars)")
 
     async def _handle_vad_started(self, frame: VADUserStartedSpeakingFrame) -> None:

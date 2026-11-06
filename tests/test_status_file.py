@@ -56,6 +56,36 @@ def _record(**over) -> StatusRecord:
     return StatusRecord(**base)
 
 
+@pytest.mark.parametrize("mode", ["success", "false", "error"])
+def test_initial_running_status_publication_is_fail_open_and_warns_once(
+    tmp_path, monkeypatch, mode
+):
+    from onoats import runtime
+
+    warnings: list[str] = []
+    monkeypatch.setattr(runtime.logger, "warning", warnings.append)
+
+    def writer(*_args, **_kwargs):
+        if mode == "error":
+            raise OSError("ws://secret:hunter2@status.invalid/path?token=leak")
+        return mode != "false"
+
+    monkeypatch.setattr(runtime._status_mod, "write_running", writer)
+    result = runtime._write_status_running(
+        tmp_path,
+        audio_source="socket",
+        stt_label="captured",
+        start_epoch=100.0,
+    )
+
+    assert result is (mode == "success")
+    assert len(warnings) == (0 if mode == "success" else 1)
+    combined = "\n".join(warnings)
+    assert "secret" not in combined and "hunter2" not in combined
+    if mode != "success":
+        assert "status and UI telemetry disabled for this run" in combined
+
+
 # ---------------------------------------------------------------------------
 # (a) schema round-trip
 # ---------------------------------------------------------------------------
@@ -660,9 +690,126 @@ def test_dual_wires_producers_at_start_rotation_stop():
     assert stop_idx < pid_rm_idx, "status-stopped must be written before pid removal"
 
     # And the start producer runs AFTER the pid file is written (pid first).
-    pid_write_idx = src.index("_write_pid_file(data_dir)")
+    pid_write_idx = src.index("_write_pid_file(data_dir, start_epoch=")
     start_idx = src.index("_write_status_running(")
     assert pid_write_idx < start_idx, "pid file must be written before status (start)"
+
+    # Ephemeral display telemetry has no authority until both identity surfaces
+    # have been published successfully.
+    publisher_idx = src.index("UITelemetryPublisher(")
+    assert start_idx < publisher_idx
+    assert "if telemetry_state is not None and status_published:" in src
+
+
+@pytest.mark.parametrize("relative", ["src/onoats/dual.py", "src/onoats/__main__.py"])
+def test_recorder_entrypoints_publish_and_teardown_control_generation_in_order(
+    relative: str,
+):
+    source = (Path(__file__).resolve().parents[1] / relative).read_text()
+    server = source.index("ControlServer(")
+    bind = source.index("await control_server.start()", server)
+    pid_publish = source.index("_write_pid_file(", bind)
+    running_publish = source.index("_write_status_running(", pid_publish)
+    assert server < bind < pid_publish < running_publish
+
+    shutdown = source.index("await control_server.close()", running_publish)
+    if relative.endswith("dual.py"):
+        finalizer_call = source.index("_finalize_shutdown_status(", shutdown)
+        assert shutdown < finalizer_call
+        helper = source.split("def _finalize_shutdown_status(", 1)[1].split(
+            "\ndef ", 1
+        )[0]
+        stopped = helper.index("_write_status_stopped(")
+        pid_remove = helper.index("_remove_pid_file(pid_path")
+        assert stopped < pid_remove
+        assert "owner_record=owner_record" in helper[pid_remove : pid_remove + 200]
+    else:
+        stopped = source.index("_write_status_stopped(", shutdown)
+        pid_remove = source.index("_remove_pid_file(pid_path", stopped)
+        assert shutdown < stopped < pid_remove
+        assert "owner_record=pid_record" in source[pid_remove : pid_remove + 200]
+
+
+def test_control_handlers_keep_flush_and_stop_actions_differential():
+    for relative in ("src/onoats/dual.py", "src/onoats/__main__.py"):
+        source = (Path(__file__).resolve().parents[1] / relative).read_text()
+        flush = source.split("async def _control_flush()", 1)[1].split(
+            "def _control_stop()", 1
+        )[0]
+        stop = source.split("def _control_stop()", 1)[1].split("control_server =", 1)[0]
+        assert 'lifecycle.flush("Control socket flush")' in flush
+        assert "LifecycleStoppingError" in flush
+        assert "shutdown_event.set()" not in flush
+        assert 'lifecycle.stop("Control socket stop")' in stop
+        assert "_mark_graceful_shutdown_requested()" not in stop
+        assert "shutdown_event.set()" not in stop
+        assert "_flush_continuation" not in stop
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "requested", "raised", "expected_error"),
+    [
+        (entrypoint, requested, raised, raised or not requested)
+        for entrypoint in ("single", "dual")
+        for requested in (False, True)
+        for raised in (False, True)
+    ],
+)
+def test_pipeline_termination_classification_whole_state_space(
+    entrypoint: str, requested: bool, raised: bool, expected_error: bool
+):
+    import asyncio
+
+    from onoats import runtime
+
+    event = asyncio.Event()
+    if requested:
+        event.set()
+    exception = RuntimeError("runner failed") if raised else None
+    assert (
+        runtime._pipeline_ended_by_error(event, entrypoint, exception=exception)
+        is expected_error
+    )
+
+
+def test_both_recorder_entrypoints_classify_returns_and_exceptions_before_cleanup():
+    root = Path(__file__).resolve().parents[1]
+    for relative in ("src/onoats/__main__.py", "src/onoats/dual.py"):
+        source = (root / relative).read_text()
+        run_body = source.split("await runner.run(task)", 1)[1].split("finally:", 1)[0]
+        assert run_body.count("_pipeline_ended_by_error(") == 2
+        assert "except BaseException as exc:" in run_body
+        assert "exception=exc" in run_body
+    single = (root / "src/onoats/__main__.py").read_text()
+    assert "return 1 if ended_by_error else 0" in single
+    assert "return asyncio.run(" in single
+
+
+@pytest.mark.parametrize("entrypoint", ["src/onoats/__main__.py", "src/onoats/dual.py"])
+@pytest.mark.parametrize("watcher_first", [False, True])
+@pytest.mark.parametrize("requested", [False, True])
+@pytest.mark.parametrize("raised", [False, True])
+def test_runner_outcome_precedes_terminal_finalization_whole_state_space(
+    entrypoint: str, watcher_first: bool, requested: bool, raised: bool
+) -> None:
+    """Watcher timing never gains status-finalization authority."""
+    del watcher_first  # Both timing cells consume the same source invariant.
+    import asyncio
+
+    from onoats import runtime
+
+    source = (Path(__file__).resolve().parents[1] / entrypoint).read_text()
+    watcher = source.split("async def _shutdown_watcher()", 1)[1].split(
+        "asyncio.create_task", 1
+    )[0]
+    assert "_on_shutdown()" not in watcher
+    event = asyncio.Event()
+    if requested:
+        event.set()
+    exception = RuntimeError("runner failed") if raised else None
+    assert runtime._pipeline_ended_by_error(event, entrypoint, exception=exception) is (
+        raised or not requested
+    )
 
 
 def test_dual_threads_captured_recovery_warning_into_status_running():
@@ -986,7 +1133,7 @@ def test_write_pid_file_refuses_verified_live_recorder(tmp_path, monkeypatch):
             "onoats._vendor.pid._live_ps_cmdline", lambda pid: "onoats bot"
         )
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)
+            _write_pid_file(tmp_path, start_epoch=100.0)
         # The draining recorder's pid file MUST survive the refused start.
         assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
     finally:
@@ -1009,7 +1156,7 @@ def test_write_pid_file_overwrites_stale_dead_recorder(tmp_path):
     proc.wait(timeout=5)
     _seed_pid_file(tmp_path, proc.pid)
 
-    pid_path = _write_pid_file(tmp_path)
+    pid_path = _write_pid_file(tmp_path, start_epoch=100.0)
     # Overwritten with OUR pid — start proceeds.
     assert pid_path.read_text(encoding="utf-8").startswith(f"{_os.getpid()}\n")
 
@@ -1024,6 +1171,119 @@ def test_remove_pid_file_skips_when_owned_by_newer_recorder(tmp_path):
     # The rightful owner can remove it.
     _remove_pid_file(pid_path, owner_pid=55555)
     assert not pid_path.exists()
+
+
+def test_exact_record_cleanup_preserves_every_successor_dimension(tmp_path):
+    """PID equality alone is never cleanup authority."""
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / ".active" / PID_FILENAME
+    pid_path.parent.mkdir(parents=True)
+    old = PidRecord(55555, "onoats bot --old", 10.0)
+    successors = [
+        PidRecord(old.pid, "onoats bot --new", old.start_epoch),
+        PidRecord(old.pid, old.cmdline, old.start_epoch + 1),
+        PidRecord(old.pid + 1, old.cmdline, old.start_epoch),
+    ]
+    for successor in successors:
+        pid_path.write_text(
+            f"{successor.pid}\nonoats-bot\n{successor.cmdline}\n"
+            f"{successor.start_epoch}\n",
+            encoding="utf-8",
+        )
+        assert compare_and_unlink_pid_record(pid_path, old) is False
+        assert pid_path.exists(), successor
+
+    pid_path.write_text(
+        f"{old.pid}\nonoats-bot\n{old.cmdline}\n{old.start_epoch}\n",
+        encoding="utf-8",
+    )
+    assert compare_and_unlink_pid_record(pid_path, old) is True
+    assert not pid_path.exists()
+
+
+def _pid_record_text(record):
+    return f"{record.pid}\nonoats-bot\n{record.cmdline}\n{record.start_epoch}\n"
+
+
+def test_exact_record_cleanup_preserves_same_pid_successor_at_final_boundary(
+    tmp_path, monkeypatch
+):
+    """Replacing the pathname after verification cannot delete the successor."""
+    import onoats._vendor.pid as pid_module
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / "onoats.pid"
+    old = PidRecord(55555, "onoats bot", 10.0)
+    successor = PidRecord(old.pid, old.cmdline, old.start_epoch + 1)
+    pid_path.write_text(_pid_record_text(old), encoding="utf-8")
+    real_rename = pid_module.os.rename
+    raced = False
+
+    def replace_at_final_boundary(source, destination):
+        nonlocal raced
+        if Path(source) == pid_path and not raced:
+            raced = True
+            replacement = tmp_path / "successor.pid"
+            replacement.write_text(_pid_record_text(successor), encoding="utf-8")
+            os.replace(replacement, pid_path)
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(pid_module.os, "rename", replace_at_final_boundary)
+
+    assert compare_and_unlink_pid_record(pid_path, old) is False
+    assert raced
+    assert pid_path.read_text(encoding="utf-8") == _pid_record_text(successor)
+
+
+def test_exact_record_cleanup_quarantine_never_overwrites_newer_public_record(
+    tmp_path, monkeypatch
+):
+    """A raced entry stays quarantined when its public name is occupied."""
+    import onoats._vendor.pid as pid_module
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / "onoats.pid"
+    old = PidRecord(55555, "onoats bot", 10.0)
+    raced_successor = PidRecord(old.pid, old.cmdline, old.start_epoch + 1)
+    newer = PidRecord(old.pid, old.cmdline, old.start_epoch + 2)
+    pid_path.write_text(_pid_record_text(old), encoding="utf-8")
+    real_rename = pid_module.os.rename
+
+    def collide_with_restore(source, destination):
+        replacement = tmp_path / "successor.pid"
+        replacement.write_text(_pid_record_text(raced_successor), encoding="utf-8")
+        os.replace(replacement, pid_path)
+        result = real_rename(source, destination)
+        pid_path.write_text(_pid_record_text(newer), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(pid_module.os, "rename", collide_with_restore)
+
+    assert compare_and_unlink_pid_record(pid_path, old) is False
+    assert pid_path.read_text(encoding="utf-8") == _pid_record_text(newer)
+    quarantined = list(tmp_path.glob(".onoats-pid-quarantine-*/onoats.pid"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == _pid_record_text(
+        raced_successor
+    )
+
+
+def test_runtime_teardown_delegates_to_exact_record_cleanup(tmp_path, monkeypatch):
+    from onoats._vendor.pid import PidRecord
+
+    pid_path = _seed_pid_file(tmp_path, 55555)
+    expected = PidRecord(55555, "onoats bot", 10.0)
+    observed = []
+
+    def compare(path, record):
+        observed.append((path, record))
+        return False
+
+    monkeypatch.setattr("onoats._vendor.pid.compare_and_unlink_pid_record", compare)
+    _remove_pid_file(pid_path, owner_record=expected)
+    assert observed == [(pid_path, expected)]
+    assert pid_path.exists()
 
 
 def test_remove_pid_file_unconditional_without_owner(tmp_path):
@@ -1050,7 +1310,7 @@ def test_write_pid_file_refuses_live_recorder_with_indeterminate_probe(
         # kill(0) succeeds (process alive) but the identity readback fails.
         monkeypatch.setattr("onoats._vendor.pid._live_ps_cmdline", lambda pid: None)
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)
+            _write_pid_file(tmp_path, start_epoch=100.0)
         # The live recorder's pid file MUST survive — never overwritten.
         assert pid_path.read_text(encoding="utf-8").startswith(f"{proc.pid}\n")
     finally:
@@ -1069,7 +1329,7 @@ def test_write_pid_file_refuses_live_legacy_fingerprintless_pid(tmp_path):
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         pid_path.write_text(f"{proc.pid}\nonoats-bot\n", encoding="utf-8")  # no line 3
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)
+            _write_pid_file(tmp_path, start_epoch=100.0)
         assert pid_path.exists()
     finally:
         proc.terminate()
@@ -1121,7 +1381,7 @@ def test_write_pid_file_is_atomic_via_os_replace(tmp_path, monkeypatch):
         return real_replace(src, dst)
 
     monkeypatch.setattr(_runtime.os, "replace", _spy_replace)
-    pid_path = _write_pid_file(tmp_path)
+    pid_path = _write_pid_file(tmp_path, start_epoch=100.0)
 
     # Final record landed via os.replace into the real path — not written in place.
     assert pid_path in replace_dests, "pid file must be published via os.replace"
@@ -1152,7 +1412,7 @@ def test_write_pid_file_refuses_concurrent_start_holding_instance_lock(tmp_path)
     _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)  # instance 1 holds the slot
     try:
         with pytest.raises(RecorderAlreadyRunningError):
-            _write_pid_file(tmp_path)  # instance 2 loses the race
+            _write_pid_file(tmp_path, start_epoch=100.0)  # instance 2 loses the race
         assert not (active / PID_FILENAME).exists(), (
             "the start that lost the instance-lock race must not publish a pid file"
         )
@@ -1293,23 +1553,27 @@ def test_swift_menu_bar_shares_one_hint_splitter_across_every_hint():
     convention is what failed: the second producer inherited the wrong
     behaviour by default, and nothing said so.
     """
-    swift = (
-        Path(__file__).resolve().parents[1]
-        / "native"
-        / "onoats-menubar"
-        / "Sources"
-        / "OnoatsMenuBarApp.swift"
+    sources = (
+        Path(__file__).resolve().parents[1] / "native" / "onoats-menubar" / "Sources"
     )
-    source = swift.read_text(encoding="utf-8")
-    assert "func hintCaptionLines(" in source, (
+    app_source = (sources / "OnoatsMenuBarApp.swift").read_text(encoding="utf-8")
+    panel_source = (sources / "RecordingPanelView.swift").read_text(encoding="utf-8")
+    assert "func hintCaptionLines(" in app_source, (
         "the shared hint splitter is gone — each hint call site is free to "
         "invent its own rendering again."
     )
+    assert "struct MenuContent" not in app_source, (
+        "the unreachable legacy menu can mask drift in the active recording panel"
+    )
     # No hint may be rendered as a bare, unsplit menu item.
-    for field in ("model.warning", "model.flushNote", "launch.loginItemHint"):
-        assert f'Text("⚠ \\({field}' not in source, field
-    for binding in ("warning", "note", "hint"):
-        assert f"hintLines({binding})" in source, binding
+    for field, binding in (
+        ("model.warning", "warning"),
+        ("model.flushNote", "note"),
+        ("launch.loginItemHint", "hint"),
+    ):
+        assert f'Text("⚠ \\({field}' not in panel_source, field
+        assert f"values.append({binding})" in panel_source, field
+    assert "hintCaptionLines(warning)" in panel_source
 
 
 def test_read_status_survives_a_non_utf8_status_file(tmp_path: Path):

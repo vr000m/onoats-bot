@@ -325,6 +325,147 @@ def test_on_recovery_fires_only_on_next_successful_connect_after_kickstart(
     assert "restarted automatically" in recovered[0]
 
 
+def test_ui_callbacks_transition_failed_recovering_ready_and_redact_detail(
+    monkeypatch,
+):
+    """Published health follows the instance handshake, never endpoint config."""
+    leaky = OSError("ws://secret:hunter2@stt.example/v1?token=private refused")
+    failure = {"exc": leaky}
+    _install_fake_client_factory(monkeypatch, lambda: failure["exc"])
+    events: list[tuple[str, str | None]] = []
+    svc = _make_service(
+        on_failed=lambda detail: events.append(("failed", detail)),
+        on_recovering=lambda: events.append(("recovering", None)),
+        on_ready=lambda: events.append(("ready", None)),
+    )
+
+    with pytest.raises(OSError):
+        asyncio.run(svc._ensure_connected())
+    assert events[0][0] == "failed"
+    assert "secret" not in events[0][1]
+    assert "hunter2" not in events[0][1]
+    assert "token=private" not in events[0][1]
+
+    failure["exc"] = None
+
+    async def _reconnect() -> None:
+        await svc._ensure_connected()
+        assert [event for event, _detail in events] == [
+            "failed",
+            "recovering",
+            "ready",
+        ]
+        await svc.cancel(None)
+
+    asyncio.run(_reconnect())
+
+
+def test_lost_established_connection_fires_recovering_once(monkeypatch):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    events: list[str] = []
+    svc = _make_service(
+        on_ready=lambda: events.append("ready"),
+        on_recovering=lambda: events.append("recovering"),
+    )
+
+    async def _run() -> None:
+        client = await _connect_and_drain_session_ready(svc)
+        assert svc._reader_task is not None
+        await client._events.put(None)
+        await asyncio.wait_for(svc._reader_task, timeout=1.0)
+
+    asyncio.run(_run())
+    assert events == ["ready", "recovering"]
+
+
+@pytest.mark.parametrize("ending", ["eof", "error", "session.closed"])
+@pytest.mark.parametrize("ownership", ["current", "superseded", "draining", "closing"])
+@pytest.mark.parametrize("was_connected", [False, True])
+def test_reader_exit_revokes_only_current_established_readiness(
+    ending, ownership, was_connected
+):
+    """All remote endings revoke ready once; detached readers never mutate health."""
+    callbacks = []
+    svc = _make_service(on_recovering=lambda: callbacks.append("recovering"))
+
+    class EndingClient(_FakeClient):
+        async def events(self):
+            if ending == "error":
+                raise OSError("remote connection lost")
+            if ending == "session.closed":
+                yield {"type": P.EVT_SESSION_CLOSED}
+
+    async def _run():
+        client = EndingClient()
+        svc._client = client
+        if ownership in {"draining", "closing"}:
+            svc._detach_client(draining=ownership == "draining")
+        elif ownership == "superseded":
+            svc._client = _FakeClient()
+        # For detached readers this can also represent a newer live connection;
+        # their exit must preserve its state regardless of its readiness.
+        svc._connected = was_connected
+        svc._ui_state = "ready" if was_connected else "starting"
+        owner = svc._client
+        await svc._read_events(client)
+        # Re-entering teardown cannot publish a second revocation.
+        await svc._read_events(client)
+        assert svc._client is owner
+
+    asyncio.run(_run())
+    revoked = ownership == "current" and was_connected
+    assert callbacks == (["recovering"] if revoked else [])
+    assert svc._connected is (was_connected and ownership != "current")
+    assert svc._ui_state == (
+        "recovering" if revoked else "ready" if was_connected else "starting"
+    )
+
+
+def test_decode_timeout_publishes_recovering_until_next_confirmed_handshake(
+    monkeypatch,
+):
+    """A reset caused by decode timeout is itself an STT health transition.
+
+    The panel must turn non-green before any demand-driven reconnect begins;
+    only the next instance handshake may publish ready again.
+    """
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    monkeypatch.setattr(wss_module, "_DECODE_TIMEOUT_SECONDS", 0.01)
+    events: list[str] = []
+    svc = _make_service(
+        on_ready=lambda: events.append("ready"),
+        on_recovering=lambda: events.append("recovering"),
+    )
+
+    async def _run() -> None:
+        frames = [frame async for frame in svc.run_stt(b"\x00\x00" * 160)]
+        assert frames, "decode timeout must remain fail-loud to the pipeline"
+        assert events == ["ready", "recovering"]
+        assert svc._connected is False
+
+        await svc._ensure_connected()
+        assert events == ["ready", "recovering", "ready"]
+        await svc.cancel(None)
+
+    asyncio.run(asyncio.wait_for(_run(), timeout=2))
+
+
+def test_raising_ui_ready_callback_does_not_discard_connection(monkeypatch):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+
+    def _raise() -> None:
+        raise RuntimeError("telemetry consumer gone")
+
+    svc = _make_service(on_ready=_raise)
+
+    async def _run() -> None:
+        await svc._ensure_connected()
+        assert svc._connected is True
+        await svc.cancel(None)
+
+    asyncio.run(_run())
+
+
 def test_reset_path_clears_cooldown_and_fires_on_recovery_none_then_rekickstarts(
     monkeypatch,
 ):
@@ -1575,3 +1716,42 @@ def test_stop_hard_closes_and_propagates_when_the_parent_drain_is_cancelled(
     assert client.session_closed is False, "no graceful session.close"
     assert client.closed is True
     assert svc._client is None and svc._connected is False
+
+
+@pytest.mark.parametrize("ending", [None, P.EVT_SESSION_CLOSED, "eof"])
+@pytest.mark.parametrize("kickstart_pending", [False, True])
+def test_negotiation_preserves_newer_reader_revocation(
+    monkeypatch, ending, kickstart_pending
+):
+    _install_fake_client_factory(monkeypatch, lambda: None)
+    events = []
+    recovered = []
+    svc = _make_service(
+        on_ready=lambda: events.append("ready"),
+        on_recovering=lambda: events.append("recovering"),
+        on_recovery=lambda message: recovered.append(message),
+    )
+    svc._kickstart_awaiting_connect = kickstart_pending
+    svc._kickstart_awaiting_connect_until = float("inf")
+
+    async def update(client, **kwargs):
+        await client._events.put({"type": P.EVT_SESSION_UPDATED})
+        if ending is not None:
+            await client._events.put(None if ending == "eof" else {"type": ending})
+
+    monkeypatch.setattr(_FakeClient, "update_session", update)
+
+    async def run():
+        if ending is None:
+            await svc._ensure_connected()
+            assert events == ["ready"]
+            assert len(recovered) == int(kickstart_pending)
+        else:
+            with pytest.raises(ConnectionError, match="ended during negotiation"):
+                await svc._ensure_connected()
+            assert "ready" not in events
+            assert not recovered
+            assert not svc._connected
+        await svc.cancel(None)
+
+    asyncio.run(run())

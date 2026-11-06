@@ -617,6 +617,29 @@ denial smoke, PR description refresh, un-draft, merge.
 
 ## Findings
 
+- **2026-11-05 correction — lifecycle and display-status authority are
+  narrower than the original Phase 5 record.** Phase 11 of
+  [`20261028-feature-menubar-control-panel.md`](20261028-feature-menubar-control-panel.md)
+  makes `RecorderLifecycleController` the sole owner of continuation rotation,
+  Stop/terminal admission, and the shutdown event across control requests,
+  signals, and both recorder entrypoints. The status file remains useful display
+  and diagnostic evidence, but its initial running write is now fail-open after
+  PID/control publication: capture, control, and transcript persistence continue
+  without UI telemetry, with process exit and the app-owned run log supplying
+  the outcome. The original implementation history below remains unchanged.
+
+- **2026-10-30 correction — the original flat menu and single status-file UI
+  model are superseded.** The current menu-bar surface is a compact window panel
+  with Start/Stop dominant, Seminar available before Start and locked read-only
+  during an app-owned run, and infrequent controls under in-panel Settings and
+  Diagnostics. The lifecycle status file remains authoritative for identity and
+  liveness; a separate ephemeral, owner/freshness-checked telemetry file supplies
+  display-only Me/Them levels, STT health, locked category, and an opt-in (off by
+  default) bounded transcript preview. App-owned runs now use per-run logs, and
+  the configured data directory is pinned from Start through exit. See
+  `20261028-feature-menubar-control-panel.md`; the original implementation record
+  below remains historical evidence.
+
 - **Post-review-fix verification PASSED (2026-06-10).** After the external
   review fixes (RT-thread drop logging moved to the worker, unbind
   serialization, Teardown registration order), the rebuilt capturer passed

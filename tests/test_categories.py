@@ -8,6 +8,7 @@ import pytest
 
 from onoats.categories import (
     DEFAULT_CATEGORY,
+    INVALID_CATEGORY_ERROR_TAG,
     InvalidCategoryError,
     category_set,
     session_meta_line,
@@ -44,6 +45,12 @@ def test_validate_category_rejects_unconfigured(monkeypatch):
     monkeypatch.delenv("ONOATS_CATEGORIES", raising=False)
     with pytest.raises(InvalidCategoryError):
         validate_category("seminars", config=_cfg(["work"]))
+
+
+def test_invalid_category_error_has_stable_machine_tag_beside_error_type():
+    """The native app matches this tag; exception prose is not its interface."""
+    assert INVALID_CATEGORY_ERROR_TAG == "ONOATS-ERROR invalid-category"
+    assert issubclass(InvalidCategoryError, ValueError)
 
 
 def test_validate_category_rejects_uncategorized(monkeypatch):

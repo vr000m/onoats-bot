@@ -1,0 +1,8 @@
+[
+  {"input": "-0.0", "accepted": true, "published": 0.0},
+  {"input": "0.0", "accepted": true, "published": 0.0},
+  {"input": "1.0", "accepted": true, "published": 1.0},
+  {"input": "1.0000001", "accepted": false, "published": null},
+  {"input": "inf", "accepted": false, "published": null},
+  {"input": "nan", "accepted": false, "published": null}
+]

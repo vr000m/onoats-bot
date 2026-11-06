@@ -32,6 +32,14 @@
 #                   AUDIO_SOURCE=socket + ONOATS_CAPTURER_BIN (printed at end).
 #   make clean
 
+# The staged installer accepts operator data only through ONOATS_INSTALL_*
+# environment variables consumed directly by Python.  Reject command-line and
+# override origins by NAME only, before any recipe can expand an operator value.
+ifneq ($(filter app-tree-hash install-staged rollback,$(MAKECMDGOALS)),)
+$(foreach input,ONOATS_INSTALL_APP ONOATS_INSTALL_DIR ONOATS_INSTALL_BACKUP_DIR ONOATS_INSTALL_ROLLBACK_RECORD ONOATS_INSTALL_EXPECTED_IDENTITY ONOATS_INSTALL_ROLLBACK_APPROVED ONOATS_INSTALL_BASELINE_DR_HASH ONOATS_INSTALL_BASELINE_CDHASH ONOATS_INSTALL_BUNDLE_ID ONOATS_INSTALL_RELEASE_IDENTITY ONOATS_INSTALL_SMOKE_RECEIPT,$(if $(or $(findstring command line,$(origin $(input))),$(findstring override,$(origin $(input)))),$(error staged-installer input $(input) must be supplied as an environment-prefix assignment),))
+$(foreach legacy,APP APP_NAME INSTALL_DIR BACKUP_DIR ROLLBACK_RECORD STAGED_APP_TREE_HASH ROLLBACK_BASELINE_APPROVED ROLLBACK_BASELINE_DR_HASH ROLLBACK_BASELINE_CDHASH BUNDLE_ID,$(if $(or $(filter environment,$(origin $(legacy))),$(findstring command line,$(origin $(legacy))),$(findstring override,$(origin $(legacy)))),$(error legacy staged-installer variable $(legacy) is unsupported; use ONOATS_INSTALL_* environment variables),))
+endif
+
 ARCH      := $(shell uname -m)
 DEPLOY    := 14.4
 IDENTITY  ?= Code Signing
@@ -43,9 +51,18 @@ SOURCES := $(wildcard $(SRC_DIR)/Sources/*.swift)
 MENUBAR_SRC_DIR := onoats-menubar
 MENUBAR_SOURCES := $(wildcard $(MENUBAR_SRC_DIR)/Sources/*.swift)
 PLIST           := $(MENUBAR_SRC_DIR)/Info.plist
+RESOURCE_DIR    := $(MENUBAR_SRC_DIR)/Resources
+RESOURCE_NAMES  := Onoats.icns \
+	OnoatsHeader.png OnoatsHeader@2x.png \
+	OnoatsMenuBarTemplateIdle.png OnoatsMenuBarTemplateIdle@2x.png \
+	OnoatsMenuBarTemplateRecording.png OnoatsMenuBarTemplateRecording@2x.png \
+	OnoatsMenuBarTemplateWarning.png OnoatsMenuBarTemplateWarning@2x.png \
+	OnoatsMenuBarTemplateBusy.png OnoatsMenuBarTemplateBusy@2x.png \
+	OnoatsMenuBarTemplateFailed.png OnoatsMenuBarTemplateFailed@2x.png
 
 BUILD := build
 APP   := Onoats.app
+APP_NAME := $(notdir $(APP))
 # Phase 5b bundle shape: the menu-bar app is the main executable
 # (CFBundleExecutable=Onoats); the capturer is embedded alongside it. One
 # bundle id => one TCC identity; the DR is unchanged by the restructure
@@ -62,9 +79,13 @@ MENUBAR_SWIFTC_FLAGS := -O -target $(ARCH)-apple-macos$(DEPLOY) \
 REPO        := $(abspath ..)
 EXTRAS      ?= macos
 INSTALL_DIR := $(HOME)/Applications
+BACKUP_DIR := $(HOME)/Library/Application Support/Onoats/app-backups
+ROLLBACK_RECORD := $(BACKUP_DIR)/approved-rollback.txt
+INSTALL_STAGED_SCRIPT := $(CURDIR)/install_staged.py
 
-.PHONY: build app sign dr cdhash rebuild print-bin clean check-identity \
-	cert install-cli install setup sign-cli setup-cli
+.PHONY: build app verify-resources sign dr cdhash rebuild print-bin clean \
+	check-identity cert install-cli install app-tree-hash install-staged rollback setup \
+	sign-cli setup-cli
 
 build: $(BUILD)/onoats-capturer $(BUILD)/Onoats
 
@@ -79,11 +100,45 @@ $(BUILD)/Onoats: $(MENUBAR_SOURCES)
 	@echo "✓ compiled $@ (menu-bar app)"
 
 app: build
-	mkdir -p $(APP)/Contents/MacOS
+	rm -rf $(APP)
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp $(BUILD)/Onoats $(MAIN_BIN)
 	cp $(BUILD)/onoats-capturer $(BIN)
 	cp $(PLIST) $(APP)/Contents/Info.plist
+	cp $(RESOURCE_DIR)/Onoats.icns $(APP)/Contents/Resources/Onoats.icns
+	cp $(RESOURCE_DIR)/OnoatsHeader.png $(APP)/Contents/Resources/OnoatsHeader.png
+	cp $(RESOURCE_DIR)/OnoatsHeader@2x.png $(APP)/Contents/Resources/OnoatsHeader@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateIdle@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateIdle@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateRecording@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateRecording@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateWarning@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateWarning@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateBusy@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateBusy@2x.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed.png
+	cp $(RESOURCE_DIR)/OnoatsMenuBarTemplateFailed@2x.png $(APP)/Contents/Resources/OnoatsMenuBarTemplateFailed@2x.png
 	@echo "✓ assembled $(APP)"
+
+# The resource directory is an equality-checked allowlist. This catches both a
+# stale file surviving assembly and a required export disappearing before the
+# bundle is signed.
+verify-resources:
+	@set -eu; \
+	app="$${ONOATS_VERIFY_RESOURCES_APP:-Onoats.app}"; \
+	resources="$$app/Contents/Resources"; \
+	[ -d "$$resources" ] && [ ! -L "$$resources" ] || { echo "✗ invalid $$resources"; exit 1; }; \
+	expected=$$(mktemp); actual=$$(mktemp); \
+	trap 'rm -f "$$expected" "$$actual"' EXIT; \
+	printf '%s\n' $(RESOURCE_NAMES) | LC_ALL=C sort > "$$expected"; \
+	find "$$resources" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort > "$$actual"; \
+	diff -u "$$expected" "$$actual" || { echo "✗ bundle resource allowlist mismatch"; exit 1; }; \
+	for name in $(RESOURCE_NAMES); do \
+	  [ -f "$$resources/$$name" ] && [ ! -L "$$resources/$$name" ] || { \
+	    echo "✗ resource must be a regular non-symlink file: $$name"; exit 1; \
+	  }; \
+	done; \
+	echo "✓ verified bundle resource allowlist"
 
 # Deliberately NOT find-identity -v: a self-signed root fails the keychain
 # *trust* evaluation so -v hides it, but codesign still signs with it and TCC
@@ -103,8 +158,10 @@ check-identity:
 # it must get its own explicit codesign line here — an unsigned addition
 # silently invalidates the outer signature.
 sign: app check-identity
+	$(MAKE) verify-resources
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(BIN)
 	codesign --force --sign "$(IDENTITY)" --identifier $(BUNDLE_ID) --timestamp=none $(APP)
+	codesign --verify --deep --strict $(APP)
 	@echo "--- designated requirement (must be byte-stable across rebuilds) ---"
 	@codesign -dr - $(APP)
 
@@ -139,6 +196,22 @@ install: sign install-cli
 	rm -rf $(INSTALL_DIR)/$(APP)
 	ditto $(APP) $(INSTALL_DIR)/$(APP)
 	@echo "✓ installed $(INSTALL_DIR)/$(APP)"
+
+# Canonical producer for the identity token recorded before staged smoke. It
+# covers bundle paths, entry types, modes, file bytes, and symlink targets.
+app-tree-hash:
+	@python3 install_staged.py env-identity
+
+# Install exactly one immutable private snapshot of the already-signed staged
+# bytes. The verified snapshot is atomically exchanged with the installed app;
+# the staged path is never read again after snapshot verification.
+install-staged:
+	@python3 install_staged.py env-install
+
+# Restore only a private, fully verified extraction of the recorded archive.
+# Atomic exchange keeps the current app installed on every validation failure.
+rollback:
+	@python3 install_staged.py env-rollback
 
 # Fresh-clone bootstrap. cert is idempotent (make_cert.sh exits 0 — and never
 # regenerates — when the identity exists). init runs only on a missing

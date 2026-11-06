@@ -1,0 +1,11 @@
+[
+  {"field": "transcript", "scalar_count": 239, "accepted": true},
+  {"field": "transcript", "scalar_count": 240, "accepted": true},
+  {"field": "transcript", "scalar_count": 241, "accepted": false},
+  {"field": "detail", "scalar_count": 256, "accepted": true},
+  {"field": "detail", "scalar_count": 257, "accepted": false},
+  {"field": "speaker_label", "scalar_count": 256, "accepted": true},
+  {"field": "speaker_label", "scalar_count": 257, "accepted": false},
+  {"field": "locked_category", "scalar_count": 256, "accepted": true},
+  {"field": "locked_category", "scalar_count": 257, "accepted": false}
+]

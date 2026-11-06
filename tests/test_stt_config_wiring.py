@@ -644,8 +644,114 @@ def test_create_stt_service_never_derives_stamp_from_config(monkeypatch):
     }
     svc = _ws_service(monkeypatch, raw=raw)
     assert svc._stamp_segment_samples is False
+
+
+def test_create_stt_service_threads_ui_state_callbacks(monkeypatch):
+    raw = {"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
+
+    def ready():
+        pass
+
+    def recovering():
+        pass
+
+    def failed(_detail):
+        pass
+
+    svc = _ws_service(
+        monkeypatch,
+        raw=raw,
+        on_ready=ready,
+        on_recovering=recovering,
+        on_failed=failed,
+    )
+
+    assert svc._on_ready is ready
+    assert svc._on_recovering is recovering
+    assert svc._on_failed is failed
     svc = _ws_service(monkeypatch, raw=raw, branch_instance="system")
     assert svc._stamp_segment_samples is False
+
+
+@pytest.mark.parametrize(("supplied", "expected_loads"), [(False, 1), (True, 0)])
+def test_create_stt_service_config_snapshot_boundary(
+    monkeypatch, supplied, expected_loads
+):
+    """Callers may pin a session snapshot; standalone calls still load now."""
+    import asyncio
+
+    cfg = OnoatsConfig(
+        raw={"stt": {"service": "websocket", "ws_socket": "/tmp/x.sock"}}
+    )
+    snapshot = runtime.RecorderSessionConfig.capture(cfg)
+    loads = 0
+
+    def load():
+        nonlocal loads
+        loads += 1
+        return cfg
+
+    async def no_preflight(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("onoats.config.load_config", load)
+    monkeypatch.setattr(runtime, "_preflight_stt_ws", no_preflight)
+    kwargs = {"config": snapshot} if supplied else {}
+    result = asyncio.run(runtime._create_stt_service(**kwargs))
+
+    assert result.service is not None
+    assert loads == expected_loads
+
+
+def test_recorder_session_config_retains_all_stt_consumers_after_env_mutation(
+    monkeypatch,
+):
+    monkeypatch.delenv("STT_SERVICE", raising=False)
+    monkeypatch.delenv("STT_WS_SOCKET", raising=False)
+    monkeypatch.delenv("STT_LAUNCHD_LABEL", raising=False)
+    cfg = OnoatsConfig(
+        raw={
+            "stt": {
+                "service": "websocket",
+                "ws_socket": "/tmp/captured.sock",
+                "launchd_label": "net.varunsingh.captured-stt",
+                "language": "sv",
+                "diarization": True,
+                "diarization_idle_remint_sec": 321,
+            }
+        }
+    )
+    snapshot = runtime.RecorderSessionConfig.capture(cfg)
+
+    monkeypatch.setenv("STT_SERVICE", "whisper")
+    monkeypatch.setenv("STT_WS_SOCKET", "/tmp/mutated.sock")
+    monkeypatch.setenv("STT_LAUNCHD_LABEL", "net.varunsingh.mutated-stt")
+
+    assert snapshot.stt_service == "websocket"
+    assert snapshot.stt_endpoint["socket_path"] == "/tmp/captured.sock"
+    assert snapshot.stt_launchd_label == "net.varunsingh.captured-stt"
+    assert snapshot.stt_language == "sv"
+    assert snapshot.diarization is True
+    assert snapshot.diarization_idle_remint_sec == 321
+    assert "captured.sock" in runtime.stt_banner(snapshot)
+    with pytest.raises(TypeError):
+        snapshot.stt_endpoint["socket_path"] = "/tmp/forbidden.sock"
+
+
+@pytest.mark.parametrize("service", ["whisper", "deepgram"])
+def test_session_snapshot_ignores_invalid_websocket_only_settings_for_other_backends(
+    monkeypatch, service
+):
+    cfg = OnoatsConfig(raw={"stt": {"service": service, "ws_port": "not-a-port"}})
+    snapshot = runtime.RecorderSessionConfig.capture(cfg)
+    assert snapshot.stt_service == service
+    assert dict(snapshot.stt_endpoint) == {}
+
+
+def test_session_snapshot_validates_websocket_settings_for_websocket_backend():
+    cfg = OnoatsConfig(raw={"stt": {"service": "websocket", "ws_port": "not-a-port"}})
+    with pytest.raises(ValueError):
+        runtime.RecorderSessionConfig.capture(cfg)
 
 
 def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
@@ -680,8 +786,10 @@ def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
         pass
 
     calls: list[tuple] = []
+    configs: list[OnoatsConfig] = []
 
     async def _spy(**kw):
+        configs.append(kw["config"])
         calls.append((kw.get("branch_instance"), kw.get("stamp_segment_samples")))
         if len(calls) == 2:
             raise _Stop
@@ -690,6 +798,7 @@ def _run_dual_until_stt(monkeypatch, tmp_path, *, flag):
     monkeypatch.setattr(dual_mod, "_create_stt_service", _spy)
     with pytest.raises(_Stop):
         asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path))
+    assert len(configs) == 2 and configs[0] is configs[1]
     return calls
 
 
