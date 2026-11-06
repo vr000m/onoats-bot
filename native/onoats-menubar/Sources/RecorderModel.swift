@@ -497,12 +497,12 @@ final class RecorderModel: ObservableObject {
     }
     private var ownedRecorderGeneration: RecorderGeneration?
 
-    private struct TelemetryAuthority: Equatable {
+    private struct ControlAuthority: Equatable {
         let directory: URL
         let pid: Int32
         let startEpoch: Double
     }
-    private var telemetryAuthority: TelemetryAuthority?
+    private var controlAuthority: ControlAuthority?
 
     var cliPath: String {
         if let override = defaults.string(forKey: "cliPath"), !override.isEmpty {
@@ -607,9 +607,9 @@ final class RecorderModel: ObservableObject {
         return ops.commandLine(pid) == storedCmdline
     }
 
-    private func setTelemetryAuthority(_ authority: TelemetryAuthority?) {
-        if telemetryAuthority != authority { clearTelemetry() }
-        telemetryAuthority = authority
+    private func setControlAuthority(_ authority: ControlAuthority?) {
+        if controlAuthority != authority { clearTelemetry() }
+        controlAuthority = authority
         if authority == nil { clearTelemetry() }
     }
 
@@ -639,12 +639,12 @@ final class RecorderModel: ObservableObject {
             return pid.pid == handle.pid && pid.startEpoch >= attempt.timeIntervalSince1970
         }()
         let externalPublication = proc == nil && alive
-        let authority: TelemetryAuthority? = {
+        let authority: ControlAuthority? = {
             guard (ownedPublication || externalPublication), let pid else { return nil }
-            return TelemetryAuthority(
+            return ControlAuthority(
                 directory: directory, pid: pid.pid, startEpoch: pid.startEpoch)
         }()
-        setTelemetryAuthority(authority)
+        setControlAuthority(authority)
 
         let matchingStatus: StatusRecord? = {
             guard let authority, let status,
@@ -699,7 +699,7 @@ final class RecorderModel: ObservableObject {
 
     /// Four-hertz display poll. This method deliberately never assigns state.
     func refreshTelemetry() {
-        guard let authority = telemetryAuthority,
+        guard let authority = controlAuthority,
               let data = ops.readData(
                 at: authority.directory.appendingPathComponent(
                     ".active/\(UiTelemetryContract.fileName)"),
@@ -749,7 +749,7 @@ final class RecorderModel: ObservableObject {
         lastFailureWasAppOwned = false
         ownedRecorderPidWasPublished = false
         ownedRecorderGeneration = nil
-        setTelemetryAuthority(nil)
+        setControlAuthority(nil)
         let pinned = dataDirResolver()
         activeDataDir = pinned
         refreshDirectoryDisplays(configured: pinned)
@@ -840,7 +840,7 @@ final class RecorderModel: ObservableObject {
             flushNote = "Flush failed: no active recorder directory"
             return
         }
-        guard let target = telemetryAuthority, target.directory == directory,
+        guard let target = controlAuthority, target.directory == directory,
               target.startEpoch > 0 else {
             flushNote = "Flush failed: recorder identity is unavailable"
             return
@@ -856,7 +856,7 @@ final class RecorderModel: ObservableObject {
 
     func stopExternal() {
         guard proc == nil, let directory = activeDataDir else { return }
-        guard let stopping = telemetryAuthority, stopping.directory == directory,
+        guard let stopping = controlAuthority, stopping.directory == directory,
               stopping.startEpoch > 0 else {
             flushNote = "Stop failed: recorder identity is unavailable"
             return
@@ -912,7 +912,7 @@ final class RecorderModel: ObservableObject {
         let directory = activeDataDir
         let knownGeneration = ownedRecorderGeneration
         prestartDetail = nil
-        setTelemetryAuthority(nil)
+        setControlAuthority(nil)
         if handle.terminationStatus == 0 {
             state = .stopped
         } else {

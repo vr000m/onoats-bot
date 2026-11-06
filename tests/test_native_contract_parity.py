@@ -152,6 +152,14 @@ def test_pid_marker_and_path_match_swift():
     assert swift_path == f".active/{PID_FILENAME}"
 
 
+def test_pid_identity_is_named_as_control_authority_in_swift():
+    source = RECORDER_MODEL.read_text(encoding="utf-8")
+    assert "ControlAuthority" in source
+    assert "controlAuthority" in source
+    assert "TelemetryAuthority" not in source
+    assert "telemetryAuthority" not in source
+
+
 def test_xdg_default_data_dir_matches_swift(monkeypatch: pytest.MonkeyPatch):
     from onoats._vendor.store import onoats_data_dir
 
