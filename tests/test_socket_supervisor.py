@@ -50,6 +50,8 @@ import asyncio
 import os
 import signal
 import stat
+import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -3129,6 +3131,52 @@ def test_recorder_drain_deadline_does_not_wait_for_suppressed_cancellation(
         await task
 
     asyncio.run(run())
+
+
+def test_supervisor_process_exit_is_bounded_after_cancellation_resistance(tmp_path):
+    """Owned cleanup completes before the explicit hard process boundary."""
+    cleanup_marker = tmp_path / "cleanup-complete"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        from pathlib import Path
+        from onoats import cli
+
+        cli._RECORDER_DRAIN_GRACE_SEC = 0.02
+
+        async def resist_forever():
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    continue
+
+        async def fake_supervisor(_rest, *, config=None):
+            asyncio.create_task(resist_forever())
+            try:
+                return 0
+            finally:
+                Path({str(cleanup_marker)!r}).write_text("done", encoding="utf-8")
+
+        cli._supervise_socket_session = fake_supervisor
+        raise SystemExit(cli._run_socket_supervisor([]))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 1
+    assert cleanup_marker.read_text(encoding="utf-8") == "done"
+    assert "forcing process exit" in result.stderr
 
 
 def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(

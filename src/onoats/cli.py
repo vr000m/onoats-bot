@@ -522,12 +522,15 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
     from onoats.runtime import RecorderAlreadyRunningError, SttPreflightError
     from onoats.transports import SocketHandshakeError
 
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+    cancellation_survivors = False
     try:
-        return _asyncio.run(_supervise_socket_session(rest, config=config))
+        rc = loop.run_until_complete(_supervise_socket_session(rest, config=config))
     except (SttPreflightError, RecorderAlreadyRunningError) as exc:
         # Mirror dual.main: actionable hint, not a traceback.
         print(f"\n{exc}\n", file=sys.stderr)
-        return 1
+        rc = 1
     except (SocketHandshakeError, CapturerTeardownError, OSError, ValueError) as exc:
         # A controlled socket-mode launch failure (bad/stale capturer handshake,
         # socket connect error, or a same-socket / config guard rejection) must
@@ -537,7 +540,30 @@ def _run_socket_supervisor(rest: list[str], *, config=None) -> int:
         logger.error(
             f"Socket supervisor: recorder failed to start ({exc!r}); exiting non-zero."
         )
-        return 1
+        rc = 1
+    finally:
+        pending = _asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            _done, survivors = loop.run_until_complete(
+                _asyncio.wait(pending, timeout=_RECORDER_DRAIN_GRACE_SEC)
+            )
+            cancellation_survivors = bool(survivors)
+        _asyncio.set_event_loop(None)
+        loop.close()
+    if cancellation_survivors:
+        # The async supervisor has already completed its authoritative capturer,
+        # socket-directory, and environment cleanup.  Do not return through the
+        # interpreter with a cancellation-resistant recorder task: Python's
+        # normal asyncio.run shutdown would await it without a deadline.
+        logger.error(
+            "Socket supervisor: recorder task survived bounded cancellation "
+            "after owned-resource cleanup; forcing process exit."
+        )
+        _SUPERVISOR_HARD_EXIT(1)
+        return 1  # only reachable under a test double for os._exit
+    return rc
 
 
 async def _supervise_socket_session(rest: list[str], *, config=None) -> int:
