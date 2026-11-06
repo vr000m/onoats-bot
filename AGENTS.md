@@ -764,3 +764,4 @@ should NOT re-flag go here, one per line:
   stop sent 0.1-0.6 s after the pipeline was ready (inside the load window), all
   exit 0 in 3-4 s with no degraded WARNING, no traceback and no macOS crash
   report. Not reproducible, so left as is. (2026-10-11)
+- **[Security] won't-fix**: the menu-bar app forwarding its full environment (incl. `PYTHONPATH`/`DYLD_*`) into the recorder (`RecorderModel.swift`) predates this branch, the recorder legitimately needs the user's environment (STT credentials), and env vars are trusted input in this threat model. (2026-11-06)
