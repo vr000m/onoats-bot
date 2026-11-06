@@ -285,7 +285,9 @@ final class NativeSystemOps: SystemOps {
         guard descriptor >= 0 else { return nil }
         var metadata = Darwin.stat()
         guard Darwin.fstat(descriptor, &metadata) == 0,
-              metadata.st_mode & S_IFMT == S_IFREG else {
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_uid == Darwin.geteuid(),
+              metadata.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
             Darwin.close(descriptor)
             return nil
         }
@@ -298,7 +300,20 @@ final class NativeSystemOps: SystemOps {
         guard let size = try? handle.seekToEnd(), size <= UInt64(maxBytes) else { return nil }
         do {
             try handle.seek(toOffset: 0)
-            return try handle.read(upToCount: maxBytes)
+            guard let data = try handle.read(upToCount: maxBytes) else { return nil }
+            var opened = Darwin.stat()
+            var current = Darwin.stat()
+            guard Darwin.fstat(handle.fileDescriptor, &opened) == 0,
+                  opened.st_size <= off_t(maxBytes),
+                  opened.st_uid == Darwin.geteuid(),
+                  opened.st_mode & (S_IWGRP | S_IWOTH) == 0,
+                  Darwin.lstat(url.path, &current) == 0,
+                  current.st_mode & S_IFMT == S_IFREG,
+                  current.st_uid == Darwin.geteuid(),
+                  current.st_mode & (S_IWGRP | S_IWOTH) == 0,
+                  opened.st_dev == current.st_dev,
+                  opened.st_ino == current.st_ino else { return nil }
+            return data
         } catch {
             return nil
         }
@@ -563,6 +578,9 @@ final class RecorderModel: ObservableObject {
         url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
     }
     private func refreshDirectoryDisplays(configured: URL) {
+        if configured.standardizedFileURL != nextDataDir.standardizedFileURL {
+            schemaDrift = false
+        }
         nextDataDir = configured
         nextDataDirDisplay = displayPath(configured)
         dataDirDisplay = nextDataDirDisplay
@@ -571,7 +589,10 @@ final class RecorderModel: ObservableObject {
 
     private func readStatus(under directory: URL) -> StatusRecord? {
         let url = directory.appendingPathComponent(".active/onoats.status.json")
-        guard let data = ops.readData(at: url) else { return nil }
+        guard let data = ops.readData(at: url) else {
+            schemaDrift = false
+            return nil
+        }
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let schema = object["schema"] as? Int,
            schema != Self.statusSchemaVersion {
@@ -584,10 +605,11 @@ final class RecorderModel: ObservableObject {
 
     private func readPid(under directory: URL) -> (pid: Int32, cmdline: String, startEpoch: Double)? {
         let url = directory.appendingPathComponent(".active/onoats.pid")
-        guard let text = ops.readText(at: url) else { return nil }
+        guard let data = ops.readData(at: url, maxBytes: 65_536),
+              let text = String(data: data, encoding: .utf8) else { return nil }
         let lines = text.trimmingCharacters(in: .whitespacesAndNewlines)
             .components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0]) else {
+        guard lines.count >= 2, lines[1] == "onoats-bot", let pid = Int32(lines[0]), pid > 0 else {
             return nil
         }
         return (pid, lines.count >= 3 ? lines[2] : "",

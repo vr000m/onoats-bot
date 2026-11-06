@@ -880,6 +880,32 @@ private func testNativeBoundedReadStateSpace(_ root: URL) throws {
                 "bounded reader blocked while opening a FIFO")
     try require(ops.readData(at: directory, maxBytes: 32) == nil,
                 "bounded reader accepted a directory")
+
+    let writable = directory.appendingPathComponent("group-writable")
+    try Data("authority".utf8).write(to: writable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o660], ofItemAtPath: writable.path)
+    try require(ops.readData(at: writable, maxBytes: 32) == nil,
+                "bounded reader accepted a group-writable authority file")
+}
+
+@MainActor
+private func testSchemaDriftClearsOnlyWhenEvidenceDisappears(_ root: URL) throws {
+    let first = root.appendingPathComponent("schema-first")
+    let second = root.appendingPathComponent("schema-second")
+    let choice = DirectoryChoice(first)
+    let ops = FakeSystemOps()
+    try ops.putJSON(["schema": 999], active(first, "onoats.status.json"))
+    let model = makeModel(ops, suite: "onoats.harness.schema-drift", directory: choice)
+    try require(model.schemaDrift, "current unsupported status schema was hidden")
+    ops.files[active(first, "onoats.status.json").path] = nil
+    model.refresh()
+    try require(!model.schemaDrift, "missing status retained stale schema drift")
+    try ops.putJSON(["schema": 999], active(first, "onoats.status.json"))
+    model.refresh()
+    try require(model.schemaDrift, "restored unsupported schema was not surfaced")
+    choice.url = second
+    model.refresh()
+    try require(!model.schemaDrift, "data-directory change retained prior schema drift")
 }
 
 @MainActor
@@ -1251,6 +1277,7 @@ struct RecorderModelHarness {
         try testActiveRunLogSurvivesClockRollback(home)
         try testReservationFailureClearsPriorRunAuthority(home)
         try testNativeBoundedReadStateSpace(home)
+        try testSchemaDriftClearsOnlyWhenEvidenceDisappears(home)
         try testNativeAppendIsAtomicAcrossSeparateWriters(home)
         try testOpenLogResolution(home)
         try testInvalidCategoryStableTagMatrix(root)
@@ -1269,6 +1296,7 @@ struct RecorderModelHarness {
             "onoats.harness.missing-cli", "onoats.harness.logs",
             "onoats.harness.owner-lifetime",
             "onoats.harness.clock-rollback", "onoats.harness.reservation-failure",
+            "onoats.harness.schema-drift",
             "onoats.harness.logs-external", "onoats.harness.open-log",
             "onoats.harness.log-collision", "onoats.harness.open-log-relaunch",
             "onoats.harness.invalid-tag-match",
