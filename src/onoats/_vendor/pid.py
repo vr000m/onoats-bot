@@ -157,6 +157,9 @@ def compare_and_unlink_pid_record(pid_path: Path, expected: PidRecord) -> bool:
         descriptor = os.open(pid_path, flags)
     except OSError:
         return False
+    # The verified descriptor stays open until the post-rename comparison: an
+    # open file cannot be freed, so its (st_dev, st_ino) cannot be recycled by
+    # a successor record between verification and the quarantine check.
     try:
         opened = os.fstat(descriptor)
         if (
@@ -175,10 +178,18 @@ def compare_and_unlink_pid_record(pid_path: Path, expected: PidRecord) -> bool:
             return False
         if record != expected:
             return False
-        opened_identity = (opened.st_dev, opened.st_ino)
+        return _quarantine_verified_pid_file(pid_path, descriptor)
     finally:
         os.close(descriptor)
 
+
+def _quarantine_verified_pid_file(pid_path: Path, descriptor: int) -> bool:
+    """Move ``pid_path`` aside and remove it only if it is ``descriptor``'s inode.
+
+    The caller holds ``descriptor`` open for the whole call, which pins the
+    verified inode: the comparison below is against that live file, never a
+    remembered number that a successor could have reused.
+    """
     try:
         quarantine_dir = Path(
             tempfile.mkdtemp(prefix=".onoats-pid-quarantine-", dir=pid_path.parent)
@@ -196,8 +207,9 @@ def compare_and_unlink_pid_record(pid_path: Path, expected: PidRecord) -> bool:
         return False
 
     try:
+        held = os.fstat(descriptor)
         moved = quarantine_path.lstat()
-        if (moved.st_dev, moved.st_ino) != opened_identity:
+        if (moved.st_dev, moved.st_ino) != (held.st_dev, held.st_ino):
             # A successor won the open-to-rename race. Restore it atomically
             # without replacing any newer entry that reached the public name.
             try:

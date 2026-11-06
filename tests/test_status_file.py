@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1278,6 +1279,84 @@ def test_exact_record_cleanup_quarantine_never_overwrites_newer_public_record(
     assert quarantined[0].read_text(encoding="utf-8") == _pid_record_text(
         raced_successor
     )
+
+
+@pytest.mark.parametrize("race", ["none", "successor-replaces-record"])
+def test_exact_record_cleanup_pins_verified_inode_through_quarantine(
+    tmp_path, monkeypatch, race
+):
+    """A freed verified inode may be recycled; a held one never is.
+
+    The filesystem model below reuses the old record's (st_dev, st_ino) for the
+    successor exactly when no descriptor still pins the verified file, which is
+    what a kernel is allowed to do. Cleanup must remove the record only when
+    the quarantined entry is the verified file, and preserve any successor.
+    """
+    import pathlib
+
+    import onoats._vendor.pid as pid_module
+    from onoats._vendor.pid import PidRecord, compare_and_unlink_pid_record
+
+    pid_path = tmp_path / "onoats.pid"
+    old = PidRecord(55555, "onoats bot", 10.0)
+    successor = PidRecord(old.pid, old.cmdline, old.start_epoch + 1)
+    pid_path.write_text(_pid_record_text(old), encoding="utf-8")
+    old_identity = (pid_path.stat().st_dev, pid_path.stat().st_ino)
+    opened: list[int] = []
+    recycled = False
+    real_open = pid_module.os.open
+    real_rename = pid_module.os.rename
+    real_lstat = pathlib.Path.lstat
+
+    def tracking_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        if Path(path) == pid_path:
+            opened.append(fd)
+        return fd
+
+    def still_pinned() -> bool:
+        for fd in opened:
+            try:
+                held = os.fstat(fd)
+            except OSError:
+                continue
+            if (held.st_dev, held.st_ino) == old_identity:
+                return True
+        return False
+
+    def rename(source, destination):
+        nonlocal recycled
+        if Path(source) == pid_path and race != "none":
+            recycled = not still_pinned()
+            pid_path.unlink()
+            pid_path.write_text(_pid_record_text(successor), encoding="utf-8")
+        return real_rename(source, destination)
+
+    def lstat(self):
+        result = real_lstat(self)
+        if (
+            recycled
+            and self.name == pid_path.name
+            and self.parent.name.startswith(".onoats-pid-quarantine-")
+        ):
+            return SimpleNamespace(
+                st_dev=old_identity[0], st_ino=old_identity[1], st_mode=result.st_mode
+            )
+        return result
+
+    monkeypatch.setattr(pid_module.os, "open", tracking_open)
+    monkeypatch.setattr(pid_module.os, "rename", rename)
+    monkeypatch.setattr(pathlib.Path, "lstat", lstat)
+
+    removed = compare_and_unlink_pid_record(pid_path, old)
+
+    if race == "none":
+        assert removed is True
+        assert not pid_path.exists()
+    else:
+        assert removed is False
+        assert not recycled, "verified descriptor was closed before quarantine"
+        assert pid_path.read_text(encoding="utf-8") == _pid_record_text(successor)
 
 
 def test_runtime_teardown_delegates_to_exact_record_cleanup(tmp_path, monkeypatch):
