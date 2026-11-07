@@ -706,7 +706,7 @@ def test_temporary_cleanup_warns_only_after_install_commit(
     )
     monkeypatch.setattr(INSTALL_STAGED, "_verify_resources", lambda *_args: None)
 
-    def replace(_candidate, _installed, _verify, commit):
+    def replace(_candidate, _installed, _verify, commit, _state=None):
         if not after_commit:
             raise INSTALL_STAGED.InstallError("injected pre-commit failure")
         commit()
@@ -1317,7 +1317,7 @@ def test_install_staged_requires_explicit_rollback_approval_before_archiving():
     assert '_run(DITTO, "-c", "-k", "--keepParent"' in installer
     assert "tempfile.mkstemp(" in installer and 'suffix=".zip"' in installer
     assert "_verify_app(candidate" in installer
-    assert "_replace_verified(candidate, installed, verify, commit)" in installer
+    assert "_replace_verified(candidate, installed, verify, commit, swap)" in installer
     assert "_write_record(record, record_fields)" in installer
     assert "commit()" in installer
 
@@ -1779,7 +1779,7 @@ def test_release_identity_rejects_source_path_replacement_during_snapshot(
         replace_during_copy(*argv)
         return Result()
 
-    monkeypatch.setattr(RELEASE_IDENTITY.subprocess, "run", replace_during_copy_run)
+    monkeypatch.setattr(RELEASE_IDENTITY, "run_bounded", replace_during_copy_run)
     cli_authority = (
         "/tmp/onoats",
         "a" * 64,
@@ -1831,6 +1831,14 @@ def test_rollback_uses_only_recorded_archive_then_reverifies_restored_app():
     assert unpack < verify < replace
 
 
+def _fake_extracted_app(app: Path, bundle_id: str = "net.varunsingh.onoats") -> None:
+    """Create a minimal extracted bundle carrying only an Info.plist identifier."""
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents/Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleIdentifier": bundle_id})
+    )
+
+
 def test_rollback_extracts_one_private_archive_snapshot_not_replaced_path(
     tmp_path, monkeypatch
 ):
@@ -1863,7 +1871,7 @@ def test_rollback_extracts_one_private_archive_snapshot_not_replaced_path(
             archive.write_bytes(b"attacker replacement")
             assert source != archive
             assert source.read_bytes() == original
-            (Path(argv[4]) / "Onoats.app").mkdir()
+            _fake_extracted_app(Path(argv[4]) / "Onoats.app")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
@@ -1971,14 +1979,14 @@ def test_rollback_uses_recorded_identity_not_current_resource_manifest(
 
     def fake_run(*argv: str, cwd=None):
         if len(argv) >= 5 and argv[1:3] == ("-x", "-k"):
-            (Path(argv[4]) / "Onoats.app").mkdir()
+            _fake_extracted_app(Path(argv[4]) / "Onoats.app")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     def verify(_app, **kwargs):
         verify_kwargs.append(kwargs)
         return "1" * 64, "2" * 64, "3" * 40
 
-    def replace(candidate, installed, verify_published, commit):
+    def replace(candidate, installed, verify_published, commit, _state=None):
         installed.parent.mkdir(parents=True, exist_ok=True)
         candidate.rename(installed)
         verify_published(installed)
@@ -2352,8 +2360,16 @@ def test_interrupted_post_exchange_verification_still_swaps_back(tmp_path, monke
     assert (candidate / "identity").read_text(encoding="utf-8") == "new"
 
 
-def test_failed_swap_back_retains_the_previous_app_tree(tmp_path, monkeypatch):
-    """F2: verify fails, then swap-back fails: the old tree must never be deleted."""
+@pytest.mark.parametrize(
+    "swap_back_failure",
+    [INSTALL_STAGED.InstallError("injected swap-back failure"), KeyboardInterrupt()],
+    ids=["exception", "interrupt"],
+)
+def test_failed_swap_back_retains_the_previous_app_tree(
+    tmp_path, monkeypatch, swap_back_failure
+):
+    """F2: verify fails, then swap-back fails or is interrupted: the old tree must
+    never be deleted, whatever kind of exception ended the swap-back."""
     staged = tmp_path / "staged" / "Onoats.app"
     staged.mkdir(parents=True)
     install_dir = tmp_path / "installed"
@@ -2371,7 +2387,7 @@ def test_failed_swap_back_retains_the_previous_app_tree(tmp_path, monkeypatch):
     def exchange(left: Path, right: Path) -> None:
         exchanges.append(1)
         if len(exchanges) > 1:
-            raise INSTALL_STAGED.InstallError("injected swap-back failure")
+            raise swap_back_failure
         swap(left, right)
 
     verified: list[Path] = []
@@ -2449,3 +2465,243 @@ def test_rollback_record_uses_the_private_atomic_writer(tmp_path):
     record.unlink()
     INSTALL_STAGED._write_record(record, fields)
     assert stat.S_IMODE(record.stat().st_mode) == 0o600
+
+
+def test_failed_withdrawal_of_a_fresh_install_names_the_live_unverified_app(
+    tmp_path, monkeypatch
+):
+    """A fresh install has no previous app: say the unverified app is live."""
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    real_rename = os.rename
+
+    def rename(source, destination):
+        if Path(source) == installed:
+            raise OSError("injected withdraw failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(INSTALL_STAGED.os, "rename", rename)
+    state = INSTALL_STAGED.SwapState()
+
+    def refuse(_path: Path) -> None:
+        raise INSTALL_STAGED.InstallError("injected verification failure")
+
+    with pytest.raises(INSTALL_STAGED.WithdrawError) as excinfo:
+        INSTALL_STAGED._replace_verified(candidate, installed, refuse, None, state)
+    assert not isinstance(excinfo.value, INSTALL_STAGED.SwapBackError)
+    assert "retained" not in str(excinfo.value)
+    assert "remove it manually" in str(excinfo.value)
+    assert state.previous_at_candidate is False
+    assert installed.exists()
+
+
+@pytest.mark.parametrize("phase", ["exchange-refused", "swap-back-ok", "committed"])
+def test_swap_state_clears_the_only_copy_flag_on_every_safe_outcome(
+    tmp_path, monkeypatch, phase
+):
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    for path, value in ((installed, "old"), (candidate, "new")):
+        path.mkdir()
+        (path / "identity").write_text(value, encoding="utf-8")
+    swap = _swap_exchange(tmp_path)
+
+    def exchange(left, right):
+        if phase == "exchange-refused":
+            raise INSTALL_STAGED.InstallError("injected exchange refusal")
+        swap(left, right)
+
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", exchange)
+    state = INSTALL_STAGED.SwapState()
+
+    def verify(_path: Path) -> None:
+        if phase == "swap-back-ok":
+            raise INSTALL_STAGED.InstallError("injected verification failure")
+
+    if phase == "committed":
+        INSTALL_STAGED._replace_verified(candidate, installed, verify, None, state)
+    else:
+        with pytest.raises(INSTALL_STAGED.InstallError):
+            INSTALL_STAGED._replace_verified(candidate, installed, verify, None, state)
+    assert state.previous_at_candidate is False
+
+
+def _approved_install_args(tmp_path: Path, install_dir: Path, record: Path):
+    staged = tmp_path / "staged" / "Onoats.app"
+    staged.mkdir(parents=True)
+    return argparse.Namespace(
+        app=str(staged),
+        install_dir=str(install_dir),
+        backup_dir=str(record.parent),
+        record=str(record),
+        expected_identity="1" * 64,
+        approved=1,
+        baseline_dr_hash="2" * 64,
+        baseline_cdhash="3" * 40,
+        bundle_id="net.varunsingh.onoats",
+        makefile_dir=str(tmp_path),
+    )
+
+
+@pytest.mark.parametrize("record_published", [True, False])
+def test_failed_commit_never_deletes_an_archive_the_published_record_names(
+    tmp_path, monkeypatch, record_published
+):
+    """A directory-fsync failure after the record's rename must keep its archive."""
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    parent = install_dir / ".onoats-install-test"
+    candidate = parent / "candidate"
+    candidate.mkdir(parents=True)
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    record = backup_dir / "approved-rollback.txt"
+    archive = backup_dir / "Onoats-test.zip"
+    archive.write_bytes(b"baseline")
+    fields = {
+        "archive": str(archive),
+        "hash": "h",
+        "tree_hash": "t",
+        "dr_hash": "2" * 64,
+        "cdhash": "3" * 40,
+    }
+
+    def write_then_fail(path: Path, payload: bytes) -> None:
+        if record_published:
+            path.write_bytes(payload)
+        raise OSError("injected post-rename directory fsync failure")
+
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_single_registration", lambda *_: None)
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_copy_snapshot", lambda *_args: (parent, candidate)
+    )
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_app",
+        lambda *_args, **_kwargs: ("1" * 64, "2" * 64, "3" * 40),
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_resources", lambda *_args: None)
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_archive_baseline", lambda *_args: (fields, archive)
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_atomic_write_private", write_then_fail)
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_replace_verified",
+        lambda _c, _i, _v, commit, _state=None: commit(),
+    )
+    args = _approved_install_args(tmp_path, install_dir, record)
+    with pytest.raises(OSError, match="fsync"):
+        INSTALL_STAGED.install(args)
+    assert archive.exists() is record_published
+
+
+def test_rollback_rejects_an_archived_app_with_a_foreign_bundle_identifier(
+    tmp_path, monkeypatch
+):
+    """The record's hashes are attestations; the archived bundle must itself be ours."""
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    archive = backup_dir / "Onoats-approved.zip"
+    payload = b"archive"
+    archive.write_bytes(payload)
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text(
+        f"archive={archive}\nhash={hashlib.sha256(payload).hexdigest()}\n"
+        f"tree_hash={'1' * 64}\ndr_hash={'2' * 64}\ncdhash={'3' * 40}\n",
+        encoding="utf-8",
+    )
+
+    def fake_run(*argv: str, cwd=None):
+        if len(argv) >= 5 and argv[1:3] == ("-x", "-k"):
+            _fake_extracted_app(Path(argv[4]) / "Onoats.app", "com.example.other")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(INSTALL_STAGED, "_run", fake_run)
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_verify_app",
+        lambda *_args, **_kwargs: ("1" * 64, "2" * 64, "3" * 40),
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_single_registration", lambda *_: None)
+    monkeypatch.setattr(
+        INSTALL_STAGED,
+        "_replace_verified",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("foreign app published")
+        ),
+    )
+    install_dir = tmp_path / "installed"
+    with pytest.raises(INSTALL_STAGED.InstallError, match="not canonical"):
+        INSTALL_STAGED.rollback(
+            argparse.Namespace(
+                install_dir=str(install_dir),
+                backup_dir=str(backup_dir),
+                record=str(record),
+                app_name="Onoats.app",
+                bundle_id="net.varunsingh.onoats",
+            )
+        )
+
+
+def _pid_is_gone(pid: int, seconds: float = 3.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize("capture", [True, False])
+def test_command_timeout_kills_the_whole_process_group(tmp_path, monkeypatch, capture):
+    """A timed-out child's helpers (a make recipe's children) must die with it."""
+    monkeypatch.setattr(RELEASE_IDENTITY, "COMMAND_TIMEOUT_SECONDS", 0.3, raising=False)
+    pidfile = tmp_path / "helper.pid"
+    script = f"sleep 60 & echo $! > {pidfile}; wait"
+    kwargs = {"capture_output": True, "text": True} if capture else {}
+    with pytest.raises(RELEASE_IDENTITY.InstallError, match="timed out"):
+        RELEASE_IDENTITY.run_bounded(["/bin/sh", "-c", script], **kwargs)
+    helper = int(pidfile.read_text(encoding="utf-8"))
+    try:
+        assert _pid_is_gone(helper), "a descendant outlived the timed-out command"
+    finally:
+        try:
+            os.kill(helper, 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_command_interrupt_kills_the_whole_process_group(tmp_path, monkeypatch):
+    pidfile = tmp_path / "helper.pid"
+    real_communicate = RELEASE_IDENTITY.subprocess.Popen.communicate
+    calls: list[int] = []
+
+    def interrupting(self, *args, **kwargs):
+        if not calls:
+            calls.append(1)
+            import time
+
+            deadline = time.monotonic() + 5
+            while not pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            raise KeyboardInterrupt
+        return real_communicate(self, *args, **kwargs)
+
+    monkeypatch.setattr(RELEASE_IDENTITY.subprocess.Popen, "communicate", interrupting)
+    script = f"sleep 60 & echo $! > {pidfile}; wait"
+    with pytest.raises(KeyboardInterrupt):
+        RELEASE_IDENTITY.run_bounded(["/bin/sh", "-c", script], capture_output=True)
+    helper = int(pidfile.read_text(encoding="utf-8"))
+    try:
+        assert _pid_is_gone(helper), "a descendant survived an interrupted command"
+    finally:
+        try:
+            os.kill(helper, 9)
+        except ProcessLookupError:
+            pass

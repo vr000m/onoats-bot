@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import signal
 import stat
 import subprocess
 import tempfile
@@ -30,20 +31,63 @@ class InstallError(RuntimeError):
     """A release identity or receipt contract check failed."""
 
 
-def run_bounded(argv, **kwargs) -> subprocess.CompletedProcess[str]:
-    """``subprocess.run`` with the shared deadline; a timeout is an InstallError.
+# After the group is killed, draining the pipes gets this long; a descendant
+# that left the group (its own setsid) and still holds a pipe is abandoned
+# rather than waited for.
+KILL_DRAIN_SECONDS = 2.0
 
-    On POSIX ``subprocess.run`` kills the child and reaps it before re-raising
-    ``TimeoutExpired``, so no hung child outlives the failure.
+
+def _kill_group(process: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group while its pid is still ours.
+
+    ``returncode`` is only set once the leader has been reaped; until then its
+    pid (and therefore the group id) cannot be recycled, so the group signal
+    cannot reach an unrelated process.
+    """
+    if process.returncode is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+    try:
+        process.communicate(timeout=KILL_DRAIN_SECONDS)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+
+
+def run_bounded(argv, **kwargs) -> subprocess.CompletedProcess[str]:
+    """Run *argv* in its own process group under the shared deadline.
+
+    A timeout, or any exception while waiting (including ``KeyboardInterrupt``),
+    kills the child's whole group, so helpers it spawned (``make`` recipes,
+    ``git`` subprocesses) cannot outlive the failure.  A timeout is an
+    ``InstallError``.  Children are session leaders: a terminal Ctrl+C no longer
+    reaches them directly, which is why the interrupt path kills the group.
     """
     limit = kwargs.pop("timeout", None)
     limit = COMMAND_TIMEOUT_SECONDS if limit is None else limit
-    try:
-        return subprocess.run(argv, timeout=limit, **kwargs)
-    except subprocess.TimeoutExpired as exc:
-        raise InstallError(
-            f"command timed out after {limit:g}s ({' '.join(map(str, argv))})"
-        ) from exc
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    stdin_data = kwargs.pop("input", None)
+    check = kwargs.pop("check", False)
+    kwargs["start_new_session"] = True
+    with subprocess.Popen(argv, **kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(stdin_data, timeout=limit)
+        except BaseException as failure:
+            _kill_group(process)
+            if isinstance(failure, subprocess.TimeoutExpired):
+                raise InstallError(
+                    f"command timed out after {limit:g}s ({' '.join(map(str, argv))})"
+                ) from failure
+            raise
+        result = subprocess.CompletedProcess(
+            process.args, process.returncode, stdout, stderr
+        )
+    if check:
+        result.check_returncode()
+    return result
 
 
 class ReleaseIdentity(NamedTuple):
@@ -431,19 +475,10 @@ def app_identity(app: Path) -> str:
     return digest.hexdigest()
 
 
-def _identity_from_private_snapshot(
-    app: Path, *, cli_authority: tuple[str, str, str, str, str]
-) -> tuple[ReleaseIdentity, SourceExecutableEvidence]:
-    info_path = app / "Contents/Info.plist"
-    executable = app / "Contents/MacOS/Onoats"
+def read_bundle_identifier(app: Path) -> str:
+    """The app's ``CFBundleIdentifier``; any unreadable plist fails closed."""
     try:
-        with executable.open("rb") as opened:
-            before = os.fstat(opened.fileno())
-            executable_hash = hashlib.file_digest(opened, "sha256").hexdigest()
-            after = os.fstat(opened.fileno())
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise InstallError("snapshot executable changed during identity derivation")
-        with info_path.open("rb") as stream:
+        with (app / "Contents/Info.plist").open("rb") as stream:
             bundle_id = plistlib.load(stream)["CFBundleIdentifier"]
     except (
         OSError,
@@ -457,8 +492,33 @@ def _identity_from_private_snapshot(
         # root as TypeError, and bad binary/XML values as ValueError; all are
         # "no stable canonical identity", never an escaping traceback.
         raise InstallError("staged app has no stable canonical identity") from exc
+    if not isinstance(bundle_id, str):
+        raise InstallError("staged app has no stable canonical identity")
+    return bundle_id
+
+
+def require_canonical_bundle(app: Path) -> str:
+    """Return the canonical bundle id, or fail unless *app* carries exactly it."""
+    bundle_id = read_bundle_identifier(app)
     if bundle_id != BUNDLE_ID:
         raise InstallError("staged app bundle identifier is not canonical")
+    return bundle_id
+
+
+def _identity_from_private_snapshot(
+    app: Path, *, cli_authority: tuple[str, str, str, str, str]
+) -> tuple[ReleaseIdentity, SourceExecutableEvidence]:
+    executable = app / "Contents/MacOS/Onoats"
+    try:
+        with executable.open("rb") as opened:
+            before = os.fstat(opened.fileno())
+            executable_hash = hashlib.file_digest(opened, "sha256").hexdigest()
+            after = os.fstat(opened.fileno())
+    except OSError as exc:
+        raise InstallError("staged app has no stable canonical identity") from exc
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise InstallError("snapshot executable changed during identity derivation")
+    bundle_id = require_canonical_bundle(app)
     cli_path, cli_hash, interpreter_path, interpreter_hash, git_identity = cli_authority
     return (
         ReleaseIdentity(
