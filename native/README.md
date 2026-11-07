@@ -294,9 +294,10 @@ Publication is one transaction (`_replace_verified`, with its contract table in
 the docstring). The new bundle is swapped in atomically and verified; any
 failure, including an interrupt, swaps the previous app back. Every installer
 child process (`make`, `codesign`, `ditto`, `git`, `lsregister`) runs in its own
-process group under a 300 s deadline; a timeout or interrupt kills the whole
-group, so no helper outlives the failure, and a timeout is an install error that
-takes the same swap-back path. Rollback additionally requires the archived
+process group under a 300 s deadline; a timeout or interrupt kills that whole
+group, so ordinary helpers do not outlive the failure (a descendant that
+deliberately leaves the group with its own `setsid` is not reached), and a
+timeout is an install error that takes the same swap-back path. Rollback additionally requires the archived
 bundle's own `CFBundleIdentifier` to be the canonical one before it publishes.
 
 If the swap-back itself fails or is interrupted, the previous app is the only
