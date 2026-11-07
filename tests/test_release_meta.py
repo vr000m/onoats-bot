@@ -2433,3 +2433,19 @@ def test_rollback_rejects_a_non_canonical_bundle_id_before_mutation(tmp_path):
             )
         )
     assert not install_dir.exists() or not any(install_dir.iterdir())
+
+
+def test_rollback_record_uses_the_private_atomic_writer(tmp_path):
+    """Finding 1: the approval record refuses a symlinked target, like receipts."""
+    target = tmp_path / "elsewhere.txt"
+    target.write_text("untouched", encoding="utf-8")
+    record = tmp_path / "backups" / "approved-rollback.txt"
+    record.parent.mkdir()
+    record.symlink_to(target)
+    fields = {key: "x" for key in ("archive", "hash", "tree_hash", "dr_hash", "cdhash")}
+    with pytest.raises(INSTALL_STAGED.InstallError):
+        INSTALL_STAGED._write_record(record, fields)
+    assert target.read_text(encoding="utf-8") == "untouched"
+    record.unlink()
+    INSTALL_STAGED._write_record(record, fields)
+    assert stat.S_IMODE(record.stat().st_mode) == 0o600

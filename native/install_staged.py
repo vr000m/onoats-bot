@@ -20,6 +20,7 @@ from release_identity import (
     InstallError,
     ReleaseIdentity,
     SmokeReceipt,
+    _atomic_write_private,
     _cdhash,
     _designated_requirement,
     app_identity,
@@ -327,20 +328,12 @@ def _clear_verified_staged_registration(
 
 
 def _write_record(record: Path, fields: dict[str, str]) -> None:
-    record.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".approved-rollback-", dir=record.parent
+    """Publish the approval record through the one private atomic writer."""
+    payload = "".join(
+        f"{key}={fields[key]}\n"
+        for key in ("archive", "hash", "tree_hash", "dr_hash", "cdhash")
     )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            for key in ("archive", "hash", "tree_hash", "dr_hash", "cdhash"):
-                handle.write(f"{key}={fields[key]}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, record)
-    except Exception:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+    _atomic_write_private(record, payload.encode("utf-8"))
 
 
 def _read_record(record: Path, backup_dir: Path) -> dict[str, str]:
