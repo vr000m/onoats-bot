@@ -82,24 +82,38 @@ class RecorderLifecycleController:
             if self._state is not LifecycleState.RUNNING:
                 raise LifecycleStoppingError("recorder is stopping")
             rotation = asyncio.create_task(self._rotate(reason, True))
+            force_wait = asyncio.create_task(self.force_exit_event.wait())
             try:
-                completed = await asyncio.shield(rotation)
-            except asyncio.CancelledError:
-                # A disconnected client must not revoke an admitted rotation,
-                # but the process-wide force escape must still bound shutdown.
-                force_wait = asyncio.create_task(self.force_exit_event.wait())
                 try:
+                    # Race the rotation against force exit while holding the
+                    # lock, so a stuck Flush cannot strand a terminal rotation
+                    # queued behind it.  ``asyncio.wait`` never cancels the
+                    # rotation when this handler is cancelled.
                     done, _pending = await asyncio.wait(
                         (rotation, force_wait),
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    if force_wait in done:
+                    if rotation not in done:
                         await _cancel_with_deadline(rotation)
+                        raise LifecycleRotationError(
+                            "continuation rotation abandoned by force exit"
+                        )
+                    completed = rotation.result()
+                except asyncio.CancelledError:
+                    # A disconnected client must not revoke an admitted rotation,
+                    # but the process-wide force escape must still bound shutdown.
+                    done, _pending = await asyncio.wait(
+                        (rotation, force_wait),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if rotation in done:
+                        if not rotation.cancelled():
+                            rotation.exception()  # mark retrieved
                     else:
-                        await asyncio.shield(rotation)
-                finally:
-                    force_wait.cancel()
-                raise
+                        await _cancel_with_deadline(rotation)
+                    raise
+            finally:
+                force_wait.cancel()
             if not completed:
                 raise LifecycleRotationError("continuation rotation failed")
             return True

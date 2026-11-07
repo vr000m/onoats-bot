@@ -655,3 +655,37 @@ def test_both_direct_entrypoints_use_bounded_event_loop_runner(
     main = source.split("def main(", 1)[1]
     assert "run_recorder_event_loop(" in main
     assert "asyncio.run(" not in main
+
+
+@_async_test
+async def test_force_exit_bounds_terminal_rotation_queued_behind_stuck_flush() -> None:
+    """Round 7: a stuck admitted Flush must not strand shutdown past force exit.
+
+    The terminal rotation waits on the lifecycle lock the Flush holds; before
+    the Flush raced force exit itself, nothing cancelled it (no adapter
+    cancellation had happened) and a second Ctrl+C was ignored.
+    """
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stuck(_reason: str, continue_session: bool) -> bool:
+        if not continue_session:
+            return True
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    controller = RecorderLifecycleController(stuck)
+    flush = asyncio.create_task(controller.flush("stuck control flush"))
+    await started.wait()
+    terminal = asyncio.create_task(controller.terminal_rotation("pipeline ended"))
+    await asyncio.sleep(0)
+    assert not terminal.done(), "terminal rotation must queue behind the Flush"
+
+    controller.force_exit_event.set()
+    await asyncio.wait_for(terminal, timeout=1.0)
+    assert cancelled.is_set(), "force exit must cancel the stuck continuation"
+    with pytest.raises(LifecycleRotationError):
+        await asyncio.wait_for(flush, timeout=0.5)
