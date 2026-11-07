@@ -947,6 +947,18 @@ private func testConfigStoreReadIsBoundedAndNeverOverwritesUnreadable(_ root: UR
     let untouched = try Data(contentsOf: notUTF8)
     try require(untouched == Data([0xff, 0xfe, 0xfd]), "the unreadable config was left untouched")
 
+    // A symlinked config is written THROUGH: the link survives, the target changes.
+    let realTarget = directory.appendingPathComponent("dotfiles-real.toml")
+    try "[stt]\nservice = \"whisper\"\n".write(to: realTarget, atomically: true, encoding: .utf8)
+    let link = directory.appendingPathComponent("linked.toml")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: realTarget)
+    try ConfigStore.writeValue(section: "stt", key: "service", value: "mlx", at: link)
+    let linkAttrs = try FileManager.default.attributesOfItem(atPath: link.path)
+    try require(linkAttrs[.type] as? FileAttributeType == .typeSymbolicLink, "the config symlink was replaced by a regular file")
+    try require(
+        kind(ConfigStore.readConfigText(at: realTarget)).contains("service = \"mlx\""),
+        "the symlink target must receive the edit")
+
     // Absent still creates it, a readable one is edited in place.
     let created = directory.appendingPathComponent("created.toml")
     try ConfigStore.writeValue(section: "stt", key: "service", value: "mlx", at: created)

@@ -192,8 +192,13 @@ enum ConfigStore {
     /// inside the subset both agree on (tests/test_native_contract_parity.py
     /// round-trips a sample through tomllib).
     static func writeValue(
-        section: String, key: String, value: String, at configURL: URL = ConfigStore.configURL
+        section: String, key: String, value: String, at requestedURL: URL = ConfigStore.configURL
     ) throws {
+        // One symlink policy for reader and writer: follow a linked config.toml
+        // (dotfile managers) and write through to its target. An atomic write
+        // to the link's own path would replace the link with a regular file
+        // and silently detach the managed dotfile.
+        let configURL = requestedURL.resolvingSymlinksInPath()
         // A control character (esp. newline) would let the value break out of
         // its line and inject arbitrary TOML keys — refuse, never sanitize.
         guard value.rangeOfCharacter(from: .newlines) == nil,
