@@ -26,16 +26,14 @@ protocol RunLogSink: AnyObject {
 /// NativeSystemOps overrides reservation with DescriptorRunLogSink below.
 private final class URLRunLogSink: RunLogSink {
     let url: URL
-    private let tailReader: ((Int) -> String?)?
-    init(url: URL, tailReader: ((Int) -> String?)? = nil) {
+    private let tailReader: (Int) -> String?
+    init(url: URL, tailReader: @escaping (Int) -> String?) {
         self.url = url
         self.tailReader = tailReader
     }
     func duplicateOutputHandle() throws -> FileHandle? { nil }
     func readTail(maxBytes: Int) -> String? {
-        if let tailReader { return tailReader(maxBytes) }
-        guard maxBytes > 0, let data = try? Data(contentsOf: url) else { return nil }
-        return String(decoding: data.suffix(maxBytes), as: UTF8.self)
+        tailReader(maxBytes)
     }
     func closeOwner() {}
 }
@@ -56,15 +54,6 @@ struct ProcessRequest {
         self.environment = environment
         self.outputSink = outputSink
     }
-
-    init(
-        executable: URL, arguments: [String], environment: [String: String]?,
-        appendOutputTo: URL?
-    ) {
-        self.init(
-            executable: executable, arguments: arguments, environment: environment,
-            outputSink: appendOutputTo.map { URLRunLogSink(url: $0) })
-    }
 }
 
 /// Keeps optional Process.arguments construction semantics while process
@@ -82,9 +71,9 @@ protocol SystemOps: AnyObject {
     ) throws -> ProcessHandle
     func processIsAlive(_ pid: Int32) -> Bool
     func commandLine(_ pid: Int32) -> String?
-    func readData(at url: URL) -> Data?
+    /// Every read is bounded and no-follow; there is deliberately no unbounded
+    /// read requirement, so a conformer cannot silently regress to one.
     func readData(at url: URL, maxBytes: Int) -> Data?
-    func readText(at url: URL) -> String?
     func readTail(at url: URL, maxBytes: Int) -> String?
     func write(_ data: Data, to url: URL) throws
     func reserveFile(at url: URL) throws -> Bool
@@ -103,16 +92,6 @@ protocol SystemOps: AnyObject {
 
 extension SystemOps {
     func terminateApplication() { NSApp.terminate(nil) }
-    func readData(at url: URL, maxBytes: Int) -> Data? {
-        guard maxBytes > 0, let data = readData(at: url), data.count <= maxBytes else {
-            return nil
-        }
-        return data
-    }
-    func readTail(at url: URL, maxBytes: Int) -> String? {
-        guard maxBytes > 0, let data = readData(at: url) else { return nil }
-        return String(decoding: data.suffix(maxBytes), as: UTF8.self)
-    }
     func contentsOfDirectory(at url: URL) -> [URL] {
         (try? FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil,
@@ -251,7 +230,6 @@ final class NativeSystemOps: SystemOps {
         return value?.isEmpty == false ? value : nil
     }
 
-    func readData(at url: URL) -> Data? { try? Data(contentsOf: url) }
     private func openRegularFile(at url: URL) -> FileHandle? {
         let descriptor = Darwin.open(
             url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
@@ -291,7 +269,6 @@ final class NativeSystemOps: SystemOps {
             return nil
         }
     }
-    func readText(at url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
     func readTail(at url: URL, maxBytes: Int) -> String? {
         guard maxBytes > 0,
               let handle = openRegularFile(at: url) else { return nil }
