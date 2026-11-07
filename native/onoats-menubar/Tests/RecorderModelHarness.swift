@@ -39,7 +39,10 @@ private final class FakeSystemOps: SystemOps {
     var exits: [ObjectIdentifier: @MainActor (ProcessHandle) -> Void] = [:]
     var scheduledIntervals: [TimeInterval] = []
     var failSpawn = false
-    var readTextCount = 0
+    /// Counts production PID-record reads, which go through the bounded
+    /// `readData(at:maxBytes:)` (RecorderRecordReader.pid). SystemOps has no
+    /// unbounded read requirement, so the fake defines none either.
+    var pidReadCount = 0
     var processAliveCount = 0
     var commandLineCount = 0
     var telemetryReadCount = 0
@@ -82,18 +85,17 @@ private final class FakeSystemOps: SystemOps {
         commandLineCount += 1
         return commands[pid]
     }
-    func readData(at url: URL) -> Data? {
-        if url.lastPathComponent == UiTelemetryContract.fileName { telemetryReadCount += 1 }
-        return files[url.path]
-    }
     func readData(at url: URL, maxBytes: Int) -> Data? {
         boundedReadLimits.append(maxBytes)
-        guard let data = readData(at: url), data.count <= maxBytes else { return nil }
+        if url.lastPathComponent == UiTelemetryContract.fileName { telemetryReadCount += 1 }
+        if url.lastPathComponent == "onoats.pid" { pidReadCount += 1 }
+        guard let data = files[url.path], data.count <= maxBytes else { return nil }
         return data
     }
-    func readText(at url: URL) -> String? {
-        readTextCount += 1
-        return files[url.path].flatMap { String(data: $0, encoding: .utf8) }
+    /// Test-only inspector of fake storage; not a SystemOps read and never
+    /// counted as one.
+    func storedText(at url: URL) -> String? {
+        files[url.path].flatMap { String(data: $0, encoding: .utf8) }
     }
     func write(_ data: Data, to url: URL) throws { files[url.path] = data }
     func deleteRegularFile(at url: URL) throws {
@@ -396,11 +398,12 @@ private func testPollingDiscipline(_ root: URL) throws {
     try require(ops.telemetryReadCount == telemetryBeforeRefresh,
                 "lifecycle refresh read/decoded telemetry")
 
-    let pidReads = ops.readTextCount
+    let pidReads = ops.pidReadCount
     let livenessReads = ops.processAliveCount
     let commandReads = ops.commandLineCount
     model.refreshTelemetry()
-    try require(ops.readTextCount == pidReads,
+    try require(pidReads > 0, "lifecycle refresh never read the PID record")
+    try require(ops.pidReadCount == pidReads,
                 "telemetry refresh reread the PID file instead of cached identity")
     try require(ops.processAliveCount == livenessReads && ops.commandLineCount == commandReads,
                 "telemetry refresh reprobed process identity/liveness")
@@ -947,7 +950,7 @@ private func testRunLogCollisionReservesFreshPath(_ root: URL) throws {
     }
     try require(reserved == expected,
                 "colliding Start reserved \(reserved.path), expected \(expected.path)")
-    try require(ops.readText(at: stale) == staleContents,
+    try require(ops.storedText(at: stale) == staleContents,
                 "colliding Start truncated or rewrote the stale run log")
     try require(ops.fileExists(at: unrelated),
                 "collision handling touched a non-matching log-like file")
