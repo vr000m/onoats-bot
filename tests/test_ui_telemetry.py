@@ -681,6 +681,11 @@ def test_restore_quarantined_directory_uses_atomic_noreplace_rename(tmp_path):
 
 
 def test_linux_renameat2_provides_atomic_noreplace_fallback(monkeypatch):
+    # The directory fd for "relative to cwd" is AT_FDCWD, which is -100 on Linux
+    # and -2 on Darwin. Pin the platform so the test means the same thing on
+    # both CI hosts (it used to compare against the Darwin constant and failed
+    # on Linux runners).
+    monkeypatch.setattr(atomic_fs.sys, "platform", "linux")
     calls = []
 
     class RenameAt2:
@@ -702,14 +707,37 @@ def test_linux_renameat2_provides_atomic_noreplace_fallback(monkeypatch):
 
     assert calls == [
         (
-            atomic_fs._AT_FDCWD,
+            atomic_fs._POSIX_AT_FDCWD,
             b"source",
-            atomic_fs._AT_FDCWD,
+            atomic_fs._POSIX_AT_FDCWD,
             b"destination",
             atomic_fs._RENAME_NOREPLACE,
         )
     ]
+    assert atomic_fs._POSIX_AT_FDCWD == -100
     assert atomic_fs.rename_noreplace_available() is True
+
+
+def test_darwin_renameatx_np_uses_the_darwin_cwd_descriptor(monkeypatch):
+    monkeypatch.setattr(atomic_fs.sys, "platform", "darwin")
+    calls = []
+
+    class RenameAtxNp:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *args):
+            calls.append(args)
+            return 0
+
+    stub = RenameAtxNp()
+    monkeypatch.setattr(
+        atomic_fs,
+        "_libc_symbol",
+        lambda name: stub if name == "renameatx_np" else None,
+    )
+    atomic_fs.rename_noreplace(Path("source"), Path("destination"))
+    assert calls[0][0] == calls[0][2] == atomic_fs._DARWIN_AT_FDCWD == -2
 
 
 def test_linux_renameat2_uses_linux_at_fdcwd(monkeypatch):
