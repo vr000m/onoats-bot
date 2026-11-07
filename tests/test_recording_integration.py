@@ -776,6 +776,78 @@ def test_recording_identity_timeout_recovers_verified_cleanup_targets(
     assert cleaned[0]["groups"] == groups
 
 
+@pytest.mark.parametrize("failure", ["open-timeout", "open-interrupt", "launch-wait"])
+def test_installed_smoke_cleans_an_app_launched_before_its_pid_was_recorded(
+    tmp_path, monkeypatch, failure
+):
+    """``open`` launched the app, then timed out: cleanup must still find and stop it."""
+    app = tmp_path / "Onoats.app"
+    executable = app / "Contents/MacOS/Onoats"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    data_dir = tmp_path / "data"
+    (data_dir / ".active").mkdir(parents=True)
+    _stub_release_identity(monkeypatch)
+    monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
+    launched = {"live": False}
+    # Preflight sees no app; once ``open`` ran, the app is live at pid 1234.
+    monkeypatch.setattr(
+        SMOKE, "_one_app_pid", lambda _app: 1234 if launched["live"] else None
+    )
+
+    def fake_open(*_args, **_kwargs):
+        launched["live"] = True
+        if failure == "open-timeout":
+            raise SMOKE.subprocess.TimeoutExpired("open", 10)
+        if failure == "open-interrupt":
+            raise KeyboardInterrupt
+        return None
+
+    monkeypatch.setattr(SMOKE.subprocess, "run", fake_open)
+    rows = {1234: SMOKE.ProcessRow(1, 1234, "app-start", str(executable.resolve()))}
+    monkeypatch.setattr(SMOKE, "_processes", lambda: dict(rows))
+    monkeypatch.setattr(SMOKE, "_process_birth", {1234: _birth(10, 20)}.get)
+    monkeypatch.setattr(
+        SMOKE, "_process_executable", lambda _pid: str(executable.resolve())
+    )
+    cleaned = []
+    monkeypatch.setattr(
+        SMOKE, "_cleanup_after_failure", lambda *_args, **kwargs: cleaned.append(kwargs)
+    )
+
+    def wait(stage, _timeout, _probe):
+        raise SMOKE.SmokeFailure(f"{stage} timed out")
+
+    monkeypatch.setattr(SMOKE, "wait_for", wait)
+    expected = (
+        KeyboardInterrupt
+        if failure == "open-interrupt"
+        else (
+            SMOKE.subprocess.TimeoutExpired
+            if failure == "open-timeout"
+            else SMOKE.SmokeFailure
+        )
+    )
+    with pytest.raises(expected):
+        SMOKE.run(
+            SimpleNamespace(
+                app=app,
+                data_dir=data_dir,
+                release_identity=tmp_path / "release-identity.json",
+                smoke_receipt=tmp_path / "receipt.json",
+                app_timeout=1,
+                recording_timeout=1,
+                activity_timeout=1,
+                stop_timeout=1,
+                transcript_timeout=1,
+                me_floor=0.01,
+            )
+        )
+    assert len(cleaned) == 1
+    identity = cleaned[0]["app_identity"]
+    assert identity is not None and identity.pid == 1234
+
+
 @pytest.mark.parametrize("failure_site", ["group-capture", "recorder-discovery"])
 def test_installed_smoke_cleanup_survives_late_topology_failures(
     tmp_path, monkeypatch, failure_site

@@ -1251,6 +1251,18 @@ def run(args: argparse.Namespace) -> None:
         # topology changes, but no such race may skip cleanup of identities
         # that were already captured and independently remain authoritative.
         try:
+            # ``open`` may have launched the app and then timed out or been
+            # interrupted, or the launch wait may have expired: no pid was
+            # recorded, yet the app can be live. The preflight proved no Onoats
+            # ran before this launch, so the one process at this executable
+            # path is ours. Rediscover it so cleanup can still stop it.
+            if app_pid is None:
+                app_pid = _one_app_pid(app)
+            if app_identity is None and app_pid is not None:
+                app_identity = _capture_process_identity(app_pid)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        try:
             if recorder is None and app_pid is not None:
                 recorder = _cleanup_recording_identity(
                     pid_path,
