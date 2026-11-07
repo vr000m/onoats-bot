@@ -45,6 +45,8 @@ private final class FakeSystemOps: SystemOps {
     var pidReadCount = 0
     var processAliveCount = 0
     var commandLineCount = 0
+    /// PIDs whose identity probe times out (`.unknown`) instead of answering.
+    var unknownCommands: Set<Int32> = []
     var telemetryReadCount = 0
     var boundedReadLimits: [Int] = []
     var opened: [URL] = []
@@ -81,9 +83,10 @@ private final class FakeSystemOps: SystemOps {
         processAliveCount += 1
         return alive.contains(pid)
     }
-    func commandLine(_ pid: Int32) -> String? {
+    func commandLine(_ pid: Int32) -> CommandLineProbe {
         commandLineCount += 1
-        return commands[pid]
+        if unknownCommands.contains(pid) { return .unknown }
+        return commands[pid].map(CommandLineProbe.command) ?? .absent
     }
     func readData(at url: URL, maxBytes: Int) -> Data? {
         boundedReadLimits.append(maxBytes)
@@ -856,14 +859,26 @@ private func testReservationFailureClearsPriorRunAuthority(_ root: URL) throws {
 @MainActor
 private func testNativeCommandLineProbeIsBounded(_ root: URL) throws {
     // Round 7: the `ps` identity probe runs on every lifecycle refresh on the
-    // main actor; a stalled child must not freeze the menu bar.
+    // main actor; a stalled child must not freeze the menu bar. Round 8: it is
+    // also killed and reported `.unknown` (never read as "dead").
     let ops = NativeSystemOps()
-    try require(ops.commandLine(getpid())?.isEmpty == false,
-                "bounded probe lost the live command line of a real process")
+    if case .command(let live) = ops.commandLine(getpid()) {
+        try require(!live.isEmpty, "bounded probe returned an empty command line")
+    } else {
+        throw HarnessFailure(
+            description: "bounded probe lost the live command line of a real process")
+    }
+    try require(ops.commandLine(Int32.max - 1) == .absent,
+                "ps proved a missing process but the probe did not say absent")
     let directory = root.appendingPathComponent("command-line-probe")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let pidFile = directory.appendingPathComponent("stalled.pid")
     let stalled = directory.appendingPathComponent("stalled-ps")
-    try Data("#!/bin/sh\nexec /bin/sleep 30\n".utf8).write(to: stalled)
+    // Ignore SIGTERM so the probe must escalate to SIGKILL.
+    try Data(
+        "#!/bin/sh\ntrap '' TERM\necho $$ > '\(pidFile.path)'\nwhile :; do /bin/sleep 1; done\n"
+            .utf8
+    ).write(to: stalled)
     try FileManager.default.setAttributes(
         [.posixPermissions: 0o700], ofItemAtPath: stalled.path)
     ops.commandLineExecutable = stalled
@@ -871,9 +886,61 @@ private func testNativeCommandLineProbeIsBounded(_ root: URL) throws {
     let started = Date()
     let value = ops.commandLine(getpid())
     let elapsed = Date().timeIntervalSince(started)
-    try require(value == nil, "a stalled probe proved an identity")
+    try require(value == .unknown, "a stalled probe did not report unknown")
     try require(elapsed < 2.0,
                 "stalled ps probe blocked the main actor for \(elapsed)s")
+    let pidText = try String(contentsOf: pidFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let stalledPID = Int32(pidText) else {
+        throw HarnessFailure(description: "stalled probe never wrote its pid")
+    }
+    var gone = false
+    for _ in 0..<40 {
+        if kill(stalledPID, 0) != 0 && errno == ESRCH { gone = true; break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    try require(gone, "a timed-out ps child survived the probe")
+}
+
+@MainActor
+private func testUnknownIdentityProbeKeepsTheLastProvenVerdict(_ root: URL) throws {
+    let directory = root.appendingPathComponent("unknown-probe")
+    let ops = FakeSystemOps()
+    let model = makeModel(
+        ops, suite: "onoats.harness.unknown-probe",
+        directory: DirectoryChoice(directory))
+
+    // No prior proof: an unproven identity fails closed.
+    putPid(ops, directory: directory, pid: 90, epoch: 40, command: "onoats bot --one")
+    ops.unknownCommands = [90]
+    model.refresh()
+    try require(model.state == .stopped, "unproven identity was accepted without a prior proof")
+
+    // Proven once, then the probe stalls: the live recorder must not flip to Stopped.
+    ops.unknownCommands = []
+    model.refresh()
+    try require(model.state == .running(ours: false), "proven generation was rejected")
+    ops.unknownCommands = [90]
+    model.refresh()
+    try require(model.state == .running(ours: false),
+                "a stalled probe read a proven live recorder as dead")
+
+    // A different generation at the same pid does not inherit the verdict.
+    putPid(ops, directory: directory, pid: 90, epoch: 41, command: "onoats bot --one")
+    model.refresh()
+    try require(model.state == .stopped, "a new generation inherited an old verdict")
+
+    // Definitive absence clears the verdict even if the probe later stalls.
+    ops.unknownCommands = []
+    model.refresh()
+    try require(model.state == .running(ours: false), "re-proven generation was rejected")
+    ops.commands[90] = nil
+    model.refresh()
+    try require(model.state == .stopped, "an absent process stayed running")
+    ops.commands[90] = "onoats bot --one"
+    ops.unknownCommands = [90]
+    model.refresh()
+    try require(model.state == .stopped, "an absent verdict was resurrected by a stalled probe")
 }
 
 @MainActor
@@ -1327,6 +1394,7 @@ struct RecorderModelHarness {
         try testRunLogCollisionReservesFreshPath(home)
         try testPollingDiscipline(root)
         try testGenerationCacheRequiresPidCommandAndPositiveEpoch(root)
+        try testUnknownIdentityProbeKeepsTheLastProvenVerdict(root)
         try testModelDeallocation(root)
         for suite in [
             "onoats.harness.directory", "onoats.harness.publication-association",

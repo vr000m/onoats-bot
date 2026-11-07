@@ -210,12 +210,46 @@ final class RecorderModel: ObservableObject {
         guard !storedCmdline.isEmpty, startEpoch.isFinite, startEpoch > 0 else {
             return false
         }
-        guard ops.processIsAlive(pid) else { return false }
+        guard ops.processIsAlive(pid) else {
+            identityVerdict = nil
+            return false
+        }
         // A PID may be recycled while a cached fingerprint is still fresh.
         // Revalidate the live command on every lifecycle refresh; the PID file's
         // positive epoch still keys downstream status and telemetry authority.
-        return ops.commandLine(pid) == storedCmdline
+        let generation = IdentityVerdict(
+            pid: pid, cmdline: storedCmdline, startEpoch: startEpoch, alive: true)
+        switch ops.commandLine(pid) {
+        case .command(let live):
+            let matches = live == storedCmdline
+            identityVerdict = IdentityVerdict(
+                pid: pid, cmdline: storedCmdline, startEpoch: startEpoch, alive: matches)
+            return matches
+        case .absent:
+            identityVerdict = nil
+            return false
+        case .unknown:
+            // A stalled probe proves nothing: keep the last proven verdict for
+            // this exact generation (so a slow `ps` cannot flip a live recorder
+            // to Stopped and invite a second Start). With no prior proof the
+            // refresh fails closed.
+            if let prior = identityVerdict, prior.sameGeneration(as: generation) {
+                return prior.alive
+            }
+            return false
+        }
     }
+
+    private struct IdentityVerdict {
+        let pid: Int32
+        let cmdline: String
+        let startEpoch: Double
+        let alive: Bool
+        func sameGeneration(as other: IdentityVerdict) -> Bool {
+            pid == other.pid && cmdline == other.cmdline && startEpoch == other.startEpoch
+        }
+    }
+    private var identityVerdict: IdentityVerdict?
 
     private func setControlAuthority(_ authority: ControlAuthority?) {
         if controlAuthority != authority { clearTelemetry() }

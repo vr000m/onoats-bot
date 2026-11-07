@@ -64,13 +64,26 @@ struct ProcessArguments {
 
 /// All process, signal, file, clock and polling effects used by the model.
 @MainActor
+/// Outcome of one bounded process-identity probe. A timeout, overflow or launch
+/// failure is `unknown`, never `absent`: a slow `ps` says nothing about whether
+/// the recorder is alive, so callers keep their last proven verdict instead of
+/// reading it as "dead".
+enum CommandLineProbe: Equatable {
+    /// The process exists and this is its full command line.
+    case command(String)
+    /// `ps` proved no such process (exit 1, no output).
+    case absent
+    /// The probe did not prove either; the caller must not infer liveness.
+    case unknown
+}
+
 protocol SystemOps: AnyObject {
     func spawn(
         _ request: ProcessRequest,
         onExit: @escaping @MainActor (ProcessHandle) -> Void
     ) throws -> ProcessHandle
     func processIsAlive(_ pid: Int32) -> Bool
-    func commandLine(_ pid: Int32) -> String?
+    func commandLine(_ pid: Int32) -> CommandLineProbe
     /// Every read is bounded and no-follow; there is deliberately no unbounded
     /// read requirement, so a conformer cannot silently regress to one.
     func readData(at url: URL, maxBytes: Int) -> Data?
@@ -249,14 +262,15 @@ final class NativeSystemOps: SystemOps {
     func processIsAlive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
 
     /// Upper bound on the main-actor wait for one `ps` identity probe. A stalled
-    /// `ps` yields `nil` (identity unproven, so this refresh fails closed) instead
-    /// of freezing the menu bar; the next lifecycle refresh probes again.
+    /// `ps` is killed and yields `.unknown` (identity unproven: the model keeps
+    /// its last proven verdict for that generation) instead of freezing the
+    /// menu bar; the next lifecycle refresh probes again.
     var commandLineTimeout: TimeInterval = 1.0
     /// Test seam: the identity probe executable (production: `/bin/ps`).
     var commandLineExecutable = URL(fileURLWithPath: "/bin/ps")
     static let commandLineMaxBytes = 64 * 1024
 
-    func commandLine(_ pid: Int32) -> String? {
+    func commandLine(_ pid: Int32) -> CommandLineProbe {
         let process = Process()
         process.executableURL = commandLineExecutable
         process.arguments = ["-p", "\(pid)", "-o", "command="]
@@ -265,21 +279,36 @@ final class NativeSystemOps: SystemOps {
         process.standardError = FileHandle.nullDevice
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
-        do { try process.run() } catch { return nil }
+        do { try process.run() } catch { return .unknown }
         // Drain off the main actor so a full pipe can never stall `ps`, and so
         // neither the read nor the exit wait is unbounded on the main actor.
         let output = BoundedPipeDrain(
             pipe.fileHandleForReading, maxBytes: Self.commandLineMaxBytes)
         let deadline = DispatchTime.now() + commandLineTimeout
-        guard exited.wait(timeout: deadline) == .success,
-              let data = output.wait(until: deadline) else {
-            process.terminate()
-            return nil
+        let exitedInTime = exited.wait(timeout: deadline) == .success
+        if !exitedInTime { stopStalledProbe(process, exited: exited) }
+        guard exitedInTime, let data = output.wait(until: deadline) else {
+            return .unknown
         }
-        guard process.terminationStatus == 0 else { return nil }
         let value = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return value?.isEmpty == false ? value : nil
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch process.terminationStatus {
+        case 0:
+            return value.isEmpty ? .unknown : .command(value)
+        case 1 where value.isEmpty:
+            return .absent
+        default:
+            return .unknown
+        }
+    }
+
+    /// Terminate, then kill, then reap a probe that missed its deadline, each
+    /// step bounded: a `ps` that ignores SIGTERM must not outlive the probe.
+    private func stopStalledProbe(_ process: Process, exited: DispatchSemaphore) {
+        process.terminate()
+        if exited.wait(timeout: .now() + 0.2) == .success { return }
+        kill(process.processIdentifier, SIGKILL)
+        _ = exited.wait(timeout: .now() + 0.5)
     }
 
     private func openRegularFile(at url: URL) -> FileHandle? {
