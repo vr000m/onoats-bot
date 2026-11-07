@@ -205,6 +205,8 @@ def _replace_verified(
     failure (any BaseException) +         candidate    True, SwapBackError
       swap-back fails or is interrupted
     fresh install, failure + withdraw ok  none         False, re-raised
+      (incl. an interrupt right after the rename: published iff the
+       candidate is gone)
     fresh install, failure + withdraw     none         False, WithdrawError
       fails                                            (unverified app live)
     ====================================  ===========  ====================
@@ -218,12 +220,20 @@ def _replace_verified(
     if installed.is_symlink():
         raise InstallError(f"refusing symlink install destination: {installed}")
     if not installed.exists():
-        os.rename(candidate, installed)
         try:
+            os.rename(candidate, installed)
             verify(installed)
             if commit is not None:
                 commit()
         except BaseException as failure:
+            # The rename sits INSIDE the try: an interrupt that lands after the
+            # rename completed must still withdraw the unverified app. Whether
+            # it was published is read from the filesystem, not the exception:
+            # the candidate is gone only if the rename ran. A rename that never
+            # happened leaves the candidate in place, and ``installed`` may then
+            # be someone else's app, which must never be moved.
+            if os.path.lexists(candidate):
+                raise
             try:
                 os.rename(installed, candidate)
             except BaseException as restore_error:

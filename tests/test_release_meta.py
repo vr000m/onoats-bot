@@ -2496,6 +2496,56 @@ def test_failed_withdrawal_of_a_fresh_install_names_the_live_unverified_app(
     assert installed.exists()
 
 
+def test_interrupt_right_after_a_fresh_install_rename_withdraws_the_unverified_app(
+    tmp_path, monkeypatch
+):
+    """The rename completed, then the process was interrupted: nothing was verified."""
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "identity").write_text("new", encoding="utf-8")
+    real_rename = os.rename
+
+    def rename(source, destination):
+        real_rename(source, destination)
+        if Path(source) == candidate:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(INSTALL_STAGED.os, "rename", rename)
+    verified: list[Path] = []
+    with pytest.raises(KeyboardInterrupt):
+        INSTALL_STAGED._replace_verified(
+            candidate, installed, verified.append, None, INSTALL_STAGED.SwapState()
+        )
+    assert not installed.exists(), "an unverified app must not stay published"
+    assert (candidate / "identity").read_text(encoding="utf-8") == "new"
+    assert verified == []
+
+
+def test_failed_fresh_install_rename_never_moves_a_concurrent_apps_tree(
+    tmp_path, monkeypatch
+):
+    """A rename that never ran leaves the candidate in place; ``installed`` is not ours."""
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+
+    def rename(source, destination):
+        # Another process published its own app between the exists() check and
+        # our rename, which then failed.
+        installed.mkdir()
+        (installed / "identity").write_text("someone-else", encoding="utf-8")
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(INSTALL_STAGED.os, "rename", rename)
+    with pytest.raises(OSError, match="injected rename failure"):
+        INSTALL_STAGED._replace_verified(
+            candidate, installed, lambda _p: None, None, INSTALL_STAGED.SwapState()
+        )
+    assert (installed / "identity").read_text(encoding="utf-8") == "someone-else"
+    assert candidate.exists()
+
+
 @pytest.mark.parametrize("phase", ["exchange-refused", "swap-back-ok", "committed"])
 def test_swap_state_clears_the_only_copy_flag_on_every_safe_outcome(
     tmp_path, monkeypatch, phase
