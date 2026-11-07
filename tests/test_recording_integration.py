@@ -777,10 +777,10 @@ def test_recording_identity_timeout_recovers_verified_cleanup_targets(
 
 
 @pytest.mark.parametrize("failure", ["open-timeout", "open-interrupt", "launch-wait"])
-def test_installed_smoke_cleans_an_app_launched_before_its_pid_was_recorded(
-    tmp_path, monkeypatch, failure
+def test_installed_smoke_reports_but_never_signals_an_app_it_did_not_capture(
+    tmp_path, monkeypatch, capsys, failure
 ):
-    """``open`` launched the app, then timed out: cleanup must still find and stop it."""
+    """``open`` timed out before a pid was captured: a process found afterwards is unproven."""
     app = tmp_path / "Onoats.app"
     executable = app / "Contents/MacOS/Onoats"
     executable.parent.mkdir(parents=True)
@@ -844,8 +844,11 @@ def test_installed_smoke_cleans_an_app_launched_before_its_pid_was_recorded(
             )
         )
     assert len(cleaned) == 1
-    identity = cleaned[0]["app_identity"]
-    assert identity is not None and identity.pid == 1234
+    assert cleaned[0]["app_identity"] is None, (
+        "an uncaptured process must not be signalled"
+    )
+    err = capsys.readouterr().err
+    assert "pid 1234" in err and "NOT signalled" in err
 
 
 @pytest.mark.parametrize("failure_site", ["group-capture", "recorder-discovery"])

@@ -1130,6 +1130,7 @@ def run(args: argparse.Namespace) -> None:
     telemetry_path = data_dir / ACTIVE_DIRNAME / UI_TELEMETRY_FILENAME
     app_pid: int | None = None
     app_identity: ProcessIdentity | None = None
+    unproven_app_pid: int | None = None
     recorder: RecorderIdentity | None = None
     groups: tuple[OwnedProcessGroup, ...] = ()
     primary_error: BaseException | None = None
@@ -1253,11 +1254,12 @@ def run(args: argparse.Namespace) -> None:
         try:
             # ``open`` may have launched the app and then timed out or been
             # interrupted, or the launch wait may have expired: no pid was
-            # recorded, yet the app can be live. The preflight proved no Onoats
-            # ran before this launch, so the one process at this executable
-            # path is ours. Rediscover it so cleanup can still stop it.
+            # captured, yet the app can be live. A process found now is NOT
+            # proven to be ours (a login item or the user can launch the same
+            # app after the preflight), and only identities this run captured
+            # itself may be signalled. Report it loudly instead.
             if app_pid is None:
-                app_pid = _one_app_pid(app)
+                unproven_app_pid = _one_app_pid(app)
             if app_identity is None and app_pid is not None:
                 app_identity = _capture_process_identity(app_pid)
         except BaseException as cleanup_error:
@@ -1290,6 +1292,14 @@ def run(args: argparse.Namespace) -> None:
             )
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
+        if unproven_app_pid is not None:
+            cleanup_errors.append(
+                SmokeFailure(
+                    f"an Onoats process (pid {unproven_app_pid}) is running that "
+                    "this smoke run could not prove it launched; it was NOT "
+                    "signalled. Quit it manually before re-running the smoke"
+                )
+            )
         if cleanup_errors:
             print(
                 "installed recording smoke cleanup failed: "
