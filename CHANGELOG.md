@@ -36,6 +36,10 @@ Annotated tags exist from `v0.9.0` forward.
   archive; `make -C native verify-resources` checks the bundle resource
   allowlist. `native/installed_recording_smoke.py` is the interactive proof
   that produces the receipt. See [native/README.md](native/README.md).
+  Release-identity, smoke-receipt and rollback-approval records are written
+  privately (`0600`) and atomically and never follow a symlinked target;
+  every installer child process is time-bounded, and a failed post-install
+  verification always restores (or loudly retains) the previous app.
 - STT self-healing (`[stt].launchd_label`) now bootstraps an unloaded job from
   the matching `~/Library/LaunchAgents/<label>.plist` after validating it
   (regular user-owned file, safe permissions, exact `Label`,
@@ -55,8 +59,9 @@ Annotated tags exist from `v0.9.0` forward.
   socket past macOS's 103-byte Unix-socket limit, and Start fails with
   "configure a shorter ONOATS_DATA_DIR".
 - One lifecycle controller orders every Flush, Stop, signal and terminal
-  rotation: a Stop admitted first rejects later Flushes; a Flush admitted
-  first completes before Stop.
+  rotation: a Stop admitted first — or a termination signal already
+  received — rejects later Flushes; a Flush admitted first completes before
+  Stop.
 - Each Start captures one immutable session configuration used by both STT
   branches, status, telemetry, diarization and shutdown diagnostics; config
   edits apply at the next Start.

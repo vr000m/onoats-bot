@@ -221,6 +221,9 @@ internals behind that surface:
     --output /tmp/onoats-release-identity.json
   ```
 
+  `--output` is written privately (mode `0600`) and atomically, and the write
+  refuses a symlinked or non-regular target instead of following it.
+
   Pass that same immutable record to smoke. It contains the canonical bundle
   identifier, designated requirement, cdhash, tree hash, main-executable hash,
   canonical CLI path, CLI entrypoint hash, interpreter path/hash, and clean CLI
