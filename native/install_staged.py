@@ -29,6 +29,7 @@ from release_identity import (
     read_smoke_receipt as _read_smoke_receipt,
     release_identity,
     release_identity_digest,
+    write_release_identity,
     write_smoke_receipt,
 )
 
@@ -551,7 +552,7 @@ def rollback(args: argparse.Namespace) -> None:
     archive = Path(fields["archive"])
     install_dir.mkdir(parents=True, exist_ok=True)
     installed = install_dir / args.app_name
-    bundle_id = getattr(args, "bundle_id", "net.varunsingh.onoats")
+    bundle_id = getattr(args, "bundle_id", BUNDLE_ID)
     _verify_single_registration(installed, bundle_id)
     parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
     candidate = parent / "candidate"
@@ -696,7 +697,7 @@ def main() -> int:
             identity = release_identity(
                 Path(args.app), cli_git_identity=args.cli_git_identity
             )
-            Path(args.output).write_text(identity.to_json() + "\n")
+            write_release_identity(Path(args.output), identity)
         elif args.command == "env-identity":
             print(
                 app_identity(

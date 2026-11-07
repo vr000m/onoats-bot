@@ -2230,3 +2230,48 @@ def test_release_check_header_documents_contract_weights_waiver():
     header = script.split("set -euo pipefail", 1)[0]
     assert "HF cache" in header
     assert "hf download mlx-community/Nemotron-3-Diarization" in header
+
+
+def _sample_identity():
+    return RELEASE_IDENTITY.ReleaseIdentity(
+        RELEASE_IDENTITY.BUNDLE_ID,
+        "identifier net.varunsingh.onoats",
+        "a" * 40,
+        "b" * 64,
+        "c" * 64,
+        "/opt/onoats/bin/onoats",
+        "e" * 64,
+        "/opt/python",
+        "f" * 64,
+        "d" * 40,
+    )
+
+
+def test_release_identity_output_is_private_and_atomic(tmp_path):
+    out = tmp_path / "release-identity.json"
+    RELEASE_IDENTITY.write_release_identity(out, _sample_identity())
+    assert (out.stat().st_mode & 0o777) == 0o600
+    assert RELEASE_IDENTITY.read_release_identity(out) == _sample_identity()
+
+
+def test_release_identity_output_never_follows_a_planted_symlink(tmp_path):
+    """Round 7: the documented /tmp output path is predictable."""
+    victim = tmp_path / "victim"
+    victim.write_text("precious", encoding="utf-8")
+    out = tmp_path / "release-identity.json"
+    out.symlink_to(victim)
+    with pytest.raises(RELEASE_IDENTITY.InstallError):
+        RELEASE_IDENTITY.write_release_identity(out, _sample_identity())
+    assert victim.read_text(encoding="utf-8") == "precious"
+    assert out.is_symlink()
+
+
+def test_release_identity_cli_writes_through_the_private_writer():
+    source = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert "write_release_identity(Path(args.output), identity)" in source
+    assert ".write_text(identity.to_json()" not in source
+
+
+def test_rollback_default_bundle_id_is_the_release_identity_owner():
+    source = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert '"net.varunsingh.onoats")' not in source

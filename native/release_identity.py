@@ -110,7 +110,7 @@ def release_identity_digest(identity: ReleaseIdentity) -> str:
 def _atomic_write_private(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise InstallError("smoke receipt output must be a regular non-symlink file")
+        raise InstallError("output must be a regular non-symlink file")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", dir=path.parent
     )
@@ -123,7 +123,7 @@ def _atomic_write_private(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise InstallError("smoke receipt output changed before publication")
+            raise InstallError("output changed before publication")
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -134,6 +134,11 @@ def _atomic_write_private(path: Path, payload: bytes) -> None:
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+
+
+def write_release_identity(path: Path, identity: ReleaseIdentity) -> None:
+    """Publish the identity privately and atomically; never follow a symlink."""
+    _atomic_write_private(path, (identity.to_json() + "\n").encode("utf-8"))
 
 
 def invalidate_smoke_receipt(path: Path) -> None:
