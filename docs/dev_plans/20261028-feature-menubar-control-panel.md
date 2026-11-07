@@ -1361,6 +1361,75 @@ as a contract instead of patched per finding.
   completed retains a stale unverified tree; the message tells the operator to
   inspect both trees.
 
+### Gauntlet design deltas (rounds 1-7, recorded 2026-11-07)
+
+Fixer-reported design decisions that the gauntlet could not attribute to a plan
+section, so they were held in `.gauntlet/design-deltas-*.md`. Each was checked
+against the code on 2026-11-07 and is recorded here as part of the design.
+
+- **Supervisor teardown defers a cancellation inside the authoritative
+  `finally`** (`cli.py`). Each awaited step (`_stop_capturer`, stderr-reader
+  retirement) runs to completion through `CancellationLedger.run_to_completion`;
+  the cancellation is remembered and re-raised only when the body ended cleanly
+  (no exception, rc 0, not already startup-cancelled). Cells changed: only
+  signal-in-teardown for rc0/rc1/start-failure, which previously skipped steps
+  and masked the rc as 0.
+- **`CancellationLedger.run_to_completion`** (`_closing.py`) is the single shielded
+  step runner and replaces `cli._run_teardown_step`'s hand-rolled loop. Only
+  `step.cancelled()` propagates as the step's own cancellation; a caller
+  cancellation landing in the turn the step finishes is remembered and the
+  result (or the step's exception) is kept.
+- **Cleanup descendant refresh is gated on the captured recorder generation**
+  (`installed_recording_smoke._refresh_owned_descendant_groups`). It returns
+  nothing when the captured recorder identity is not live before or after the
+  snapshot and raises only when that live generation's ancestry changed, so the
+  normal post-Stop state no longer fails the smoke. The earlier in-try snapshot
+  stays strict.
+- **App evidence is bound to the launched kernel generation**
+  (`_recording_identity` takes `app_identity`, not `app_pid`; the dynamic code
+  check reads the app's birth tuple before and after). A recycled app pid is now
+  a `SmokeFailure`, not accepted evidence.
+- **Pid and control-socket quarantine twins** (`_vendor/pid.py`,
+  `control_socket.py`). An unprovable held-descriptor identity (`fstat` raising)
+  is treated as not proven and the entry is restored, matching `control_socket`.
+  Two implementations stay on purpose: `pid.py` is vendored (stdlib plus loguru
+  only) and `control_socket` is an import-free leaf that receives its no-replace
+  rename by injection, so neither may import a shared helper. One whole-state-space
+  parity test pins them. Documented allowed difference: a mismatch restore leaves
+  an extra quarantine hard link for pid and none for control; neither deletes.
+
+Two further entries in that file were malformed (`(invalid)`) and carry no
+decision.
+
+### Gauntlet round 8 follow-ups (2026-11-07)
+
+Three more rounds of Codex review kept finding narrower cases in the installer
+and process boundary. Each was fixed at the contract level:
+
+- A fresh install's `os.rename` sits inside the `try`; whether the unverified app
+  was published is read from the filesystem (the candidate is gone), never from
+  the exception, so a rename that never ran cannot move a concurrent app.
+- `run_bounded` decodes output only after `communicate` returns, because
+  `communicate(text=True)` can reap the leader and then raise. The group kill
+  covers every failure while the leader is unreaped; helpers a leader detached
+  and left behind after a normal exit are outside the contract (a reaped pgid can
+  be recycled).
+- The CLI shim target is read through `release_identity.read_interpreter_line`
+  (non-blocking, regular file only, bounded), so a FIFO swapped in fails closed.
+- A rollback record larger than the read prefix counts as possibly naming the
+  archive. `_record_line` is the one owner of the record's line format.
+- The installed smoke signals only identities it captured itself. A process found
+  after a failed or timed-out `open` is reported, not signalled.
+- `launchctl bootstrap` cannot consume `/dev/fd/N` (launchd opens the path in its
+  own process; rc 5, verified live), so a private `0400` snapshot in a `0700`
+  directory is used instead.
+- `stamp_supervisor_failure(not_before=...)` takes a floor minted before the
+  Start's first status write, so the prompt-pending waiting record still counts as
+  this Start's while an older record is never rewritten.
+- `config.toml` reads are bounded and non-blocking, a failed read is never
+  treated as an empty file by the writer, and a symlinked config is written
+  through.
+
 ## Final Results
 
 ### Summary
