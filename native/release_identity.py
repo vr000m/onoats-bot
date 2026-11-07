@@ -63,21 +63,40 @@ def run_bounded(argv, **kwargs) -> subprocess.CompletedProcess[str]:
     ``git`` subprocesses) cannot outlive the failure.  A timeout is an
     ``InstallError``.  Children are session leaders: a terminal Ctrl+C no longer
     reaches them directly, which is why the interrupt path kills the group.
+
+    Scope of the group kill: it covers every failure while the leader is still
+    unreaped (timeout, interrupt, a broken pipe). Once the leader has exited and
+    been reaped its pid, and so the pgid, may be recycled, so nothing is
+    signalled; helpers a leader deliberately detached from its stdio and left
+    behind after a normal exit are outside this contract. Output is therefore
+    decoded only after ``communicate`` returns, so a decode error can never be
+    the exception that arrives with an unkillable group.
     """
     limit = kwargs.pop("timeout", None)
     limit = COMMAND_TIMEOUT_SECONDS if limit is None else limit
     if kwargs.pop("capture_output", False):
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
+    # Text decoding must NOT happen inside ``communicate``: with ``text=True`` it
+    # can reap the leader and then raise ``UnicodeDecodeError``, an exception
+    # that would arrive after the group became unkillable (the leader's pid, and
+    # so the pgid, may be recycled once reaped). Communicate in bytes and decode
+    # only after the group has been settled.
+    text = bool(kwargs.pop("text", False) or kwargs.pop("universal_newlines", False))
+    encoding = kwargs.pop("encoding", None)
+    errors = kwargs.pop("errors", None)
+    decode = text or encoding is not None or errors is not None
     stdin_data = kwargs.pop("input", None)
     if stdin_data is not None:
         # ``communicate(input=...)`` writes nothing unless stdin is a pipe.
         kwargs["stdin"] = subprocess.PIPE
+        if isinstance(stdin_data, str):
+            stdin_data = stdin_data.encode(encoding or "utf-8", errors or "strict")
     check = kwargs.pop("check", False)
     kwargs["start_new_session"] = True
     with subprocess.Popen(argv, **kwargs) as process:
         try:
-            stdout, stderr = process.communicate(stdin_data, timeout=limit)
+            raw_stdout, raw_stderr = process.communicate(stdin_data, timeout=limit)
         except BaseException as failure:
             _kill_group(process)
             if isinstance(failure, subprocess.TimeoutExpired):
@@ -85,9 +104,17 @@ def run_bounded(argv, **kwargs) -> subprocess.CompletedProcess[str]:
                     f"command timed out after {limit:g}s ({' '.join(map(str, argv))})"
                 ) from failure
             raise
-        result = subprocess.CompletedProcess(
-            process.args, process.returncode, stdout, stderr
-        )
+        returncode = process.returncode
+
+    def decoded(value):
+        if value is None or not decode:
+            return value
+        value = value.decode(encoding or "utf-8", errors or "strict")
+        return value.replace("\r\n", "\n").replace("\r", "\n") if text else value
+
+    result = subprocess.CompletedProcess(
+        process.args, returncode, decoded(raw_stdout), decoded(raw_stderr)
+    )
     if check:
         result.check_returncode()
     return result
@@ -269,6 +296,32 @@ def preserve_final_component(path: Path) -> Path:
     return expanded.parent.resolve() / expanded.name
 
 
+_SHEBANG_MAX_BYTES = 4096
+
+
+def read_interpreter_line(path: Path) -> bytes:
+    """First line of a CLI shim target, read without ever blocking or following.
+
+    The target lives in the user's checkout, so it can be swapped for a FIFO
+    between resolution and read; a plain ``read_bytes()`` would then hang the
+    installer or smoke. Open non-blocking, require a regular file, read a
+    bounded prefix, and fail closed otherwise.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise InstallError(f"CLI shim target is not a regular file: {path}")
+        head = os.read(descriptor, _SHEBANG_MAX_BYTES)
+    finally:
+        os.close(descriptor)
+    lines = head.splitlines()
+    if not lines:
+        raise InstallError(f"CLI shim target is empty: {path}")
+    return lines[0]
+
+
 def _sha256_file(path: Path) -> str:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -324,7 +377,7 @@ def observed_cli_authority(
         if not shim.is_symlink():
             raise InstallError("CLI shim is not the stable ~/.local/bin/onoats link")
         target = shim.resolve(strict=True)
-        first_line = target.read_bytes().splitlines()[0]
+        first_line = read_interpreter_line(target)
         if not first_line.startswith(b"#!"):
             raise InstallError("CLI shim target has no interpreter authority")
         interpreter = Path(os.fsdecode(first_line[2:])).resolve(strict=True)
@@ -398,7 +451,7 @@ def verify_cli_authority(identity: ReleaseIdentity, effective_path: Path) -> Pat
         raise InstallError("effective app CLI is not the approved stable symlink")
     try:
         target = selected.resolve(strict=True)
-        first_line = target.read_bytes().splitlines()[0]
+        first_line = read_interpreter_line(target)
         if not first_line.startswith(b"#!"):
             raise InstallError("effective app CLI has no interpreter authority")
         interpreter = Path(os.fsdecode(first_line[2:])).resolve(strict=True)

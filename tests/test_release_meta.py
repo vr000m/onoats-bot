@@ -2786,3 +2786,67 @@ def test_run_bounded_delivers_input_to_the_child():
         ["/bin/cat"], input="payload", capture_output=True, text=True, check=True
     )
     assert result.stdout == "payload"
+
+
+def test_run_bounded_text_mode_matches_subprocess_run_and_decodes_after_the_wait():
+    """Decoding moved out of ``communicate``: same results, decode errors surface after."""
+    script = "import sys; sys.stdout.write('a\\r\\nb\\rc'); sys.stdout.flush()"
+    expected = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    actual = RELEASE_IDENTITY.run_bounded(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    assert actual.stdout == expected.stdout == "a\nb\nc"
+    assert actual.returncode == 0
+
+    invalid = "import sys; sys.stdout.buffer.write(b'\\xff\\xfe'); sys.stdout.flush()"
+    with pytest.raises(UnicodeDecodeError):
+        RELEASE_IDENTITY.run_bounded(
+            [sys.executable, "-c", invalid], capture_output=True, text=True
+        )
+    replaced = RELEASE_IDENTITY.run_bounded(
+        [sys.executable, "-c", invalid],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert replaced.stdout == "��"
+    raw = RELEASE_IDENTITY.run_bounded(
+        [sys.executable, "-c", invalid], capture_output=True
+    )
+    assert raw.stdout == b"\xff\xfe"
+
+
+@pytest.mark.parametrize("kind", ["regular", "fifo", "empty", "symlink"])
+def test_cli_shim_target_read_is_bounded_and_never_blocks(tmp_path, kind):
+    """A shim target swapped for a FIFO must fail closed, not hang the installer."""
+    target = tmp_path / "onoats"
+    if kind == "regular":
+        target.write_bytes(b"#!/usr/bin/python3\nprint('x')\n")
+    elif kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "empty":
+        target.write_bytes(b"")
+    else:
+        real = tmp_path / "real"
+        real.write_bytes(b"#!/usr/bin/python3\n")
+        target.symlink_to(real)
+    if kind == "regular":
+        assert RELEASE_IDENTITY.read_interpreter_line(target) == b"#!/usr/bin/python3"
+        return
+    expected = OSError if kind == "symlink" else RELEASE_IDENTITY.InstallError
+    with pytest.raises(expected):
+        RELEASE_IDENTITY.read_interpreter_line(target)
+
+
+def test_oversized_rollback_record_counts_as_possibly_naming_the_archive(tmp_path):
+    """Only a prefix is read; an archive line beyond it must not read as absent."""
+    archive = tmp_path / "Onoats-test.zip"
+    record = tmp_path / "approved-rollback.txt"
+    padding = "x" * (INSTALL_STAGED.ROLLBACK_RECORD_MAX_BYTES + 10)
+    record.write_text(
+        f"filler={padding}\n{INSTALL_STAGED._record_line('archive', str(archive))}",
+        encoding="utf-8",
+    )
+    assert INSTALL_STAGED._record_names_archive(record, archive) is True

@@ -433,6 +433,10 @@ def _record_names_archive(record: Path, archive: Path) -> bool:
         return True
     finally:
         os.close(descriptor)
+    if len(raw) > ROLLBACK_RECORD_MAX_BYTES:
+        # Only a prefix was read: the archive line may lie beyond it, so the
+        # record cannot be proven not to name the archive.
+        return True
     return _record_line("archive", str(archive)).encode() in raw
 
 
