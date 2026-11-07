@@ -1965,3 +1965,12 @@ def test_pid_value_validation_is_shared_by_all_authority_callers(
     else:
         assert target.record is None
         assert probed == []
+
+
+def test_session_config_repr_never_contains_secrets() -> None:
+    import dataclasses
+
+    from onoats.runtime import RecorderSessionConfig
+
+    hidden = {f.name for f in dataclasses.fields(RecorderSessionConfig) if not f.repr}
+    assert {"secrets", "stt_endpoint"} <= hidden

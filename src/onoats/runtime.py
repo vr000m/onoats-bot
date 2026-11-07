@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
@@ -89,12 +89,12 @@ class RecorderSessionConfig:
     stt_service: str
     stt_model: str
     stt_language: str
-    stt_endpoint: Mapping[str, object]
+    stt_endpoint: Mapping[str, object] = field(repr=False)
     stt_launchd_label: str | None
     diarization: bool
     diarization_idle_remint_sec: float | None
     display_label: str
-    secrets: Mapping[str, str]
+    secrets: Mapping[str, str] = field(repr=False)
 
     @classmethod
     def capture(cls, config: OnoatsConfig | None = None) -> RecorderSessionConfig:
