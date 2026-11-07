@@ -2764,7 +2764,8 @@ def test_record_names_archive_state_space_never_blocks_or_follows(tmp_path, kind
     record = tmp_path / "approved-rollback.txt"
     expected = True
     if kind == "names":
-        record.write_text(f"archive={archive}\nhash=h\n", encoding="utf-8")
+        fields = {key: "x" for key in ("hash", "tree_hash", "dr_hash", "cdhash")}
+        INSTALL_STAGED._write_record(record, {"archive": str(archive), **fields})
     elif kind == "other":
         record.write_text("archive=/elsewhere/Onoats-x.zip\nhash=h\n", encoding="utf-8")
         expected = False

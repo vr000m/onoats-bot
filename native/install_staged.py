@@ -389,10 +389,19 @@ def _clear_verified_staged_registration(
         raise InstallError("staged LaunchServices registration could not be removed")
 
 
+def _record_line(key: str, value: str) -> str:
+    """The one place the approval record's ``key=value`` line format is defined.
+
+    ``_write_record`` emits it and ``_record_names_archive`` matches it, so the
+    two cannot drift: a format change here changes both.
+    """
+    return f"{key}={value}\n"
+
+
 def _write_record(record: Path, fields: dict[str, str]) -> None:
     """Publish the approval record through the one private atomic writer."""
     payload = "".join(
-        f"{key}={fields[key]}\n"
+        _record_line(key, fields[key])
         for key in ("archive", "hash", "tree_hash", "dr_hash", "cdhash")
     )
     _atomic_write_private(record, payload.encode("utf-8"))
@@ -424,7 +433,7 @@ def _record_names_archive(record: Path, archive: Path) -> bool:
         return True
     finally:
         os.close(descriptor)
-    return f"archive={archive}\n".encode() in raw
+    return _record_line("archive", str(archive)).encode() in raw
 
 
 def _read_record(record: Path, backup_dir: Path) -> dict[str, str]:
