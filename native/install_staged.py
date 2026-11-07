@@ -148,8 +148,26 @@ def _exchange(left: Path, right: Path) -> None:
         raise InstallError(f"atomic bundle exchange failed: {os.strerror(error)}")
 
 
+class SwapBackError(InstallError):
+    """Restoring the pre-install tree failed; the caller must retain ``retained``.
+
+    After the first exchange ``candidate`` holds the previous app.  If the
+    swap-back fails that tree exists nowhere else, so the caller's temporary
+    cleanup must not delete it.
+    """
+
+    def __init__(self, message: str, retained: Path) -> None:
+        super().__init__(message)
+        self.retained = retained
+
+
 def _replace_verified(candidate: Path, installed: Path, verify, commit=None) -> None:
-    """Publish candidate and restore the old app unless verification and commit pass."""
+    """Publish candidate and restore the old app unless verification and commit pass.
+
+    Any failure between publication and commit — including a timeout or an
+    interrupt (``BaseException``) — swaps the previous state back.  If that
+    swap-back itself fails, ``SwapBackError`` names the retained previous tree.
+    """
     if installed.is_symlink():
         raise InstallError(f"refusing symlink install destination: {installed}")
     if not installed.exists():
@@ -158,8 +176,15 @@ def _replace_verified(candidate: Path, installed: Path, verify, commit=None) -> 
             verify(installed)
             if commit is not None:
                 commit()
-        except Exception:
-            os.rename(installed, candidate)
+        except BaseException as failure:
+            try:
+                os.rename(installed, candidate)
+            except Exception as restore_error:
+                raise SwapBackError(
+                    f"unverified app is still published at {installed} and could "
+                    f"not be withdrawn ({restore_error}); remove it manually",
+                    candidate,
+                ) from failure
             raise
         return
     _exchange(candidate, installed)
@@ -167,8 +192,16 @@ def _replace_verified(candidate: Path, installed: Path, verify, commit=None) -> 
         verify(installed)
         if commit is not None:
             commit()
-    except Exception:
-        _exchange(candidate, installed)
+    except BaseException as failure:
+        try:
+            _exchange(candidate, installed)
+        except Exception as restore_error:
+            raise SwapBackError(
+                f"could not restore the previous app ({restore_error}); it is "
+                f"retained at {candidate} and the unverified app is at "
+                f"{installed} — move the retained tree back manually",
+                candidate,
+            ) from failure
         raise
     try:
         _remove_path(candidate)
@@ -463,6 +496,7 @@ def install(args: argparse.Namespace) -> None:
     parent, candidate = _copy_snapshot(staged, install_dir, staged.name)
     archive: Path | None = None
     committed = False
+    retain_parent = False
     try:
         candidate_identity, candidate_dr, _candidate_cdhash = _verify_app(
             candidate, expected_identity=expected
@@ -518,10 +552,22 @@ def install(args: argparse.Namespace) -> None:
                 record.unlink(missing_ok=True)
             committed = True
 
-        _replace_verified(candidate, installed, verify, commit)
+        try:
+            _replace_verified(candidate, installed, verify, commit)
+        except SwapBackError:
+            # The previous app lives only inside ``parent`` (and the baseline
+            # archive, when approved); never clean up the sole copy.
+            retain_parent = True
+            raise
         print(f"✓ installed exact staged app at {installed}")
     finally:
-        if archive is not None:
+        if retain_parent:
+            print(
+                f"✗ retained previous app tree under {parent}"
+                + (f" and baseline archive {archive}" if archive else ""),
+                file=os.sys.stderr,
+            )
+        elif archive is not None:
             try:
                 archive.unlink(missing_ok=True)
             except Exception as exc:
@@ -532,7 +578,8 @@ def install(args: argparse.Namespace) -> None:
                 else:
                     raise
         try:
-            shutil.rmtree(parent)
+            if not retain_parent:
+                shutil.rmtree(parent)
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -556,6 +603,7 @@ def rollback(args: argparse.Namespace) -> None:
     parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
     candidate = parent / "candidate"
     committed = False
+    retain_parent = False
     try:
         archive = _copy_archive_snapshot(archive, parent, fields["hash"])
         _run(DITTO, "-x", "-k", str(archive), str(parent))
@@ -571,19 +619,26 @@ def rollback(args: argparse.Namespace) -> None:
             _verify_single_registration(installed, bundle_id)
             committed = True
 
-        _replace_verified(
-            candidate,
-            installed,
-            lambda path: _verify_app(
-                path,
-                expected_identity=fields["tree_hash"],
-            ),
-            commit,
-        )
+        try:
+            _replace_verified(
+                candidate,
+                installed,
+                lambda path: _verify_app(
+                    path,
+                    expected_identity=fields["tree_hash"],
+                ),
+                commit,
+            )
+        except SwapBackError:
+            retain_parent = True
+            raise
         print(f"✓ restored approved app archive {archive}")
     finally:
+        if retain_parent:
+            print(f"✗ retained previous app tree under {parent}", file=os.sys.stderr)
         try:
-            shutil.rmtree(parent)
+            if not retain_parent:
+                shutil.rmtree(parent)
         except FileNotFoundError:
             pass
         except Exception as exc:

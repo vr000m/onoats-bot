@@ -2332,3 +2332,79 @@ def test_malformed_info_plist_fails_closed_as_install_error(tmp_path, info_plist
         RELEASE_IDENTITY._identity_from_private_snapshot(
             app, cli_authority=("a", "b", "c", "d", "e")
         )
+
+
+def test_interrupted_post_exchange_verification_still_swaps_back(tmp_path, monkeypatch):
+    """KeyboardInterrupt is not an Exception; it must not skip the swap-back."""
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    for path, value in ((installed, "old"), (candidate, "new")):
+        path.mkdir()
+        (path / "identity").write_text(value, encoding="utf-8")
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", _swap_exchange(tmp_path))
+
+    def interrupted(_path: Path) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        INSTALL_STAGED._replace_verified(candidate, installed, interrupted)
+    assert (installed / "identity").read_text(encoding="utf-8") == "old"
+    assert (candidate / "identity").read_text(encoding="utf-8") == "new"
+
+
+def test_failed_swap_back_retains_the_previous_app_tree(tmp_path, monkeypatch):
+    """F2: verify fails, then swap-back fails: the old tree must never be deleted."""
+    staged = tmp_path / "staged" / "Onoats.app"
+    staged.mkdir(parents=True)
+    install_dir = tmp_path / "installed"
+    installed = install_dir / "Onoats.app"
+    installed.mkdir(parents=True)
+    (installed / "identity").write_text("old", encoding="utf-8")
+    parent = install_dir / ".onoats-install-test"
+    candidate = parent / "candidate"
+    candidate.mkdir(parents=True)
+    (candidate / "identity").write_text("new", encoding="utf-8")
+    expected_identity = "1" * 64
+    swap = _swap_exchange(tmp_path)
+    exchanges: list[int] = []
+
+    def exchange(left: Path, right: Path) -> None:
+        exchanges.append(1)
+        if len(exchanges) > 1:
+            raise INSTALL_STAGED.InstallError("injected swap-back failure")
+        swap(left, right)
+
+    verified: list[Path] = []
+
+    def verify_app(path: Path, **_kwargs):
+        verified.append(path)
+        if path == installed:
+            raise INSTALL_STAGED.InstallError("injected post-publish failure")
+        return expected_identity, "2" * 64, "3" * 40
+
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_single_registration", lambda *_: None)
+    monkeypatch.setattr(
+        INSTALL_STAGED, "_copy_snapshot", lambda *_args: (parent, candidate)
+    )
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_app", verify_app)
+    monkeypatch.setattr(INSTALL_STAGED, "_verify_resources", lambda *_args: None)
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", exchange)
+    args = argparse.Namespace(
+        app=str(staged),
+        install_dir=str(install_dir),
+        backup_dir=str(tmp_path / "backups"),
+        record=str(tmp_path / "backups/approved-rollback.txt"),
+        expected_identity=expected_identity,
+        approved=0,
+        baseline_dr_hash="",
+        baseline_cdhash="",
+        bundle_id="net.varunsingh.onoats",
+        makefile_dir=str(tmp_path),
+    )
+    with pytest.raises(INSTALL_STAGED.InstallError, match="retained at"):
+        INSTALL_STAGED.install(args)
+
+    assert len(exchanges) == 2
+    assert (candidate / "identity").read_text(encoding="utf-8") == "old", (
+        "the only copy of the previous app was deleted by temporary cleanup"
+    )
