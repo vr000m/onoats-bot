@@ -2275,3 +2275,60 @@ def test_release_identity_cli_writes_through_the_private_writer():
 def test_rollback_default_bundle_id_is_the_release_identity_owner():
     source = NATIVE_INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert '"net.varunsingh.onoats")' not in source
+
+
+def _swap_exchange(tmp_path: Path):
+    def exchange(left: Path, right: Path) -> None:
+        temporary = tmp_path / "exchange"
+        left.rename(temporary)
+        right.rename(left)
+        temporary.rename(right)
+
+    return exchange
+
+
+def test_installer_child_process_timeout_fails_loud(tmp_path, monkeypatch):
+    """Round 7: every installer child is bounded; a hang is an InstallError."""
+    monkeypatch.setattr(RELEASE_IDENTITY, "COMMAND_TIMEOUT_SECONDS", 0.2, raising=False)
+    with pytest.raises(INSTALL_STAGED.InstallError, match="timed out"):
+        INSTALL_STAGED._run("/bin/sleep", "5")
+    with pytest.raises(INSTALL_STAGED.InstallError, match="timed out"):
+        RELEASE_IDENTITY._run("/bin/sleep", "5")
+
+
+def test_hung_post_exchange_verification_rolls_back(tmp_path, monkeypatch):
+    """A hung verifier must reach the rollback path, not leave the new app live."""
+    monkeypatch.setattr(RELEASE_IDENTITY, "COMMAND_TIMEOUT_SECONDS", 0.2, raising=False)
+    installed = tmp_path / "Onoats.app"
+    candidate = tmp_path / "candidate"
+    for path, value in ((installed, "old"), (candidate, "new")):
+        path.mkdir()
+        (path / "identity").write_text(value, encoding="utf-8")
+    monkeypatch.setattr(INSTALL_STAGED, "_exchange", _swap_exchange(tmp_path))
+    committed: list[bool] = []
+
+    def hung_verify(_path: Path) -> None:
+        INSTALL_STAGED._run("/bin/sleep", "5")
+
+    with pytest.raises(INSTALL_STAGED.InstallError, match="timed out"):
+        INSTALL_STAGED._replace_verified(
+            candidate, installed, hung_verify, lambda: committed.append(True)
+        )
+    assert committed == []
+    assert (installed / "identity").read_text(encoding="utf-8") == "old"
+
+
+@pytest.mark.parametrize(
+    "info_plist",
+    [b"<?xml version='1.0'?><plist><dict><key>CFBundle", b"<plist><array/></plist>"],
+)
+def test_malformed_info_plist_fails_closed_as_install_error(tmp_path, info_plist):
+    """F1: expat/TypeError from plistlib must not escape the identity contract."""
+    app = tmp_path / "Onoats.app"
+    (app / "Contents/MacOS").mkdir(parents=True)
+    (app / "Contents/MacOS/Onoats").write_bytes(b"binary")
+    (app / "Contents/Info.plist").write_bytes(info_plist)
+    with pytest.raises(RELEASE_IDENTITY.InstallError, match="canonical identity"):
+        RELEASE_IDENTITY._identity_from_private_snapshot(
+            app, cli_authority=("a", "b", "c", "d", "e")
+        )

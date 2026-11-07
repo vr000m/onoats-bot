@@ -29,6 +29,7 @@ from release_identity import (
     read_smoke_receipt as _read_smoke_receipt,
     release_identity,
     release_identity_digest,
+    run_bounded,
     write_release_identity,
     write_smoke_receipt,
 )
@@ -71,9 +72,7 @@ def _normalise_private_tree(app: Path) -> None:
         if stat.S_IMODE(info.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
             raise InstallError(f"copied entry is writable beyond owner: {path}")
     if os.uname().sysname == "Darwin":
-        result = subprocess.run(
-            (CHMOD, "-RN", str(app)), capture_output=True, text=True
-        )
+        result = run_bounded((CHMOD, "-RN", str(app)), capture_output=True, text=True)
         if result.returncode:
             raise InstallError(f"could not strip copied ACL metadata: {result.stderr}")
 
@@ -83,7 +82,7 @@ def _run(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+    result = run_bounded(argv, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode:
         detail = (result.stdout + result.stderr).strip()
         raise InstallError(f"command failed ({' '.join(argv)}): {detail}")

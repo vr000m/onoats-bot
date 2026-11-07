@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from typing import Callable, NamedTuple
 from urllib.parse import unquote, urlparse
+from xml.parsers.expat import ExpatError
 
 BUNDLE_ID = "net.varunsingh.onoats"
 CHMOD = "/bin/chmod"
@@ -19,10 +20,30 @@ CODESIGN = "/usr/bin/codesign"
 DITTO = "/usr/bin/ditto"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SMOKE_RECEIPT_VERSION = 1
+# Every installer/identity child process is bounded.  A hung make, codesign,
+# ditto, git or lsregister must fail loud (InstallError) so a published but
+# unverified bundle always reaches the rollback path instead of hanging there.
+COMMAND_TIMEOUT_SECONDS = 300.0
 
 
 class InstallError(RuntimeError):
     """A release identity or receipt contract check failed."""
+
+
+def run_bounded(argv, **kwargs) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run`` with the shared deadline; a timeout is an InstallError.
+
+    On POSIX ``subprocess.run`` kills the child and reaps it before re-raising
+    ``TimeoutExpired``, so no hung child outlives the failure.
+    """
+    limit = kwargs.pop("timeout", None)
+    limit = COMMAND_TIMEOUT_SECONDS if limit is None else limit
+    try:
+        return subprocess.run(argv, timeout=limit, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError(
+            f"command timed out after {limit:g}s ({' '.join(map(str, argv))})"
+        ) from exc
 
 
 class ReleaseIdentity(NamedTuple):
@@ -227,7 +248,7 @@ def observed_cli_authority(
     *,
     checkout: Path | None = None,
     shim: Path | None = None,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = run_bounded,
 ) -> tuple[str, str, str, str, str]:
     """Bind canonical CLI path, entrypoint, interpreter, and clean git HEAD."""
     checkout = (checkout or SCRIPT_DIR.parent).resolve()
@@ -298,6 +319,7 @@ def observed_cli_authority(
         ValueError,
         json.JSONDecodeError,
         subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
     ) as exc:
         raise InstallError(
             "CLI git identity could not be independently verified"
@@ -350,7 +372,7 @@ class SourceExecutableEvidence(NamedTuple):
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, capture_output=True, text=True)
+    result = run_bounded(argv, capture_output=True, text=True)
     if result.returncode:
         detail = (result.stdout + result.stderr).strip()
         raise InstallError(f"command failed ({' '.join(argv)}): {detail}")
@@ -423,7 +445,17 @@ def _identity_from_private_snapshot(
             raise InstallError("snapshot executable changed during identity derivation")
         with info_path.open("rb") as stream:
             bundle_id = plistlib.load(stream)["CFBundleIdentifier"]
-    except (OSError, KeyError, plistlib.InvalidFileException) as exc:
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        ExpatError,
+        plistlib.InvalidFileException,
+    ) as exc:
+        # plistlib surfaces malformed XML as expat's ExpatError, a non-dict
+        # root as TypeError, and bad binary/XML values as ValueError; all are
+        # "no stable canonical identity", never an escaping traceback.
         raise InstallError("staged app has no stable canonical identity") from exc
     if bundle_id != BUNDLE_ID:
         raise InstallError("staged app bundle identifier is not canonical")
@@ -463,7 +495,7 @@ def release_identity(
         raise InstallError("staged app identity source is unavailable") from exc
     with tempfile.TemporaryDirectory(prefix="onoats-release-identity-") as directory:
         snapshot = Path(directory) / "snapshot"
-        result = subprocess.run(
+        result = run_bounded(
             [DITTO, str(app), str(snapshot)], capture_output=True, text=True
         )
         if result.returncode:
