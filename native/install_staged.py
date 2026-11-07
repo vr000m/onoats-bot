@@ -396,13 +396,24 @@ def _record_names_archive(record: Path, archive: Path) -> bool:
     not prove the record is absent; deleting an archive a record still names
     would leave an approval that rollback can never satisfy.
     """
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        with record.open("rb") as stream:
-            raw = stream.read(ROLLBACK_RECORD_MAX_BYTES + 1)
+        descriptor = os.open(record, flags)
     except FileNotFoundError:
         return False
     except OSError:
         return True
+    try:
+        # Anything that is not a plain regular file (FIFO, device, symlink
+        # target) cannot be proven not to name the archive: retain, never read.
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return True
+        raw = os.read(descriptor, ROLLBACK_RECORD_MAX_BYTES + 1)
+    except OSError:
+        return True
+    finally:
+        os.close(descriptor)
     return f"archive={archive}\n".encode() in raw
 
 

@@ -2705,3 +2705,25 @@ def test_command_interrupt_kills_the_whole_process_group(tmp_path, monkeypatch):
             os.kill(helper, 9)
         except ProcessLookupError:
             pass
+
+
+@pytest.mark.parametrize("kind", ["missing", "names", "other", "fifo", "symlink"])
+def test_record_names_archive_state_space_never_blocks_or_follows(tmp_path, kind):
+    """Only a missing record or a regular one naming another archive allows deletion."""
+    archive = tmp_path / "Onoats-test.zip"
+    record = tmp_path / "approved-rollback.txt"
+    expected = True
+    if kind == "names":
+        record.write_text(f"archive={archive}\nhash=h\n", encoding="utf-8")
+    elif kind == "other":
+        record.write_text("archive=/elsewhere/Onoats-x.zip\nhash=h\n", encoding="utf-8")
+        expected = False
+    elif kind == "missing":
+        expected = False
+    elif kind == "fifo":
+        os.mkfifo(record)
+    else:
+        target = tmp_path / "target.txt"
+        target.write_text(f"archive={archive}\n", encoding="utf-8")
+        record.symlink_to(target)
+    assert INSTALL_STAGED._record_names_archive(record, archive) is expected
