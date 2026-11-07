@@ -854,6 +854,29 @@ private func testReservationFailureClearsPriorRunAuthority(_ root: URL) throws {
 }
 
 @MainActor
+private func testNativeCommandLineProbeIsBounded(_ root: URL) throws {
+    // Round 7: the `ps` identity probe runs on every lifecycle refresh on the
+    // main actor; a stalled child must not freeze the menu bar.
+    let ops = NativeSystemOps()
+    try require(ops.commandLine(getpid())?.isEmpty == false,
+                "bounded probe lost the live command line of a real process")
+    let directory = root.appendingPathComponent("command-line-probe")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let stalled = directory.appendingPathComponent("stalled-ps")
+    try Data("#!/bin/sh\nexec /bin/sleep 30\n".utf8).write(to: stalled)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: stalled.path)
+    ops.commandLineExecutable = stalled
+    ops.commandLineTimeout = 0.3
+    let started = Date()
+    let value = ops.commandLine(getpid())
+    let elapsed = Date().timeIntervalSince(started)
+    try require(value == nil, "a stalled probe proved an identity")
+    try require(elapsed < 2.0,
+                "stalled ps probe blocked the main actor for \(elapsed)s")
+}
+
+@MainActor
 private func testNativeBoundedReadStateSpace(_ root: URL) throws {
     let ops = NativeSystemOps()
     let directory = root.appendingPathComponent("bounded-read")
@@ -1295,6 +1318,7 @@ struct RecorderModelHarness {
         try testActiveRunLogSurvivesClockRollback(home)
         try testReservationFailureClearsPriorRunAuthority(home)
         try testNativeBoundedReadStateSpace(home)
+        try testNativeCommandLineProbeIsBounded(home)
         try testStatusRecordsUseTheBoundedAuthorityReader(home)
         try testSchemaDriftClearsOnlyWhenEvidenceDisappears(home)
         try testNativeAppendIsAtomicAcrossSeparateWriters(home)

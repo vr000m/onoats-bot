@@ -173,6 +173,40 @@ private final class DescriptorRunLogSink: RunLogSink {
     }
 }
 
+/// Reads a child's pipe to EOF on a background queue, keeping at most
+/// `maxBytes`; `nil` from `wait(until:)` means EOF missed the deadline or the
+/// output overflowed the bound.
+private final class BoundedPipeDrain: @unchecked Sendable {
+    private let lock = NSLock()
+    private let finished = DispatchSemaphore(value: 0)
+    private var data = Data()
+    private var overflowed = false
+
+    init(_ handle: FileHandle, maxBytes: Int) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            while true {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break }
+                lock.lock()
+                if data.count + chunk.count > maxBytes {
+                    overflowed = true
+                } else {
+                    data.append(chunk)
+                }
+                lock.unlock()
+            }
+            finished.signal()
+        }
+    }
+
+    func wait(until deadline: DispatchTime) -> Data? {
+        guard finished.wait(timeout: deadline) == .success else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return overflowed ? nil : data
+    }
+}
+
 private final class NativePollHandle: PollHandle {
     let timer: Timer
     init(_ timer: Timer) { self.timer = timer }
@@ -214,16 +248,34 @@ final class NativeSystemOps: SystemOps {
 
     func processIsAlive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
 
+    /// Upper bound on the main-actor wait for one `ps` identity probe. A stalled
+    /// `ps` yields `nil` (identity unproven, so this refresh fails closed) instead
+    /// of freezing the menu bar; the next lifecycle refresh probes again.
+    var commandLineTimeout: TimeInterval = 1.0
+    /// Test seam: the identity probe executable (production: `/bin/ps`).
+    var commandLineExecutable = URL(fileURLWithPath: "/bin/ps")
+    static let commandLineMaxBytes = 64 * 1024
+
     func commandLine(_ pid: Int32) -> String? {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.executableURL = commandLineExecutable
         process.arguments = ["-p", "\(pid)", "-o", "command="]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         do { try process.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        // Drain off the main actor so a full pipe can never stall `ps`, and so
+        // neither the read nor the exit wait is unbounded on the main actor.
+        let output = BoundedPipeDrain(
+            pipe.fileHandleForReading, maxBytes: Self.commandLineMaxBytes)
+        let deadline = DispatchTime.now() + commandLineTimeout
+        guard exited.wait(timeout: deadline) == .success,
+              let data = output.wait(until: deadline) else {
+            process.terminate()
+            return nil
+        }
         guard process.terminationStatus == 0 else { return nil }
         let value = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
