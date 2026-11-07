@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import os
 import plistlib
+import stat
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -157,6 +159,7 @@ def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_pa
     calls: list[list[str]] = []
     envs: list[dict[str, str]] = []
     consumed: list[bytes] = []
+    snapshots: list[Path] = []
     expected = plist.read_bytes()
 
     def fake_run(argv, **kwargs):
@@ -168,9 +171,11 @@ def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_pa
             )
         if argv[1] == "bootstrap":
             plist.write_bytes(plistlib.dumps({"Label": "attacker.replacement"}))
-            (fd,) = kwargs["pass_fds"]
-            os.lseek(fd, 0, os.SEEK_SET)
-            consumed.append(os.read(fd, launchd._LAUNCH_AGENT_PLIST_MAX_BYTES + 1))
+            snapshot = Path(argv[3])
+            snapshots.append(snapshot)
+            assert stat.S_IMODE(snapshot.stat().st_mode) == 0o400
+            assert stat.S_IMODE(snapshot.parent.stat().st_mode) == 0o700
+            consumed.append(snapshot.read_bytes())
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
@@ -181,8 +186,13 @@ def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_pa
     assert launchd.kickstart_stt_server(label) is True
     assert calls[0] == ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"]
     assert calls[1][:3] == ["/bin/launchctl", "bootstrap", f"gui/{uid}"]
-    assert calls[1][3].startswith("/dev/fd/")
+    # launchd opens the path in its own process, so a /dev/fd/N argument cannot
+    # work (launchctl rc 5, verified live): it must be a real private file.
+    assert not calls[1][3].startswith("/dev/fd/")
+    assert Path(calls[1][3]) != plist
     assert consumed == [expected]
+    assert len(snapshots) == 1
+    assert not snapshots[0].exists() and not snapshots[0].parent.exists()
     assert all("STT_WS_TOKEN" not in env for env in envs)
 
 

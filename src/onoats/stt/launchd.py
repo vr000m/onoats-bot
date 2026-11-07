@@ -73,6 +73,7 @@ launchd's GUI-domain model, not something this module can fix.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import plistlib
 import pwd
@@ -80,7 +81,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -246,53 +247,39 @@ def _validated_launch_agent_bytes(label: str, uid: int) -> bytes | None:
             os.close(fd)
 
 
-def _immutable_launch_agent_snapshot(data: bytes) -> int:
-    """Return a read-only fd for an unlinked private copy of ``data``.
+@contextlib.contextmanager
+def _private_launch_agent_snapshot(data: bytes) -> Iterator[Path]:
+    """Yield a private, read-only file holding exactly the validated ``data``.
 
-    ``launchctl`` receives ``/dev/fd/<fd>`` while the descriptor is inherited.
-    The source LaunchAgent pathname and the temporary pathname are therefore
-    outside the consume step: the child can only read the exact validated bytes.
+    ``launchctl bootstrap`` hands the path to launchd, which opens it in its own
+    process, so an inherited ``/dev/fd/<n>`` cannot work (launchctl fails with
+    rc 5; verified live on macOS). The snapshot therefore lives at a real path
+    inside a fresh ``mkdtemp`` ``0700`` directory, is created ``O_EXCL`` and
+    ``O_NOFOLLOW`` and sealed ``0400``, and is removed on exit. The mutable
+    ``~/Library/LaunchAgents`` pathname is never consumed. Residual: a process
+    running as the same user could still replace the file inside the window, but
+    that user can already rewrite the LaunchAgents plist itself.
     """
     directory = Path(tempfile.mkdtemp(prefix="onoats-launch-agent-"))
-    os.chmod(directory, 0o700)
     path = directory / "validated.plist"
-    write_fd: int | None = None
-    read_fd: int | None = None
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        os.chmod(directory, 0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
-        write_fd = os.open(path, flags, 0o600)
-        view = memoryview(data)
-        while view:
-            written = os.write(write_fd, view)
-            if written <= 0:
-                raise OSError("short write while snapshotting launch agent")
-            view = view[written:]
-        os.fsync(write_fd)
-        os.fchmod(write_fd, 0o400)
-        os.close(write_fd)
-        write_fd = None
-
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        read_fd = os.open(path, flags)
-        if os.fstat(read_fd).st_size != len(data):
-            raise OSError("launch agent snapshot size changed")
-        copied = os.read(read_fd, len(data) + 1)
-        if copied != data:
-            raise OSError("launch agent snapshot bytes changed")
-        os.lseek(read_fd, 0, os.SEEK_SET)
-
-        path.unlink()
-        directory.rmdir()
-        return read_fd
-    except Exception:
-        if read_fd is not None:
-            os.close(read_fd)
-        raise
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write while snapshotting launch agent")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o400)
+        finally:
+            os.close(descriptor)
+        yield path
     finally:
-        if write_fd is not None:
-            os.close(write_fd)
         try:
             path.unlink()
         except FileNotFoundError:
@@ -315,19 +302,15 @@ def _bootstrap_stt_server(label: str, uid: int, env: dict[str, str]) -> bool:
         return False
 
     domain = f"gui/{uid}"
-    snapshot_fd = _immutable_launch_agent_snapshot(data)
-    try:
+    with _private_launch_agent_snapshot(data) as snapshot:
         result = subprocess.run(
-            [_LAUNCHCTL, "bootstrap", domain, f"/dev/fd/{snapshot_fd}"],
+            [_LAUNCHCTL, "bootstrap", domain, str(snapshot)],
             capture_output=True,
             text=True,
             timeout=_KICKSTART_TIMEOUT_SEC,
             check=False,
             env=env,
-            pass_fds=(snapshot_fd,),
         )
-    finally:
-        os.close(snapshot_fd)
     if result.returncode == 0:
         logger.info(f"STT: bootstrapped unloaded launch agent {label!r}")
         return True

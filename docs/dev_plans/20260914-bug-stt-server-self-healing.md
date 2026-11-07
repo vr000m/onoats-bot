@@ -347,8 +347,8 @@ Context lifecycle — what enters context at each step, and whether it clears or
   the configured `launchd_label` is not loaded, onoats bootstraps it from the one
   fixed `~/Library/LaunchAgents/<label>.plist`, only after a bounded no-follow read
   confirms a regular user-owned file with safe write permissions, an exact
-  `Label` and `RunAtLoad=true`, and from an unlinked descriptor-backed snapshot of
-  those bytes. A successful bootstrap is itself the launch request (no immediate
+  `Label` and `RunAtLoad=true`, and from a private snapshot (`0400` file in a `0700` temp dir) of
+  those bytes; an unlinked `/dev/fd/N` snapshot was tried first and does not work (launchd opens the path in its own process; rc 5, verified live 2026-11-07). A successful bootstrap is itself the launch request (no immediate
   kickstart). No port inference or arbitrary plist path is allowed. A job with no
   matching plist is still out of scope, as the Non-Goal says.
 - (append findings here as work proceeds)

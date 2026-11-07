@@ -43,7 +43,8 @@ Annotated tags exist from `v0.9.0` forward.
 - STT self-healing (`[stt].launchd_label`) now bootstraps an unloaded job from
   the matching `~/Library/LaunchAgents/<label>.plist` after validating it
   (regular user-owned file, safe permissions, exact `Label`,
-  `RunAtLoad=true`).
+  `RunAtLoad=true`). Bootstrap reads a private snapshot of the validated
+  bytes, because launchd cannot open an inherited `/dev/fd/N`.
 
 ### Changed
 

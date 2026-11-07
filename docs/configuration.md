@@ -114,7 +114,7 @@ The plist must:
 - contain the exact configured `Label`; and
 - set `RunAtLoad=true`.
 
-Onoats validates a descriptor-backed snapshot of the file. It never infers a
+Onoats validates the file, then bootstraps from a private snapshot of the validated bytes (never the LaunchAgents pathname). It never infers a
 launch agent from the endpoint port and never accepts an arbitrary plist path.
 A successful bootstrap is the launch request; onoats does not immediately
 kickstart a job that is already booting.

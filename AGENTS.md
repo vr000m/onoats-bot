@@ -376,8 +376,11 @@ server is unreachable, onoats asks `launchd` to start or restart the *managed*
 job. A loaded job is kickstarted. An unloaded job may be bootstrapped only from
 the matching `~/Library/LaunchAgents/<label>.plist`, after a bounded no-follow
 read confirms a regular user-owned file, safe write permissions, and an exact
-`Label`, with `RunAtLoad=true`. Bootstrap consumes an unlinked descriptor-backed
-snapshot of those validated bytes, never the mutable LaunchAgents pathname.
+`Label`, with `RunAtLoad=true`. Bootstrap consumes a private snapshot of those validated bytes (a
+`0400` file in a fresh `0700` `mkdtemp` directory, removed afterwards), never the
+mutable LaunchAgents pathname. It must be a real path: `launchctl bootstrap`
+passes it to launchd, which opens it in its own process, so an inherited
+`/dev/fd/N` fails with rc 5 (verified live on macOS).
 Successful bootstrap is the launch request; do
 not immediately kickstart the already-booting job. No port inference or
 arbitrary plist path is allowed. These
