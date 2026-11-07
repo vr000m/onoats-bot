@@ -65,6 +65,12 @@ struct SettingsPanelView: View {
                     Button("Open config.toml for endpoint settings") { model.openConfig() }
                         .focused($focus, equals: .config)
                     appliesNextStart
+                    if let failure = model.configWriteFailure {
+                        Text(failure)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }

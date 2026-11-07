@@ -60,6 +60,10 @@ final class RecorderModel: ObservableObject {
     @Published private(set) var activeDataDirDisplay: String?
     @Published private(set) var nextDataDirDisplay = ""
     @Published var flushNote: String?
+    /// Why the last config.toml edit from the panel was refused, or nil. The
+    /// writer refuses an unreadable config rather than overwrite it, so the
+    /// panel must say so instead of silently snapping the picker back.
+    @Published private(set) var configWriteFailure: String?
     @Published var stopRequested = false
     @Published private(set) var prestartDetail: String?
     @Published private(set) var seminarConfigurationFailure = false
@@ -693,7 +697,12 @@ final class RecorderModel: ObservableObject {
     }
 
     func setSTTService(_ service: String) {
-        try? ConfigStore.writeValue(section: "stt", key: "service", value: service)
+        do {
+            try ConfigStore.writeValue(section: "stt", key: "service", value: service)
+            configWriteFailure = nil
+        } catch {
+            configWriteFailure = "Could not save the speech-to-text service: \(error)"
+        }
         refresh()
     }
 
