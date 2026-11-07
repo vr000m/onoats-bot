@@ -311,3 +311,71 @@ def test_work_spawned_by_a_cancellation_handler_gets_no_finalizer_turns(
     assert (result, exits, spawned_cancelled) == (5, [], [True])
     assert len(finalizer_started) == 1
     assert all(tick < finalizer_started[0] for tick in ticks)
+
+
+def test_task_created_by_an_asyncgen_finalizer_fails_teardown(monkeypatch) -> None:
+    """Round 7: work spawned during finalization must not be silently dropped.
+
+    Before the settled stage, a task created by an async generator's ``finally``
+    stayed pending, the loop closed over it, and teardown reported success
+    (the original result, ``hard_exit`` unused).
+    """
+    monkeypatch.setattr(_event_loop, "FINALIZER_TIMEOUT_SECONDS", FINALIZER_TIMEOUT)
+    exits: list[int] = []
+    failures: list[bool] = []
+    retained: list[object] = []
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    async def generator():
+        try:
+            yield None
+        finally:
+            retained.append(asyncio.get_running_loop().create_task(forever()))
+
+    async def run() -> int:
+        stream = generator()
+        retained.append(stream)
+        await anext(stream)
+        return 7
+
+    result = _event_loop.run_bounded_event_loop(
+        run(),
+        cancel_timeout=CANCEL_TIMEOUT,
+        hard_exit=exits.append,
+        on_cleanup_failure=lambda: failures.append(True),
+    )
+    assert (result, exits, failures) == (1, [1], [True])
+
+
+def test_task_created_and_finished_during_finalization_is_clean(monkeypatch) -> None:
+    """A finalizer-spawned task that completes by itself is not a failure."""
+    monkeypatch.setattr(_event_loop, "FINALIZER_TIMEOUT_SECONDS", FINALIZER_TIMEOUT)
+    exits: list[int] = []
+    retained: list[object] = []
+
+    async def quick() -> None:
+        return None
+
+    async def generator():
+        try:
+            yield None
+        finally:
+            task = asyncio.get_running_loop().create_task(quick())
+            retained.append(task)
+            await task
+
+    async def run() -> int:
+        stream = generator()
+        retained.append(stream)
+        await anext(stream)
+        return 7
+
+    result = _event_loop.run_bounded_event_loop(
+        run(),
+        cancel_timeout=CANCEL_TIMEOUT,
+        hard_exit=exits.append,
+        on_cleanup_failure=lambda: None,
+    )
+    assert (result, exits) == (7, [])

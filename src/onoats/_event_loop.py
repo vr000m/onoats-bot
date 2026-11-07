@@ -42,6 +42,13 @@ def run_bounded_event_loop(
        ``FINALIZER_TIMEOUT_SECONDS``. A slow but successful async-generator
        shutdown cannot consume this budget.
 
+    4. **Settled.** After both finalizers succeed no task may remain pending: a
+       finalizer can create work (an async generator's ``finally`` spawning a
+       task), and that work must not be silently discarded by ``loop.close()``.
+       A pending task fails this stage; it is not given another turn.
+       Callbacks scheduled with ``call_later``/``call_at`` are not tasks and are
+       discarded by ``loop.close()``.
+
     A finalizer fails when it raises, when running it raises, or when it is
     still pending at its deadline (it is then cancelled, never given another
     turn).
@@ -55,6 +62,7 @@ def run_bounded_event_loop(
       grace with pending, *, *
     clean, fails or times out, *       none; 3 skipped      fail
     clean, ok, fails or times out      none                 fail
+    clean, ok, ok, task left pending   none                 fail
     =================================  ==================  ==================
 
     "fail" means ``on_cleanup_failure()``, then ``hard_exit(1)``, then return
@@ -79,6 +87,7 @@ def run_bounded_event_loop(
                 _cancel_pending_tasks(loop, max(0.0, cancel_timeout))
                 and _run_finalizer(loop, loop.shutdown_asyncgens())
                 and _run_finalizer(loop, loop.shutdown_default_executor())
+                and _no_pending_tasks(loop)
             )
         finally:
             asyncio.set_event_loop(None)
@@ -122,6 +131,11 @@ def _cancel_pending_tasks(loop: asyncio.AbstractEventLoop, grace: float) -> bool
         for task in pending:
             task.cancel()
     return True
+
+
+def _no_pending_tasks(loop: asyncio.AbstractEventLoop) -> bool:
+    """True when finalization left no task scheduled (stage 4)."""
+    return not asyncio.all_tasks(loop)
 
 
 def _run_finalizer(
