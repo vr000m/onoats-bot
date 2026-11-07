@@ -118,7 +118,8 @@ The controller's one async lock orders accepted commands:
   continuation or terminal rotation within a bounded settle time and leaves the
   rotation's file state to the recorder's hard process boundary.
 
-Therefore simultaneous Stop/Flush is resolved solely by lock acquisition order,
+Therefore simultaneous Stop/Flush is resolved by lock acquisition order plus the
+admission state seen under that lock,
 and an acknowledgement always describes an action already accepted by that same
 recorder generation.
 
