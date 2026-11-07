@@ -45,6 +45,13 @@ Annotated tags exist from `v0.9.0` forward.
   (regular user-owned file, safe permissions, exact `Label`,
   `RunAtLoad=true`). Bootstrap reads a private snapshot of the validated
   bytes, because launchd cannot open an inherited `/dev/fd/N`.
+- The menu-bar app reads `config.toml` with a size limit and without blocking,
+  and no longer overwrites a config it could not read (too large, not UTF-8, not
+  a regular file). Settings shows why a service change was refused. A symlinked
+  `config.toml` is written through, so a dotfile-managed link stays a link.
+- The installed recording smoke no longer signals an Onoats process it did not
+  capture itself. After a failed or timed-out `open` it reports the pid and asks
+  you to quit the app by hand.
 
 ### Changed
 

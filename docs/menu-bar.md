@@ -55,6 +55,11 @@ The app edits the same `~/.config/onoats/config.toml` as the CLI, except for
 the UI-only transcript-preview preference. A running session keeps its captured
 settings; edits apply at the next Start.
 
+The app reads `config.toml` through a bounded, non-blocking read (1 MiB limit,
+regular files only). It never overwrites a config it could not read: Settings
+shows the reason and leaves the file as it was. A symlinked `config.toml` is
+written through to its target, so the link survives an edit.
+
 ## Session and data-directory authority
 
 Each Start captures one immutable session configuration. Both STT branches,

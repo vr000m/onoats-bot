@@ -136,6 +136,16 @@ registry dep, not a git pin).
   session begins. Default-input-device changes (e.g. AirPods removal) are the **capturer's** job
   to absorb by re-binding and continuing to stream; see
   `docs/audio-socket-contract.md`.
+- **Failure stamps are floor-guarded.** `status.stamp_supervisor_failure` takes
+  `not_before`, and the supervisor passes `stamp_floor`, minted before this Start's
+  first status write (so the prompt-pending waiting record still counts). A record
+  older than the floor belongs to a previous generation and is never rewritten;
+  `onoats status` must not show this Start's failure on an older session's record.
+  The recorder's `session_floor` (device apply) is later and deliberately
+  separate. Pinned by `tests/test_socket_supervisor.py`
+  (`capturer_death_before_write_running`) and `tests/test_status_file.py`.
+- `onoats flush` and `onoats stop` share `cli._send_generation_bound_command`, so
+  argument checks, generation verification and stale-pid cleanup cannot drift.
 - Shared recorder arg handling lives in `dual._apply_recorder_args` — both
   `dual.main` and the supervisor route through it, so interactive/category
   handling can't drift.
@@ -239,6 +249,12 @@ Single-instance + pid-file ownership (`runtime.py`, pinned by
   place — mirrors `onoats.status.write_status`. A concurrent reader (a draining
   recorder's owner-checked removal) sees either the complete old record or the
   complete new one, never an empty/partial file mid-write.
+- **The installer's rollback record has one line-format owner.**
+  `install_staged._record_line` is used by `_write_record` and by
+  `_record_names_archive`, which keeps a baseline archive the record may name. A
+  record that is missing is the only "not named" answer besides a regular file
+  that is fully read and does not contain the archive line; unreadable, non-regular
+  and oversized (larger than the read prefix) records all retain the archive.
 - **Pid removal is exact-record checked and fails closed.**
   `compare_and_unlink_pid_record` removes **only** when the file still records
   the captured PID, cmdline, and start epoch. It atomically moves the public
