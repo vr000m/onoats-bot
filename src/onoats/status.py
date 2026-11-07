@@ -827,6 +827,7 @@ def stamp_supervisor_failure(
     exit_reason: str,
     supervisor_rc: int,
     last_error: str | None = None,
+    not_before: float | None = None,
 ) -> Path | None:
     """Enrich an existing stopped record with the supervisor's verdict.
 
@@ -834,7 +835,10 @@ def stamp_supervisor_failure(
     socket supervisor then knows the *specific* cause (capturer-crash vs the
     recorder's own fatal ErrorFrame) and the final rc. This stamps those without
     clobbering the recorder's start detail. No-op (returns ``None``) if there is no
-    record to enrich.
+    record to enrich, or when ``not_before`` is given and the record is older than
+    it: a record that predates this session (the Start's own status write failed,
+    which is a fail-open display boundary) belongs to a previous generation and
+    must not be rewritten with this session's failure.
 
     Concurrency contract: this is a read-modify-write and is **deliberately
     last-writer-wins**. The supervisor calls it after waiting for recorder drain,
@@ -846,6 +850,8 @@ def stamp_supervisor_failure(
     """
     current = read_status(data_dir)
     if current is None:
+        return None
+    if not_before is not None and current.start_time < not_before:
         return None
     return write_status(
         data_dir,

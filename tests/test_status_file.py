@@ -1974,3 +1974,28 @@ def test_session_config_repr_never_contains_secrets() -> None:
 
     hidden = {f.name for f in dataclasses.fields(RecorderSessionConfig) if not f.repr}
     assert {"secrets", "stt_endpoint"} <= hidden
+
+
+@pytest.mark.parametrize("record_age", ["previous-session", "this-session"])
+def test_stamp_supervisor_failure_never_rewrites_a_previous_sessions_record(
+    tmp_path: Path, record_age: str
+):
+    """A Start whose own status write failed leaves the previous record on disk."""
+    write_running(tmp_path, pid=11, audio_source="socket", stt_label="mlx")
+    write_stopped(tmp_path, exit_reason="clean")
+    record = read_status(tmp_path)
+    floor = record.start_time + (10.0 if record_age == "previous-session" else -10.0)
+    result = stamp_supervisor_failure(
+        tmp_path,
+        exit_reason="capturer-crash",
+        supervisor_rc=1,
+        last_error="capturer exited mid-session",
+        not_before=floor,
+    )
+    after = read_status(tmp_path)
+    if record_age == "previous-session":
+        assert result is None
+        assert after == record
+    else:
+        assert result is not None
+        assert after.exit_reason == "capturer-crash"

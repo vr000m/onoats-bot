@@ -1121,7 +1121,7 @@ async def _drain_recorder_bounded(recorder_task, logger, cause: str) -> bool:
     return False
 
 
-def _settle_recorder_rc(rc, logger, data_dir) -> int:
+def _settle_recorder_rc(rc, logger, data_dir, session_floor=None) -> int:
     """Map a finished recorder's return code to the supervisor rc (fail-loud).
 
     Shared by both paths on which the recorder finishes by itself — it won the
@@ -1142,7 +1142,10 @@ def _settle_recorder_rc(rc, logger, data_dir) -> int:
         # reason; enrich it with the supervisor's final rc so `onoats status`
         # / the menu bar can show the exit code.
         status_file.stamp_supervisor_failure(
-            data_dir, exit_reason="fatal_error_frame", supervisor_rc=rc
+            data_dir,
+            exit_reason="fatal_error_frame",
+            supervisor_rc=rc,
+            not_before=session_floor,
         )
     else:
         logger.info("Socket supervisor: recorder exited; stopping capturer")
@@ -1252,6 +1255,7 @@ async def _run_recorder_with_capturer(
                 recorder_task.result(),  # re-raise if the recorder failed
                 logger,
                 data_dir,
+                session_floor,
             )
 
         # Capturer finished first → it died mid-session. The recorder's own
@@ -1294,9 +1298,12 @@ async def _run_recorder_with_capturer(
                         "recorder did not finish draining after the stop request; "
                         "force-cancelled"
                     ),
+                    not_before=session_floor,
                 )
                 return 1
-            return _settle_recorder_rc(recorder_task.result(), logger, data_dir)
+            return _settle_recorder_rc(
+                recorder_task.result(), logger, data_dir, session_floor
+            )
         logger.error(
             f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
             "branch surfaced an ErrorFrame and is rotating the partial session. "
@@ -1324,6 +1331,7 @@ async def _run_recorder_with_capturer(
             exit_reason=exit_reason,
             supervisor_rc=1,
             last_error="capturer exited mid-session; partial recording rotated to pending/",
+            not_before=session_floor,
         )
         return 1
     except asyncio.CancelledError:
@@ -1344,6 +1352,7 @@ async def _run_recorder_with_capturer(
                     "recorder suppressed startup cancellation past its bounded "
                     "drain grace; supervisor forced process exit"
                 ),
+                not_before=session_floor,
             )
             await _stop_capturer(capturer_proc, logger)
             _SUPERVISOR_HARD_EXIT(1)
@@ -1500,17 +1509,16 @@ def _compare_and_unlink_stale_pid(pid_path: Path, expected_record) -> None:
     compare_and_unlink_pid_record(pid_path, expected_record)
 
 
-def _cmd_flush(rest: list[str]) -> int:
-    """Ask the authenticated recorder generation to rotate its buffer.
+def _send_generation_bound_command(command: str, rest: list[str], accepted: str) -> int:
+    """The one implementation of ``onoats flush`` / ``onoats stop``.
 
-    This is the seam an integrating consumer's ``flush`` pass-through execs. It
-    resolves the pid from ``<data_dir>/.active/onoats.pid`` (marker
-    ``onoats-bot``) under the forwarded ``ONOATS_DATA_DIR`` root.
-
-    ``_cmd_stop`` follows the same identity and control-channel path with a
-    distinct wire command. Neither command falls back to PID signalling.
+    Arguments, generation verification, stale-pid cleanup and the control-socket
+    exchange are identical for both commands; only the wire ``command`` and the
+    acceptance wording differ, so a fix can never reach one and miss the other.
+    Neither command falls back to PID signalling.
     """
-    parser = argparse.ArgumentParser(prog="onoats flush")
+    prog = f"onoats {command}"
+    parser = argparse.ArgumentParser(prog=prog)
     parser.add_argument(
         "--data-dir",
         default=None,
@@ -1550,23 +1558,33 @@ def _cmd_flush(rest: list[str]) -> int:
         # if it STILL records the stale pid we resolved (compare-and-unlink).
         if target.stale:
             _compare_and_unlink_stale_pid(pid_path, target.record)
-        print(f"onoats flush: {target.reason} (pid file {pid_path})", file=sys.stderr)
+        print(f"{prog}: {target.reason} (pid file {pid_path})", file=sys.stderr)
         return 1
     if target.record is None:
-        print("onoats flush: recorder identity is incomplete", file=sys.stderr)
+        print(f"{prog}: recorder identity is incomplete", file=sys.stderr)
         return 1
     try:
         response = send_control_command(
-            data_dir or _resolve_data_dir(), target.record, "flush"
+            data_dir or _resolve_data_dir(), target.record, command
         )
     except ControlError as exc:
-        print(f"onoats flush: {exc}", file=sys.stderr)
+        print(f"{prog}: {exc}", file=sys.stderr)
         return 1
     if not response.ok:
-        print(f"onoats flush: {response.message}", file=sys.stderr)
+        print(f"{prog}: {response.message}", file=sys.stderr)
         return 1
-    print(f"onoats flush: recorder pid {target.record.pid} accepted flush")
+    print(f"{prog}: recorder pid {target.record.pid} {accepted}")
     return 0
+
+
+def _cmd_flush(rest: list[str]) -> int:
+    """Ask the authenticated recorder generation to rotate its buffer.
+
+    This is the seam an integrating consumer's ``flush`` pass-through execs. It
+    resolves the pid from ``<data_dir>/.active/onoats.pid`` (marker
+    ``onoats-bot``) under the forwarded ``ONOATS_DATA_DIR`` root.
+    """
+    return _send_generation_bound_command("flush", rest, "accepted flush")
 
 
 def _cmd_stop(rest: list[str]) -> int:
@@ -1576,63 +1594,7 @@ def _cmd_stop(rest: list[str]) -> int:
     own control socket. The recorder marks graceful shutdown before acknowledging;
     the command returns on acceptance, not confirmed process exit.
     """
-    parser = argparse.ArgumentParser(prog="onoats stop")
-    parser.add_argument(
-        "--data-dir",
-        default=None,
-        help="Data dir override (else $ONOATS_DATA_DIR / XDG default).",
-    )
-    parser.add_argument(
-        "--expected-pid", type=int, default=None, help=argparse.SUPPRESS
-    )
-    parser.add_argument(
-        "--expected-start-epoch", type=float, default=None, help=argparse.SUPPRESS
-    )
-    args = parser.parse_args(rest)
-    if (args.expected_pid is None) != (args.expected_start_epoch is None):
-        parser.error(
-            "--expected-pid and --expected-start-epoch must be supplied together"
-        )
-    if args.expected_pid is not None and (
-        args.expected_pid <= 0
-        or not math.isfinite(args.expected_start_epoch)
-        or args.expected_start_epoch <= 0
-    ):
-        parser.error("expected recorder identity must contain a positive pid and epoch")
-    data_dir = Path(args.data_dir) if args.data_dir else None
-
-    from onoats._vendor.pid import resolve_flush_target
-    from onoats.control_socket import ControlError, send_control_command
-
-    pid_path = _pid_path(data_dir)
-    target = resolve_flush_target(
-        pid_path,
-        expected_pid=args.expected_pid,
-        expected_start_epoch=args.expected_start_epoch,
-    )
-    if target.pid is None:
-        # Identity could not be confirmed. Drop a now-untrustworthy pid file so
-        # the next run starts clean, but never signal an unverified pid — and only
-        # if it STILL records the stale pid we resolved (compare-and-unlink).
-        if target.stale:
-            _compare_and_unlink_stale_pid(pid_path, target.record)
-        print(f"onoats stop: {target.reason} (pid file {pid_path})", file=sys.stderr)
-        return 1
-    if target.record is None:
-        print("onoats stop: recorder identity is incomplete", file=sys.stderr)
-        return 1
-    try:
-        response = send_control_command(
-            data_dir or _resolve_data_dir(), target.record, "stop"
-        )
-    except ControlError as exc:
-        print(f"onoats stop: {exc}", file=sys.stderr)
-        return 1
-    if not response.ok:
-        print(f"onoats stop: {response.message}", file=sys.stderr)
-        return 1
-    print(f"onoats stop: recorder pid {target.record.pid} accepted graceful shutdown")
-    return 0
+    return _send_generation_bound_command("stop", rest, "accepted graceful shutdown")
 
 
 def _cmd_devices(rest: list[str]) -> int:
