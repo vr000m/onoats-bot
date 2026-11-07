@@ -290,6 +290,24 @@ required app and CLI baseline field and passes preflight. When the release plan
 records an incomplete baseline, use `ONOATS_INSTALL_ROLLBACK_APPROVED=0` and do
 not invoke rollback for that run.
 
+Publication is one transaction (`_replace_verified`, with its contract table in
+the docstring). The new bundle is swapped in atomically and verified; any
+failure, including an interrupt, swaps the previous app back. Every installer
+child process (`make`, `codesign`, `ditto`, `git`, `lsregister`) runs in its own
+process group under a 300 s deadline; a timeout or interrupt kills the whole
+group, so no helper outlives the failure, and a timeout is an install error that
+takes the same swap-back path. Rollback additionally requires the archived
+bundle's own `CFBundleIdentifier` to be the canonical one before it publishes.
+
+If the swap-back itself fails or is interrupted, the previous app is the only
+copy and the installer keeps it: the error names the retained
+`.onoats-install-*` (or `.onoats-rollback-*`) directory inside the install
+directory. Inspect both that directory's `candidate` and the installed
+`Onoats.app`, then move the previous app back by hand. A failed *fresh* install
+has no previous app; if its unverified bundle cannot be withdrawn the error says
+so and the bundle at the install path must be removed manually. A failure after
+the rollback record is published keeps the baseline archive the record names.
+
 All staged-installer operator input is environment-only data read directly by
 `install_staged.py`: `ONOATS_INSTALL_APP`, `ONOATS_INSTALL_DIR`,
 `ONOATS_INSTALL_BACKUP_DIR`, `ONOATS_INSTALL_ROLLBACK_RECORD`,

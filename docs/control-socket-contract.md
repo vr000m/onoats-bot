@@ -106,6 +106,17 @@ The controller's one async lock orders accepted commands:
 - SIGINT/SIGTERM enter the same Stop admission, so a Flush observed after any
   shutdown source begins is rejected as `stopping`. SIGUSR1 enters the same
   continuation path as socket Flush.
+- Admission is decided under the lock from the controller's state, not from
+  arrival order alone. A Flush is admitted only while the session is `RUNNING`
+  and no termination intent exists: the first termination signal's synchronous
+  latch (set before its Stop coroutine reaches the lock), the shutdown event and
+  the force-exit event all count as intent. A Flush that finds any of them set,
+  or a Stop or terminal rotation already admitted, is rejected as `stopping`
+  even if its own request arrived first. The full table is the
+  `RecorderLifecycleController` docstring.
+- A second termination signal (force exit) cancels an admitted Flush's stuck
+  continuation or terminal rotation within a bounded settle time and leaves the
+  rotation's file state to the recorder's hard process boundary.
 
 Therefore simultaneous Stop/Flush is resolved solely by lock acquisition order,
 and an acknowledgement always describes an action already accepted by that same

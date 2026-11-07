@@ -100,7 +100,8 @@ class RecorderLifecycleController:
         return self._state is not LifecycleState.RUNNING
 
     def _continuation_admissible(self) -> bool:
-        """Rows 1-4 of the admission table: no termination intent of any kind."""
+        """Row 1 of the admission table, the only row that admits a Flush: RUNNING
+        with no termination intent of any kind (rows 2-4 reject)."""
         with self._signal_lock:
             latched = self._first_signal_latched
         return (

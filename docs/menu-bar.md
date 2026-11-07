@@ -22,8 +22,9 @@ Missing, legacy, replaced, or recycled endpoints fail closed.
 
 Direct `SIGUSR1` and `SIGTERM` remain compatibility inputs for terminals
 and service managers. All control and signal requests enter one lifecycle
-controller, so a Stop admitted first rejects later Flush requests, while a Flush
-admitted first completes before Stop. See the
+controller, so a Stop admitted first rejects later Flush requests, a Flush
+admitted first completes before Stop, and a Flush is also rejected once a
+termination signal has latched even if its Stop has not yet been processed. See the
 [control-socket contract](control-socket-contract.md).
 
 ### Seminar
