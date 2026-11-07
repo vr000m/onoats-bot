@@ -65,7 +65,6 @@ ifneq ($(filter command line environment environment override,$(origin APP)),)
 $(error APP is fixed to the repository-local Onoats.app staging path)
 endif
 APP   := Onoats.app
-APP_NAME := $(notdir $(APP))
 # Phase 5b bundle shape: the menu-bar app is the main executable
 # (CFBundleExecutable=Onoats); the capturer is embedded alongside it. One
 # bundle id => one TCC identity; the DR is unchanged by the restructure
@@ -82,9 +81,6 @@ MENUBAR_SWIFTC_FLAGS := -O -target $(ARCH)-apple-macos$(DEPLOY) \
 REPO        := $(abspath ..)
 EXTRAS      ?= macos
 INSTALL_DIR := $(HOME)/Applications
-BACKUP_DIR := $(HOME)/Library/Application Support/Onoats/app-backups
-ROLLBACK_RECORD := $(BACKUP_DIR)/approved-rollback.txt
-INSTALL_STAGED_SCRIPT := $(CURDIR)/install_staged.py
 
 .PHONY: build app verify-resources sign dr cdhash rebuild print-bin clean \
 	check-identity cert install-cli install app-tree-hash install-staged rollback setup \
