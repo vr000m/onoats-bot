@@ -632,6 +632,7 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
     import secrets
     import shutil
     import tempfile
+    import time
 
     from loguru import logger
 
@@ -803,6 +804,12 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
         # 4. Wait (bounded) for BOTH sockets to appear. If the capturer dies or
         # is too slow, fail loud rather than hang the recorder on a connect that
         # never succeeds.
+        # Every status record this Start writes (the prompt-pending waiting
+        # record, then the recorder's own) is stamped at/after this instant, so
+        # it is the floor for the supervisor's failure stamps. It is deliberately
+        # earlier than _run_recorder_with_capturer's `session_floor`, which only
+        # recognises the recorder's running record.
+        stamp_floor = time.time()
         ready = await _wait_for_sockets(
             capturer_proc,
             (mic_sock, system_sock),
@@ -859,6 +866,7 @@ async def _supervise_socket_session_inner(rest: list[str], *, config=None) -> in
             data_dir,
             device_state,
             session_config=session_config,
+            stamp_floor=stamp_floor,
         )
     except asyncio.CancelledError:
         startup_cancelled = True
@@ -1121,7 +1129,7 @@ async def _drain_recorder_bounded(recorder_task, logger, cause: str) -> bool:
     return False
 
 
-def _settle_recorder_rc(rc, logger, data_dir, session_floor=None) -> int:
+def _settle_recorder_rc(rc, logger, data_dir, stamp_floor=None) -> int:
     """Map a finished recorder's return code to the supervisor rc (fail-loud).
 
     Shared by both paths on which the recorder finishes by itself — it won the
@@ -1145,7 +1153,7 @@ def _settle_recorder_rc(rc, logger, data_dir, session_floor=None) -> int:
             data_dir,
             exit_reason="fatal_error_frame",
             supervisor_rc=rc,
-            not_before=session_floor,
+            not_before=stamp_floor,
         )
     else:
         logger.info("Socket supervisor: recorder exited; stopping capturer")
@@ -1160,8 +1168,13 @@ async def _run_recorder_with_capturer(
     device_state=None,
     *,
     session_config,
+    stamp_floor=None,
 ) -> int:
     """Run the recorder + a capturer-death watcher; return the supervisor rc.
+
+    ``stamp_floor`` is the instant before this Start's first status write; the
+    supervisor's failure stamps never touch an older record. ``None`` falls back
+    to ``session_floor`` (only the recorder's own record qualifies).
 
     ``session_config`` is the supervisor's per-Start ``RecorderSessionConfig``
     and is required: ``run_onoats_dual`` re-loads configuration when handed
@@ -1202,6 +1215,8 @@ async def _run_recorder_with_capturer(
     # Any write_running at/after this instant belongs to THIS session — the
     # deferred device-apply task keys on it so it never stamps a stale record.
     session_floor = time.time()
+    if stamp_floor is None:
+        stamp_floor = session_floor
     # The per-Start snapshot is required (keyword-only, no default, never None)
     # and passed unconditionally: a caller that omits it, or a recorder that
     # cannot accept it, fails loudly (TypeError) rather than silently
@@ -1255,7 +1270,7 @@ async def _run_recorder_with_capturer(
                 recorder_task.result(),  # re-raise if the recorder failed
                 logger,
                 data_dir,
-                session_floor,
+                stamp_floor,
             )
 
         # Capturer finished first → it died mid-session. The recorder's own
@@ -1298,11 +1313,11 @@ async def _run_recorder_with_capturer(
                         "recorder did not finish draining after the stop request; "
                         "force-cancelled"
                     ),
-                    not_before=session_floor,
+                    not_before=stamp_floor,
                 )
                 return 1
             return _settle_recorder_rc(
-                recorder_task.result(), logger, data_dir, session_floor
+                recorder_task.result(), logger, data_dir, stamp_floor
             )
         logger.error(
             f"Socket supervisor: capturer exited mid-session (rc={rc}); the recorder "
@@ -1331,7 +1346,7 @@ async def _run_recorder_with_capturer(
             exit_reason=exit_reason,
             supervisor_rc=1,
             last_error="capturer exited mid-session; partial recording rotated to pending/",
-            not_before=session_floor,
+            not_before=stamp_floor,
         )
         return 1
     except asyncio.CancelledError:
@@ -1352,7 +1367,7 @@ async def _run_recorder_with_capturer(
                     "recorder suppressed startup cancellation past its bounded "
                     "drain grace; supervisor forced process exit"
                 ),
-                not_before=session_floor,
+                not_before=stamp_floor,
             )
             await _stop_capturer(capturer_proc, logger)
             _SUPERVISOR_HARD_EXIT(1)

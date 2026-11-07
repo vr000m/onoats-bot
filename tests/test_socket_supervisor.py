@@ -3533,6 +3533,52 @@ def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(
     assert any("capturer exited mid-session" in record for record in logger.records)
 
 
+@pytest.mark.parametrize("record_age", ["this-start", "previous-start"])
+def test_capturer_death_before_write_running_stamps_only_this_starts_record(
+    tmp_path, monkeypatch, record_age
+):
+    """The prompt-pending waiting record is this Start's; an older record is not."""
+    import logging
+
+    from onoats import runtime
+    from onoats import status as status_file
+
+    class Capturer:
+        async def wait(self):
+            await asyncio.sleep(0.01)
+            return 23
+
+    async def recorder(**_kwargs):
+        await asyncio.sleep(60)  # still in STT preflight: never reaches write_running
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 0.05)
+    status_file.write_prestart_waiting(
+        tmp_path, audio_source="socket", note="waiting for the system-audio prompt"
+    )
+    written = status_file.read_status(tmp_path).start_time
+    floor = written - 5.0 if record_age == "this-start" else written + 5.0
+    rc = asyncio.run(
+        cli._run_recorder_with_capturer(
+            [],
+            Capturer(),
+            logging.getLogger("test"),
+            tmp_path,
+            session_config=object(),
+            stamp_floor=floor,
+        )
+    )
+    after = status_file.read_status(tmp_path)
+    assert rc == 1
+    if record_age == "this-start":
+        assert after.running is False
+        assert after.exit_reason == "capturer-crash"
+        assert after.supervisor_rc == 1
+    else:
+        assert after.running is True and after.exit_reason is None
+
+
 class _NeverExitingCapturer:
     async def wait(self):
         await asyncio.Event().wait()
