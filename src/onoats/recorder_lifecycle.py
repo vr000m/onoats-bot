@@ -48,6 +48,29 @@ class RecorderLifecycleController:
     Once stopping is admitted no later continuation can reopen the session.
     Terminal rotation is idempotent so pipeline-finally and shutdown-watcher
     paths may safely converge here.
+
+    Admission contract (checked under the lock, at the moment of admission).
+    "latched" is the first termination signal's synchronous latch, set before
+    its Stop coroutine reaches the lock; ``shutdown``/``force`` are the events.
+
+    ======== ======= ======== ===== ================ =============== ============
+    _state   latched shutdown force flush            stop            terminal
+    ======== ======= ======== ===== ================ =============== ============
+    RUNNING  no      no       no    admit            admit -> STOP-  admit ->
+                                                     PING            STOPPING
+    RUNNING  yes     any      any   reject           admit           admit
+    RUNNING  any     yes      any   reject           admit           admit
+    RUNNING  any     any      yes   reject           admit           admit
+    STOPPING any     any      any   reject           ``False``       admit
+    STOPPED  any     any      any   reject           ``False``       ``False``
+    ======== ======= ======== ===== ================ =============== ============
+
+    Rows 2-4 are the window in which a second (force) signal, or the first
+    signal's latch, has already expressed termination intent but no Stop has
+    reached the lock yet; a Flush there must not start a continuation file.
+    An *already admitted* Flush or terminal rotation races ``force``: force
+    first abandons it (bounded cancel; Flush raises ``LifecycleRotationError``,
+    terminal returns ``False``), rotation first keeps its own result.
     """
 
     def __init__(
@@ -76,10 +99,21 @@ class RecorderLifecycleController:
     def stopping(self) -> bool:
         return self._state is not LifecycleState.RUNNING
 
+    def _continuation_admissible(self) -> bool:
+        """Rows 1-4 of the admission table: no termination intent of any kind."""
+        with self._signal_lock:
+            latched = self._first_signal_latched
+        return (
+            self._state is LifecycleState.RUNNING
+            and not latched
+            and not self.shutdown_event.is_set()
+            and not self.force_exit_event.is_set()
+        )
+
     async def flush(self, reason: str) -> bool:
         """Complete one continuation rotation, or reject after stop admission."""
         async with self._lock:
-            if self._state is not LifecycleState.RUNNING:
+            if not self._continuation_admissible():
                 raise LifecycleStoppingError("recorder is stopping")
             rotation = asyncio.create_task(self._rotate(reason, True))
             force_wait = asyncio.create_task(self.force_exit_event.wait())
@@ -170,9 +204,11 @@ class RecorderLifecycleController:
                 self._first_signal_latched = True
         if force:
             # Forced shutdown is deliberately outside the lifecycle lock.  An
-            # admitted continuation owns that lock until its shielded rotation
-            # completes, but a second signal must still wake the shutdown
-            # watcher and bound process exit when that rotation is stuck.
+            # admitted continuation or terminal rotation holds that lock while
+            # it races its rotation against ``force_exit_event``; setting the
+            # event without the lock is what lets that race abandon a stuck
+            # rotation, wake the shutdown watcher, and bound process exit.
+            # Setting the events also closes continuation admission.
             def force_shutdown() -> None:
                 self.shutdown_event.set()
                 self.force_exit_event.set()

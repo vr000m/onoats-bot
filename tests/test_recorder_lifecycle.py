@@ -689,3 +689,41 @@ async def test_force_exit_bounds_terminal_rotation_queued_behind_stuck_flush() -
     assert cancelled.is_set(), "force exit must cancel the stuck continuation"
     with pytest.raises(LifecycleRotationError):
         await asyncio.wait_for(flush, timeout=0.5)
+
+
+@pytest.mark.parametrize(
+    "intent", ["first_signal_latched", "second_signal_force", "force_event_only"]
+)
+@_async_test
+async def test_flush_rejected_once_termination_intent_precedes_stop_admission(
+    intent: str,
+) -> None:
+    """Round 7 re-run: rows 2-4 of the admission table.
+
+    A second signal (or the first signal's latch) can precede its Stop reaching
+    the lock, leaving ``_state`` RUNNING.  A Flush arriving in that window must
+    be rejected, never start a continuation rotation.
+    """
+    rotation = RotationSpy()
+    controller, _shutdown, force, _marks = _controller(rotation)
+    loop = asyncio.get_running_loop()
+    scheduled: list[asyncio.AbstractEventLoop] = []
+    controller.schedule_stop = lambda target: scheduled.append(target)
+
+    if intent == "force_event_only":
+        force.set()
+    else:
+        assert controller.signal(loop) is False
+        if intent == "second_signal_force":
+            assert controller.signal(loop) is True
+            await asyncio.sleep(0)
+            assert force.is_set()
+    assert controller.state == "running", "test must exercise the pre-Stop window"
+
+    with pytest.raises(LifecycleStoppingError):
+        await controller.flush("late flush after termination intent")
+    assert rotation.calls == []
+    # Stop and terminal admission remain open in this window.
+    assert await controller.stop("queued first-signal stop") is True
+    assert await controller.terminal_rotation("shutdown") is True
+    assert rotation.calls == [("shutdown", False)]

@@ -159,8 +159,10 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
   SIGINT/SIGTERM, and pipeline-finally paths are adapters into its one async
   lock; they do not set the shutdown event or rotate buffers independently. A
   Flush admitted first completes its continuation rotation before Stop; once
-  Stop or terminal rotation is admitted, every later Flush is rejected. The
-  second termination signal retains the force-exit escape without reopening
+  Stop or terminal rotation is admitted — or a termination signal has latched
+  or set `shutdown_event`/`force_exit_event` before its Stop reached the lock —
+  every later Flush is rejected (admission table in the controller docstring).
+  The second termination signal retains the force-exit escape without reopening
   lifecycle admission.
 - **Never target an unverified, replaced, or recycled generation.** The CLI
   verifies one complete PID record, then sends that record's PID/start epoch to
