@@ -2777,3 +2777,11 @@ def test_record_names_archive_state_space_never_blocks_or_follows(tmp_path, kind
         target.write_text(f"archive={archive}\n", encoding="utf-8")
         record.symlink_to(target)
     assert INSTALL_STAGED._record_names_archive(record, archive) is expected
+
+
+def test_run_bounded_delivers_input_to_the_child():
+    """``input=`` must reach the child; without a stdin pipe it was silently dropped."""
+    result = RELEASE_IDENTITY.run_bounded(
+        ["/bin/cat"], input="payload", capture_output=True, text=True, check=True
+    )
+    assert result.stdout == "payload"

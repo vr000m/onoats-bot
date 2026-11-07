@@ -70,6 +70,9 @@ def run_bounded(argv, **kwargs) -> subprocess.CompletedProcess[str]:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
     stdin_data = kwargs.pop("input", None)
+    if stdin_data is not None:
+        # ``communicate(input=...)`` writes nothing unless stdin is a pipe.
+        kwargs["stdin"] = subprocess.PIPE
     check = kwargs.pop("check", False)
     kwargs["start_new_session"] = True
     with subprocess.Popen(argv, **kwargs) as process:
