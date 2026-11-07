@@ -41,7 +41,9 @@ settlement: it cancels accepted handlers and their admitted continuation work,
 then performs a short bounded close before removing only the captured endpoint.
 Deadline expiry abandons cancellation-resistant work instead of awaiting it a
 second time. Direct recorder event loops and the socket supervisor apply a final
-hard process boundary if abandoned tasks survive owned-resource cleanup.
+hard process boundary if loop teardown fails: a task survives cancellation,
+an async-generator or default-executor finalizer fails or times out, or a
+finalizer leaves a task pending.
 Failure of the initial running-status write disables status and UI telemetry for
 that run but does not revoke the already-published PID/control authority or stop
 recording.

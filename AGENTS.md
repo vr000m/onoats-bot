@@ -187,7 +187,7 @@ Load-bearing invariants (pinned by `tests/test_cli.py`):
   socket supervisor both delegate pending-task cancellation plus async-generator
   and default-executor finalization to `onoats._event_loop.run_bounded_event_loop`.
   Teardown is ordered stages (pending-task cancellation, then
-  `shutdown_asyncgens`, then `shutdown_default_executor`) and the **first failed
+  `shutdown_asyncgens`, then `shutdown_default_executor`, then a check that no task is left pending) and the **first failed
   stage ends it**: no later finalizer runs and no abandoned task gets another
   loop turn, then `on_cleanup_failure()` + `hard_exit(1)` (`os._exit` in both
   callers). A zero cancel timeout means no grace for pending work — a task
@@ -793,6 +793,6 @@ should NOT re-flag go here, one per line:
   exit 0 in 3-4 s with no degraded WARNING, no traceback and no macOS crash
   report. Not reproducible, so left as is. (2026-10-11)
 - **[Security] won't-fix**: the menu-bar app forwarding its full environment (incl. `PYTHONPATH`/`DYLD_*`) into the recorder (`RecorderModel.swift`) predates this branch, the recorder legitimately needs the user's environment (STT credentials), and env vars are trusted input in this threat model. (2026-11-06)
-- **[Logic] analysis-error**: "loop finalizers are skipped after a surviving task" (round-5) misread the separate-budget rule, which keeps cancellation grace from consuming the finalizer budget when pending-task cancellation *succeeds*. Running a finalizer needs `run_until_complete`, which gives every abandoned task more turns (round 6 measured a zero-grace handler running and delaying `hard_exit` by 2 s), and the process `os._exit`s anyway. `_event_loop` ends teardown at the first failed stage; `tests/test_event_loop.py` pins it. (2026-11-06)
+- **[Logic] won't-fix**: "loop finalizers are skipped after a surviving task" (round 5 accepted this and added finalizer-after-survivor; round 6 reversed it). The separate-budget rule keeps cancellation grace from consuming the finalizer budget when pending-task cancellation *succeeds*. Running a finalizer needs `run_until_complete`, which gives every abandoned task more turns (round 6 measured a zero-grace handler running and delaying `hard_exit` by 2 s), and the process `os._exit`s anyway. `_event_loop` ends teardown at the first failed stage; `tests/test_event_loop.py` pins it. (2026-11-06)
 - **[Architecture] won't-fix**: the installed smoke's `ACTIVE_DIRNAME`/`STATUS_FILENAME`/`PID_FILENAME`/`PID_MARKER` stay local copies pinned by `tests/test_recording_integration.py`, not moved into `onoats_contracts`. That would not give one owner: the vendored, self-contained `onoats._vendor.pid` must keep its own `PID_FILENAME`/`PID_MARKER`, `onoats.status` owns `STATUS_FILENAME`, and Swift holds a parity-tested copy. An earlier round asked for the opposite. (2026-11-06)
 - **[Architecture] won't-fix**: the control-server bind + PID + running-status publication is not extracted into one helper shared by `__main__.py` and `dual.py`. Both sequences are pinned in order by `tests/test_status_file.py::test_recorder_entrypoints_publish_and_teardown_control_generation_in_order` and `__main__.py` points at dual.py's ordering contract; extracting late in the branch would invalidate that evidence. (2026-11-06)
