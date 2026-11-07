@@ -1118,3 +1118,16 @@ def test_warning_log_actions_preserve_owned_external_distinction():
     assert re.search(r"if\s+model\.canOpenLogForCurrentSurface", recording)
     assert "model.seminarConfigurationFailure" in recording
     assert "Seminar needs 'seminars' in config.toml [categories]" in recording
+
+
+def test_system_ops_protocol_stays_main_actor_isolated():
+    """An attribute separated from its declaration silently binds to the next one.
+
+    A doc comment and a helper type once landed between `@MainActor` and
+    `protocol SystemOps`, which moved the isolation onto the helper.
+    """
+    source = (REPO / "native/onoats-menubar/Sources/RecorderSystemOps.swift").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(r"^@MainActor\nprotocol SystemOps: AnyObject \{", source, re.M)
+    assert not re.search(r"^@MainActor\n(?:///.*\n)*enum ", source, re.M)

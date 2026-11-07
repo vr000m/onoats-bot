@@ -62,8 +62,6 @@ struct ProcessArguments {
     var arguments: [String]?
 }
 
-/// All process, signal, file, clock and polling effects used by the model.
-@MainActor
 /// Outcome of one bounded process-identity probe. A timeout, overflow or launch
 /// failure is `unknown`, never `absent`: a slow `ps` says nothing about whether
 /// the recorder is alive, so callers keep their last proven verdict instead of
@@ -77,6 +75,8 @@ enum CommandLineProbe: Equatable {
     case unknown
 }
 
+/// All process, signal, file, clock and polling effects used by the model.
+@MainActor
 protocol SystemOps: AnyObject {
     func spawn(
         _ request: ProcessRequest,
