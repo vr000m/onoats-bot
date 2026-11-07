@@ -2408,3 +2408,28 @@ def test_failed_swap_back_retains_the_previous_app_tree(tmp_path, monkeypatch):
     assert (candidate / "identity").read_text(encoding="utf-8") == "old", (
         "the only copy of the previous app was deleted by temporary cleanup"
     )
+
+
+def test_rollback_rejects_a_non_canonical_bundle_id_before_mutation(tmp_path):
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    archive = backup_dir / "Onoats-approved.zip"
+    archive.write_bytes(b"archive")
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text(
+        f"archive={archive}\nhash={'0' * 64}\ntree_hash={'1' * 64}\n"
+        f"dr_hash={'2' * 64}\ncdhash={'3' * 40}\n",
+        encoding="utf-8",
+    )
+    install_dir = tmp_path / "installed"
+    with pytest.raises(INSTALL_STAGED.InstallError, match="canonical bundle"):
+        INSTALL_STAGED.rollback(
+            argparse.Namespace(
+                install_dir=str(install_dir),
+                backup_dir=str(backup_dir),
+                record=str(record),
+                app_name="Onoats.app",
+                bundle_id="com.example.unrelated",
+            )
+        )
+    assert not install_dir.exists() or not any(install_dir.iterdir())

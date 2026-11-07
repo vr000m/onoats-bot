@@ -599,6 +599,12 @@ def rollback(args: argparse.Namespace) -> None:
     install_dir.mkdir(parents=True, exist_ok=True)
     installed = install_dir / args.app_name
     bundle_id = getattr(args, "bundle_id", BUNDLE_ID)
+    if bundle_id != BUNDLE_ID:
+        # Same gate as install(): the registration-uniqueness check is only
+        # meaningful for the canonical LaunchServices namespace.
+        raise InstallError(
+            "ONOATS_INSTALL_BUNDLE_ID may only redundantly name the canonical bundle"
+        )
     _verify_single_registration(installed, bundle_id)
     parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
     candidate = parent / "candidate"
