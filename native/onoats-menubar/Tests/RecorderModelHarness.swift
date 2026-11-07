@@ -902,6 +902,59 @@ private func testNativeCommandLineProbeIsBounded(_ root: URL) throws {
     try require(gone, "a timed-out ps child survived the probe")
 }
 
+private func testConfigStoreReadIsBoundedAndNeverOverwritesUnreadable(_ root: URL) throws {
+    let directory = root.appendingPathComponent("config-bounded")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+    func kind(_ result: ConfigStore.ConfigText) -> String {
+        switch result {
+        case .absent: return "absent"
+        case .unreadable: return "unreadable"
+        case .text(let text): return "text:\(text)"
+        }
+    }
+
+    let missing = directory.appendingPathComponent("missing.toml")
+    try require(kind(ConfigStore.readConfigText(at: missing)) == "absent", "missing file is absent")
+
+    let regular = directory.appendingPathComponent("regular.toml")
+    try "[stt]\nservice = \"whisper\"\n".write(to: regular, atomically: true, encoding: .utf8)
+    try require(
+        kind(ConfigStore.readConfigText(at: regular)) == "text:[stt]\nservice = \"whisper\"\n",
+        "a regular file reads back verbatim")
+
+    let oversized = directory.appendingPathComponent("oversized.toml")
+    try Data(repeating: 0x61, count: ConfigStore.maxConfigBytes + 1).write(to: oversized)
+    try require(kind(ConfigStore.readConfigText(at: oversized)) == "unreadable", "oversized is unreadable")
+
+    let notUTF8 = directory.appendingPathComponent("binary.toml")
+    try Data([0xff, 0xfe, 0xfd]).write(to: notUTF8)
+    try require(kind(ConfigStore.readConfigText(at: notUTF8)) == "unreadable", "invalid UTF-8 is unreadable")
+
+    // A FIFO with no writer would block String(contentsOf:) forever.
+    let fifo = directory.appendingPathComponent("fifo.toml")
+    try require(mkfifo(fifo.path, 0o600) == 0, "mkfifo failed")
+    try require(kind(ConfigStore.readConfigText(at: fifo)) == "unreadable", "a FIFO must not hang or read")
+
+    // The writer must refuse, never replace the whole file with one key.
+    for target in [oversized, notUTF8, fifo] {
+        var threw = false
+        do {
+            try ConfigStore.writeValue(section: "stt", key: "service", value: "mlx", at: target)
+        } catch { threw = true }
+        try require(threw, "writeValue must refuse an unreadable config: \(target.lastPathComponent)")
+    }
+    let untouched = try Data(contentsOf: notUTF8)
+    try require(untouched == Data([0xff, 0xfe, 0xfd]), "the unreadable config was left untouched")
+
+    // Absent still creates it, a readable one is edited in place.
+    let created = directory.appendingPathComponent("created.toml")
+    try ConfigStore.writeValue(section: "stt", key: "service", value: "mlx", at: created)
+    try require(kind(ConfigStore.readConfigText(at: created)).contains("service = \"mlx\""), "created")
+    try ConfigStore.writeValue(section: "stt", key: "service", value: "whisper", at: regular)
+    try require(kind(ConfigStore.readConfigText(at: regular)).contains("whisper"), "edited in place")
+}
+
 @MainActor
 private func testUnknownIdentityProbeKeepsTheLastProvenVerdict(_ root: URL) throws {
     let directory = root.appendingPathComponent("unknown-probe")
@@ -1395,6 +1448,7 @@ struct RecorderModelHarness {
         try testPollingDiscipline(root)
         try testGenerationCacheRequiresPidCommandAndPositiveEpoch(root)
         try testUnknownIdentityProbeKeepsTheLastProvenVerdict(root)
+        try testConfigStoreReadIsBoundedAndNeverOverwritesUnreadable(root)
         try testModelDeallocation(root)
         for suite in [
             "onoats.harness.directory", "onoats.harness.publication-association",

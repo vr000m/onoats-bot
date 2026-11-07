@@ -35,6 +35,47 @@ enum ConfigStore {
         URL(fileURLWithPath: NSHomeDirectory() + "/.config/onoats/config.toml")
     }
 
+    /// Largest config.toml this editor will read. The file is a handful of
+    /// short `key = "value"` lines; anything bigger is not a config this
+    /// editor understands, and reading it would stall the main actor.
+    static let maxConfigBytes = 1 << 20
+
+    /// Outcome of one bounded read. `unreadable` (non-regular file, oversized,
+    /// invalid UTF-8, I/O error) is deliberately distinct from `absent`: the
+    /// writer must never treat a file it could not read as an empty one, or it
+    /// would replace the user's whole config with a single key.
+    enum ConfigText {
+        case absent
+        case unreadable
+        case text(String)
+    }
+
+    /// Bounded read of the config: opens non-blocking (a FIFO cannot hang the
+    /// caller), requires a regular file once opened, and never reads past
+    /// `maxConfigBytes`. Symlinks are followed on purpose: dotfile managers
+    /// commonly link config.toml, and the Python reader follows them too.
+    static func readConfigText(at url: URL = configURL) -> ConfigText {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { return errno == ENOENT ? .absent : .unreadable }
+        defer { Darwin.close(descriptor) }
+        var metadata = Darwin.stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0,
+            metadata.st_mode & S_IFMT == S_IFREG,
+            metadata.st_size <= off_t(maxConfigBytes)
+        else { return .unreadable }
+        var data = Data()
+        var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = Darwin.read(descriptor, &chunk, chunk.count)
+            if count < 0 { return .unreadable }
+            if count == 0 { break }
+            data.append(chunk, count: count)
+            if data.count > maxConfigBytes { return .unreadable }
+        }
+        guard let text = String(data: data, encoding: .utf8) else { return .unreadable }
+        return .text(text)
+    }
+
     // TOML basic-string escaping, restricted to the subset this editor speaks
     // (see writeValue): backslash and double-quote are the two characters
     // legal in macOS paths that would otherwise break out of the quoted
@@ -77,7 +118,7 @@ enum ConfigStore {
     /// degrading a present-but-empty/unterminated-quote value to the same
     /// `nil` an absent key would produce.
     static func readValuePresence(section: String, key: String) -> ReadResult {
-        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else {
+        guard case .text(let text) = readConfigText() else {
             return .absent
         }
         var current = ""
@@ -150,7 +191,9 @@ enum ConfigStore {
     /// reads with full tomllib, so anything this writer emits must stay
     /// inside the subset both agree on (tests/test_native_contract_parity.py
     /// round-trips a sample through tomllib).
-    static func writeValue(section: String, key: String, value: String) throws {
+    static func writeValue(
+        section: String, key: String, value: String, at configURL: URL = ConfigStore.configURL
+    ) throws {
         // A control character (esp. newline) would let the value break out of
         // its line and inject arbitrary TOML keys — refuse, never sanitize.
         guard value.rangeOfCharacter(from: .newlines) == nil,
@@ -159,7 +202,16 @@ enum ConfigStore {
             throw ConfigWriteError(
                 description: "config value for \(section).\(key) contains a control character")
         }
-        let text = (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
+        let text: String
+        switch readConfigText(at: configURL) {
+        case .absent: text = ""
+        case .text(let existing): text = existing
+        case .unreadable:
+            // Never fall back to "" here: that would overwrite a config we
+            // merely failed to read (oversized, non-regular, not UTF-8).
+            throw ConfigWriteError(
+                description: "config.toml could not be read safely; refusing to overwrite it")
+        }
         var lines = text.components(separatedBy: "\n")
         let newLine = "\(key) = \"\(escape(value))\""
 
