@@ -244,8 +244,11 @@ internals behind that surface:
   delivery, but the userspace check and signal are not generation-atomic; that
   residual race is accepted. Cleanup signals only identities the run captured
   itself: if `open` fails or times out before the app's pid is captured, a process
-  found afterwards is reported with its pid and left running, because a login item
-  or the user could have launched it. The CLI shim target is read through a
+  found afterwards is never signalled, because a login item or the user could have
+  launched it. It is asked to quit (AppleScript, addressed by the exact installed
+  app path) only when no recorder is provably live: a pid record, a held
+  single-instance lock, or an unreadable lock leaf all keep it running, and it is
+  reported with its pid so you can quit it by hand. The CLI shim target is read through a
   bounded, non-blocking regular-file read, so a target replaced by a FIFO fails
   closed instead of hanging the installer or smoke. For an explicit clean install from the repository
   root, run:

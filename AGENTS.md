@@ -337,7 +337,12 @@ which would hand the abandoned task more turns — and the process hard-exits.
   and only a live recorder whose ancestry changed fails the smoke. This reaches helpers created during the
   interactive recording window without granting PGID-wide signal authority;
   every member still passes the captured kernel-birth and secondary-identity
-  checks before TERM/KILL.
+  checks before TERM/KILL. A process found after a failed or timed-out `open`
+  was not captured and is never signalled; `_quit_unproven_app` may only ask it
+  to quit by exact app path (AppleScript, path as argv data), and only when
+  `_recorder_idle` proves no recorder is live (no pid record, shared `flock` on
+  `onoats.lock` succeeds, lock leaf is a regular file). Any unprovable answer
+  leaves it running and reports it.
 - **Rollback approval is one immutable read.** `approved-rollback.txt` is read
   through one bounded, no-follow, owner/mode-checked regular-file descriptor;
   the bytes, descriptor metadata, and final pathname identity must agree before
@@ -827,3 +832,10 @@ should NOT re-flag go here, one per line:
   the socket supervisor then cross the final hard process boundary (`os._exit`), which
   ends the task. A rotation that outlives the cancel deadline is never an in-process
   state to repair. (2026-11-07)
+- **[Logic] won't-fix**: `release_identity.run_bounded` does not kill a helper that
+  detached (`setsid`, double fork) and outlived a leader that exited normally. The
+  group kill runs only while the leader is unreaped, because a reaped group id can
+  be recycled and signalling it would hit an unrelated process. The children it
+  spawns (`codesign`, `ps`, `hdiutil`-style tools) do not detach; a leaked helper is
+  the smaller failure than a signal to a recycled group. Documented in the
+  function's docstring. (2026-11-07)

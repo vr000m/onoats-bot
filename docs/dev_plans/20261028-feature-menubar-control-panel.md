@@ -1419,7 +1419,14 @@ and process boundary. Each was fixed at the contract level:
 - A rollback record larger than the read prefix counts as possibly naming the
   archive. `_record_line` is the one owner of the record's line format.
 - The installed smoke signals only identities it captured itself. A process found
-  after a failed or timed-out `open` is reported, not signalled.
+  after a failed or timed-out `open` is never signalled (decided with the owner,
+  2026-11-07): it is asked to quit by exact app path through AppleScript only when
+  `_recorder_idle` proves no recorder is live (no pid record, shared `flock` on
+  `onoats.lock` succeeds, regular lock leaf); otherwise it is reported and left
+  running.
+- `run_bounded` leaves a helper that detached and outlived a normally exited
+  leader alone (accepted 2026-11-07; recorded as a dismissed finding in
+  AGENTS.md).
 - `launchctl bootstrap` cannot consume `/dev/fd/N` (launchd opens the path in its
   own process; rc 5, verified live), so a private `0400` snapshot in a `0700`
   directory is used instead.

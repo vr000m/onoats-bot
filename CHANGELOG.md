@@ -50,8 +50,10 @@ Annotated tags exist from `v0.9.0` forward.
   a regular file). Settings shows why a service change was refused. A symlinked
   `config.toml` is written through, so a dotfile-managed link stays a link.
 - The installed recording smoke no longer signals an Onoats process it did not
-  capture itself. After a failed or timed-out `open` it reports the pid and asks
-  you to quit the app by hand.
+  capture itself. After a failed or timed-out `open`, a process it cannot prove it
+  launched is asked to quit (AppleScript, by exact app path, never a signal) only
+  when no recorder is provably live in the data directory. Otherwise it reports the
+  pid and asks you to quit the app by hand.
 
 ### Changed
 
