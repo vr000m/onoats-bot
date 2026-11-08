@@ -1,6 +1,6 @@
 # Task: Recover or Fail Loud When the System Tap Stalls After Process Resume
 
-**Status**: Complete
+**Status**: In Progress
 **Component**: macos, transport, recorder
 **Assigned to**: Codex
 **Priority**: High
@@ -14,8 +14,9 @@ Ensure the native system-audio capturer cannot remain apparently healthy after
 its active pacer misses more than two seconds of process uptime. That heartbeat
 stall makes the Core Audio tap generation untrustworthy: the capturer must stop
 emitting, attempt ordered cleanup, and terminate with a distinct non-zero code
-within two further seconds so the supervisor rotates the partial session. A
-later Start creates a wholly fresh generation.
+within two further seconds so the supervisor rotates the partial session. For
+an app-owned recording, the menu-bar lifecycle then starts one bounded fresh
+generation automatically; direct CLI sessions remain explicitly restarted.
 
 ## Context
 
@@ -28,9 +29,10 @@ therefore cannot be the fatal signal. The reproducible independent signal is
 the multi-second gap in the capturer's own 20 ms pacer after the process resumes.
 That signal is deliberately named a **capturer heartbeat stall**, not proof of
 `SIGSTOP`: scheduler starvation or a debugger pause can produce the same
-process-uptime gap. `mach_absolute_time` does not advance during host sleep, so
-ordinary sleep/wake is outside this detector and remains covered by the
-existing device and socket contracts.
+process-uptime gap. Apple documents that
+[`mach_absolute_time` does not advance during host sleep](https://developer.apple.com/documentation/driverkit/mach_absolute_time),
+so ordinary sleep/wake is outside this detector. Tap survival across sleep/wake
+remains a separate live-verification item under the existing device contract.
 
 ## Requirements
 
@@ -45,6 +47,15 @@ existing device and socket contracts.
 - Preserve the supervisor as the sole owner of whole-generation restart; the
   native capturer must not reconnect sockets or silently create a second tap
   generation behind the recorder.
+- After a generation-verified app-owned `capture-heartbeat-stalled` exit, start
+  one fresh supervisor generation automatically, preserving the failed run's
+  pinned data directory and category. Never auto-restart external sessions,
+  generic failures, user-requested Stop, or Quit.
+- Prevent restart loops: one automatic recovery is admitted per failure cluster.
+  A second heartbeat stall before the replacement generation has remained
+  healthy for 60 seconds stays visibly failed; the stability window then rearms
+  recovery for a later independent stall. A later manual app-owned Start begins
+  a new cluster and resets the budget immediately.
 - Retain teardown ordering as best-effort cleanup: stop device, destroy IOProc,
   destroy aggregate, destroy tap, then close sockets through the existing
   single exit path. The heartbeat-fault path arms an independent hard-exit
@@ -70,6 +81,8 @@ existing device and socket contracts.
   ownership during recovery.
 - Process boundary: a detected stall must be non-zero and bounded so the
   supervisor reports truncation and owns the next generation.
+- App lifecycle: only a matching app-owned heartbeat status may schedule a
+  replacement. Stop, Quit, stale timers, and repeated early faults must win.
 - Realtime safety: the IOProc remains copy-only; no logging, Core Audio API
   call, allocation-heavy recovery, or contended recovery lock runs there.
 
@@ -78,8 +91,8 @@ existing device and socket contracts.
 ### Phase 1: Suspension Watchdog and Deterministic Harness
 
 **Impl files:** `native/onoats-capturer/Sources/ProcessSuspensionWatchdog.swift`
-**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/onoats-capturer/Tests/FrameChunkerSuspensionHarness.swift, native/test_capturer_watchdog.sh`
-**Test command:** `bash native/test_capturer_watchdog.sh`
+**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift`
+**Test command:** `BUILD_DIR="$(mktemp -d)" && swiftc native/onoats-capturer/Sources/Support.swift native/onoats-capturer/Sources/ProcessSuspensionWatchdog.swift native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift -o "$BUILD_DIR/watchdog-harness" && "$BUILD_DIR/watchdog-harness"`
 **Validation cmd:** `make -C native build`
 **Goal:** Create the previously absent `Tests/` directory and prove the pure
 heartbeat and terminal-admission state space before wiring it into capture.
@@ -93,14 +106,10 @@ heartbeat and terminal-admission state space before wiring it into capture.
 - Build a direct Swift harness for normal cadence, exact-boundary, over-boundary,
   re-arm, clock-regression, first-terminal-event admission, and both race
   orderings. Compile the new pure source in the normal native build too.
-- Drive the production `FrameChunker` pacer in a child process: a real 1.5 s
-  STOP/CONT stays alive, while a real 2.5 s STOP/CONT reaches the terminal
-  callback and exits rc 14.
-
 ### Phase 2: Fail-Loud Native-to-Supervisor Boundary
 
 **Impl files:** `native/onoats-capturer/Sources/Resampler.swift, native/onoats-capturer/Sources/SystemCapture.swift, native/onoats-capturer/Sources/Support.swift, native/onoats-capturer/Sources/main.swift, src/onoats/cli.py, native/Makefile`
-**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/test_capturer_watchdog.sh, tests/test_capturer_mic_liveness.py, tests/test_socket_supervisor.py, tests/test_native_contract_parity.py`
+**Test files:** `native/onoats-capturer/Tests/FrameChunkerSuspensionHarness.swift, native/test_capturer_watchdog.sh, tests/test_capturer_mic_liveness.py, tests/test_socket_supervisor.py, tests/test_native_contract_parity.py`
 **Test command:** `bash native/test_capturer_watchdog.sh && uv run pytest tests/test_capturer_mic_liveness.py tests/test_socket_supervisor.py tests/test_native_contract_parity.py -q`
 **Validation cmd:** `make -C native build`
 **Goal:** An over-threshold heartbeat gap invalidates the entire native capture
@@ -126,6 +135,9 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
   rotation, non-zero status, and no transport self-reconnect.
 - Exercise rc 14 through the mid-session capturer-death watcher, not only the
   pre-socket startup path, and assert `capture-heartbeat-stalled` is stamped.
+- Drive the production `FrameChunker` pacer in a child process after its callback
+  and exit-code wiring exists: a real 1.5 s STOP/CONT stays alive, while a real
+  2.5 s STOP/CONT reaches the terminal callback and exits rc 14.
 
 ### Phase 3: Contract Documentation and Live Verification
 
@@ -133,7 +145,9 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
 **Test files:** `scripts/check_review_markers.py, tests/test_release_meta.py`
 **Test command:** `python3 scripts/check_review_markers.py && uv run ruff format && uv run ruff check && uv run pytest`
 **Validation cmd:** `bash native/test_capturer_watchdog.sh && make -C native build`
-**Goal:** Documentation and live behavior state the same boundary: process suspension fails the current generation; only a later explicit Start creates a new one.
+**Goal:** Documentation and live behavior state the same boundary: process
+suspension fails the current generation; CLI recovery is explicit, while the
+menu-bar app may own a bounded automatic fresh Start.
 
 - Update the native and socket contracts plus the root maintainer invariant.
 - Gate the macOS-native heartbeat and real-pacer harness in the pre-tag release
@@ -153,6 +167,44 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
   verify the failed generation left no tap, aggregate, capturer, or socket.
 - Start a new recording and confirm the fresh tap again captures non-zero
   `them` audio from the same video.
+
+### Phase 4: App-Owned Automatic Generation Recovery
+
+**Impl files:** `native/onoats-menubar/Sources/RecorderModel.swift, native/onoats-menubar/Sources/RecorderSystemOps.swift, AGENTS.md, docs/audio-socket-contract.md, docs/menu-bar.md, native/README.md, docs/dev_plans/20261028-feature-menubar-control-panel.md, docs/dev_plans/20261107-bug-capturer-system-tap-resume.md`
+**Test files:** `native/onoats-menubar/Tests/RecorderModelHarness.swift`
+**Test command:** `bash native/test_recorder_model.sh`
+**Validation cmd:** `python3 scripts/check_review_markers.py && uv run ruff format && uv run ruff check && uv run pytest && bash native/test_capturer_watchdog.sh && make -C native build`
+**Goal:** Recover an app-owned heartbeat fault by creating one fresh, fully
+isolated recorder/capturer generation while user Stop/Quit and loop prevention
+remain authoritative.
+
+- Add a one-shot scheduler seam to the injected native system operations so
+  restart and stability timers are deterministic in the Swift harness.
+- Admit automatic recovery only from the retained app-owned process exit after
+  a 0.5-second post-exit classification delay re-reads a generation-validated
+  status reason
+  `capture-heartbeat-stalled`. The owned supervisor exits rc 1; native rc 14 is
+  visible only through that status reason and must never be expected from the
+  app's `ProcessHandle`.
+- Capture an immutable recovery request before `handleExit` clears state. It
+  carries the failed generation, pinned data directory, category, and recovery
+  budget token; an internal Start consumes it without re-resolving those inputs.
+- Retire the failed process and log ownership before spawning the replacement;
+  preserve its pinned data directory and category, but mint a new run log,
+  process, supervisor socket directory, nonce, sockets, and Core Audio tap.
+- Surface recovery in the existing panel notice area while the replacement is
+  starting and after authoritative PID publication confirms it is running.
+- Cancel pending recovery on Quit or user Stop; Stop before exit, during the
+  delay, or after replacement spawn remains authoritative. All non-heartbeat
+  failures remain terminal. Allow one restart per failure cluster; a manual
+  app-owned Start resets the cluster, while an automatic replacement rearms
+  only after that exact generation remains authoritative for 60 seconds.
+- Cover exact-reason/generation admission, stale and generic rejection,
+  delayed final-status publication, immutable context capture, retirement-before-
+  spawn ordering, data-directory/category preservation, fresh process/log
+  creation, both recovery notices, successful recovery, replacement spawn and
+  startup failure, second-stall suppression, generation-bound stable-window
+  rearm, stale-timer rejection, every Stop race, and Quit cancellation.
 
 ## Technical Specifications
 
@@ -181,6 +233,15 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
 - `native/README.md` — document operator-visible failure and manual
   STOP/CONT verification.
 - `AGENTS.md` — record the load-bearing no-in-process-reconnect invariant.
+- `native/onoats-menubar/Sources/RecorderModel.swift` — own the app-only,
+  generation-verified restart admission, recovery budget, stability rearm, and
+  user-visible recovery notice.
+- `native/onoats-menubar/Sources/RecorderSystemOps.swift` — expose an injected
+  one-shot scheduling boundary for restart and stability timers.
+- `native/onoats-menubar/Tests/RecorderModelHarness.swift` — pin the complete
+  recovery admission and cancellation state space with a fake clock/scheduler.
+- `docs/menu-bar.md` — describe automatic recovery, session splitting, and the
+  visible second-failure behavior.
 - `docs/dev_plans/20261028-feature-menubar-control-panel.md` — append a dated
   correction below its review marker and cross-link this plan.
 
@@ -226,6 +287,19 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
 - Dispatch terminal action only after releasing the chunker lock so teardown
   cannot reverse the chunker-to-writer lock order or stop the chunker while its
   pacer still holds that lock.
+- Auto-restart only at the app lifecycle boundary. The Python supervisor still
+  owns one generation and exits non-zero after rotating it; `RecorderModel`
+  may launch a wholly new supervisor only after the retained child exits and
+  its matching status proves the heartbeat reason.
+- Use one restart per failure cluster, not an unbounded retry loop. A replacement
+  generation must remain authoritatively running for 60 seconds before the
+  budget rearms; another early heartbeat failure remains visible and stopped.
+  A manual Start explicitly creates a new cluster and resets the budget.
+- Carry recovery across cleanup as an immutable request. Capture it while the
+  failed generation, pinned directory, and category are still available; retire
+  the old process and log; then let a one-shot timer re-read matching final
+  status and consume the request. Generation-bound timers become inert after
+  Stop, Quit, failure, or replacement.
 
 ### Dependencies
 
@@ -248,7 +322,7 @@ commit `2e1c7b6cc647b8e9cd1b8c9002fcf9c1411bd17b` is an ancestor of that base.
 | Pacer heartbeat to watchdog | `FrameChunker` | `ProcessSuspensionWatchdog` | Wake time is sampled before the chunker lock. A normal 20 ms wake, exactly 2 s, host sleep, and audio content never trip; only a process-uptime gap greater than 2 s trips. |
 | Watchdog to native teardown | `SystemCapture` | `main.swift` / `Teardown` | Callback runs outside the chunker lock, first terminal admission wins, and a fault exits with the distinct code within a separate 2 s deadline. |
 | Capturer exit to session failure | native capturer | Python socket supervisor | Existing early-exit path stops both branches, rotates partial output, reports failure, and never reconnects the transport. |
-| New generation | menu-bar app or CLI Start | Python supervisor | A later explicit Start mints a new socket directory and nonce and creates a new tap; no in-process tap replacement is attempted. |
+| New generation | menu-bar `RecorderModel` or explicit CLI Start | Python supervisor | A verified app-owned heartbeat exit schedules one bounded fresh Start; CLI and other failures remain manual. Every Start mints a new socket directory, nonce, process, run log, and tap; no in-process replacement is attempted. |
 
 ## Architecture & Call Flow
 
@@ -264,6 +338,8 @@ graph LR
     C -->|system socket| R
     C -->|non-zero exit after suspension gap| S
     S -->|stop and rotate partial session| R
+    S -->|rc 1 plus matching heartbeat status| A
+    A -->|bounded fresh Start| S
 ```
 
 Trigger order — one reproduced suspension failure:
@@ -271,6 +347,7 @@ Trigger order — one reproduced suspension failure:
 ```mermaid
 sequenceDiagram
     participant U as User or OS
+    participant A as Menu-bar app
     participant C as Native capturer
     participant W as Suspension watchdog
     participant S as Python supervisor
@@ -281,7 +358,9 @@ sequenceDiagram
     C->>C: ordered teardown and non-zero exit
     C-->>S: process exit plus socket EOF
     S->>R: cancel, finalise, rotate partial session
-    S-->>U: failed recording; next Start required
+    S-->>A: owned exit rc 1 plus matching heartbeat status
+    A->>S: start one fresh generation
+    S-->>U: recording resumes in a new session
 ```
 
 Context lifecycle — what each process owns:
@@ -293,7 +372,7 @@ Context lifecycle — what each process owns:
 | 3 | Pacer wake | current monotonic tick and prior tick | Tick replaces prior tick; no audio samples retained | Watchdog returns normal or gap |
 | 4 | Gap detected | fixed failure reason and non-zero exit code | Log/status failure persists; native resources cleared | Capturer exits |
 | 5 | Supervisor observes exit | immutable generation identity and partial session | Session rotates to `pending/`; sockets and nonce discarded | Process returns non-zero |
-| 6 | Later explicit Start | entirely new paths, nonce, tap, aggregate, IOProc | New generation; no old native context reused | New recording begins |
+| 6 | Explicit CLI Start or bounded app recovery | immutable recovery request or user-selected inputs | Request consumed once; old native context never reused | New paths, process, log, nonce, tap, aggregate, and IOProc begin |
 
 ## Testing Notes
 
@@ -305,6 +384,8 @@ Context lifecycle — what each process owns:
 - [x] Embedded signed-capturer STOP/CONT verification using the supplied system
   audio under the production CLI supervisor.
 - [x] App-owned menu-bar Start/Stop smoke on the same signed bundle.
+- [ ] App-owned heartbeat recovery state-space harness.
+- [ ] App-owned automatic restart live smoke on the signed bundle.
 
 ### Test Results
 
@@ -316,6 +397,8 @@ Context lifecycle — what each process owns:
 - [x] Live embedded signed-capturer verification records a bounded fail-loud
   restart, clean residue checks, and fresh-generation `them` recovery.
 - [x] App-owned signed-app smoke passes.
+- [ ] Automatic replacement generation publishes healthy `them` without a
+  manual Start.
 
 ### Edge Cases Tested
 
@@ -336,6 +419,13 @@ Context lifecycle — what each process owns:
   with the distinct non-zero reason no later than two seconds after its first
   resumed pacer wake; indefinite warning-only silence is impossible.
 - A normal paused player or digital-silence stream does not force a restart.
+- An app-owned heartbeat fault automatically creates one fresh generation;
+  repeated early faults stop visibly instead of forming a restart loop.
+- Recovery starts only after failed-generation process/log retirement and a
+  0.5-second matching-status re-read; it preserves directory and category while
+  minting every generation identity anew.
+- Direct CLI sessions, generic failures, external recorders, user Stop, and Quit
+  never enter app-owned automatic recovery.
 - The supervisor remains the only whole-generation restart owner, and every
   heartbeat fault rotates the partial session through existing fail-loud logic.
 - No resource residue, duplicate tap chain, branch mixing, or unbounded wait is
@@ -345,13 +435,14 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ 0050e4607ad42e5333cdbac4a603cedc9070d31e -->
+<!-- reviewed: 2026-11-08 @ cc837769ec15645825ca67a767636a5d8e82d020 -->
 
 ## Progress
 
 - [x] Phase 1: Suspension Watchdog and Deterministic Harness
 - [x] Phase 2: Fail-Loud Native-to-Supervisor Boundary
 - [x] Phase 3: Contract Documentation and Live Verification
+- [ ] Phase 4: App-Owned Automatic Generation Recovery
 
 ## Findings
 
@@ -400,6 +491,11 @@ Context lifecycle — what each process owns:
   recorder's generic `fatal_error_frame` during ordered drain; after the
   supervisor's authoritative final stamp, both the UI and CLI reported
   `capture-heartbeat-stalled` with supervisor rc 1.
+- 2026-11-08: user acceptance clarified that a stopped error panel is not
+  sufficient recovery because an ordinary user may not notice the recorder
+  exited. The completed fail-loud plan was reopened with Phase 4: the menu-bar
+  app will automatically launch one fresh generation after an authenticated
+  app-owned heartbeat failure, with a stability-window loop guard.
 
 ## Issues & Solutions
 
@@ -424,7 +520,7 @@ Context lifecycle — what each process owns:
 - Automated implementation and contract verification are complete. Live
   signed-capturer STOP/CONT, residue cleanup, and fresh-generation recovery are
   verified through both the production CLI supervisor and an app-owned menu-bar
-  Start.
+  Start. Automatic app-owned replacement is the reopened Phase 4 work.
 
 ### Outcomes
 
