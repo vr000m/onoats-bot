@@ -28,6 +28,9 @@ final class RecorderModel: ObservableObject {
     static let maxRunLogs = 10
     static let categoryErrorTailBytes = 64 * 1024
     static let telemetryMaxBytes = UiTelemetryContract.maxSnapshotBytes
+    static let heartbeatStallExitReason = "capture-heartbeat-stalled"
+    static let heartbeatRecoveryClassificationDelay: TimeInterval = 0.5
+    static let heartbeatRecoveryStabilityWindow: TimeInterval = 60
 
     /// Stop/Flush helpers need only a deterministic executable search path and
     /// basic user/locale context. Never forward the app's API keys, recorder
@@ -73,6 +76,7 @@ final class RecorderModel: ObservableObject {
     private var runLogFinishing = false
     private var runLogReservationAttempted = false
     @Published private(set) var mostRecentRunStartedAt: Date?
+    @Published private(set) var automaticRecoveryActive = false
 
     @Published private(set) var meActivity: UiTelemetryActivity?
     @Published private(set) var themActivity: UiTelemetryActivity?
@@ -112,6 +116,22 @@ final class RecorderModel: ObservableObject {
         let startEpoch: Double
     }
     private var ownedRecorderGeneration: RecorderGeneration?
+
+    private struct HeartbeatRecoveryRequest {
+        let failedGeneration: RecorderGeneration
+        let directory: URL
+        let seminarMode: Bool
+        let token: UInt64
+        let failureReason: String
+        let failureDetail: String?
+    }
+    private var heartbeatRecoveryRequest: HeartbeatRecoveryRequest?
+    private var heartbeatRecoveryClassification: PollHandle?
+    private var heartbeatRecoveryStability: PollHandle?
+    private var heartbeatRecoveryGeneration: RecorderGeneration?
+    private var heartbeatRecoveryReady = false
+    private var heartbeatRecoveryToken: UInt64 = 0
+    private var heartbeatRecoveryBudgetConsumed = false
 
     private struct ControlAuthority: Equatable {
         let directory: URL
@@ -173,6 +193,8 @@ final class RecorderModel: ObservableObject {
         statusPoll?.cancel()
         telemetryPoll?.cancel()
         quitPoll?.cancel()
+        heartbeatRecoveryClassification?.cancel()
+        heartbeatRecoveryStability?.cancel()
     }
 
     private func displayPath(_ url: URL) -> String {
@@ -314,6 +336,9 @@ final class RecorderModel: ObservableObject {
                 }
                 prestartDetail = nil
                 if case .stopping = state {} else { state = .running(ours: true) }
+                if let generation = ownedRecorderGeneration {
+                    confirmAutomaticRecovery(generation)
+                }
             } else {
                 if let status, let attempt = spawnedAt,
                    status.pid == handle.pid,
@@ -386,19 +411,28 @@ final class RecorderModel: ObservableObject {
         if enabled { refreshTelemetry() } else { transcriptPreview = nil }
     }
 
-    var canStart: Bool { proc == nil && mostRecentRunLogSink == nil && cliAvailable }
+    private var canSpawnRecorder: Bool {
+        proc == nil && mostRecentRunLogSink == nil && cliAvailable
+    }
+    var canStart: Bool { canSpawnRecorder && !automaticRecoveryActive }
 
     func start() {
         guard canStart else { return }
+        invalidateHeartbeatRecovery(resetBudget: true)
+        beginStart(directory: dataDirResolver(), seminar: seminarMode, automatic: false)
+    }
+
+    private func beginStart(directory pinned: URL, seminar: Bool, automatic: Bool) {
+        guard canSpawnRecorder else { return }
         userRequestedStop = false
-        flushNote = nil
+        if !automatic { flushNote = nil }
         prestartDetail = nil
         seminarConfigurationFailure = false
         lastFailureWasAppOwned = false
         ownedRecorderPidWasPublished = false
         ownedRecorderGeneration = nil
         setControlAuthority(nil)
-        let pinned = dataDirResolver()
+        seminarMode = seminar
         activeDataDir = pinned
         refreshDirectoryDisplays(configured: pinned)
         let attempt = ops.now()
@@ -427,7 +461,7 @@ final class RecorderModel: ObservableObject {
         environment["ONOATS_CAPTURER_BIN"] = capturerPath
         environment[Self.dataDirEnvironment] = pinned.path
         var p = ProcessArguments(arguments: ["bot"])
-        if seminarMode { p.arguments? += ["--category", Self.seminarCategory] }
+        if seminar { p.arguments? += ["--category", Self.seminarCategory] }
         let request = ProcessRequest(
             executable: URL(fileURLWithPath: cliPath), arguments: p.arguments ?? ["bot"],
             environment: environment, outputSink: runLog)
@@ -443,22 +477,59 @@ final class RecorderModel: ObservableObject {
             activeDataDir = nil
             activeDataDirDisplay = nil
             lastFailureWasAppOwned = true
-            state = .failed(reason: "spawn-failed", detail: error.localizedDescription)
+            let reason = automatic ? "automatic-restart-spawn-failed" : "spawn-failed"
+            state = .failed(reason: reason, detail: error.localizedDescription)
+            if automatic {
+                automaticRecoveryActive = false
+                heartbeatRecoveryRequest = nil
+                flushNote = "Automatic capture recovery failed to start"
+            }
             pruneRunLogs()
         }
     }
 
     func stop() {
+        if automaticRecoveryActive, proc?.isRunning != true {
+            cancelAutomaticRecovery()
+            return
+        }
         guard let handle = proc, handle.isRunning else { return }
         userRequestedStop = true
         state = .stopping
         handle.terminate()
     }
 
+    func cancelAutomaticRecovery() {
+        guard automaticRecoveryActive else { return }
+        let request = heartbeatRecoveryRequest
+        heartbeatRecoveryToken &+= 1
+        heartbeatRecoveryClassification?.cancel()
+        heartbeatRecoveryClassification = nil
+        heartbeatRecoveryStability?.cancel()
+        heartbeatRecoveryStability = nil
+        heartbeatRecoveryGeneration = nil
+        heartbeatRecoveryRequest = nil
+        automaticRecoveryActive = false
+        flushNote = "Automatic capture recovery cancelled"
+        if let handle = proc, handle.isRunning {
+            userRequestedStop = true
+            state = .stopping
+            handle.terminate()
+        } else {
+            state = .failed(
+                reason: request?.failureReason ?? Self.heartbeatStallExitReason,
+                detail: request?.failureDetail)
+        }
+    }
+
     func quitApp() {
         guard quitRequestedAt == nil else { return }
         quitRequestedAt = ops.now()
-        if let handle = proc, handle.isRunning, !userRequestedStop { stop() }
+        if automaticRecoveryActive, proc?.isRunning != true {
+            cancelAutomaticRecovery()
+        } else if let handle = proc, handle.isRunning, !userRequestedStop {
+            stop()
+        }
         finishQuitIfReady()
         guard quitRequestedAt != nil else { return }
         quitPoll = ops.schedule(every: 0.25) { [weak self] in self?.finishQuitIfReady() }
@@ -559,41 +630,155 @@ final class RecorderModel: ObservableObject {
         defer { finishQuitIfReady() }
         let directory = activeDataDir
         let knownGeneration = ownedRecorderGeneration
+        let attempt = spawnedAt
+        let stoppedByUser = userRequestedStop
         prestartDetail = nil
         setControlAuthority(nil)
+        var acceptedStatus: StatusRecord?
         if handle.terminationStatus == 0 {
             state = .stopped
         } else {
-            var status = directory.flatMap { readStatus(under: $0) }
-            if let value = status {
-                if knownGeneration == nil
-                    || knownGeneration!.pid != handle.pid
-                    || knownGeneration!.command.isEmpty
-                    || value.pid != knownGeneration!.pid || spawnedAt == nil
-                    || value.start_time < spawnedAt!.timeIntervalSince1970
-                    || value.start_time != knownGeneration!.startEpoch {
-                    status = nil
-                }
+            if let directory, let knownGeneration, let attempt,
+               knownGeneration.pid == handle.pid {
+                acceptedStatus = matchingExitStatus(
+                    under: directory, generation: knownGeneration, notBefore: attempt)
             }
             let pidWasPublished = ownedRecorderPidWasPublished
                 || currentAttemptPublicationEvidence(handle: handle, directory: directory)
             state = .failed(
-                reason: status?.exit_reason ?? "exit code \(handle.terminationStatus)",
-                detail: status?.last_error)
+                reason: acceptedStatus?.exit_reason ?? "exit code \(handle.terminationStatus)",
+                detail: acceptedStatus?.last_error)
             lastFailureWasAppOwned = true
             seminarConfigurationFailure = !pidWasPublished
                 && runLogTailContainsInvalidCategoryTag()
         }
+        let recoveryRequest: HeartbeatRecoveryRequest? = {
+            guard handle.terminationStatus != 0, !stoppedByUser, quitRequestedAt == nil,
+                  !heartbeatRecoveryBudgetConsumed, let directory, let knownGeneration,
+                  let attempt, knownGeneration.pid == handle.pid,
+                  !knownGeneration.command.isEmpty,
+                  knownGeneration.startEpoch >= attempt.timeIntervalSince1970,
+                  acceptedStatus?.exit_reason == Self.heartbeatStallExitReason
+                    || acceptedStatus?.exit_reason == "fatal_error_frame"
+            else { return nil }
+            heartbeatRecoveryToken &+= 1
+            return HeartbeatRecoveryRequest(
+                failedGeneration: knownGeneration,
+                directory: directory,
+                seminarMode: seminarMode,
+                token: heartbeatRecoveryToken,
+                failureReason: acceptedStatus?.exit_reason
+                    ?? "exit code \(handle.terminationStatus)",
+                failureDetail: acceptedStatus?.last_error)
+        }()
         userRequestedStop = false
         ownedRecorderGeneration = nil
-        seminarMode = false
         proc = nil
         runLogFinishing = true
         releaseRunLogSinkIfIdle()
         activeDataDir = nil
         activeDataDirDisplay = nil
         spawnedAt = nil
+        if recoveryRequest == nil {
+            seminarMode = false
+            invalidateHeartbeatRecovery(resetBudget: false)
+        }
         refreshDirectoryDisplays(configured: dataDirResolver())
+        if let recoveryRequest {
+            scheduleHeartbeatRecoveryClassification(recoveryRequest)
+        }
+    }
+
+    private func matchingExitStatus(
+        under directory: URL, generation: RecorderGeneration, notBefore attempt: Date? = nil
+    ) -> StatusRecord? {
+        guard !generation.command.isEmpty, let status = readStatus(under: directory),
+              status.pid == generation.pid,
+              status.start_time == generation.startEpoch,
+              attempt.map({ status.start_time >= $0.timeIntervalSince1970 }) ?? true
+        else { return nil }
+        return status
+    }
+
+    private func scheduleHeartbeatRecoveryClassification(
+        _ request: HeartbeatRecoveryRequest
+    ) {
+        heartbeatRecoveryRequest = request
+        heartbeatRecoveryReady = false
+        automaticRecoveryActive = true
+        state = .starting
+        flushNote = "Capture stalled; restarting automatically…"
+        heartbeatRecoveryClassification?.cancel()
+        heartbeatRecoveryClassification = ops.schedule(
+            after: Self.heartbeatRecoveryClassificationDelay
+        ) { [weak self] in
+            guard let self, self.automaticRecoveryActive,
+                  self.heartbeatRecoveryRequest?.token == request.token
+            else { return }
+            self.heartbeatRecoveryClassification = nil
+            let status = self.matchingExitStatus(
+                under: request.directory, generation: request.failedGeneration)
+            guard status?.exit_reason == Self.heartbeatStallExitReason else {
+                self.automaticRecoveryActive = false
+                self.heartbeatRecoveryRequest = nil
+                self.heartbeatRecoveryReady = false
+                self.seminarMode = false
+                self.flushNote = nil
+                self.state = .failed(
+                    reason: status?.exit_reason ?? request.failureReason,
+                    detail: status?.last_error ?? request.failureDetail)
+                return
+            }
+            self.heartbeatRecoveryBudgetConsumed = true
+            self.heartbeatRecoveryReady = true
+            self.startClassifiedHeartbeatRecoveryIfReady()
+        }
+    }
+
+    private func startClassifiedHeartbeatRecoveryIfReady() {
+        guard automaticRecoveryActive, heartbeatRecoveryReady,
+              let request = heartbeatRecoveryRequest, canSpawnRecorder
+        else { return }
+        heartbeatRecoveryReady = false
+        beginStart(
+            directory: request.directory, seminar: request.seminarMode, automatic: true)
+    }
+
+    private func confirmAutomaticRecovery(_ generation: RecorderGeneration) {
+        guard automaticRecoveryActive, heartbeatRecoveryBudgetConsumed,
+              heartbeatRecoveryGeneration == nil else { return }
+        heartbeatRecoveryGeneration = generation
+        flushNote = "Capture recovered automatically in a new recording"
+        let token = heartbeatRecoveryRequest?.token ?? heartbeatRecoveryToken
+        heartbeatRecoveryStability?.cancel()
+        heartbeatRecoveryStability = ops.schedule(
+            after: Self.heartbeatRecoveryStabilityWindow
+        ) { [weak self] in
+            guard let self, self.automaticRecoveryActive,
+                  self.heartbeatRecoveryRequest?.token == token,
+                  self.heartbeatRecoveryGeneration == generation,
+                  self.ownedRecorderGeneration == generation,
+                  self.proc?.isRunning == true
+            else { return }
+            self.heartbeatRecoveryStability = nil
+            self.heartbeatRecoveryRequest = nil
+            self.heartbeatRecoveryGeneration = nil
+            self.heartbeatRecoveryBudgetConsumed = false
+            self.automaticRecoveryActive = false
+        }
+    }
+
+    private func invalidateHeartbeatRecovery(resetBudget: Bool) {
+        heartbeatRecoveryToken &+= 1
+        heartbeatRecoveryClassification?.cancel()
+        heartbeatRecoveryClassification = nil
+        heartbeatRecoveryStability?.cancel()
+        heartbeatRecoveryStability = nil
+        heartbeatRecoveryRequest = nil
+        heartbeatRecoveryGeneration = nil
+        heartbeatRecoveryReady = false
+        automaticRecoveryActive = false
+        if resetBudget { heartbeatRecoveryBudgetConsumed = false }
     }
 
     private var ownedRecorderPidWasPublished = false
@@ -694,6 +879,7 @@ final class RecorderModel: ObservableObject {
         sink.closeOwner()
         mostRecentRunLogSink = nil
         runLogFinishing = false
+        startClassifiedHeartbeatRecoveryIfReady()
     }
 
     func setSTTService(_ service: String) {

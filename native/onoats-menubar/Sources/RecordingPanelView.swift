@@ -266,9 +266,17 @@ struct RecordingPanelView: View {
                 .focused($focus, equals: .flush)
                 .help("Rotate the current transcript and keep recording")
         case .starting:
-            Button("Starting…") {}
-                .buttonStyle(.borderedProminent).controlSize(.large)
-                .frame(maxWidth: .infinity).disabled(true)
+            if model.automaticRecoveryActive {
+                Button("Cancel Recovery") { model.cancelAutomaticRecovery() }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    .frame(maxWidth: .infinity)
+                    .focused($focus, equals: .primary)
+                    .help("Cancel the automatic fresh-generation restart")
+            } else {
+                Button("Starting…") {}
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    .frame(maxWidth: .infinity).disabled(true)
+            }
         case .stopping:
             Button("Stopping and draining…") {}
                 .buttonStyle(.borderedProminent).controlSize(.large)
@@ -307,7 +315,7 @@ struct RecordingPanelView: View {
     private var statusTitle: String {
         switch model.state {
         case .stopped: return model.cliAvailable ? "Ready to record" : "Recorder unavailable"
-        case .starting: return "Starting…"
+        case .starting: return model.automaticRecoveryActive ? "Recovering…" : "Starting…"
         case .running: return model.stopRequested ? "Stopping (draining)…" : "Recording"
         case .stopping: return "Stopping (draining)…"
         case .failed: return "Recording failed"

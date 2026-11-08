@@ -101,6 +101,8 @@ protocol SystemOps: AnyObject {
     func now() -> Date
     func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
         -> PollHandle
+    func schedule(after interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
+        -> PollHandle
 }
 
 extension SystemOps {
@@ -441,6 +443,14 @@ final class NativeSystemOps: SystemOps {
     func schedule(every interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
         -> PollHandle {
         let timer = Timer(timeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in action() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        return NativePollHandle(timer)
+    }
+    func schedule(after interval: TimeInterval, _ action: @escaping @MainActor () -> Void)
+        -> PollHandle {
+        let timer = Timer(timeInterval: interval, repeats: false) { _ in
             Task { @MainActor in action() }
         }
         RunLoop.main.add(timer, forMode: .common)

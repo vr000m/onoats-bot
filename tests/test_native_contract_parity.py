@@ -613,9 +613,14 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
     assert category, "RecorderModel.seminarCategory literal not found"
     assert category.group(1) == SEMINAR_CATEGORY
     assert re.search(
-        r'if seminarMode \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
+        r"beginStart\(directory: dataDirResolver\(\), seminar: seminarMode, "
+        r"automatic: false\)",
         swift,
-    ), "start() no longer passes --category when seminarMode is on"
+    ), "manual start no longer snapshots the Seminar selection"
+    assert re.search(
+        r'if seminar \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
+        swift,
+    ), "the shared start path no longer passes --category for Seminar"
 
     configured = OnoatsConfig(
         {"categories": {"set": ["uncategorized", category.group(1)]}}

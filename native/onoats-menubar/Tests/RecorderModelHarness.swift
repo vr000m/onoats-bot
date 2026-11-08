@@ -55,6 +55,7 @@ private final class FakeSystemOps: SystemOps {
     var failReservation = false
     var applicationTerminations = 0
     var pollActions: [@MainActor () -> Void] = []
+    var oneShotActions: [(TimeInterval, FakePoll, @MainActor () -> Void)] = []
     func terminateApplication() { applicationTerminations += 1 }
 
     func spawn(
@@ -137,6 +138,21 @@ private final class FakeSystemOps: SystemOps {
         pollActions.append(action)
         return FakePoll()
     }
+    func schedule(
+        after interval: TimeInterval, _ action: @escaping @MainActor () -> Void
+    ) -> PollHandle {
+        let poll = FakePoll()
+        oneShotActions.append((interval, poll, action))
+        return poll
+    }
+    func fireNextOneShot() throws {
+        guard !oneShotActions.isEmpty else {
+            throw HarnessFailure(description: "no one-shot action was scheduled")
+        }
+        let (delay, poll, action) = oneShotActions.removeFirst()
+        nowValue = nowValue.addingTimeInterval(delay)
+        if !poll.cancelled { action() }
+    }
 
     func put(_ text: String, _ path: URL) { files[path.path] = Data(text.utf8) }
     func putJSON(_ object: [String: Any], _ path: URL) throws {
@@ -182,6 +198,16 @@ private func status(
         "mic_device": NSNull(),
         "system_device": NSNull(),
     ]
+}
+
+private func stoppedStatus(
+    pid: Int32, epoch: Double, reason: String, detail: String = "capturer exited"
+) -> [String: Any] {
+    var record = status(pid: pid, epoch: epoch, running: false)
+    record["exit_reason"] = reason
+    record["last_error"] = detail
+    record["supervisor_rc"] = 1
+    return record
 }
 
 private func telemetry(pid: Int32, epoch: Double, now: Double) -> [String: Any] {
@@ -1367,6 +1393,252 @@ private func testExitDiagnosticIdentityStateSpace(_ root: URL) throws {
 }
 
 @MainActor
+private func testHeartbeatAutomaticRecovery(_ root: URL) throws {
+    let suite = "onoats.harness.heartbeat-recovery"
+    defer { cleanupSuite(suite) }
+    let directory = root.appendingPathComponent("heartbeat-recovery")
+    let choice = DirectoryChoice(directory)
+    let ops = FakeSystemOps()
+    let model = makeModel(ops, suite: suite, directory: choice)
+
+    model.seminarMode = true
+    model.start()
+    let failed = ops.processes[0]
+    let failedEpoch = ops.nowValue.timeIntervalSince1970
+    putPid(ops, directory: directory, pid: failed.pid, epoch: failedEpoch)
+    model.refresh()
+    let failedLog = model.mostRecentRunLogURL
+
+    removePid(ops, directory: directory, pid: failed.pid)
+    try ops.putJSON(
+        stoppedStatus(
+            pid: failed.pid, epoch: failedEpoch,
+            reason: RecorderModel.heartbeatStallExitReason),
+        active(directory, "onoats.status.json"))
+    ops.finish(failed, status: 1)
+
+    try require(model.automaticRecoveryActive, "heartbeat exit did not admit recovery")
+    try require(ops.processes.count == 1, "replacement spawned before classification delay")
+    try require(model.flushNote?.contains("restarting automatically") == true,
+                "pending recovery notice was not visible")
+
+    try ops.fireNextOneShot()
+    try require(ops.processes.count == 2, "classified heartbeat did not spawn replacement")
+    try require(ops.requests[1].arguments == ["bot", "--category", "seminars"],
+                "automatic recovery lost the recording category")
+    try require(
+        ops.requests[1].environment?[RecorderModel.dataDirEnvironment] == directory.path,
+        "automatic recovery lost the pinned data directory")
+    try require(model.mostRecentRunLogURL != failedLog,
+                "automatic recovery reused the failed generation's run log")
+
+    let replacement = ops.processes[1]
+    let replacementEpoch = ops.nowValue.timeIntervalSince1970
+    putPid(ops, directory: directory, pid: replacement.pid, epoch: replacementEpoch)
+    model.refresh()
+    try require(model.state == .running(ours: true),
+                "replacement publication did not restore running state")
+    try require(model.flushNote?.contains("recovered automatically") == true,
+                "confirmed recovery notice was not visible")
+
+    try ops.fireNextOneShot()
+    try require(!model.automaticRecoveryActive,
+                "stable replacement did not rearm and retire recovery state")
+
+    removePid(ops, directory: directory, pid: replacement.pid)
+    try ops.putJSON(
+        stoppedStatus(
+            pid: replacement.pid, epoch: replacementEpoch,
+            reason: RecorderModel.heartbeatStallExitReason),
+        active(directory, "onoats.status.json"))
+    ops.finish(replacement, status: 1)
+    try require(model.automaticRecoveryActive,
+                "stable replacement did not rearm later heartbeat recovery")
+    try ops.fireNextOneShot()
+    try require(ops.processes.count == 3,
+                "rearmed heartbeat recovery did not create a fresh generation")
+}
+
+@MainActor
+private func testHeartbeatRecoveryFailureAndCancellationMatrix(_ root: URL) throws {
+    typealias OwnedCase = (
+        model: RecorderModel, ops: FakeSystemOps, directory: URL,
+        process: FakeProcess, epoch: Double
+    )
+    var suites: [String] = []
+    defer { for suite in suites { cleanupSuite(suite) } }
+
+    func makeCase(_ name: String) -> OwnedCase {
+        let suite = "onoats.harness.heartbeat-" + name
+        suites.append(suite)
+        let directory = root.appendingPathComponent("heartbeat-" + name)
+        let ops = FakeSystemOps()
+        let model = makeModel(
+            ops, suite: suite, directory: DirectoryChoice(directory))
+        model.start()
+        let process = ops.processes[0]
+        let epoch = ops.nowValue.timeIntervalSince1970
+        putPid(ops, directory: directory, pid: process.pid, epoch: epoch)
+        model.refresh()
+        return (model, ops, directory, process, epoch)
+    }
+
+    func finish(
+        _ owned: OwnedCase, reason: String, statusPid: Int32? = nil,
+        statusEpoch: Double? = nil
+    ) throws {
+        removePid(owned.ops, directory: owned.directory, pid: owned.process.pid)
+        try owned.ops.putJSON(
+            stoppedStatus(
+                pid: statusPid ?? owned.process.pid,
+                epoch: statusEpoch ?? owned.epoch, reason: reason),
+            active(owned.directory, "onoats.status.json"))
+        owned.ops.finish(owned.process, status: 1)
+    }
+
+    do {
+        let owned = makeCase("generic")
+        try finish(owned, reason: "capturer-crash")
+        try require(!owned.model.automaticRecoveryActive,
+                    "generic capturer failure admitted automatic recovery")
+        try require(owned.ops.oneShotActions.isEmpty,
+                    "generic capturer failure scheduled recovery work")
+    }
+
+    do {
+        let owned = makeCase("stale")
+        try finish(
+            owned, reason: RecorderModel.heartbeatStallExitReason,
+            statusPid: owned.process.pid + 1)
+        try require(!owned.model.automaticRecoveryActive,
+                    "foreign heartbeat status admitted automatic recovery")
+    }
+
+    do {
+        let owned = makeCase("delayed-status")
+        try finish(owned, reason: "fatal_error_frame")
+        try owned.ops.putJSON(
+            stoppedStatus(
+                pid: owned.process.pid, epoch: owned.epoch,
+                reason: RecorderModel.heartbeatStallExitReason),
+            active(owned.directory, "onoats.status.json"))
+        try owned.ops.fireNextOneShot()
+        try require(owned.ops.processes.count == 2,
+                    "delayed authoritative heartbeat status was not recovered")
+    }
+
+    do {
+        let owned = makeCase("stop-before-exit")
+        owned.model.stop()
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        try require(!owned.model.automaticRecoveryActive,
+                    "user Stop lost to heartbeat recovery")
+    }
+
+    do {
+        let owned = makeCase("cancel-delay")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        owned.model.cancelAutomaticRecovery()
+        try owned.ops.fireNextOneShot()
+        try require(owned.ops.processes.count == 1,
+                    "cancelled delayed recovery still spawned")
+        try require(owned.model.state == .failed(
+            reason: RecorderModel.heartbeatStallExitReason,
+            detail: "capturer exited"), "cancelled recovery hid the original failure")
+    }
+
+    do {
+        let owned = makeCase("quit-delay")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        owned.model.quitApp()
+        try owned.ops.fireNextOneShot()
+        try require(owned.ops.processes.count == 1,
+                    "Quit allowed delayed recovery to spawn")
+        try require(owned.ops.applicationTerminations == 1,
+                    "Quit did not finish after cancelling delayed recovery")
+    }
+
+    do {
+        let owned = makeCase("spawn-failure")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        owned.ops.failSpawn = true
+        try owned.ops.fireNextOneShot()
+        if case .failed(let reason, _) = owned.model.state {
+            try require(reason == "automatic-restart-spawn-failed",
+                        "automatic spawn failure used the wrong reason")
+        } else {
+            throw HarnessFailure(description: "automatic spawn failure was not visible")
+        }
+        try require(!owned.model.automaticRecoveryActive,
+                    "automatic replacement spawn failure entered a retry loop")
+        try require(owned.ops.processes.count == 1,
+                    "spawn failure created an unexpected replacement")
+    }
+
+    do {
+        let owned = makeCase("retirement-order")
+        owned.model.flush()
+        let auxiliary = owned.ops.processes[1]
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        try owned.ops.fireNextOneShot()
+        try require(owned.ops.processes.count == 2,
+                    "replacement spawned before failed log ownership retired")
+        owned.ops.finish(auxiliary, status: 0)
+        try require(owned.ops.processes.count == 3,
+                    "replacement did not start after failed ownership retired")
+    }
+
+    do {
+        let owned = makeCase("cancel-after-spawn")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        try owned.ops.fireNextOneShot()
+        let replacement = owned.ops.processes[1]
+        owned.model.cancelAutomaticRecovery()
+        try require(replacement.terminateCount == 1,
+                    "Cancel Recovery did not stop the starting replacement")
+        owned.ops.finish(replacement, status: 0)
+        try require(owned.ops.processes.count == 2,
+                    "cancelled starting replacement spawned another generation")
+    }
+
+    do {
+        let owned = makeCase("early-second-stall")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        try owned.ops.fireNextOneShot()
+        let replacement = owned.ops.processes[1]
+        let epoch = owned.ops.nowValue.timeIntervalSince1970
+        putPid(owned.ops, directory: owned.directory, pid: replacement.pid, epoch: epoch)
+        owned.model.refresh()
+        removePid(owned.ops, directory: owned.directory, pid: replacement.pid)
+        try owned.ops.putJSON(
+            stoppedStatus(
+                pid: replacement.pid, epoch: epoch,
+                reason: RecorderModel.heartbeatStallExitReason),
+            active(owned.directory, "onoats.status.json"))
+        owned.ops.finish(replacement, status: 1)
+        try require(owned.ops.processes.count == 2,
+                    "second early stall entered an automatic restart loop")
+        try require(!owned.model.automaticRecoveryActive,
+                    "second early stall did not remain visibly failed")
+        try owned.ops.fireNextOneShot()
+        try require(!owned.model.automaticRecoveryActive,
+                    "stale stability timer rearmed a failed replacement")
+    }
+
+    do {
+        let owned = makeCase("replacement-startup-failure")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        try owned.ops.fireNextOneShot()
+        let replacement = owned.ops.processes[1]
+        owned.ops.finish(replacement, status: 1)
+        try require(owned.ops.processes.count == 2,
+                    "replacement startup failure triggered an unbounded retry")
+        try require(!owned.model.automaticRecoveryActive,
+                    "replacement startup failure did not settle visibly")
+    }
+}
+
+@MainActor
 private func testPruningQuarantineStateSpace(_ root: URL) throws {
     for replacement in ["unchanged", "regular", "symlink", "missing", "occupied", "recreated"] {
         let ops = NativeSystemOps()
@@ -1435,6 +1707,8 @@ struct RecorderModelHarness {
         let root = home.appendingPathComponent("data")
         try testStartAuxiliaryStateSpace(root)
         try testExitDiagnosticIdentityStateSpace(root)
+        try testHeartbeatAutomaticRecovery(root)
+        try testHeartbeatRecoveryFailureAndCancellationMatrix(root)
         try testPruningQuarantineStateSpace(root)
         try testQuitOwnershipMatrix(root)
         try testDirectoryAuthority(root)
