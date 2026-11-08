@@ -186,7 +186,9 @@ struct RecordingPanelView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 104)
+                .frame(
+                    minHeight: 36, idealHeight: 48, maxHeight: 128,
+                    alignment: .topLeading)
 
                 HStack {
                     if model.canOpenLogForCurrentSurface {

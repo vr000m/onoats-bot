@@ -1097,9 +1097,16 @@ def test_panel_keyboard_focus_and_icon_accessibility_contracts_are_explicit():
 def test_warning_region_is_bounded_and_panel_does_not_render_log_contents():
     _, recording, settings = _panel_sources()
     assert "hintCaptionLines" in recording
-    assert re.search(r"maxHeight\s*:\s*\d+", recording), (
-        "warning/failure text must have a bounded wrapping region"
+    height_bounds = re.search(
+        r"\.frame\s*\(\s*minHeight:\s*(\d+),\s*idealHeight:\s*(\d+),"
+        r"\s*maxHeight:\s*(\d+)",
+        recording,
     )
+    assert height_bounds, (
+        "warning/failure text must reserve visible wrapped height and remain bounded"
+    )
+    minimum, ideal, maximum = map(int, height_bounds.groups())
+    assert 28 <= minimum <= ideal <= maximum <= 160
     assert re.search(r"\.fixedSize\s*\(\s*horizontal:\s*false", recording)
 
     combined = recording + settings
