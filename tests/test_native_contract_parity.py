@@ -993,8 +993,18 @@ def test_recording_panel_keeps_primary_actions_and_live_distinctions_visible():
     ):
         assert label in recording, f"main panel lost {label!r}"
 
-    # Start/Stop are the one prominent, full-width action; Flush remains
-    # secondary. Enablement stays tied to the existing model authorities.
+    running = recording.split("case .running(let ours):", 1)[1].split(
+        "case .starting:", 1
+    )[0]
+    assert re.search(
+        r'HStack\s*\([^)]*\)\s*\{.*Button\("Flush"\).*'
+        r'Button\("Stop Recording"\)',
+        running,
+        re.S,
+    ), "Flush must be the secondary action beside the prominent Stop action"
+
+    # Start/Stop stay prominent; Flush shares the recording action row as the
+    # secondary action. Enablement remains tied to the model authorities.
     assert recording.count(".buttonStyle(.borderedProminent)") >= 1
     assert ".frame(maxWidth: .infinity)" in recording
     assert re.search(r"\.disabled\s*\(\s*!model\.canStart\s*\)", recording)
