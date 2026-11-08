@@ -128,9 +128,11 @@ replacement.
 
 The app permits one automatic restart per failure cluster. The replacement must
 remain authoritatively running for 60 seconds before another automatic recovery
-is allowed. If it stalls earlier, the panel remains visibly failed instead of
-entering a restart loop. A manual Start begins a new cluster. Direct CLI and
-externally started recordings do not use this app-owned recovery path.
+is allowed. Missing or replaced PID authority restarts that full window, and a
+live external successor cancels the app replacement. If the replacement stalls
+earlier, the panel remains visibly failed instead of entering a restart loop. A
+manual Start begins a new cluster. Direct CLI and externally started recordings
+do not use this app-owned recovery path.
 
 ### Login item warning
 

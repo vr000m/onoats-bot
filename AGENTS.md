@@ -136,7 +136,9 @@ registry dep, not a git pin).
   supervisor rc 1, re-reads the exact failed generation's status, and starts a
   fresh generation only for `capture-heartbeat-stalled`. One restart is allowed
   per failure cluster; the exact replacement must remain authoritative for 60 s
-  to rearm it, while a manual Start resets the cluster. Stop, Cancel Recovery,
+  to rearm it. Missing or replaced PID publication cancels that stability
+  window and requires a fresh full 60 s; a live external successor cancels the
+  app replacement. A manual Start resets the cluster. Stop, Cancel Recovery,
   Quit, stale timers, generic failures, and external sessions never auto-restart.
   Direct CLI sessions remain stopped. Pinned by
   `native/test_capturer_watchdog.sh`, `native/test_recorder_model.sh`,

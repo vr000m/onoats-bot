@@ -90,8 +90,11 @@ onoats devices      # list PortAudio devices
    the result.
 
 The recorder never reconnects a failed native audio stream itself. Failures are
-bounded and loud; the supervisor owns restart, while partial transcripts still
-rotate into the queue.
+bounded and loud; each supervisor owns one generation, while partial transcripts
+still rotate into the queue. For a menu-bar-owned
+`capture-heartbeat-stalled` failure only, the app verifies the exact failed
+generation and starts one wholly fresh supervisor generation automatically.
+Direct CLI sessions and other failures remain stopped.
 
 ## Cross-platform matrix
 

@@ -389,7 +389,7 @@ Context lifecycle — what each process owns:
 - [x] Embedded signed-capturer STOP/CONT verification using the supplied system
   audio under the production CLI supervisor.
 - [x] App-owned menu-bar Start/Stop smoke on the same signed bundle.
-- [ ] App-owned heartbeat recovery state-space harness.
+- [x] App-owned heartbeat recovery state-space harness.
 - [ ] App-owned automatic restart live smoke on the signed bundle.
 
 ### Test Results
@@ -431,8 +431,8 @@ Context lifecycle — what each process owns:
   minting every generation identity anew.
 - Direct CLI sessions, generic failures, external recorders, user Stop, and Quit
   never enter app-owned automatic recovery.
-- The supervisor remains the only whole-generation restart owner, and every
-  heartbeat fault rotates the partial session through existing fail-loud logic.
+- Each supervisor remains the sole owner of its generation; the app may launch
+  a new supervisor only after the failed generation rotates and exits.
 - No resource residue, duplicate tap chain, branch mixing, or unbounded wait is
   introduced.
 - Focused tests, full tests, Ruff format/check, review-marker validation, and
@@ -440,14 +440,16 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ 465559c27328fd323a36096a09d108ace9e1c70a -->
+<!-- reviewed: 2026-11-08 @ 8fc6f443bc3b665e10dd9fe48922bb7ac3a1befa -->
 
 ## Progress
 
 - [x] Phase 1: Suspension Watchdog and Deterministic Harness
 - [x] Phase 2: Fail-Loud Native-to-Supervisor Boundary
 - [x] Phase 3: Contract Documentation and Live Verification
-- [ ] Phase 4: App-Owned Automatic Generation Recovery
+- [x] Phase 4: App-Owned Automatic Generation Recovery implementation and
+  automated verification
+- [ ] Phase 4 acceptance: signed-app automatic replacement with healthy `them`
 
 ## Findings
 
@@ -518,6 +520,14 @@ Context lifecycle — what each process owns:
   early second-stall suppression, stale timers, and stable rearming. The native
   app build, watchdog harness, Ruff, marker check, and full suite also passed:
   8,142 tests passed and 13 skipped.
+- 2026-11-08: incremental deep review found seven fresh root causes: queued
+  capture data could pass a stopped chunker; log reservation could wedge
+  recovery; PID-authority loss could still rearm the budget; lifecycle polling
+  could hide pending recovery; Stop could lose an exit-callback race; an
+  external successor could provoke a doomed spawn; and public/plan docs lagged.
+  All were fixed with production state-space regressions. Final verification
+  passed: both native harnesses, native app build, Ruff format/check, and the
+  full suite (8,142 passed, 13 skipped).
 
 ## Issues & Solutions
 
@@ -536,17 +546,24 @@ Context lifecycle — what each process owns:
   heartbeat status can replace the recorder's transient generic failure. The
   immutable request retains only the exact failed generation, directory,
   category, and budget token; every native/process identity is minted anew.
+- Terminal `FrameChunker.stop()` now rejects a queued worker append under the
+  same lock, so neither filler nor captured audio leaves an invalid generation.
+- Automatic recovery uses one failure finalizer for spawn and log setup, keeps
+  Stop intent across a queued exit callback, preserves admitted recovery across
+  lifecycle polls, and requires a continuously authoritative replacement.
 
 ## Final Results
 
 ### Summary
 
 - The current generation now fails with rc 14 after a system-pacer heartbeat
-  gap greater than 2 s. The supervisor remains the only restart owner.
+  gap greater than 2 s. Each supervisor remains the sole owner of one generation;
+  the app owns the bounded transition to a fresh supervisor.
 - Automated implementation and contract verification are complete. Live
-  signed-capturer STOP/CONT, residue cleanup, and fresh-generation recovery are
-  verified through both the production CLI supervisor and an app-owned menu-bar
-  Start. Automatic app-owned replacement is the reopened Phase 4 work.
+  signed-capturer STOP/CONT, residue cleanup, and manual fresh-generation
+  recovery are verified through both the production CLI supervisor and an
+  app-owned menu-bar Start. Automatic replacement is implemented and remains
+  open only for the signed-app acceptance smoke.
 
 ### Outcomes
 
@@ -555,6 +572,9 @@ Context lifecycle — what each process owns:
 - A heartbeat fault arms a separate 2 s process boundary before ordered cleanup.
 - The observed live fault exited in 75.8 ms, rotated the partial session, and
   left no aggregate, tap, socket directory, capturer, or recorder residue.
+- An exact app-owned heartbeat failure now creates at most one fresh supervisor
+  generation. Authority loss restarts the 60-second stability window; Stop,
+  Quit, external successors, and replacement setup failures settle visibly.
 
 ### Learnings
 
@@ -566,3 +586,5 @@ Context lifecycle — what each process owns:
 
 - Verify a real host sleep/wake separately; the uptime clock excludes sleep,
   but this work does not claim the Core Audio tap itself survives that event.
+- Run the signed-app automatic replacement smoke and confirm the new generation
+  publishes healthy `them` without a manual Start.
