@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-08
+
 ### Added
 
 - **Menu-bar control panel.** The menu-bar icon now opens a recording panel
