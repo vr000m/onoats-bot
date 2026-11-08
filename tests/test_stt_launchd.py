@@ -12,7 +12,12 @@ import it without either importing the other.
 from __future__ import annotations
 
 import asyncio
+import os
+import plistlib
+import stat
 import subprocess
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -131,6 +136,191 @@ def test_kickstart_returns_false_on_nonzero_exit(monkeypatch):
     )
     monkeypatch.setattr(launchd.os, "getuid", lambda: 1)
     assert launchd.kickstart_stt_server("label") is False
+
+
+def _write_launch_agent(path, label: str) -> None:
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": label,
+                "ProgramArguments": ["/usr/bin/true"],
+                "RunAtLoad": True,
+            }
+        )
+    )
+    path.chmod(0o644)
+
+
+def test_kickstart_bootstraps_matching_unloaded_launch_agent(monkeypatch, tmp_path):
+    label = "pipecat.stt-server.nemotron"
+    uid = os.getuid()
+    plist = tmp_path / f"{label}.plist"
+    _write_launch_agent(plist, label)
+    calls: list[list[str]] = []
+    envs: list[dict[str, str]] = []
+    consumed: list[bytes] = []
+    snapshots: list[Path] = []
+    expected = plist.read_bytes()
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        envs.append(kwargs["env"])
+        if argv[1] == "kickstart" and len(calls) == 1:
+            return subprocess.CompletedProcess(
+                argv, 113, "", f'Could not find service "{label}"'
+            )
+        if argv[1] == "bootstrap":
+            plist.write_bytes(plistlib.dumps({"Label": "attacker.replacement"}))
+            snapshot = Path(argv[3])
+            snapshots.append(snapshot)
+            assert stat.S_IMODE(snapshot.stat().st_mode) == 0o400
+            assert stat.S_IMODE(snapshot.parent.stat().st_mode) == 0o700
+            consumed.append(snapshot.read_bytes())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: uid)
+    monkeypatch.setenv("STT_WS_TOKEN", "must-not-reach-launchctl")
+
+    assert launchd.kickstart_stt_server(label) is True
+    assert calls[0] == ["/bin/launchctl", "kickstart", "-k", f"gui/{uid}/{label}"]
+    assert calls[1][:3] == ["/bin/launchctl", "bootstrap", f"gui/{uid}"]
+    # launchd opens the path in its own process, so a /dev/fd/N argument cannot
+    # work (launchctl rc 5, verified live): it must be a real private file.
+    assert not calls[1][3].startswith("/dev/fd/")
+    assert Path(calls[1][3]) != plist
+    assert consumed == [expected]
+    assert len(snapshots) == 1
+    assert not snapshots[0].exists() and not snapshots[0].parent.exists()
+    assert all("STT_WS_TOKEN" not in env for env in envs)
+
+
+@pytest.mark.parametrize(
+    "unsafe", ["symlink", "wrong-label", "writable", "no-run-at-load"]
+)
+def test_kickstart_refuses_unsafe_unloaded_launch_agent(monkeypatch, tmp_path, unsafe):
+    label = "pipecat.stt-server.nemotron"
+    uid = os.getuid()
+    real = tmp_path / "real.plist"
+    _write_launch_agent(real, label if unsafe != "wrong-label" else "other.label")
+    plist = tmp_path / f"{label}.plist"
+    if unsafe == "symlink":
+        plist.symlink_to(real)
+    else:
+        real.rename(plist)
+    if unsafe == "writable":
+        plist.chmod(0o666)
+    if unsafe == "no-run-at-load":
+        payload = plistlib.loads(plist.read_bytes())
+        payload["RunAtLoad"] = False
+        plist.write_bytes(plistlib.dumps(payload))
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+    monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: uid)
+
+    assert launchd.kickstart_stt_server(label) is False
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<?xml version="1.0"?><plist><dict><key>Label</key>',
+        b"<plist><dict><key>Label</key><date>not-a-date</date></dict></plist>",
+        b"<plist><dict><key>Label</key><integer>x</integer></dict></plist>",
+        b"<plist><dict><string>Label</string></dict></plist>",
+        b"bplist00" + b"\x00" * 40,
+        b"",
+        b"<plist><array><string>x</string></array></plist>",
+    ],
+    ids=[
+        "truncated-xml",
+        "bad-date",
+        "bad-integer",
+        "unexpected-element",
+        "bad-binary",
+        "empty",
+        "not-a-dict",
+    ],
+)
+def test_kickstart_treats_every_unparseable_launch_agent_as_invalid(
+    monkeypatch, tmp_path, payload
+):
+    """No plist parse failure escapes the never-raises kickstart contract."""
+    label = "pipecat.stt-server.nemotron"
+    uid = os.getuid()
+    plist = tmp_path / f"{label}.plist"
+    plist.write_bytes(payload)
+    plist.chmod(0o600)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+    monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: uid)
+
+    assert launchd._validated_launch_agent_bytes(label, uid) is None
+    assert launchd.kickstart_stt_server(label) is False
+    assert [call[1] for call in calls] == ["kickstart"]
+
+
+def test_kickstart_refuses_wrong_owner_or_oversized_launch_agent(monkeypatch, tmp_path):
+    label = "pipecat.stt-server.nemotron"
+    uid = os.getuid()
+    plist = tmp_path / f"{label}.plist"
+    _write_launch_agent(plist, label)
+    real_fstat = launchd.os.fstat
+
+    def wrong_owner(fd):
+        info = real_fstat(fd)
+        return SimpleNamespace(
+            st_mode=info.st_mode,
+            st_uid=uid + 1,
+            st_size=info.st_size,
+            st_dev=info.st_dev,
+            st_ino=info.st_ino,
+            st_mtime_ns=info.st_mtime_ns,
+            st_ctime_ns=info.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
+    monkeypatch.setattr(launchd.os, "fstat", wrong_owner)
+    assert launchd._validated_launch_agent_bytes(label, uid) is None
+
+    monkeypatch.setattr(launchd.os, "fstat", real_fstat)
+    plist.write_bytes(b"x" * (launchd._LAUNCH_AGENT_PLIST_MAX_BYTES + 1))
+    assert launchd._validated_launch_agent_bytes(label, uid) is None
+
+
+def test_bootstrap_race_accepts_job_loaded_by_another_process(monkeypatch, tmp_path):
+    label = "pipecat.stt-server.nemotron"
+    uid = os.getuid()
+    plist = tmp_path / f"{label}.plist"
+    _write_launch_agent(plist, label)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "print":
+            return subprocess.CompletedProcess(argv, 0, "loaded", "")
+        return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+    monkeypatch.setattr(launchd, "_launch_agent_path", lambda _label, _uid: plist)
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+    monkeypatch.setattr(launchd.os, "getuid", lambda: uid)
+
+    assert launchd.kickstart_stt_server(label) is True
+    assert [call[1] for call in calls] == ["kickstart", "bootstrap", "print"]
 
 
 @pytest.mark.parametrize(

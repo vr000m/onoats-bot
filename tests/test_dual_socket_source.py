@@ -47,6 +47,7 @@ Interface (verified against the landed Phase-2 implementation):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from pathlib import Path
 
@@ -442,6 +443,23 @@ def test_guard_accepts_distinct_paths(two_paths):
     assert mic_label != system_label
 
 
+def test_socket_level_callbacks_stay_bound_to_their_branch(two_paths):
+    """The builder wires fixed Me/Them observers without a shared fan-out."""
+    _base, mic, system = two_paths
+    mic_levels: list[float] = []
+    system_levels: list[float] = []
+
+    mic_t, system_t, _mic_label, _system_label = _socket_builder()(
+        _cfg(mic, system),
+        on_mic_level=mic_levels.append,
+        on_system_level=system_levels.append,
+    )
+
+    assert mic_t.input()._on_level.__self__ is mic_levels
+    assert system_t.input()._on_level.__self__ is system_levels
+    assert mic_t.input()._on_level is not system_t.input()._on_level
+
+
 # ---------------------------------------------------------------------------
 # Generation nonce: cfg.capturer_nonce must reach the transport handshake gate
 # ---------------------------------------------------------------------------
@@ -742,6 +760,58 @@ class _Stop(Exception):
     """Sentinel raised by the builder spies to cut run_onoats_dual short."""
 
 
+def test_socket_telemetry_uses_the_exact_transcript_buffer_run_id():
+    """One recorder-minted token must attest telemetry and every JSONL header."""
+    import onoats.dual as dual_mod
+
+    source = inspect.getsource(dual_mod.run_onoats_dual)
+    buffer_pos = source.index("TranscriptBuffer(")
+    telemetry_pos = source.index("UITelemetryState(")
+
+    assert buffer_pos < telemetry_pos, (
+        "TranscriptBuffer must mint the run id before schema-v2 telemetry is built"
+    )
+    assert "TranscriptBuffer(\n        data_dir=data_dir," in source
+    telemetry_call = source[telemetry_pos : source.index(")", telemetry_pos) + 1]
+    assert "transcript_buffer.run_id" in telemetry_call
+    assert source.count("transcript_buffer.run_id") == 1, (
+        "dual must wire the buffer-owned id directly, not mint or transform another id"
+    )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_transcript_storage_uses_the_resolved_session_data_dir(
+    explicit, tmp_path, monkeypatch
+):
+    """Explicit and environment-resolved sessions give storage one authority."""
+    import onoats.dual as dual_mod
+    import onoats.processors.transcript_buffer as buffer_mod
+
+    selected = tmp_path / ("explicit" if explicit else "environment")
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    monkeypatch.setenv("ONOATS_DATA_DIR", str(tmp_path / "environment"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    captured = []
+
+    class FakeBuffer:
+        run_id = "0123456789abcdef0123456789abcdef"
+
+        def __init__(self, **kwargs):
+            captured.append(kwargs["data_dir"])
+
+    monkeypatch.setattr(buffer_mod, "TranscriptBuffer", FakeBuffer)
+    monkeypatch.setattr(dual_mod, "_acquire_instance_lock", lambda *_args: None)
+
+    def stop_before_capture(*_args, **_kwargs):
+        raise _Stop
+
+    monkeypatch.setattr(dual_mod, "_build_socket_transports", stop_before_capture)
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=selected if explicit else None))
+
+    assert captured == [selected]
+
+
 def _dual_spies(monkeypatch, tmp_path, *, preflight_raises: bool):
     import onoats.dual as dual_mod
     from onoats import runtime
@@ -812,6 +882,52 @@ def test_dual_diarization_lock_then_preflight_precede_capture(
         asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
 
     assert calls[:3] == ["lock", "preflight", builder], calls
+
+
+@pytest.mark.parametrize("source", ["portaudio", "socket"])
+@pytest.mark.parametrize("supplied", [False, True], ids=["captured", "supplied"])
+def test_session_snapshot_lock_order_whole_backend_state_space(
+    source, supplied, tmp_path, monkeypatch
+):
+    """Every backend locks before selecting one immutable session snapshot."""
+    import onoats.dual as dual_mod
+    from onoats import runtime
+    from onoats.config import load_config
+
+    monkeypatch.setenv("AUDIO_SOURCE", source)
+    monkeypatch.setenv("ONOATS_DIARIZATION", "0")
+    raw_config = load_config()
+    snapshot = runtime.RecorderSessionConfig.capture(raw_config)
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        dual_mod, "_acquire_instance_lock", lambda *_args: calls.append("lock")
+    )
+
+    def capture(_cls, config):
+        assert calls == ["lock"]
+        assert config is raw_config
+        calls.append("capture")
+        return snapshot
+
+    monkeypatch.setattr(runtime.RecorderSessionConfig, "capture", classmethod(capture))
+
+    def stop(*_args, **_kwargs):
+        calls.append("transport")
+        raise _Stop
+
+    monkeypatch.setattr(dual_mod, f"_build_{source}_transports", stop)
+    if source == "portaudio":
+        monkeypatch.setattr(
+            "onoats.config.audio_devices.select_dual_input_devices", stop
+        )
+
+    kwargs = {"session_config": snapshot} if supplied else {"config": raw_config}
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data", **kwargs))
+
+    expected = ["lock", "transport"] if supplied else ["lock", "capture", "transport"]
+    assert calls == expected
 
 
 @pytest.mark.parametrize("source", ["portaudio", "socket"])

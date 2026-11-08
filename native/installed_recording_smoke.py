@@ -1,0 +1,1465 @@
+#!/usr/bin/env python3
+"""Bounded signed-app recording proof without printing transcript contents."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import fcntl
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterator
+from typing import NamedTuple, TypeVar
+
+T = TypeVar("T")
+_PROC_PIDTBSDINFO = 3
+_MAXCOMLEN = 16
+JSONL_LINE_LIMIT = 1024 * 1024
+CONTROL_FILE_LIMIT = 64 * 1024
+TIMEOUT_DEFAULTS = {
+    "app_timeout": 15.0,
+    "recording_timeout": 120.0,
+    "activity_timeout": 120.0,
+    "stop_timeout": 120.0,
+    "transcript_timeout": 30.0,
+}
+
+
+def _load_telemetry_contract():
+    """Load constants from this checkout, never from an installed package."""
+    path = Path(__file__).resolve().parents[1] / "src/onoats_contracts/ui_telemetry.py"
+    spec = importlib.util.spec_from_file_location(
+        "onoats_smoke_telemetry_contract", path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("UI telemetry contract source is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_TELEMETRY_CONTRACT = _load_telemetry_contract()
+UI_TELEMETRY_SCHEMA_VERSION = _TELEMETRY_CONTRACT.UI_TELEMETRY_SCHEMA_VERSION
+UI_TELEMETRY_FILENAME = _TELEMETRY_CONTRACT.UI_TELEMETRY_FILENAME
+SNAPSHOT_EXPIRY_SECONDS = _TELEMETRY_CONTRACT.SNAPSHOT_EXPIRY_SECONDS
+AUDIO_OBSERVATION_EXPIRY_SECONDS = _TELEMETRY_CONTRACT.AUDIO_OBSERVATION_EXPIRY_SECONDS
+LEVEL_MIN = _TELEMETRY_CONTRACT.LEVEL_MIN
+LEVEL_MAX = _TELEMETRY_CONTRACT.LEVEL_MAX
+_TRANSCRIPT_RUN_ID_RE = re.compile(_TELEMETRY_CONTRACT.TRANSCRIPT_RUN_ID_PATTERN)
+
+# Recorder-authority file names and PID marker. The smoke stays free of
+# ``onoats`` imports (it inspects an installed app from outside), so these are
+# local copies pinned to their Python owners (``onoats.status.STATUS_FILENAME``,
+# ``onoats._vendor.pid.PID_FILENAME`` / ``PID_MARKER``, and
+# ``onoats.runtime.LOCK_FILENAME``) by
+# ``tests/test_recording_integration.py``; change them together.
+ACTIVE_DIRNAME = ".active"
+STATUS_FILENAME = "onoats.status.json"
+PID_FILENAME = "onoats.pid"
+LOCK_FILENAME = "onoats.lock"
+PID_MARKER = "onoats-bot"
+
+
+class SmokeFailure(RuntimeError):
+    """One stage of the installed recording proof failed."""
+
+
+def _invalidate_receipt(path: Path) -> None:
+    from release_identity import invalidate_smoke_receipt
+
+    invalidate_smoke_receipt(path)
+
+
+def _publish_receipt(path: Path, identity) -> None:
+    from release_identity import write_smoke_receipt
+
+    write_smoke_receipt(path, identity)
+
+
+def _preserve_final_component(path: Path) -> Path:
+    from release_identity import preserve_final_component
+
+    return preserve_final_component(path)
+
+
+def _effective_app_cli_path(expected) -> Path:
+    """Read the launch configuration without resolving its final component."""
+    result = subprocess.run(
+        ["/usr/bin/defaults", "read", expected.bundle_id, "cliPath"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    configured = result.stdout.strip() if result.returncode == 0 else ""
+    return Path(configured or expected.cli_path).expanduser()
+
+
+def _verify_effective_cli_authority(expected) -> Path:
+    try:
+        from release_identity import InstallError, verify_cli_authority
+
+        return verify_cli_authority(expected, _effective_app_cli_path(expected))
+    except (OSError, ValueError, InstallError) as exc:
+        raise SmokeFailure("effective app CLI authority could not be verified") from exc
+
+
+def _positive_finite_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return value
+
+
+def _validate_timeout_arguments(args: argparse.Namespace) -> None:
+    for field, default in TIMEOUT_DEFAULTS.items():
+        value = float(getattr(args, field, default))
+        if not math.isfinite(value) or value <= 0:
+            option = field.replace("_", "-")
+            raise SmokeFailure(f"--{option} must be finite and greater than zero")
+        setattr(args, field, value)
+
+
+def _verify_release_identity(app: Path, identity_path: Path):
+    """Re-derive the immutable staged identity before and after recording."""
+    try:
+        from release_identity import (
+            InstallError,
+            observe_and_derive_release_identity,
+            read_release_identity,
+        )
+
+        expected = read_release_identity(identity_path)
+        observed = observe_and_derive_release_identity(app)
+    except (OSError, ValueError, InstallError) as exc:
+        raise SmokeFailure("release identity could not be verified") from exc
+    if observed != expected:
+        raise SmokeFailure("release identity changed")
+    return expected
+
+
+def _dynamic_code_identity(pid: int) -> tuple[str, str]:
+    """Read designated requirement and cdhash for a running PID via Security."""
+    if sys.platform != "darwin":
+        raise SmokeFailure("dynamic code identity requires macOS Security.framework")
+    security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    core = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    ref = ctypes.c_void_p
+    core.CFRelease.argtypes = [ref]
+    core.CFNumberCreate.argtypes = [ref, ctypes.c_long, ctypes.c_void_p]
+    core.CFNumberCreate.restype = ref
+    core.CFDictionaryCreate.argtypes = [
+        ref,
+        ctypes.POINTER(ref),
+        ctypes.POINTER(ref),
+        ctypes.c_long,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    core.CFDictionaryCreate.restype = ref
+    core.CFDictionaryGetValue.argtypes = [ref, ref]
+    core.CFDictionaryGetValue.restype = ref
+    core.CFStringGetLength.argtypes = [ref]
+    core.CFStringGetLength.restype = ctypes.c_long
+    core.CFStringGetMaximumSizeForEncoding.argtypes = [ctypes.c_long, ctypes.c_uint]
+    core.CFStringGetMaximumSizeForEncoding.restype = ctypes.c_long
+    core.CFStringGetCString.argtypes = [
+        ref,
+        ctypes.c_char_p,
+        ctypes.c_long,
+        ctypes.c_uint,
+    ]
+    core.CFStringGetCString.restype = ctypes.c_bool
+    core.CFDataGetLength.argtypes = [ref]
+    core.CFDataGetLength.restype = ctypes.c_long
+    core.CFDataGetBytePtr.argtypes = [ref]
+    core.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_ubyte)
+
+    security.SecCodeCopyGuestWithAttributes.argtypes = [
+        ref,
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecCodeCopyGuestWithAttributes.restype = ctypes.c_int32
+    security.SecCodeCopyDesignatedRequirement.argtypes = [
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecCodeCopyDesignatedRequirement.restype = ctypes.c_int32
+    security.SecRequirementCopyString.argtypes = [
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecRequirementCopyString.restype = ctypes.c_int32
+    security.SecCodeCopySigningInformation.argtypes = [
+        ref,
+        ctypes.c_uint,
+        ctypes.POINTER(ref),
+    ]
+    security.SecCodeCopySigningInformation.restype = ctypes.c_int32
+
+    pid_key = ref.in_dll(security, "kSecGuestAttributePid")
+    unique_key = ref.in_dll(security, "kSecCodeInfoUnique")
+    pid_value = ctypes.c_int32(pid)
+    pid_number = core.CFNumberCreate(None, 3, ctypes.byref(pid_value))
+    if not pid_number:
+        raise SmokeFailure("dynamic code identity could not allocate PID attribute")
+    attributes = code = requirement = requirement_text = signing = None
+    try:
+        keys = (ref * 1)(pid_key)
+        values = (ref * 1)(pid_number)
+        attributes = core.CFDictionaryCreate(None, keys, values, 1, None, None)
+        code = ref()
+        if not attributes or security.SecCodeCopyGuestWithAttributes(
+            None, attributes, 0, ctypes.byref(code)
+        ):
+            raise SmokeFailure(
+                "running app PID has no Security.framework code identity"
+            )
+        requirement = ref()
+        if security.SecCodeCopyDesignatedRequirement(
+            code, 0, ctypes.byref(requirement)
+        ):
+            raise SmokeFailure("running app has no designated requirement")
+        requirement_text = ref()
+        if security.SecRequirementCopyString(
+            requirement, 0, ctypes.byref(requirement_text)
+        ):
+            raise SmokeFailure("running app requirement could not be rendered")
+        encoding = 0x08000100
+        size = (
+            core.CFStringGetMaximumSizeForEncoding(
+                core.CFStringGetLength(requirement_text), encoding
+            )
+            + 1
+        )
+        buffer = ctypes.create_string_buffer(size)
+        if not core.CFStringGetCString(requirement_text, buffer, size, encoding):
+            raise SmokeFailure("running app requirement is not UTF-8")
+        signing = ref()
+        if security.SecCodeCopySigningInformation(code, 1 << 1, ctypes.byref(signing)):
+            raise SmokeFailure("running app signing information is unavailable")
+        unique = core.CFDictionaryGetValue(signing, unique_key)
+        if not unique:
+            raise SmokeFailure("running app signing information has no cdhash")
+        length = core.CFDataGetLength(unique)
+        cdhash = bytes(core.CFDataGetBytePtr(unique)[:length]).hex()
+        return buffer.value.decode("utf-8"), cdhash
+    finally:
+        for value in (
+            signing,
+            requirement_text,
+            requirement,
+            code,
+            attributes,
+            pid_number,
+        ):
+            if value:
+                core.CFRelease(value)
+
+
+def _verify_dynamic_release_identity(pid: int, expected) -> None:
+    requirement, cdhash = _dynamic_code_identity(pid)
+    if requirement != expected.designated_requirement or cdhash != expected.cdhash:
+        raise SmokeFailure("running app dynamic code identity does not match release")
+
+
+def _require_launched_app(app_identity: ProcessIdentity, stage: str) -> None:
+    """The app PID must still name the exact launched kernel generation."""
+    if _process_birth(app_identity.pid) != app_identity.process_birth:
+        raise SmokeFailure(f"{stage} failed: launched app generation changed")
+
+
+def _verify_launched_app_code(app_identity: ProcessIdentity, expected) -> None:
+    """Authenticate the launched generation, not whichever process owns its PID.
+
+    The kernel birth tuple is read before and after the dynamic code check; a
+    PID cannot be reused while its process lives, so equal births bracketing
+    the check prove it authenticated the captured launch generation.
+    """
+    _require_launched_app(app_identity, "dynamic code identity")
+    _verify_dynamic_release_identity(app_identity.pid, expected)
+    _require_launched_app(app_identity, "dynamic code identity")
+
+
+class ProcessBirth(NamedTuple):
+    seconds: int
+    microseconds: int
+
+
+class RecorderIdentity(NamedTuple):
+    pid: int
+    start_epoch: float
+    command: str
+    process_start: str
+    pgid: int
+    process_birth: ProcessBirth
+
+
+class ProcessRow(NamedTuple):
+    parent: int
+    pgid: int
+    start: str
+    command: str
+
+
+class ProcessIdentity(NamedTuple):
+    pid: int
+    pgid: int
+    start: str
+    command: str
+    process_birth: ProcessBirth
+
+
+class OwnedProcessGroup(NamedTuple):
+    pgid: int
+    members: tuple[ProcessIdentity, ...]
+
+
+class CleanupTargetResult(NamedTuple):
+    label: str
+    pid: int
+    initial_state: str
+    term_sent: bool
+    kill_sent: bool
+    final_state: str
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * _MAXCOMLEN),
+        ("pbi_name", ctypes.c_char * (_MAXCOMLEN * 2)),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _process_birth(pid: int) -> ProcessBirth | None:
+    """Read the kernel process generation used as signalling authority."""
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    proc_pidinfo = libproc.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    info = _ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    if proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) != size:
+        return None
+    return ProcessBirth(int(info.pbi_start_tvsec), int(info.pbi_start_tvusec))
+
+
+def wait_for(
+    stage: str,
+    timeout: float,
+    probe: Callable[[], T | None],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    deadline = clock() + timeout
+    while True:
+        value = probe()
+        if value is not None:
+            return value
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise SmokeFailure(f"{stage} timed out after {timeout:.1f}s")
+        sleep(min(0.2, remaining))
+
+
+def _control_text(path: Path) -> str | None:
+    """Read one bounded, regular, no-follow control-file descriptor."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or metadata.st_size > CONTROL_FILE_LIMIT
+            ):
+                return None
+            data = os.read(fd, CONTROL_FILE_LIMIT + 1)
+            if len(data) > CONTROL_FILE_LIMIT:
+                return None
+            current = os.lstat(path)
+            if not stat.S_ISREG(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != (metadata.st_dev, metadata.st_ino):
+                return None
+            return data.decode("utf-8")
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeError):
+        return None
+
+
+def _process_executable(pid: int) -> str | None:
+    """Kernel executable path; argv text is never app authentication."""
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidpath = libproc.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        if proc_pidpath(pid, buffer, len(buffer)) <= 0:
+            return None
+        return os.fsdecode(buffer.value)
+    except OSError:
+        return None
+
+
+def _json(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(
+            _control_text(path) or "",
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _processes() -> dict[int, ProcessRow]:
+    result = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,command="],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    found: dict[int, ProcessRow] = {}
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 8)
+        if (
+            len(fields) == 9
+            and fields[0].isdigit()
+            and fields[1].isdigit()
+            and fields[2].isdigit()
+        ):
+            found[int(fields[0])] = ProcessRow(
+                int(fields[1]), int(fields[2]), " ".join(fields[3:8]), fields[8]
+            )
+    return found
+
+
+def _one_app_pid(app: Path) -> int | None:
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    matches = [pid for pid in _processes() if _process_executable(pid) == executable]
+    if len(matches) > 1:
+        raise SmokeFailure("app identity failed: multiple matching Onoats processes")
+    return matches[0] if matches else None
+
+
+def _pid_file_matches(
+    pid_path: Path, *, pid: int, start_epoch: float, command: str
+) -> bool:
+    try:
+        fields = (_control_text(pid_path) or "").splitlines()
+        return (
+            len(fields) >= 4
+            and fields[1].strip() == PID_MARKER
+            and bool(command.strip())
+            and fields[2].strip() == command.strip()
+            and int(fields[0]) == pid
+            and float(fields[3]) == start_epoch
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _recording_identity(
+    status_path: Path,
+    pid_path: Path,
+    *,
+    app_identity: ProcessIdentity,
+    expected_release=None,
+) -> RecorderIdentity | None:
+    app_pid = app_identity.pid
+    status = _json(status_path)
+    if not status or status.get("running") is not True:
+        return None
+    try:
+        recorder_pid = int(status["pid"])
+        epoch = float(status["start_time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(epoch):
+        return None
+    initial = _processes()
+    initial_chain = _ancestry_chain(recorder_pid, app_pid, initial)
+    if initial_chain is None:
+        raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
+    births_before = {pid: _process_birth(pid) for pid in initial_chain}
+    if any(birth is None for birth in births_before.values()):
+        return None
+    processes = _processes()
+    current_chain = _ancestry_chain(recorder_pid, app_pid, processes)
+    if current_chain != initial_chain:
+        return None
+    births_after = {pid: _process_birth(pid) for pid in current_chain}
+    if births_after != births_before:
+        return None
+    if births_after.get(app_pid) != app_identity.process_birth:
+        raise SmokeFailure("recorder ancestry failed: launched app generation changed")
+    if not _descends_from(recorder_pid, app_pid, processes):
+        raise SmokeFailure("recorder ancestry failed: recorder is not app-owned")
+    if expected_release is not None:
+        interpreter = _verify_effective_cli_authority(expected_release)
+        if _process_executable(recorder_pid) != str(interpreter):
+            raise SmokeFailure(
+                "recorder executable lineage is not the approved CLI interpreter"
+            )
+    if not _pid_file_matches(
+        pid_path,
+        pid=recorder_pid,
+        start_epoch=epoch,
+        command=processes[recorder_pid].command,
+    ):
+        return None
+    row = processes[recorder_pid]
+    birth = births_after[recorder_pid]
+    assert birth is not None
+    return RecorderIdentity(
+        recorder_pid, epoch, row.command, row.start, row.pgid, birth
+    )
+
+
+def _cleanup_recording_identity(
+    pid_path: Path,
+    *,
+    app_pid: int,
+    app_identity: ProcessIdentity | None = None,
+    expected_release=None,
+) -> RecorderIdentity | None:
+    """Capture a signal-safe recorder identity without trusting status/telemetry.
+
+    This is the failure-cleanup discovery path.  The PID authority record,
+    stable process birth, app ancestry, command fingerprint, and approved
+    interpreter must all agree; partial or stale display records confer no
+    signalling authority.
+    """
+    fields = (_control_text(pid_path) or "").splitlines()
+    if len(fields) < 4 or fields[1].strip() != PID_MARKER:
+        return None
+    try:
+        recorder_pid = int(fields[0])
+        epoch = float(fields[3])
+    except ValueError:
+        return None
+    command = fields[2].strip()
+    if recorder_pid <= 0 or not command or not math.isfinite(epoch) or epoch <= 0:
+        return None
+    initial = _processes()
+    chain = _ancestry_chain(recorder_pid, app_pid, initial)
+    if chain is None:
+        return None
+    births_before = {pid: _process_birth(pid) for pid in chain}
+    if any(birth is None for birth in births_before.values()):
+        return None
+    current = _processes()
+    if _ancestry_chain(recorder_pid, app_pid, current) != chain:
+        return None
+    if app_identity is not None and current.get(app_pid) is not None:
+        if not _identity_matches(app_identity):
+            return None
+    births_after = {pid: _process_birth(pid) for pid in chain}
+    if births_after != births_before:
+        return None
+    row = current.get(recorder_pid)
+    birth = births_after.get(recorder_pid)
+    if row is None or birth is None or row.command.strip() != command:
+        return None
+    if not _pid_file_matches(
+        pid_path, pid=recorder_pid, start_epoch=epoch, command=row.command
+    ):
+        return None
+    if expected_release is not None:
+        interpreter = _verify_effective_cli_authority(expected_release)
+        if _process_executable(recorder_pid) != str(interpreter):
+            return None
+    return RecorderIdentity(
+        recorder_pid, epoch, row.command, row.start, row.pgid, birth
+    )
+
+
+def _wait_identity_gone(identity: ProcessIdentity, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _identity_matches(identity):
+            return True
+        time.sleep(0.1)
+    return not _identity_matches(identity)
+
+
+def _recorder_process_identity(identity: RecorderIdentity) -> ProcessIdentity:
+    return ProcessIdentity(
+        identity.pid,
+        identity.pgid,
+        identity.process_start,
+        identity.command,
+        identity.process_birth,
+    )
+
+
+def _app_process_matches(app: Path, identity: ProcessIdentity) -> bool:
+    executable = str((app / "Contents/MacOS/Onoats").resolve())
+    return (_process_executable(identity.pid) == executable) and _identity_matches(
+        identity
+    )
+
+
+def _capture_process_identity(pid: int) -> ProcessIdentity | None:
+    """Capture command/topology between two matching kernel-birth reads."""
+    birth_before = _process_birth(pid)
+    if birth_before is None:
+        return None
+    row = _processes().get(pid)
+    birth_after = _process_birth(pid)
+    if row is None or birth_after != birth_before:
+        return None
+    return ProcessIdentity(pid, row.pgid, row.start, row.command, birth_after)
+
+
+def _identity_matches(identity: ProcessIdentity) -> bool:
+    row = _processes().get(identity.pid)
+    return row is not None and (
+        row.pgid == identity.pgid
+        and row.start == identity.start
+        and row.command == identity.command
+        and _process_birth(identity.pid) == identity.process_birth
+    )
+
+
+def _signal_identity(identity: ProcessIdentity, sig: signal.Signals) -> bool:
+    """Signal only an exact captured process generation."""
+    if not _identity_matches(identity):
+        return False
+    os.kill(identity.pid, sig)
+    return True
+
+
+def _signal_app(app: Path, identity: ProcessIdentity, sig: signal.Signals) -> bool:
+    """Signal only the exact captured app generation at its verified path."""
+    if not _app_process_matches(app, identity):
+        return False
+    os.kill(identity.pid, sig)
+    return True
+
+
+def _owned_descendant_groups(
+    app_pid: int, recorder_pid: int
+) -> tuple[OwnedProcessGroup, ...]:
+    """Snapshot smoke-owned descendant groups while their ancestry is provable."""
+    initial = _processes()
+    initial_pids = _capture_related_pids(initial, app_pid, recorder_pid)
+    births_before = {pid: _process_birth(pid) for pid in initial_pids}
+    if any(birth is None for birth in births_before.values()):
+        raise SmokeFailure("process capture failed: generation unavailable")
+    processes = _processes()
+    current_pids = _capture_related_pids(processes, app_pid, recorder_pid)
+    births_after = {pid: _process_birth(pid) for pid in current_pids}
+    if current_pids != initial_pids or births_after != births_before:
+        raise SmokeFailure("process capture failed: generation changed during snapshot")
+    app_row = processes.get(app_pid)
+    grouped: dict[int, list[ProcessIdentity]] = {}
+    for pid, row in processes.items():
+        if not _descends_from(pid, recorder_pid, processes):
+            continue
+        if app_row is not None and row.pgid == app_row.pgid:
+            continue
+        birth = births_after[pid]
+        assert birth is not None
+        grouped.setdefault(row.pgid, []).append(
+            ProcessIdentity(pid, row.pgid, row.start, row.command, birth)
+        )
+    return tuple(
+        OwnedProcessGroup(pgid, tuple(members))
+        for pgid, members in sorted(grouped.items())
+    )
+
+
+def _refresh_owned_descendant_groups(
+    app_pid: int, recorder: RecorderIdentity
+) -> tuple[OwnedProcessGroup, ...]:
+    """Re-snapshot descendants only while the captured recorder generation lives.
+
+    A recorder that has exited (the normal graceful-stop state) or whose PID now
+    names another generation contributes nothing: earlier snapshots stay the
+    cleanup authority, and orphans of an exited recorder are no longer provable
+    by ancestry. Only a still-live captured recorder whose ancestry changed is
+    an error. A snapshot is kept only if that generation is live after it too.
+    """
+    identity = _recorder_process_identity(recorder)
+    if not _identity_matches(identity):
+        return ()
+    try:
+        groups = _owned_descendant_groups(app_pid, recorder.pid)
+    except SmokeFailure:
+        if not _identity_matches(identity):
+            return ()
+        raise
+    if not _identity_matches(identity):
+        return ()
+    return groups
+
+
+def _merge_owned_groups(
+    *snapshots: tuple[OwnedProcessGroup, ...],
+) -> tuple[OwnedProcessGroup, ...]:
+    """Union independently verified group-member generations."""
+    grouped: dict[int, dict[ProcessIdentity, None]] = {}
+    for snapshot in snapshots:
+        for group in snapshot:
+            members = grouped.setdefault(group.pgid, {})
+            for member in group.members:
+                members[member] = None
+    return tuple(
+        OwnedProcessGroup(
+            pgid,
+            tuple(sorted(members, key=lambda item: (item.pid, item.process_birth))),
+        )
+        for pgid, members in sorted(grouped.items())
+    )
+
+
+def _signal_owned_group(group: OwnedProcessGroup, sig: signal.Signals) -> bool:
+    """Signal only exact captured members; the PGID grants no extra authority."""
+    signalled = False
+    for member in group.members:
+        signalled = _signal_identity(member, sig) or signalled
+    return signalled
+
+
+def _captured_state(
+    identity: ProcessIdentity, matches: Callable[[ProcessIdentity], bool]
+) -> str:
+    if matches(identity):
+        return "live"
+    row = _processes().get(identity.pid)
+    birth = _process_birth(identity.pid)
+    return "gone" if row is None or birth is None else "recycled"
+
+
+def _wait_captured_not_live(
+    identity: ProcessIdentity,
+    matches: Callable[[ProcessIdentity], bool],
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not matches(identity):
+            return True
+        time.sleep(0.1)
+    return not matches(identity)
+
+
+def _cleanup_captured_target(
+    label: str,
+    identity: ProcessIdentity,
+    *,
+    matches: Callable[[ProcessIdentity], bool],
+    send: Callable[[ProcessIdentity, signal.Signals], bool],
+    timeout: float,
+) -> tuple[CleanupTargetResult, tuple[BaseException, ...]]:
+    """Run the complete bounded cleanup sequence for one captured identity."""
+    initial = _captured_state(identity, matches)
+    term_sent = False
+    kill_sent = False
+    failures: list[BaseException] = []
+    if initial == "live":
+        try:
+            term_sent = send(identity, signal.SIGTERM)
+        except BaseException as exc:
+            failures.append(exc)
+        if matches(identity):
+            _wait_captured_not_live(identity, matches, timeout)
+        if matches(identity):
+            try:
+                kill_sent = send(identity, signal.SIGKILL)
+            except BaseException as exc:
+                failures.append(exc)
+            if matches(identity):
+                _wait_captured_not_live(identity, matches, timeout)
+    final = _captured_state(identity, matches)
+    if final == "live":
+        final = "surviving"
+        failures.append(SmokeFailure(f"{label} pid {identity.pid} survived SIGKILL"))
+    return (
+        CleanupTargetResult(label, identity.pid, initial, term_sent, kill_sent, final),
+        tuple(failures),
+    )
+
+
+def _cleanup_after_failure(
+    app: Path,
+    *,
+    app_identity: ProcessIdentity | None,
+    recorder: RecorderIdentity | None = None,
+    status_path: Path | None = None,
+    pid_path: Path | None = None,
+    groups: tuple[OwnedProcessGroup, ...] = (),
+    timeout: float = 5.0,
+) -> tuple[CleanupTargetResult, ...]:
+    """Boundedly stop only identities proven to belong to this smoke run."""
+    # Ancestry is a discovery gate only. Once captured, each identity remains
+    # independently eligible for cleanup even if its ancestor exits first.
+    failures: list[BaseException] = []
+    results: list[CleanupTargetResult] = []
+
+    def cleanup(
+        label: str,
+        identity: ProcessIdentity,
+        *,
+        matches: Callable[[ProcessIdentity], bool] = _identity_matches,
+        send: Callable[[ProcessIdentity, signal.Signals], bool] = _signal_identity,
+    ) -> None:
+        result, target_failures = _cleanup_captured_target(
+            label,
+            identity,
+            matches=matches,
+            send=send,
+            timeout=timeout,
+        )
+        results.append(result)
+        failures.extend(target_failures)
+
+    if recorder is not None:
+        try:
+            cleanup("recorder", _recorder_process_identity(recorder))
+        except BaseException as exc:
+            failures.append(exc)
+
+    for group in groups:
+        for member in group.members:
+            try:
+                cleanup(f"group {group.pgid} member", member)
+            except BaseException as exc:
+                failures.append(exc)
+
+    if app_identity is not None:
+        try:
+            cleanup(
+                "app",
+                app_identity,
+                matches=lambda identity: _app_process_matches(app, identity),
+                send=lambda identity, sig: _signal_app(app, identity, sig),
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    if failures:
+        details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
+        raise SmokeFailure(f"bounded cleanup encountered errors: {details}")
+    return tuple(results)
+
+
+def _descends_from(pid: int, ancestor: int, processes: dict[int, ProcessRow]) -> bool:
+    seen: set[int] = set()
+    current = pid
+    while current > 1 and current not in seen:
+        if current == ancestor:
+            return True
+        seen.add(current)
+        row = processes.get(current)
+        if row is None:
+            return False
+        current = row.parent
+    return False
+
+
+def _ancestry_chain(
+    pid: int, ancestor: int, processes: dict[int, ProcessRow]
+) -> frozenset[int] | None:
+    chain: set[int] = set()
+    current = pid
+    while current > 1 and current not in chain:
+        chain.add(current)
+        if current == ancestor:
+            return frozenset(chain)
+        row = processes.get(current)
+        if row is None:
+            return None
+        current = row.parent
+    return None
+
+
+def _capture_related_pids(
+    processes: dict[int, ProcessRow], app_pid: int, recorder_pid: int
+) -> frozenset[int]:
+    ancestry = _ancestry_chain(recorder_pid, app_pid, processes)
+    if ancestry is None:
+        raise SmokeFailure("process capture failed: recorder ancestry changed")
+    descendants = {
+        pid for pid in processes if _descends_from(pid, recorder_pid, processes)
+    }
+    return ancestry | descendants
+
+
+def _check_transcript_deadline(
+    deadline: float | None, clock: Callable[[], float]
+) -> None:
+    if deadline is not None and clock() >= deadline:
+        raise SmokeFailure("transcript proof timed out while scanning JSONL")
+
+
+def _bounded_jsonl_lines(
+    path: Path,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+):
+    """Open once, no-follow, then yield JSON objects from one regular-file fd."""
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SmokeFailure("transcript proof failed: unsafe JSONL candidate")
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        with handle:
+            while True:
+                _check_transcript_deadline(deadline, clock)
+                raw = handle.readline(JSONL_LINE_LIMIT + 2)
+                if not raw:
+                    return
+                content = raw[:-1] if raw.endswith(b"\n") else raw
+                if len(content) > JSONL_LINE_LIMIT:
+                    raise SmokeFailure(
+                        "transcript proof failed: JSONL line limit exceeded"
+                    )
+                try:
+                    yield json.loads(content)
+                except (UnicodeDecodeError, ValueError):
+                    yield None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _header_run_id(path: Path) -> str | None:
+    try:
+        first = next(_bounded_jsonl_lines(path), None)
+    except OSError:
+        return None
+    if not isinstance(first, dict) or first.get("type") != "session_meta":
+        return None
+    run_id = first.get("run_id")
+    if not isinstance(run_id, str) or _TRANSCRIPT_RUN_ID_RE.fullmatch(run_id) is None:
+        return None
+    return run_id
+
+
+def _attested_file_has_me(
+    path: Path,
+    transcript_run_id: str,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Validate header and utterances through the same opened descriptor."""
+    lines = _bounded_jsonl_lines(path, deadline=deadline, clock=clock)
+    first = next(lines, None)
+    if not isinstance(first, dict) or first.get("type") != "session_meta":
+        return False
+    if first.get("run_id") != transcript_run_id:
+        return False
+    for entry in lines:
+        if (
+            isinstance(entry, dict)
+            and entry.get("type") == "utterance"
+            and entry.get("source") == "me"
+            and isinstance(entry.get("text"), str)
+            and bool(entry["text"].strip())
+        ):
+            return True
+    return False
+
+
+def _prelaunch_run_ids(data_dir: Path) -> set[str]:
+    """Classify every existing transcript before launch as defence in depth."""
+    run_ids: set[str] = set()
+    for path in data_dir.rglob("*.jsonl") if data_dir.exists() else ():
+        try:
+            run_id = _header_run_id(path)
+        except (OSError, SmokeFailure) as exc:
+            raise SmokeFailure(
+                "transcript pre-launch failed: unsafe JSONL candidate"
+            ) from exc
+        if run_id is None:
+            raise SmokeFailure(
+                "transcript pre-launch failed: unclassifiable JSONL candidate"
+            )
+        run_ids.add(run_id)
+    return run_ids
+
+
+def _new_me_utterance(
+    data_dir: Path,
+    transcript_run_id: str,
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool | None:
+    """Accept only a canonical Me utterance from the telemetry-attested run."""
+    for path in data_dir.rglob("*.jsonl") if data_dir.exists() else ():
+        _check_transcript_deadline(deadline, clock)
+        try:
+            if _attested_file_has_me(
+                path, transcript_run_id, deadline=deadline, clock=clock
+            ):
+                return True
+        except OSError:
+            continue
+    return None
+
+
+def _graceful_stop_evidence(
+    status_path: Path, *, recorder_pid: int, start_epoch: float
+) -> bool | None:
+    """Accept only this recorder run's canonical graceful stopped record."""
+    status = _json(status_path)
+    if not status or status.get("running") is not False:
+        return None
+    try:
+        stopped_pid = int(status["pid"])
+        stopped_epoch = float(status["start_time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if stopped_pid != recorder_pid or stopped_epoch != start_epoch:
+        return None
+    if (
+        status.get("exit_reason") != "graceful"
+        or status.get("supervisor_rc") not in (None, 0)
+        or status.get("last_error") is not None
+    ):
+        raise SmokeFailure(
+            "graceful app-owned stop failed: matching recorder did not report "
+            "a canonical graceful exit"
+        )
+    return True
+
+
+def _verify_signed_app(app: Path) -> None:
+    if not app.is_dir() or app.is_symlink():
+        raise SmokeFailure(f"app is not a regular bundle directory: {app}")
+    subprocess.run(
+        ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+
+
+@contextlib.contextmanager
+def _recorder_idle_lease(active_dir: Path) -> Iterator[bool]:
+    """Yield True only while no recorder can start or is live in this data dir.
+
+    The proof is a shared ``flock`` on ``onoats.lock`` that is HELD for the whole
+    ``with`` body, not probed and released: a live recorder holds the exclusive
+    lock for its entire life, so while this lease is held a recorder that is
+    already running makes the answer False, and one that tries to start is
+    refused by the single-instance gate instead of beginning a session that the
+    caller's quit would then stop. The pid record is rechecked after the lock is
+    held. Anything unprovable (a pid record, an unsafe or unopenable lock leaf, a
+    held lock) yields False. The lock leaf is created if absent, exactly as the
+    recorder would, so a first run is still covered.
+    """
+    lock_path = active_dir / LOCK_FILENAME
+    if os.path.lexists(active_dir / PID_FILENAME):
+        yield False
+        return
+    try:
+        active_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+        )
+    except OSError:
+        yield False
+        return
+    try:
+        held = False
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                held = not os.path.lexists(active_dir / PID_FILENAME)
+        except OSError:
+            held = False
+        yield held
+    finally:
+        os.close(fd)
+
+
+def _ask_app_to_quit(app: Path) -> bool:
+    """Ask the app at exactly ``app`` to quit. No signal is ever sent."""
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                "tell application (item 1 of argv) to quit",
+                "-e",
+                "end run",
+                str(app),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _quit_unproven_app(
+    app: Path, pid: int, *, active_dir: Path, timeout: float = 10.0
+) -> str | None:
+    """Politely quit an app this run could not prove it launched, if it is safe.
+
+    Returns None when the app was asked to quit and is gone; otherwise the
+    reason it was left running. Safe means: the executable path is exactly this
+    smoke's installed app (re-read just now) and no recorder is provably live
+    under a lease held until the app is gone, so a quit cannot drain and stop a
+    real recording, including one whose Start races the quit.
+    """
+    with _recorder_idle_lease(active_dir) as idle:
+        if not idle:
+            return "a recorder may be live in the data directory"
+        if _one_app_pid(app) != pid:
+            return "the process no longer matches the installed app"
+        if not _ask_app_to_quit(app):
+            return "the quit request failed"
+        # The lease stays held until the app is gone, so no recorder can begin
+        # between the proof and the quit taking effect.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _one_app_pid(app) is None:
+                return None
+            time.sleep(0.2)
+    return "it did not quit in time"
+
+
+def run(args: argparse.Namespace) -> None:
+    _validate_timeout_arguments(args)
+    if not math.isfinite(args.me_floor) or not 0.0 <= args.me_floor <= 1.0:
+        raise SmokeFailure("--me-floor must be finite and inside [0.0, 1.0]")
+    app = Path(args.app).expanduser().resolve()
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    identity_path = _preserve_final_component(Path(args.release_identity))
+    receipt_path = Path(
+        getattr(
+            args,
+            "smoke_receipt",
+            identity_path.with_name(f"{identity_path.name}.smoke-receipt.json"),
+        )
+    ).expanduser()
+    receipt_path = _preserve_final_component(receipt_path)
+    try:
+        _invalidate_receipt(receipt_path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SmokeFailure("smoke receipt could not be invalidated") from exc
+    expected_release = _verify_release_identity(app, identity_path)
+    _verify_effective_cli_authority(expected_release)
+    _verify_signed_app(app)
+    executable = (app / "Contents/MacOS/Onoats").resolve()
+    verified_executable = executable.stat()
+    preexisting = _one_app_pid(app)
+    if preexisting is not None:
+        raise SmokeFailure(
+            f"app preflight failed: Onoats is already running (pid {preexisting})"
+        )
+    prelaunch_run_ids = _prelaunch_run_ids(data_dir)
+    status_path = data_dir / ACTIVE_DIRNAME / STATUS_FILENAME
+    pid_path = data_dir / ACTIVE_DIRNAME / PID_FILENAME
+    telemetry_path = data_dir / ACTIVE_DIRNAME / UI_TELEMETRY_FILENAME
+    app_pid: int | None = None
+    app_identity: ProcessIdentity | None = None
+    unproven_app_pid: int | None = None
+    recorder: RecorderIdentity | None = None
+    groups: tuple[OwnedProcessGroup, ...] = ()
+    primary_error: BaseException | None = None
+    try:
+        subprocess.run(["/usr/bin/open", str(app)], check=True, timeout=10)
+        print("Open the Onoats panel, press Start, and speak into the microphone.")
+
+        app_pid = wait_for(
+            "signed app launch", args.app_timeout, lambda: _one_app_pid(app)
+        )
+        app_identity = _capture_process_identity(app_pid)
+        if app_identity is None:
+            raise SmokeFailure("app launch failed: new process vanished")
+        launched_app = app_identity
+        _verify_launched_app_code(launched_app, expected_release)
+        current_executable = executable.stat()
+        if (verified_executable.st_dev, verified_executable.st_ino) != (
+            current_executable.st_dev,
+            current_executable.st_ino,
+        ):
+            raise SmokeFailure("app launch failed: verified executable was replaced")
+        recorder = wait_for(
+            "app-owned recorder identity",
+            args.recording_timeout,
+            lambda: _recording_identity(
+                status_path,
+                pid_path,
+                app_identity=launched_app,
+                expected_release=expected_release,
+            ),
+        )
+        recorder_pid, epoch = recorder.pid, recorder.start_epoch
+        groups = _owned_descendant_groups(app_pid, recorder_pid)
+
+        def nonzero_me() -> str | None:
+            telemetry = _json(telemetry_path)
+            if not telemetry:
+                return None
+            now = time.time()
+            if (
+                telemetry.get("pid") != recorder_pid
+                or telemetry.get("start_epoch") != epoch
+            ):
+                raise SmokeFailure(
+                    "telemetry ownership failed: stale or external session"
+                )
+            if telemetry.get("schema") != UI_TELEMETRY_SCHEMA_VERSION:
+                return None
+            transcript_run_id = telemetry.get("transcript_run_id")
+            if (
+                not isinstance(transcript_run_id, str)
+                or _TRANSCRIPT_RUN_ID_RE.fullmatch(transcript_run_id) is None
+            ):
+                return None
+            if transcript_run_id in prelaunch_run_ids:
+                raise SmokeFailure(
+                    "transcript attestation failed: recorder reused a pre-launch run id"
+                )
+            audio = telemetry.get("audio")
+            me = audio.get("me") if isinstance(audio, dict) else None
+            if not isinstance(me, dict):
+                return None
+            try:
+                level = float(me["level"])
+                observed_at = float(me["observed_at"])
+                updated_at = float(telemetry["updated_at"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                not all(
+                    math.isfinite(value) for value in (level, observed_at, updated_at)
+                )
+                or not LEVEL_MIN <= level <= LEVEL_MAX
+            ):
+                return None
+            snapshot_age = now - updated_at
+            observation_age = now - observed_at
+            if (
+                not 0.0 <= snapshot_age <= SNAPSHOT_EXPIRY_SECONDS
+                or not 0.0 <= observation_age <= AUDIO_OBSERVATION_EXPIRY_SECONDS
+                or observed_at > updated_at
+            ):
+                return None
+            return transcript_run_id if level > args.me_floor else None
+
+        transcript_run_id = wait_for(
+            "fresh non-zero Me activity", args.activity_timeout, nonzero_me
+        )
+        print("Non-zero Me activity confirmed. Press Stop in the Onoats panel.")
+
+        wait_for(
+            "graceful app-owned stop",
+            args.stop_timeout,
+            lambda: (
+                _graceful_stop_evidence(
+                    status_path, recorder_pid=recorder_pid, start_epoch=epoch
+                )
+                if not pid_path.exists()
+                else None
+            ),
+        )
+        transcript_deadline = time.monotonic() + args.transcript_timeout
+        wait_for(
+            "durable Me utterance",
+            args.transcript_timeout,
+            lambda: _new_me_utterance(
+                data_dir, transcript_run_id, deadline=transcript_deadline
+            ),
+        )
+        _verify_launched_app_code(launched_app, expected_release)
+        _verify_release_identity(app, identity_path)
+        _verify_effective_cli_authority(expected_release)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_errors: list[BaseException] = []
+        # Discovery is best-effort at this point. It may race process exit or
+        # topology changes, but no such race may skip cleanup of identities
+        # that were already captured and independently remain authoritative.
+        try:
+            # ``open`` may have launched the app and then timed out or been
+            # interrupted, or the launch wait may have expired: no pid was
+            # captured, yet the app can be live. A process found now is NOT
+            # proven to be ours (a login item or the user can launch the same
+            # app after the preflight), and only identities this run captured
+            # itself may be signalled. Report it loudly instead.
+            if app_pid is None:
+                unproven_app_pid = _one_app_pid(app)
+            if app_identity is None and app_pid is not None:
+                app_identity = _capture_process_identity(app_pid)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        try:
+            if recorder is None and app_pid is not None:
+                recorder = _cleanup_recording_identity(
+                    pid_path,
+                    app_pid=app_pid,
+                    app_identity=app_identity,
+                    expected_release=expected_release,
+                )
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if recorder is not None and app_pid is not None:
+            try:
+                groups = _merge_owned_groups(
+                    groups, _refresh_owned_descendant_groups(app_pid, recorder)
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        try:
+            _cleanup_after_failure(
+                app,
+                app_identity=app_identity,
+                recorder=recorder,
+                status_path=status_path,
+                pid_path=pid_path,
+                groups=groups,
+            )
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if unproven_app_pid is not None:
+            try:
+                left_running = _quit_unproven_app(
+                    app, unproven_app_pid, active_dir=pid_path.parent
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                left_running = "the quit attempt raised"
+            if left_running is None:
+                print(
+                    f"installed recording smoke: asked the Onoats app (pid "
+                    f"{unproven_app_pid}) that this run could not prove it "
+                    "launched to quit; it is gone",
+                    file=sys.stderr,
+                )
+            else:
+                cleanup_errors.append(
+                    SmokeFailure(
+                        f"an Onoats process (pid {unproven_app_pid}) is running "
+                        "that this smoke run could not prove it launched; it was "
+                        f"NOT signalled and was left running ({left_running}). "
+                        "Quit it manually before re-running the smoke"
+                    )
+                )
+        if cleanup_errors:
+            print(
+                "installed recording smoke cleanup failed: "
+                + "; ".join(
+                    f"{type(error).__name__}: {error}" for error in cleanup_errors
+                ),
+                file=sys.stderr,
+            )
+            if primary_error is None:
+                raise cleanup_errors[0]
+    try:
+        _publish_receipt(receipt_path, expected_release)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SmokeFailure("successful smoke receipt could not be published") from exc
+    print(
+        "Installed recording smoke passed: app-owned Me activity and durable utterance."
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--app", required=True)
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--release-identity", required=True)
+    parser.add_argument("--smoke-receipt", required=True)
+    parser.add_argument("--app-timeout", type=_positive_finite_float, default=15.0)
+    parser.add_argument(
+        "--recording-timeout", type=_positive_finite_float, default=120.0
+    )
+    parser.add_argument(
+        "--activity-timeout", type=_positive_finite_float, default=120.0
+    )
+    parser.add_argument("--stop-timeout", type=_positive_finite_float, default=120.0)
+    parser.add_argument(
+        "--transcript-timeout", type=_positive_finite_float, default=30.0
+    )
+    parser.add_argument("--me-floor", type=float, default=0.01)
+    return parser
+
+
+def main() -> int:
+    try:
+        run(_parser().parse_args())
+    except (SmokeFailure, OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"installed recording smoke failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

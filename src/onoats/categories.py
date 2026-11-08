@@ -24,6 +24,7 @@ import json
 from onoats.config import OnoatsConfig, load_config
 
 DEFAULT_CATEGORY = "uncategorized"
+INVALID_CATEGORY_ERROR_TAG = "ONOATS-ERROR invalid-category"
 
 
 def category_set(config: OnoatsConfig | None = None) -> set[str]:

@@ -80,7 +80,7 @@ diarization = [
 onoats = "onoats.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/onoats"]
+packages = ["src/onoats", "src/onoats_contracts"]
 
 [tool.hatch.build.targets.sdist]
 # Scratch experiments (and any local clips/logs under them) stay in the repo

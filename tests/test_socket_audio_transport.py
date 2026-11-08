@@ -411,6 +411,75 @@ async def test_frames_surface_with_correct_format(path):
     assert [f.metadata.get("socket_seq") for f in audio] == list(range(n_frames))
 
 
+@pytest.mark.anyio
+async def test_level_observer_receives_normalized_pcm16_peak(path):
+    """The observer sees the validated frame's absolute PCM16 peak.
+
+    The callback is a display-only side channel: it must not replace or mutate
+    the frame that continues through the ordinary staging path.
+    """
+    samples = [-32768, -8192, 0, 16384]
+    pcm = pcm_from_samples(samples)
+    observed: list[float] = []
+
+    async def feed(writer: asyncio.StreamWriter):
+        writer.write(make_header())
+        writer.write(make_frame(0, pcm))
+        await writer.drain()
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    server = _SocketWriterServer(path, feed)
+    await server.start()
+    try:
+        transport = _make_transport(path, on_level=observed.append)
+        down, _up = await asyncio.wait_for(
+            run_test(transport, frames_to_send=[SleepFrame(0.15)]),
+            timeout=WAIT_TIMEOUT,
+        )
+    finally:
+        await server.aclose()
+
+    assert observed == [1.0]
+    audio = [f for f in down if isinstance(f, InputAudioRawFrame)]
+    assert len(audio) == 1
+    assert audio[0].audio == pcm
+
+
+@pytest.mark.anyio
+async def test_raising_level_observer_is_fail_open_and_does_not_change_staging(path):
+    """Telemetry callback failure cannot stop or drop recorder audio."""
+    pcm = pcm_from_samples([4096, -16384, 7])
+    calls = 0
+
+    def raise_from_observer(_level: float) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("display telemetry is unavailable")
+
+    async def feed(writer: asyncio.StreamWriter):
+        writer.write(make_header())
+        for seq in range(3):
+            writer.write(make_frame(seq, pcm))
+        await writer.drain()
+        await asyncio.sleep(WAIT_TIMEOUT)
+
+    server = _SocketWriterServer(path, feed)
+    await server.start()
+    try:
+        transport = _make_transport(path, on_level=raise_from_observer)
+        down, _up = await asyncio.wait_for(
+            run_test(transport, frames_to_send=[SleepFrame(0.2)]),
+            timeout=WAIT_TIMEOUT,
+        )
+    finally:
+        await server.aclose()
+
+    audio = [f for f in down if isinstance(f, InputAudioRawFrame)]
+    assert calls == 3
+    assert [f.metadata["socket_seq"] for f in audio] == [0, 1, 2]
+    assert all(f.audio == pcm for f in audio)
+
+
 # ---------------------------------------------------------------------------
 # Start ordering: readiness precedes the first push (no None-queue race)
 # ---------------------------------------------------------------------------
@@ -729,6 +798,46 @@ async def test_frame_larger_than_byte_cap_is_dropped_not_spun(path):
     assert transport._stage.empty()
     assert transport._staged_bytes == 0
     assert transport._dropped_frames == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "policy", [BackpressurePolicy.DROP_NEWEST, BackpressurePolicy.DROP_OLDEST]
+)
+async def test_level_observer_sees_only_frames_handed_to_pipeline(path, policy):
+    observed: list[float] = []
+    transport = _make_transport(
+        path,
+        max_buffered_frames=1,
+        backpressure_policy=policy,
+        on_level=observed.append,
+    )
+    quiet = InputAudioRawFrame(
+        audio=pcm_from_samples([0]), sample_rate=16000, num_channels=1
+    )
+    loud = InputAudioRawFrame(
+        audio=pcm_from_samples([32767]), sample_rate=16000, num_channels=1
+    )
+    await transport._stage_frame(quiet)
+    await transport._stage_frame(loud)
+    assert observed == [], "staging or eviction refreshed display-only telemetry"
+
+    delivered = asyncio.Event()
+
+    async def capture(_frame):
+        delivered.set()
+
+    transport.push_audio_frame = capture  # type: ignore[method-assign]
+    transport._audio_in_queue = asyncio.Queue()
+    pump = asyncio.create_task(transport._pump_loop())
+    await asyncio.wait_for(delivered.wait(), timeout=WAIT_TIMEOUT)
+    pump.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pump
+    if policy is BackpressurePolicy.DROP_NEWEST:
+        assert observed == [0.0]
+    else:
+        assert observed[0] > 0.99
 
 
 @pytest.mark.anyio

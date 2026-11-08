@@ -15,6 +15,78 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **Menu-bar control panel.** The menu-bar icon now opens a recording panel
+  (Start / Stop / Flush, Seminar lock badge, per-branch audio activity, STT
+  health, optional latest-transcript preview) and a settings panel (microphone picker, STT service, data directory,
+  transcript-preview preference, Open Config, diagnostics and logs). Every
+  app-owned Start writes `~/Library/Logs/Onoats/onoats-bot-<spawnEpoch>.log`;
+  the newest ten are kept. See [docs/menu-bar.md](docs/menu-bar.md).
+- **Display-only UI telemetry** (`.active/onoats.ui.json`): fresh audio levels,
+  per-branch STT state, the locked category and an opt-in transcript preview.
+  It is fail-open: a telemetry failure never affects capture, control,
+  transcript persistence or shutdown.
+- **`onoats_contracts`**, a stdlib-only package shipped in the wheel beside
+  `onoats`, holding the UI-telemetry schema constants shared by the recorder,
+  the native smoke and (via parity tests) the Swift decoder.
+- `make -C native install-staged` installs one verified, immutable snapshot of
+  a signed staged app, and only with a matching release identity and installed
+  recording smoke receipt; `make -C native rollback` restores the recorded
+  archive; `make -C native verify-resources` checks the bundle resource
+  allowlist. `native/installed_recording_smoke.py` is the interactive proof
+  that produces the receipt. See [native/README.md](native/README.md).
+  Release-identity, smoke-receipt and rollback-approval records are written
+  privately (`0600`) and atomically and never follow a symlinked target;
+  every installer child process is time-bounded, and a failed post-install
+  verification always restores (or loudly retains) the previous app.
+- STT self-healing (`[stt].launchd_label`) now bootstraps an unloaded job from
+  the matching `~/Library/LaunchAgents/<label>.plist` after validating it
+  (regular user-owned file, safe permissions, exact `Label`,
+  `RunAtLoad=true`). Bootstrap reads a private snapshot of the validated
+  bytes, because launchd cannot open an inherited `/dev/fd/N`.
+- The menu-bar app reads `config.toml` with a size limit and without blocking,
+  and no longer overwrites a config it could not read (too large, not UTF-8, not
+  a regular file). Settings shows why a service change was refused. A symlinked
+  `config.toml` is written through, so a dotfile-managed link stays a link.
+- The installed recording smoke no longer signals an Onoats process it did not
+  capture itself. After a failed or timed-out `open`, a process it cannot prove it
+  launched is asked to quit (AppleScript, by exact app path, never a signal) only
+  when no recorder is provably live in the data directory, under a lock held until
+  the app is gone. Otherwise it reports the pid and asks you to quit the app by hand.
+- `install-staged` and `rollback` hold an exclusive lock on the install directory
+  for the whole transaction, so two runs at once can no longer undo a reported
+  install; the second fails with "already running".
+- The release identity now works on a real `uv tool` install. Its CLI check ran
+  the venv's `python` after resolving the symlink to the base interpreter, which
+  cannot see the venv's packages, so `import onoats` failed and no identity could
+  be created. It now launches the shebang path and still hashes the resolved
+  interpreter.
+
+### Changed
+
+- **`onoats flush` and `onoats stop` use a recorder-owned control socket**
+  (`.active/onoats-control.sock`) instead of sending SIGUSR1/SIGTERM to a PID.
+  Each request names the full PID + start-epoch generation and is accepted
+  only from the same user; a missing, legacy, replaced or recycled endpoint
+  fails closed and the CLI never falls back to a signal. Windows control
+  requests fail closed. Direct SIGUSR1/SIGTERM remain supported for terminals
+  and service managers. See
+  [docs/control-socket-contract.md](docs/control-socket-contract.md).
+  The data directory path must now be at most 75 bytes: longer paths push the
+  socket past macOS's 103-byte Unix-socket limit, and Start fails with
+  "configure a shorter ONOATS_DATA_DIR".
+- One lifecycle controller orders every Flush, Stop, signal and terminal
+  rotation: a Stop admitted first — or a termination signal already
+  received — rejects later Flushes; a Flush admitted first completes before
+  Stop.
+- Each Start captures one immutable session configuration used by both STT
+  branches, status, telemetry, diarization and shutdown diagnostics; config
+  edits apply at the next Start.
+- Stale PID-file cleanup removes the record only when PID, command and start
+  epoch all still match, so a draining recorder can no longer delete a
+  successor's PID file.
+
 ## [1.5.1] - 2026-10-28
 
 ### Fixed

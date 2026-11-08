@@ -73,17 +73,25 @@ launchd's GUI-domain model, not something this module can fix.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import plistlib
+import pwd
+import stat
 import subprocess
+import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 from loguru import logger
 
 from onoats.config import validate_launchd_label
 
 _KICKSTART_TIMEOUT_SEC = 5
+_LAUNCH_AGENT_PLIST_MAX_BYTES = 64 * 1024
+_UNLOADED_SERVICE_MARKERS = ("could not find service", "service not found")
 
 # Absolute path, not a bare ``launchctl`` name resolved through the inherited
 # PATH: this shellout has restart/kill effect on a launchd job, so it must not
@@ -158,6 +166,172 @@ def _kickstart_env() -> dict[str, str]:
         if val is not None:
             env[key] = val
     return env
+
+
+def _launch_agent_path(label: str, uid: int) -> Path:
+    """Return the only plist path self-healing may bootstrap."""
+    home = Path(pwd.getpwuid(uid).pw_dir)
+    return home / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _validated_launch_agent_bytes(label: str, uid: int) -> bytes | None:
+    """Read and validate the fixed LaunchAgent into one bounded byte snapshot."""
+    path = _launch_agent_path(label, uid)
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd: int | None = None
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file")
+        if info.st_uid != uid:
+            raise ValueError(f"owner uid {info.st_uid} does not match {uid}")
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError("group/world-writable plist")
+        if info.st_size > _LAUNCH_AGENT_PLIST_MAX_BYTES:
+            raise ValueError("plist exceeds 64 KiB")
+        chunks: list[bytes] = []
+        remaining = _LAUNCH_AGENT_PLIST_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > _LAUNCH_AGENT_PLIST_MAX_BYTES:
+            raise ValueError("plist exceeds 64 KiB")
+        try:
+            payload = plistlib.loads(data)
+        except Exception as exc:  # noqa: BLE001 - parse of untrusted bytes
+            # plistlib has no closed failure set: malformed XML raises
+            # expat's ExpatError, a bad <date> AttributeError, binary
+            # offsets IndexError/OverflowError. Every parse failure is the
+            # same verdict -- not a valid plist -- and must stay inside this
+            # function's ValueError path (kickstart never raises).
+            raise ValueError(f"plist does not parse: {type(exc).__name__}") from exc
+        if not isinstance(payload, dict) or payload.get("Label") != label:
+            raise ValueError("plist Label does not match configured label")
+        if payload.get("RunAtLoad") is not True:
+            raise ValueError("plist must set RunAtLoad=true")
+
+        after = os.fstat(fd)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ):
+            raise ValueError("plist changed during validation")
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError("plist pathname changed during validation")
+        return data
+    except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        logger.warning(f"STT: launch agent {path} is not safe to bootstrap: {exc}")
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def _private_launch_agent_snapshot(data: bytes) -> Iterator[Path]:
+    """Yield a private, read-only file holding exactly the validated ``data``.
+
+    ``launchctl bootstrap`` hands the path to launchd, which opens it in its own
+    process, so an inherited ``/dev/fd/<n>`` cannot work (launchctl fails with
+    rc 5; verified live on macOS). The snapshot therefore lives at a real path
+    inside a fresh ``mkdtemp`` ``0700`` directory, is created ``O_EXCL`` and
+    ``O_NOFOLLOW`` and sealed ``0400``, and is removed on exit. The mutable
+    ``~/Library/LaunchAgents`` pathname is never consumed. Residual: a process
+    running as the same user could still replace the file inside the window, but
+    that user can already rewrite the LaunchAgents plist itself.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="onoats-launch-agent-"))
+    path = directory / "validated.plist"
+    try:
+        os.chmod(directory, 0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write while snapshotting launch agent")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o400)
+        finally:
+            os.close(descriptor)
+        yield path
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def _looks_unloaded(result: subprocess.CompletedProcess[str]) -> bool:
+    detail = f"{result.stderr}\n{result.stdout}".lower()
+    return any(marker in detail for marker in _UNLOADED_SERVICE_MARKERS)
+
+
+def _bootstrap_stt_server(label: str, uid: int, env: dict[str, str]) -> bool:
+    """Bootstrap one explicitly configured, fixed-path user LaunchAgent."""
+    data = _validated_launch_agent_bytes(label, uid)
+    if data is None:
+        return False
+
+    domain = f"gui/{uid}"
+    with _private_launch_agent_snapshot(data) as snapshot:
+        result = subprocess.run(
+            [_LAUNCHCTL, "bootstrap", domain, str(snapshot)],
+            capture_output=True,
+            text=True,
+            timeout=_KICKSTART_TIMEOUT_SEC,
+            check=False,
+            env=env,
+        )
+    if result.returncode == 0:
+        logger.info(f"STT: bootstrapped unloaded launch agent {label!r}")
+        return True
+
+    # Another process may have loaded the job after our first kickstart.
+    probe = subprocess.run(
+        [_LAUNCHCTL, "print", f"{domain}/{label}"],
+        capture_output=True,
+        text=True,
+        timeout=_KICKSTART_TIMEOUT_SEC,
+        check=False,
+        env=env,
+    )
+    if probe.returncode != 0:
+        logger.warning(
+            f"STT: bootstrap of {label!r} failed (rc={result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+        return False
+    logger.info(f"STT: launch agent {label!r} became loaded concurrently")
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,15 +549,15 @@ REGISTRY = KickstartRegistry()
 
 
 def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
-    """Ask launchd to restart the managed job ``label``. Never raises.
+    """Ask launchd to start or restart the managed job ``label``. Never raises.
 
     Runs ``launchctl kickstart -k gui/<uid>/<label>`` synchronously
     (best-effort shellout, mirrors ``runtime._own_ps_cmdline``). ``uid``
     defaults to ``os.getuid()`` when not passed. Returns ``True`` only on
-    rc 0 — a non-zero exit (label not loaded, permission denied, no such
-    domain) or any exception is swallowed and returns ``False``, so callers
-    can treat every failure mode identically: fall through to today's
-    behavior.
+    rc 0. If launchctl reports that the job is unloaded, validate and bootstrap
+    the matching ``~/Library/LaunchAgents/<label>.plist``. The bootstrap path
+    is fixed by the validated label; Onoats never infers a job from a port or
+    accepts an arbitrary plist path. Other failures return ``False``.
 
     A ``True`` return means only that launchd accepted the restart
     request, not that the server is answering again — callers must confirm
@@ -434,6 +608,7 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
         # and a bare `AttributeError` escaping from the *first* line would
         # break it before the handled block is ever entered.
         resolved_uid = uid if uid is not None else os.getuid()
+        env = _kickstart_env()
         argv = [_LAUNCHCTL, "kickstart", "-k", f"gui/{resolved_uid}/{label}"]
         result = subprocess.run(
             argv,
@@ -441,10 +616,12 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
             text=True,
             timeout=_KICKSTART_TIMEOUT_SEC,
             check=False,
-            env=_kickstart_env(),
+            env=env,
         )
         if result.returncode == 0:
             return True
+        if _looks_unloaded(result):
+            return _bootstrap_stt_server(label, resolved_uid, env)
         logger.warning(
             f"STT: kickstart of {label!r} failed (rc={result.returncode}): "
             f"{result.stderr.strip() or result.stdout.strip()}"
@@ -470,6 +647,7 @@ def kickstart_stt_server(label: str, uid: int | None = None) -> bool:
         # caller that bypassed the config resolver raises ``TypeError``
         # before any of the shapes above can fire.
         TypeError,
+        KeyError,
     ) as exc:
         logger.warning(f"STT: kickstart of {label!r} failed: {exc}")
         return False

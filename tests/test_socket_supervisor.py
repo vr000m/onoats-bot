@@ -50,6 +50,8 @@ import asyncio
 import os
 import signal
 import stat
+import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -400,7 +402,7 @@ def _install_fake_recorder(
     state: dict = {"rotated_path": None, "frames_read": 0, "connected": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         from onoats._vendor import session_queue
         from onoats._vendor.store import onoats_data_dir
@@ -533,7 +535,13 @@ def sup_env(short_root, fake_capturer, monkeypatch):
 
     # Shorten the supervisor's internal grace windows so a hang surfaces fast.
     monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 5.0, raising=False)
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 5.0, raising=False)
+    # This budget is not part of the behavior under test: it must merely leave
+    # enough room for the separately spawned Python fixture to import and emit
+    # its startup event/exit under a loaded CI host. Individual timeout tests
+    # override it with their own bounded semantic budget below.
+    monkeypatch.setattr(
+        cli, "_SOCKET_WAIT_TIMEOUT_SEC", max(5.0, SUP_TIMEOUT), raising=False
+    )
     monkeypatch.setattr(cli, "_CAPTURER_TERM_GRACE_SEC", 2.0, raising=False)
 
     pending_dir = data_dir / "sessions" / "pending"
@@ -546,7 +554,7 @@ def _pending_files(pending_dir: Path) -> list[Path]:
     return sorted(pending_dir.glob("*.jsonl"))
 
 
-def _run_supervisor_bounded(rest=None) -> int:
+def _run_supervisor_bounded(rest=None, **supervisor_kwargs) -> int:
     """Run the synchronous supervisor in a worker thread, bounded by SUP_TIMEOUT.
 
     The supervisor runs its own ``asyncio.run`` loop, so it must NOT be called
@@ -559,7 +567,7 @@ def _run_supervisor_bounded(rest=None) -> int:
 
     def _target() -> None:
         try:
-            box["rc"] = cli._run_socket_supervisor(rest or [])
+            box["rc"] = cli._run_socket_supervisor(rest or [], **supervisor_kwargs)
         except BaseException as exc:  # noqa: BLE001 - surfaced to the test
             box["exc"] = exc
 
@@ -742,7 +750,8 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
     """
     from onoats.transports.socket_audio import SocketHandshakeError
 
-    async def _raise_handshake(rest):
+    async def _raise_handshake(rest, *, config=None):
+        del config
         raise SocketHandshakeError("stale/foreign capturer: handshake nonce mismatch")
 
     monkeypatch.setattr(cli, "_supervise_socket_session", _raise_handshake)
@@ -909,7 +918,7 @@ def test_clean_recorder_exit_returns_zero_and_stops_capturer(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -974,7 +983,7 @@ def test_capturer_spawned_in_isolated_session_and_clean_exit_is_zero(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         # Healthy streaming capturer; the recorder reads a few frames then
         # returns cleanly (EndFrame-equivalent) while the capturer is STILL
@@ -1049,7 +1058,7 @@ def test_capturer_exit_during_graceful_stop_is_clean_only_for_rc0(
     set_capturer_behaviour("exit-on-peer-close", rc=capturer_rc)
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         from onoats._vendor import session_queue
         from onoats._vendor.store import onoats_data_dir
@@ -1110,7 +1119,7 @@ def test_stop_requested_recorder_drain_overrun_is_force_cancelled_and_stamped(
     set_capturer_behaviour("exit-on-peer-close", rc=0)
 
     async def _hung_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         from onoats._vendor.store import onoats_data_dir
 
@@ -1137,6 +1146,48 @@ def test_stop_requested_recorder_drain_overrun_is_force_cancelled_and_stamped(
     assert st is not None and st.running is False
     assert st.exit_reason == "recorder-drain-timeout"
     assert st.supervisor_rc == 1
+
+
+def test_capturer_post_sigkill_reap_is_bounded_and_reports_survivor(monkeypatch):
+    class CapturingLogger:
+        def __init__(self):
+            self.records: list[str] = []
+
+        def warning(self, message):
+            self.records.append(message)
+
+        def error(self, message):
+            self.records.append(message)
+
+    logger = CapturingLogger()
+
+    class UnkillableCapturer:
+        pid = 8765
+        returncode = None
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    signals: list[int] = []
+
+    def still_alive(_proc, sig, _logger):
+        signals.append(sig)
+        return True
+
+    monkeypatch.setattr(cli, "_signal_capturer_group", still_alive)
+    monkeypatch.setattr(cli, "_CAPTURER_TERM_GRACE_SEC", 0.01)
+    monkeypatch.setattr(cli, "_CAPTURER_KILL_REAP_GRACE_SEC", 0.01)
+
+    async def exercise():
+        return await asyncio.wait_for(
+            cli._stop_capturer(UnkillableCapturer(), logger), timeout=0.5
+        )
+
+    assert asyncio.run(exercise()) is False
+    assert signal.SIGTERM in signals
+    assert signal.SIGKILL in signals
+    assert signals[-1] == 0, "final survivor report lacked a post-reap probe"
+    assert any("survived bounded SIGTERM/SIGKILL" in row for row in logger.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1236,7 +1287,7 @@ def test_capturer_teardown_reaps_group_on_clean_shutdown(
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         # Healthy streaming capturer; read a few frames then return cleanly while
         # the capturer (and its child) are still alive — the graceful-shutdown
@@ -1330,7 +1381,7 @@ def test_capturer_env_is_allowlisted_and_excludes_secrets(
     # The recorder reads a few frames then returns cleanly so the supervisor runs
     # to a normal completion (we only need the captured spawn env).
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -1461,7 +1512,7 @@ def test_supervisor_mints_private_0700_socket_dir(
     captured: dict = {}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         captured["mic"] = os.environ.get("ONOATS_MIC_SOCKET")
         captured["system"] = os.environ.get("ONOATS_SYSTEM_SOCKET")
@@ -1915,6 +1966,52 @@ async def test_stderr_reader_survives_overlong_line(short_root, log_sink):
     assert any("overlong" in r for r in log_sink.records)
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failure",
+    [ConnectionResetError("reset by peer"), OSError("EIO"), RuntimeError("boom")],
+    ids=["connection-reset", "oserror", "runtime-error"],
+)
+async def test_stderr_reader_never_raises_on_a_failed_pipe(
+    short_root, log_sink, failure
+):
+    """A pipe read failure other than the overlong-line ValueError ends the
+    drain with a WARNING instead of escaping (the docstring's "never raises
+    out"); a status write raising a non-OSError does not stop the drain."""
+
+    class FailingReader:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            raise failure
+
+    reader = FailingReader()
+    await cli._drain_capturer_stderr(reader, short_root, logger)
+    assert reader.calls == 1
+    assert any("stderr pipe failed" in r for r in log_sink.records)
+
+
+@pytest.mark.anyio
+async def test_stderr_reader_survives_a_non_oserror_status_write(
+    short_root, log_sink, monkeypatch
+):
+    from onoats import status as status_file
+
+    def explode(*_args, **_kwargs):
+        raise ValueError("bad status value")
+
+    monkeypatch.setattr(status_file, "set_warning_branch", explode)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"ONOATS-EVENT zero-run-warning branch=mic hint=x\n")
+    reader.feed_data(b"tail line\n")
+    reader.feed_eof()
+    await cli._drain_capturer_stderr(reader, short_root, logger)
+    assert reader.at_eof()
+    assert any("could not update status fields" in r for r in log_sink.records)
+
+
 def test_capturer_stderr_tee_and_flood_cannot_block(
     sup_env, log_sink, monkeypatch, set_capturer_behaviour, capfd
 ):
@@ -2169,7 +2266,11 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
     from onoats import status as status_file
 
     data_dir, _ = sup_env
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 1.0)
+    # Leave enough room for a cold Python fixture to start and announce the
+    # pending prompt under full-suite load; the later bind still forces the
+    # extension branch while staying below the production 10s base budget.
+    fixture_base_wait = 8.0
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", fixture_base_wait)
     monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", float(SUP_TIMEOUT))
     set_capturer_behaviour(
         "stream",
@@ -2177,14 +2278,14 @@ def test_waiting_for_permission_extends_socket_wait_to_success(
             "ONOATS-EVENT waiting-for-permission branch=system "
             "hint=tap creation pending the TCC prompt"
         ],
-        bind_delay=2.5,  # > the 1.0s base budget: without the extension this
+        bind_delay=fixture_base_wait + 0.5,  # without the extension this
         # run is a capturer-start-timeout
     )
 
     state: dict = {"frames_read": 0}
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -2225,7 +2326,11 @@ def test_waiting_for_permission_timeout_names_the_prompt(
     from onoats import status as status_file
 
     data_dir, _ = sup_env
-    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 0.5)
+    # The assertion is that the announced prompt grants one bounded extension,
+    # not that a fresh Python subprocess imports and emits the event in <500ms.
+    # Keep startup scheduling out of the contract while preserving a short,
+    # explicitly bounded base + extension window.
+    monkeypatch.setattr(cli, "_SOCKET_WAIT_TIMEOUT_SEC", 2.0)
     monkeypatch.setattr(cli, "_PERMISSION_WAIT_EXTRA_SEC", 1.0)
     set_capturer_behaviour(
         "hang",
@@ -2329,8 +2434,14 @@ def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
 
     # Start-of-session: real pid file + real running status (pid FIRST, then
     # status — the start half of the same ordering contract).
-    pid_path = runtime._write_pid_file(data_dir)
-    runtime._write_status_running(data_dir, audio_source="socket", stt_label="fake-stt")
+    start_epoch = 900.25
+    pid_path = runtime._write_pid_file(data_dir, start_epoch=start_epoch)
+    runtime._write_status_running(
+        data_dir,
+        audio_source="socket",
+        stt_label="fake-stt",
+        start_epoch=start_epoch,
+    )
     assert pid_path.exists()
     start_rec = status_file.read_status(data_dir)
     assert start_rec is not None and start_rec.running is True
@@ -2380,6 +2491,314 @@ def test_shutdown_tail_writes_status_stopped_before_pid_unlink(
     )
 
 
+def test_shutdown_tail_cleans_telemetry_between_stopped_status_and_pid_removal(
+    tmp_path, monkeypatch
+):
+    """Cleanup is owner-checked at the only safe shutdown ordering seam."""
+    from onoats import dual
+
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active" / "onoats.pid"
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(
+        dual, "_restore_terminal", lambda *a, **k: events.append("terminal")
+    )
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    dual._finalize_shutdown_status(
+        data_dir,
+        pid_path,
+        ended_by_error=False,
+        telemetry_cleanup=lambda: events.append("telemetry-cleanup"),
+    )
+
+    assert events.index("stopped") < events.index("telemetry-cleanup")
+    assert events.index("telemetry-cleanup") < events.index("pid-removed")
+
+
+def test_shutdown_tail_default_has_no_telemetry_side_effect(tmp_path, monkeypatch):
+    """The optional seam preserves the pre-telemetry shutdown behaviour."""
+    from onoats import dual
+
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active" / "onoats.pid"
+    events: list[str] = []
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(
+        dual, "_restore_terminal", lambda *a, **k: events.append("terminal")
+    )
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    dual._finalize_shutdown_status(data_dir, pid_path, ended_by_error=False)
+
+    assert events == ["stopped", "terminal", "pid-removed"]
+
+
+def test_telemetry_shutdown_uses_publisher_lifecycle_api(tmp_path, monkeypatch):
+    """Production delegates request/wait/cancel/cleanup to the sole owner."""
+    import asyncio
+
+    from onoats import dual
+
+    events: list[str] = []
+
+    class CancellationResistantPublisher:
+        def __init__(self):
+            self.stop_requested = asyncio.Event()
+            self.task = asyncio.create_task(
+                self._run(), name="test-owned-ui-telemetry-publisher"
+            )
+
+        async def _run(self):
+            await self.stop_requested.wait()
+            events.append("publisher-owned-task-stopped")
+
+        def request_stop(self):
+            events.append("publisher-request-stop")
+            self.stop_requested.set()
+            return self.task
+
+        async def stop(self, *, timeout, force_exit_event, cleanup):
+            events.append(f"publisher-stop-called:{timeout}")
+            task = self.request_stop()
+            await task
+            if cleanup:
+                self.cleanup()
+
+        def cleanup(self):
+            events.append("telemetry-cleanup")
+
+    data_dir = tmp_path / "data"
+    pid_path = data_dir / ".active" / "onoats.pid"
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(dual, "_restore_terminal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    async def scenario():
+        publisher = CancellationResistantPublisher()
+        await dual._stop_telemetry_publisher(
+            publisher, force_exit_event=asyncio.Event()
+        )
+        dual._finalize_shutdown_status(
+            data_dir,
+            pid_path,
+            ended_by_error=False,
+            telemetry_cleanup=publisher.cleanup,
+        )
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        return [
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+
+    pending_tasks = asyncio.run(scenario())
+
+    assert "publisher-stop-called:0.5" in events
+    assert events[1:3] == [
+        "publisher-request-stop",
+        "publisher-owned-task-stopped",
+    ]
+    assert events.index("stopped") < events.index("telemetry-cleanup")
+    assert events.index("telemetry-cleanup") < events.index("pid-removed")
+    assert pending_tasks == []
+
+
+def test_late_force_exit_interrupts_normal_telemetry_wait_promptly():
+    """A second signal interrupts the already-started normal 0.5 s wait."""
+    import asyncio
+
+    from onoats import dual
+
+    class PublisherWithOwnedTask:
+        def __init__(self):
+            self.requested = asyncio.Event()
+            self.task = asyncio.create_task(
+                self._run(), name="test-owned-ui-telemetry-publisher"
+            )
+
+        async def _run(self):
+            await asyncio.Future()
+
+        def request_stop(self):
+            self.requested.set()
+            return self.task
+
+        async def stop(self, *, timeout, force_exit_event, cleanup):
+            self.request_stop()
+            await force_exit_event.wait()
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+
+    async def scenario():
+        force_exit_event = asyncio.Event()
+        publisher = PublisherWithOwnedTask()
+        helper_task = asyncio.create_task(
+            dual._stop_telemetry_publisher(
+                publisher, force_exit_event=force_exit_event
+            ),
+            name="test-stop-telemetry-helper",
+        )
+        await publisher.requested.wait()
+        await asyncio.sleep(0)
+
+        started = asyncio.get_running_loop().time()
+        force_exit_event.set()
+        await asyncio.wait_for(
+            helper_task,
+            timeout=0.2,
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        pending = [
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+        return elapsed, publisher.task.done(), pending
+
+    elapsed, publisher_done, pending_tasks = asyncio.run(scenario())
+
+    assert elapsed < 0.2
+    assert publisher_done
+    assert pending_tasks == []
+
+
+def test_cancellation_resistant_telemetry_cannot_block_shutdown_finalization(
+    tmp_path, monkeypatch
+):
+    """A publisher that swallows cancellation cannot strand status or PID cleanup."""
+    import asyncio
+
+    from onoats import dual
+
+    events: list[str] = []
+
+    class ResistantPublisher:
+        def __init__(self):
+            self.release = asyncio.Event()
+            self.task = asyncio.create_task(
+                self._run(), name="test-cancellation-resistant-telemetry"
+            )
+
+        async def _run(self):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                events.append("cancel-swallowed")
+                await self.release.wait()
+
+        def request_stop(self):
+            events.append("stop-requested")
+            return self.task
+
+        def cleanup(self):
+            events.append("telemetry-cleanup")
+
+        async def stop(self, *, timeout, force_exit_event, cleanup):
+            self.request_stop()
+            done, _ = await asyncio.wait({self.task}, timeout=timeout)
+            if self.task not in done:
+                self.task.cancel()
+                await asyncio.wait({self.task}, timeout=0.1)
+            if cleanup:
+                self.cleanup()
+
+    monkeypatch.setattr(
+        dual, "_write_status_stopped", lambda *a, **k: events.append("stopped")
+    )
+    monkeypatch.setattr(dual, "_restore_terminal", lambda *a, **k: None)
+    monkeypatch.setattr(
+        dual, "_remove_pid_file", lambda *a, **k: events.append("pid-removed")
+    )
+
+    async def scenario():
+        publisher = ResistantPublisher()
+        started = asyncio.get_running_loop().time()
+        await dual._stop_telemetry_publisher(
+            publisher, force_exit_event=asyncio.Event()
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        dual._finalize_shutdown_status(
+            tmp_path,
+            tmp_path / ".active" / "onoats.pid",
+            ended_by_error=False,
+            telemetry_cleanup=publisher.cleanup,
+        )
+        publisher.release.set()
+        await publisher.task
+        return elapsed
+
+    elapsed = asyncio.run(scenario())
+
+    assert elapsed < 0.75
+    assert events.index("cancel-swallowed") < events.index("stopped")
+    assert events.index("stopped") < events.index("telemetry-cleanup")
+    assert events.index("telemetry-cleanup") < events.index("pid-removed")
+
+
+def test_run_shutdown_uses_bounded_telemetry_stop_before_finalization():
+    """Pin the helper into the real nested shutdown path, not only unit tests."""
+    import inspect
+
+    from onoats import dual
+
+    source = inspect.getsource(dual.run_onoats_dual)
+    stop_at = source.index("await _stop_telemetry_publisher(")
+    finalize_at = source.index("_finalize_shutdown_status(", stop_at)
+    assert stop_at < finalize_at
+
+
+def test_pid_status_and_telemetry_share_the_caller_minted_epoch(tmp_path):
+    """All three run-ownership surfaces carry one byte-identical epoch."""
+    import json
+
+    from onoats import runtime
+    from onoats import status as status_file
+    from onoats.ui_telemetry import UITelemetryPublisher, UITelemetryState
+
+    data_dir = tmp_path / "data"
+    start_epoch = 1_793_000_000.125
+    transcript_run_id = "0123456789abcdef0123456789abcdef"
+    pid_path = runtime._write_pid_file(data_dir, start_epoch=start_epoch)
+    assert runtime._write_status_running(
+        data_dir,
+        audio_source="socket",
+        stt_label="fake-stt",
+        start_epoch=start_epoch,
+    )
+    publisher = UITelemetryPublisher(
+        data_dir,
+        UITelemetryState(os.getpid(), start_epoch, transcript_run_id=transcript_run_id),
+    )
+    assert publisher.write_once(now=start_epoch + 0.25)
+
+    pid_epoch = float(pid_path.read_text(encoding="utf-8").splitlines()[3])
+    status_epoch = status_file.read_status(data_dir).start_time
+    telemetry = json.loads(
+        (data_dir / ".active" / "onoats.ui.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["transcript_run_id"] == transcript_run_id
+    telemetry_epoch = telemetry["start_epoch"]
+    assert pid_epoch == status_epoch == telemetry_epoch == start_epoch
+
+
 def test_diarization_preflight_fails_loud_before_capturer_spawn(sup_env, monkeypatch):
     """Flag on + preflight failure: rc=1, capturer never spawned, and the shared
     call-order list proves lock -> preflight precede any spawn."""
@@ -2409,6 +2828,364 @@ def test_diarization_preflight_fails_loud_before_capturer_spawn(sup_env, monkeyp
 
     assert _run_supervisor_bounded([]) == 1
     assert order == ["lock", "preflight"]
+
+
+@pytest.mark.parametrize("prior_env", [False, True], ids=["unset-env", "set-env"])
+@pytest.mark.parametrize("failure_stage", ["chmod", "nonce", "config", "preflight"])
+def test_supervisor_startup_failure_cleanup_whole_state_space(
+    sup_env, monkeypatch, prior_env, failure_stage
+):
+    """Every failure after socket-dir ownership restores env and removes the dir."""
+    import secrets as _secrets
+    import tempfile as _tempfile
+
+    from onoats import runtime
+
+    keys = (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    )
+    expected = {}
+    for index, key in enumerate(keys):
+        value = f"prior-{index}" if prior_env else None
+        expected[key] = value
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    minted: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def mint(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        minted.append(path)
+        return path
+
+    monkeypatch.setattr(_tempfile, "mkdtemp", mint)
+
+    if failure_stage == "chmod":
+        monkeypatch.setattr(
+            os, "chmod", lambda *_args: (_ for _ in ()).throw(OSError("chmod"))
+        )
+    elif failure_stage == "nonce":
+        monkeypatch.setattr(
+            _secrets,
+            "token_hex",
+            lambda *_args: (_ for _ in ()).throw(ValueError("nonce")),
+        )
+    elif failure_stage == "config":
+        monkeypatch.setattr(
+            runtime.RecorderSessionConfig,
+            "capture",
+            classmethod(
+                lambda _cls, _config=None: (_ for _ in ()).throw(ValueError("config"))
+            ),
+        )
+    else:
+        monkeypatch.setenv("ONOATS_DIARIZATION", "1")
+
+        def fail_preflight(_config):
+            raise runtime.DiarizationPreflightError("preflight")
+
+        monkeypatch.setattr(runtime, "_preflight_diarization", fail_preflight)
+
+    assert _run_supervisor_bounded([]) == 1
+    assert minted and all(not Path(path).exists() for path in minted)
+    assert {key: os.environ.get(key) for key in keys} == expected
+
+
+@pytest.mark.parametrize("prior_identity", [None, "stale-generation"])
+def test_supervisor_snapshot_uses_exact_minted_generation_identity(
+    sup_env, monkeypatch, prior_identity
+):
+    """Empty and stale caller identities are replaced before snapshot capture."""
+    import secrets as _secrets
+
+    from onoats import runtime
+    from onoats.config import load_config
+
+    for key in (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    ):
+        if prior_identity is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, prior_identity)
+    config = load_config()
+    monkeypatch.setattr(_secrets, "token_hex", lambda _size: "a" * 32)
+    captured: list[tuple[str | None, str | None, str | None]] = []
+
+    def capture(_cls, supplied_config=None):
+        captured.append(
+            (
+                supplied_config.mic_socket,
+                supplied_config.system_socket,
+                supplied_config.capturer_nonce,
+            )
+        )
+        raise ValueError("stop after generation capture")
+
+    monkeypatch.setattr(runtime.RecorderSessionConfig, "capture", classmethod(capture))
+
+    assert _run_supervisor_bounded([], config=config) == 1
+    assert len(captured) == 1
+    mic_socket, system_socket, nonce = captured[0]
+    assert mic_socket is not None and mic_socket.endswith("/mic.sock")
+    assert system_socket is not None and system_socket.endswith("/system.sock")
+    assert Path(mic_socket).parent == Path(system_socket).parent
+    assert nonce == "a" * 32
+
+
+@pytest.mark.parametrize("ready", [False, True], ids=["startup", "running"])
+@pytest.mark.parametrize("recorder_rc", [0, 1])
+@pytest.mark.parametrize("teardown_ok", [False, True])
+def test_supervisor_return_code_includes_teardown_whole_state_space(
+    sup_env, monkeypatch, ready, recorder_rc, teardown_ok
+):
+    """A surviving capturer group dominates every otherwise-clean return path."""
+
+    class EmptyStderr:
+        async def readline(self):
+            return b""
+
+    class Capturer:
+        pid = 43210
+        returncode = None
+        stderr = EmptyStderr()
+
+    async def spawn(*_args, **_kwargs):
+        return Capturer()
+
+    async def sockets(*_args, **_kwargs):
+        return ready
+
+    async def recorder(*_args, **_kwargs):
+        return recorder_rc
+
+    stop_results: list[bool] = []
+
+    async def stop(*_args, **_kwargs):
+        stop_results.append(teardown_ok)
+        return teardown_ok
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+    monkeypatch.setattr(cli, "_run_recorder_with_capturer", recorder)
+    monkeypatch.setattr(cli, "_stop_capturer", stop)
+
+    result = _run_supervisor_bounded([])
+    expected = 1 if not ready or recorder_rc != 0 or not teardown_ok else 0
+    assert result == expected
+    assert stop_results
+
+
+def test_supervisor_cancellation_with_teardown_failure_is_nonzero(sup_env, monkeypatch):
+    """Startup cancellation cannot mask a capturer group that survives teardown."""
+    import tempfile as _tempfile
+
+    socket_keys = (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    )
+    prior = {key: os.environ.get(key) for key in socket_keys}
+    minted: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def mint(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        minted.append(path)
+        return path
+
+    class EmptyStderr:
+        async def readline(self):
+            return b""
+
+    class Capturer:
+        pid = 43211
+        returncode = None
+        stderr = EmptyStderr()
+
+    async def spawn(*_args, **_kwargs):
+        return Capturer()
+
+    async def sockets(*_args, **_kwargs):
+        return True
+
+    async def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    async def teardown_failed(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(_tempfile, "mkdtemp", mint)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+    monkeypatch.setattr(cli, "_run_recorder_with_capturer", cancel)
+    monkeypatch.setattr(cli, "_stop_capturer", teardown_failed)
+
+    assert _run_supervisor_bounded([]) == 1
+    assert minted and all(not Path(path).exists() for path in minted)
+    assert {key: os.environ.get(key) for key in socket_keys} == prior
+
+
+@pytest.mark.parametrize("reader_outcome", ["ok", "raises", "step-cancelled"])
+@pytest.mark.parametrize("stop_outcome", ["ok", "survivor", "raises", "step-cancelled"])
+@pytest.mark.parametrize("signal_in_teardown", ["none", "mid-step", "same-turn"])
+@pytest.mark.parametrize("body", ["rc0", "rc1", "start-failure", "startup-signal"])
+def test_supervisor_teardown_is_cancellation_safe_whole_state_space(
+    sup_env,
+    monkeypatch,
+    log_sink,
+    body,
+    signal_in_teardown,
+    stop_outcome,
+    reader_outcome,
+):
+    """Neither a signal nor a failing step during teardown can skip a step or
+    mask rc — the ``cli._run_teardown_step`` contract, cell by cell.
+
+    The startup handler stays installed until the recorder installs its own.
+    A signal arriving while the authoritative ``finally`` is already tearing
+    down (after a clean rc, a non-zero rc, or a start failure) must let every
+    teardown step finish and must not turn a failure into rc=0. ``same-turn``
+    lands the signal in the event-loop turn ``_stop_capturer`` finishes, before
+    the shield wakes the supervisor: the step's result must still be honoured,
+    not discarded by a re-raised cancellation. A step that raises or cancels
+    itself must not skip the later steps (stderr join, socket-dir removal, env
+    restore); a failed stop counts as a surviving capturer group, a failed
+    reader is logged only.
+    """
+    import tempfile as _tempfile
+
+    from onoats import runtime
+
+    socket_keys = (
+        "ONOATS_MIC_SOCKET",
+        "ONOATS_SYSTEM_SOCKET",
+        "ONOATS_CAPTURER_NONCE",
+    )
+    prior = {key: os.environ.get(key) for key in socket_keys}
+    minted: list[str] = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def mint(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        minted.append(path)
+        return path
+
+    class EmptyStderr:
+        async def readline(self):
+            await asyncio.sleep(0.01)
+            return b""
+
+    class Capturer:
+        pid = 43212
+        returncode = None
+        stderr = EmptyStderr()
+
+    events: list[str] = []
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        real_add = loop.add_signal_handler
+        handlers = {}
+
+        def add(sig, callback, *args):
+            handlers[sig] = lambda: callback(*args)
+            real_add(sig, callback, *args)
+
+        monkeypatch.setattr(loop, "add_signal_handler", add)
+
+        async def spawn(*_args, **_kwargs):
+            return Capturer()
+
+        async def sockets(*_args, **_kwargs):
+            return True
+
+        async def recorder(*_args, **_kwargs):
+            if body == "rc0":
+                return 0
+            if body == "rc1":
+                return 1
+            if body == "start-failure":
+                raise runtime.SttPreflightError("stt unreachable")
+            handlers[signal.SIGTERM]()
+            await asyncio.sleep(1)
+            raise AssertionError("startup signal did not cancel the body")
+
+        async def stop(*_args, **_kwargs):
+            events.append("stop-start")
+            if signal_in_teardown == "mid-step":
+                handlers[signal.SIGTERM]()
+            await asyncio.sleep(0.01)
+            if signal_in_teardown == "same-turn":
+                # Runs before the step task's done callbacks (the shield's
+                # wake-up), i.e. in the same loop turn the step finishes.
+                asyncio.get_running_loop().call_soon(handlers[signal.SIGTERM])
+            events.append("stop-done")
+            if stop_outcome == "raises":
+                raise PermissionError("kill denied")
+            if stop_outcome == "step-cancelled":
+                raise asyncio.CancelledError
+            return stop_outcome == "ok"
+
+        real_await_stderr = cli._await_stderr_reader
+
+        async def await_stderr(stderr_task):
+            await real_await_stderr(stderr_task)
+            events.append("stderr-joined")
+            if reader_outcome == "raises":
+                raise ConnectionResetError("stderr pipe reset")
+            if reader_outcome == "step-cancelled":
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+        monkeypatch.setattr(cli, "_run_recorder_with_capturer", recorder)
+        monkeypatch.setattr(cli, "_stop_capturer", stop)
+        monkeypatch.setattr(cli, "_await_stderr_reader", await_stderr)
+        return await asyncio.wait_for(
+            cli._supervise_socket_session([]), timeout=SUP_TIMEOUT
+        )
+
+    teardown_ok = stop_outcome == "ok"
+    # A signal in teardown runs the startup handler (requested=True), so its
+    # replayed cancellation maps to rc=0; a step's own cancellation is
+    # remembered too but, with no signal, propagates as a cancellation.
+    unrequested_cancel = signal_in_teardown == "none" and (
+        reader_outcome == "step-cancelled"
+    )
+    monkeypatch.setattr(_tempfile, "mkdtemp", mint)
+    if body == "start-failure":
+        with pytest.raises(runtime.SttPreflightError):
+            asyncio.run(run())
+    elif body == "startup-signal" and not teardown_ok:
+        with pytest.raises(cli.CapturerTeardownError):
+            asyncio.run(run())
+    elif body == "rc0" and teardown_ok and unrequested_cancel:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run())
+    else:
+        expected = 0 if body in ("rc0", "startup-signal") and teardown_ok else 1
+        assert asyncio.run(run()) == expected
+
+    assert events == ["stop-start", "stop-done", "stderr-joined"]
+    if stop_outcome in ("raises", "step-cancelled"):
+        assert any(
+            "teardown step failed (stopping the capturer" in r for r in log_sink.records
+        )
+    if reader_outcome in ("raises", "step-cancelled"):
+        assert any(
+            "teardown step failed (retiring the capturer stderr" in r
+            for r in log_sink.records
+        )
+    assert minted and all(not Path(path).exists() for path in minted)
+    assert {key: os.environ.get(key) for key in socket_keys} == prior
 
 
 def test_diarization_flag_off_never_calls_preflight_in_supervisor(sup_env, monkeypatch):
@@ -2441,7 +3218,7 @@ def _install_clean_recorder(monkeypatch):
     """A recorder that reads a few frames and returns voluntarily (rc=0 path)."""
 
     async def _fake_run_onoats_dual(
-        *, live_terminal=False, locked_category=None, data_dir=None
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config=None
     ):
         mic = os.environ["ONOATS_MIC_SOCKET"]
         reader, writer = await asyncio.open_unix_connection(mic)
@@ -2526,3 +3303,451 @@ def test_diarization_flag_off_never_preflights(
 
     assert "preflight" not in calls
     assert "spawn" in calls
+
+
+def test_recorder_drain_deadline_does_not_wait_for_suppressed_cancellation(
+    monkeypatch,
+):
+    """Deadline x cancellation handling stays bounded for both task outcomes."""
+
+    class Logger:
+        def warning(self, _message):
+            pass
+
+    async def run():
+        monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 0.01)
+
+        async def resists_once():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.15)
+
+        task = asyncio.create_task(resists_once())
+        started = asyncio.get_running_loop().time()
+        drained = await cli._drain_recorder_bounded(task, Logger(), "in test")
+        elapsed = asyncio.get_running_loop().time() - started
+        assert drained is False
+        assert elapsed < 0.08
+        await task
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("supervisor_outcome", ["return", "raise"])
+def test_supervisor_process_exit_is_bounded_after_cancellation_resistance(
+    tmp_path, supervisor_outcome
+):
+    """Owned cleanup completes before the explicit hard process boundary."""
+    cleanup_marker = tmp_path / f"cleanup-complete-{supervisor_outcome}"
+    outcome = (
+        'raise RuntimeError("unexpected supervisor failure")'
+        if supervisor_outcome == "raise"
+        else "return 0"
+    )
+    resistance = (
+        "asyncio.get_running_loop().run_in_executor(None, threading.Event().wait)"
+        if supervisor_outcome == "raise"
+        else "asyncio.create_task(resist_forever())"
+    )
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import threading
+        from pathlib import Path
+        from onoats import cli
+
+        cli._RECORDER_DRAIN_GRACE_SEC = 0.02
+
+        async def resist_forever():
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    continue
+
+        async def fake_supervisor(_rest, *, config=None):
+            {resistance}
+            try:
+                {outcome}
+            finally:
+                Path({str(cleanup_marker)!r}).write_text("done", encoding="utf-8")
+
+        cli._supervise_socket_session = fake_supervisor
+        raise SystemExit(cli._run_socket_supervisor([]))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 1
+    assert cleanup_marker.read_text(encoding="utf-8") == "done"
+    assert "forcing process exit" in result.stderr
+
+
+@pytest.mark.parametrize("stalled_phase", ["async-generator", "default-executor"])
+def test_supervisor_loop_cleanup_deadline_is_process_bounded(tmp_path, stalled_phase):
+    """Every post-resource loop cleanup cell shares the hard exit deadline."""
+    cleanup_marker = tmp_path / f"{stalled_phase}-owned-cleanup"
+    setup = (
+        "held = stalled_generator(); await held.__anext__(); retained.append(held)"
+        if stalled_phase == "async-generator"
+        else "asyncio.get_running_loop().run_in_executor(None, threading.Event().wait)"
+    )
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import threading
+        from pathlib import Path
+        from onoats import cli
+
+        cli._RECORDER_DRAIN_GRACE_SEC = 0.02
+        retained = []
+
+        async def stalled_generator():
+            try:
+                yield None
+            finally:
+                await asyncio.Event().wait()
+
+        async def fake_supervisor(_rest, *, config=None):
+            {setup}
+            try:
+                return 0
+            finally:
+                Path({str(cleanup_marker)!r}).write_text("done", encoding="utf-8")
+
+        cli._supervise_socket_session = fake_supervisor
+        raise SystemExit(cli._run_socket_supervisor([]))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert cleanup_marker.read_text(encoding="utf-8") == "done"
+    assert "event-loop cleanup exceeded its absolute deadline" in result.stderr
+
+
+def test_supervisor_normal_loop_cleanup_completes_before_return(tmp_path):
+    """The non-stalled async-generator and executor cells both finish normally."""
+    asyncgen_marker = tmp_path / "asyncgen-clean"
+    executor_marker = tmp_path / "executor-clean"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        from pathlib import Path
+        from onoats import cli
+
+        async def cleaned_generator():
+            try:
+                yield None
+            finally:
+                Path({str(asyncgen_marker)!r}).write_text("done", encoding="utf-8")
+
+        async def fake_supervisor(_rest, *, config=None):
+            held = cleaned_generator()
+            await held.__anext__()
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                Path({str(executor_marker)!r}).write_text,
+                "done",
+                "utf-8",
+            )
+            return 0
+
+        cli._supervise_socket_session = fake_supervisor
+        raise SystemExit(cli._run_socket_supervisor([]))
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert asyncgen_marker.read_text(encoding="utf-8") == "done"
+    assert executor_marker.read_text(encoding="utf-8") == "done"
+
+
+def test_simultaneous_recorder_and_capturer_completion_is_fail_loud(
+    tmp_path, monkeypatch
+):
+    """The complete 2x2 race space gives capturer completion failure priority."""
+    from onoats import runtime
+
+    class Capturer:
+        async def wait(self):
+            return 23
+
+    class Logger:
+        def __init__(self):
+            self.records = []
+
+        def error(self, message):
+            self.records.append(message)
+
+        def warning(self, message):
+            self.records.append(message)
+
+        def info(self, message):
+            self.records.append(message)
+
+    async def recorder(**_kwargs):
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    logger = Logger()
+    rc = asyncio.run(
+        cli._run_recorder_with_capturer(
+            [], Capturer(), logger, tmp_path, session_config=object()
+        )
+    )
+    assert rc == 1
+    assert any("capturer exited mid-session" in record for record in logger.records)
+
+
+@pytest.mark.parametrize("record_age", ["this-start", "previous-start"])
+def test_capturer_death_before_write_running_stamps_only_this_starts_record(
+    tmp_path, monkeypatch, record_age
+):
+    """The prompt-pending waiting record is this Start's; an older record is not."""
+    import logging
+
+    from onoats import runtime
+    from onoats import status as status_file
+
+    class Capturer:
+        async def wait(self):
+            await asyncio.sleep(0.01)
+            return 23
+
+    async def recorder(**_kwargs):
+        await asyncio.sleep(60)  # still in STT preflight: never reaches write_running
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    monkeypatch.setattr(cli, "_RECORDER_DRAIN_GRACE_SEC", 0.05)
+    status_file.write_prestart_waiting(
+        tmp_path, audio_source="socket", note="waiting for the system-audio prompt"
+    )
+    written = status_file.read_status(tmp_path).start_time
+    floor = written - 5.0 if record_age == "this-start" else written + 5.0
+    rc = asyncio.run(
+        cli._run_recorder_with_capturer(
+            [],
+            Capturer(),
+            logging.getLogger("test"),
+            tmp_path,
+            session_config=object(),
+            stamp_floor=floor,
+        )
+    )
+    after = status_file.read_status(tmp_path)
+    assert rc == 1
+    if record_age == "this-start":
+        assert after.running is False
+        assert after.exit_reason == "capturer-crash"
+        assert after.supervisor_rc == 1
+    else:
+        assert after.running is True and after.exit_reason is None
+
+
+class _NeverExitingCapturer:
+    async def wait(self):
+        await asyncio.Event().wait()
+
+
+def test_supervisor_passes_the_per_start_snapshot_unconditionally(
+    tmp_path, monkeypatch
+):
+    """The supervisor hands run_onoats_dual the exact per-Start snapshot."""
+    import logging
+
+    from onoats import runtime
+
+    snapshot = object()
+    seen = []
+
+    async def recorder(
+        *, live_terminal=False, locked_category=None, data_dir=None, session_config
+    ):
+        seen.append(session_config)
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    rc = asyncio.run(
+        cli._run_recorder_with_capturer(
+            [],
+            _NeverExitingCapturer(),
+            logging.getLogger("test"),
+            tmp_path,
+            session_config=snapshot,
+        )
+    )
+    assert rc == 0
+    assert seen == [snapshot]
+
+
+@pytest.mark.parametrize("variant", ["omitted", "none"])
+def test_supervisor_recorder_runner_requires_the_snapshot(
+    tmp_path, monkeypatch, variant
+):
+    """Omitting the snapshot (or passing None, the recorder's re-load trigger)
+    is a TypeError before the recorder starts, never a silent config re-load."""
+    import logging
+
+    calls = []
+
+    async def recorder(**_kwargs):
+        calls.append(True)
+        return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    kwargs = {} if variant == "omitted" else {"session_config": None}
+    with pytest.raises(TypeError, match="session_config"):
+        asyncio.run(
+            cli._run_recorder_with_capturer(
+                [],
+                _NeverExitingCapturer(),
+                logging.getLogger("test"),
+                tmp_path,
+                **kwargs,
+            )
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("variant", ["missing", "renamed"])
+def test_recorder_that_cannot_take_the_snapshot_fails_loudly(
+    tmp_path, monkeypatch, variant
+):
+    """A recorder signature without ``session_config`` is a TypeError, never a
+    silently dropped snapshot that would make the recorder re-load config."""
+    import logging
+
+    from onoats import runtime
+
+    calls = []
+
+    if variant == "missing":
+
+        async def recorder(*, live_terminal=False, locked_category=None, data_dir=None):
+            calls.append(True)
+            return 0
+
+    else:
+
+        async def recorder(
+            *, live_terminal=False, locked_category=None, data_dir=None, snapshot=None
+        ):
+            calls.append(True)
+            return 0
+
+    monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+    monkeypatch.setattr(runtime, "_graceful_shutdown_requested", False)
+    with pytest.raises(TypeError, match="session_config"):
+        asyncio.run(
+            cli._run_recorder_with_capturer(
+                [],
+                _NeverExitingCapturer(),
+                logging.getLogger("test"),
+                tmp_path,
+                session_config=object(),
+            )
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("stage", ["spawn", "sockets", "preflight", "running"])
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
+def test_supervisor_stop_owns_capturer_through_startup_and_running(
+    sup_env, monkeypatch, set_capturer_behaviour, stage, stop_signal
+):
+    """Both startup cancellation and recorder drain reap the isolated child."""
+    from onoats import runtime
+
+    set_capturer_behaviour("hang")
+    children = []
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        real_add = loop.add_signal_handler
+        handlers = {}
+
+        def add(sig, callback, *args):
+            handlers[sig] = lambda: callback(*args)
+            real_add(sig, callback, *args)
+
+        monkeypatch.setattr(loop, "add_signal_handler", add)
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def spawn(*args, **kwargs):
+            assert stop_signal in handlers, "capturer spawned before signal ownership"
+            child = await real_spawn(*args, **kwargs)
+            children.append(child)
+            if stage == "spawn":
+                assert stop_signal in handlers, "startup signal has no owner"
+                handlers[stop_signal]()
+            return child
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+        async def sockets(*args, **kwargs):
+            if stage == "sockets":
+                assert stop_signal in handlers, "socket-wait signal has no owner"
+                handlers[stop_signal]()
+                await asyncio.sleep(0)
+            return True  # lifecycle seam; no socket data is needed by this recorder
+
+        monkeypatch.setattr(cli, "_wait_for_sockets", sockets)
+
+        async def recorder(**kwargs):
+            if stage == "preflight":
+                assert stop_signal in handlers, "preflight signal has no owner"
+                handlers[stop_signal]()
+                await asyncio.sleep(0)
+            elif stage == "running":
+                shutdown = asyncio.Event()
+                runtime._install_signal_handlers(
+                    shutdown, asyncio.Event(), None, None, loop
+                )
+                handlers[stop_signal]()
+                await asyncio.wait_for(shutdown.wait(), timeout=1)
+                assert runtime.graceful_shutdown_requested()
+
+        monkeypatch.setattr("onoats.dual.run_onoats_dual", recorder)
+        result = await asyncio.wait_for(
+            cli._supervise_socket_session([]), timeout=SUP_TIMEOUT
+        )
+        assert result == 0
+        assert children and all(child.returncode is not None for child in children)
+
+    asyncio.run(run())

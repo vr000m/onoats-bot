@@ -1,0 +1,377 @@
+[
+  {
+    "name": "valid",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1699999999.75,
+      "audio": {
+        "me": {"level": 0.25, "observed_at": 1699999999.5},
+        "them": {"level": 1.0, "observed_at": 1699999999.25}
+      },
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      },
+      "transcript": {"text": "hello", "source": "them", "speaker_label": "S1"},
+      "locked_category": "seminars"
+    }
+  },
+  {
+    "name": "schema-drift",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 1,
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "foreign-pid",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4243,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "foreign-epoch",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999901.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "dead-owner",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": false,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "snapshot-expiry-boundary",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1699999995.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "unknown", "detail": null},
+        "them": {"state": "unknown", "detail": null},
+        "aggregate": "unknown"
+      }
+    }
+  },
+  {
+    "name": "stale-snapshot",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1699999994.999,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "unknown", "detail": null},
+        "them": {"state": "unknown", "detail": null},
+        "aggregate": "unknown"
+      }
+    }
+  },
+  {
+    "name": "future-snapshot-boundary",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000005.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "unknown", "detail": null},
+        "them": {"state": "unknown", "detail": null},
+        "aggregate": "unknown"
+      }
+    }
+  },
+  {
+    "name": "future-snapshot",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000005.001,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "unknown", "detail": null},
+        "them": {"state": "unknown", "detail": null},
+        "aggregate": "unknown"
+      }
+    }
+  },
+  {
+    "name": "stale-me-only",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "expected_me_signal": false,
+    "expected_them_signal": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {
+        "me": {"level": 0.5, "observed_at": 1699999998.999},
+        "them": {"level": 0.75, "observed_at": 1699999999.0}
+      },
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "level-boundaries",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {
+        "me": {"level": -0.0, "observed_at": 1700000000.0},
+        "them": {"level": 1.0, "observed_at": 1700000000.0}
+      },
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "level-overflow",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {
+        "me": {"level": 1.0000001, "observed_at": 1700000000.0},
+        "them": null
+      },
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "aggregate-mismatch",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "failed", "detail": "offline"},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "invalid-state",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "green", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "missing-transcript-run-id",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  },
+  {
+    "name": "rollback-future-me",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": true,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "0123456789abcdef0123456789abcdef",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {
+        "me": {"level": 0.5, "observed_at": 1700003600.0},
+        "them": null
+      },
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      },
+      "locked_category": "seminars"
+    }
+  },
+  {
+    "name": "invalid-transcript-run-id",
+    "now": 1700000000.0,
+    "owner_pid": 4242,
+    "owner_start_epoch": 1699999900.0,
+    "owner_alive": true,
+    "accepted": false,
+    "snapshot": {
+      "schema": 2,
+      "transcript_run_id": "ABCDEF0123456789ABCDEF0123456789",
+      "pid": 4242,
+      "start_epoch": 1699999900.0,
+      "updated_at": 1700000000.0,
+      "audio": {"me": null, "them": null},
+      "stt": {
+        "me": {"state": "ready", "detail": null},
+        "them": {"state": "ready", "detail": null},
+        "aggregate": "ready"
+      }
+    }
+  }
+]

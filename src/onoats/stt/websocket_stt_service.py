@@ -51,9 +51,11 @@ reconnected session sees its first ``transcript.completed``/
 from __future__ import annotations
 
 import asyncio
+import enum
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 
 from loguru import logger
 from pipecat.frames.frames import (
@@ -140,6 +142,21 @@ _CONNECT_TIMEOUT_SECONDS = 5.0
 _RECONNECT_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
 
 
+class SttConnectionState(enum.StrEnum):
+    """Framework-neutral connection lifecycle states."""
+
+    STARTING = "starting"
+    READY = "ready"
+    RECOVERING = "recovering"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class SttConnectionEvent:
+    state: SttConnectionState
+    detail: str | None = None
+
+
 class WebSocketSTTService(SegmentedSTTService):
     """STTService that forwards VAD-delimited audio to the stt_server.
 
@@ -163,6 +180,7 @@ class WebSocketSTTService(SegmentedSTTService):
         instance_name: str | None = None,
         on_recovery: Callable[[str | None], None] | None = None,
         on_preflight_confirmed: Callable[[], None] | None = None,
+        on_connection_event: Callable[[SttConnectionEvent], None] | None = None,
         stamp_segment_samples: bool = False,
         **kwargs,
     ) -> None:
@@ -219,6 +237,8 @@ class WebSocketSTTService(SegmentedSTTService):
         # though the cooldown registry itself is process-wide/shared.
         self._launchd_label = launchd_label
         self._on_recovery = on_recovery
+        self._on_connection_event = on_connection_event
+        self._connection_state = SttConnectionState.STARTING
         # Identifies this instance in the process-wide unhealthy registry
         # (`onoats.stt.launchd.REGISTRY`), which gates the early cooldown
         # reset so one instance's confirmed transcript is not mistaken for
@@ -508,6 +528,11 @@ class WebSocketSTTService(SegmentedSTTService):
                     logger.warning(
                         f"{self.name}: decode timed out — resetting connection"
                     )
+                    # Decode timeout revokes this branch's last confirmed
+                    # handshake.  Publish recovery before tearing the socket
+                    # down; only _ensure_connected's next completed handshake
+                    # may move the branch back to ready.
+                    self._emit_connection_event(SttConnectionState.RECOVERING)
                     await self._discard_stale()
                     yield ErrorFrame(error="stt_server decode timed out")
                     return
@@ -541,6 +566,9 @@ class WebSocketSTTService(SegmentedSTTService):
     async def _ensure_connected(self) -> None:
         if self._connected and self._client is not None:
             return
+
+        if self._connection_state is SttConnectionState.FAILED:
+            self._emit_connection_event(SttConnectionState.RECOVERING)
 
         # Close any stale client/reader from a prior (crashed) session so we
         # don't leak the websocket or race a dying reader with the new one.
@@ -609,6 +637,16 @@ class WebSocketSTTService(SegmentedSTTService):
                     # `except BaseException`.
                     await self._discard_stale()
                     raise
+                # The reader can consume session.updated AND a subsequent
+                # close before this task resumes. The acknowledgement alone
+                # cannot grant readiness after that newer revocation.
+                if (
+                    self._client is not client
+                    or not self._connected
+                    or self._reader_task is None
+                    or self._reader_task.done()
+                ):
+                    raise ConnectionError("STT session ended during negotiation")
                 # Backend identity from server.hello — surfaces an operational
                 # misconfig (wrong ASR behind STT_WS_SOCKET) directly in the log,
                 # and is stashed on the instance so callers (banner, metrics,
@@ -628,6 +666,7 @@ class WebSocketSTTService(SegmentedSTTService):
                     )
                 else:
                     logger.info(f"{self.name}: connected to {endpoint}{backend_desc}")
+                self._emit_connection_event(SttConnectionState.READY)
                 # A kickstart this instance itself triggered (on a prior
                 # exhaustion) is confirmed live only once we reach here —
                 # fire on_recovery's "restarted" message now, and arm the
@@ -686,6 +725,7 @@ class WebSocketSTTService(SegmentedSTTService):
         logger.error(
             f"{self.name}: giving up after {total_attempts} connect attempts to {endpoint}"
         )
+        self._emit_connection_event(SttConnectionState.FAILED, safe_exc_text(last_exc))
         # Only a *reachability* failure can plausibly be fixed by restarting
         # the server. A protocol/auth failure (a 401 from a server that is
         # demonstrably up and answering, a TLS error, an unexpected first
@@ -697,6 +737,21 @@ class WebSocketSTTService(SegmentedSTTService):
         if isinstance(last_exc, (TimeoutError, OSError)):
             await self._maybe_kickstart()
         raise last_exc
+
+    def _emit_connection_event(
+        self, state: SttConnectionState, detail: str | None = None
+    ) -> None:
+        """Publish neutral health events without coupling transport to a UI."""
+        event = SttConnectionEvent(state, detail)
+        self._connection_state = state
+        if self._on_connection_event is None:
+            return
+        try:
+            self._on_connection_event(event)
+        except Exception as exc:
+            logger.warning(
+                f"{self.name}: connection-event callback failed: {safe_exc_text(exc)}"
+            )
 
     async def _negotiate_session(self, client: TranscriptionClient) -> None:
         """Send ``session.update`` and wait for the server's ack.
@@ -1026,6 +1081,11 @@ class WebSocketSTTService(SegmentedSTTService):
                     logger.warning(
                         f"{self.name}: connection lost (no session.closed received)"
                     )
+                if was_connected:
+                    # Any remote ending revokes the live handshake, including
+                    # session.closed. Local shutdown detaches ownership first,
+                    # so its draining/closing reader never publishes recovery.
+                    self._emit_connection_event(SttConnectionState.RECOVERING)
                 # If the socket closed while a decode was in flight, fail
                 # fast instead of letting run_stt hit its 90 s timeout.
                 if (

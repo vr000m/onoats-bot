@@ -6,6 +6,9 @@ on:
   pull_request:
 
 jobs:
+  python-313-contracts:
+    uses: ./.github/workflows/python-313-contracts.yml
+
   lint-and-test:
     runs-on: ubuntu-latest
     steps:

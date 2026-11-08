@@ -113,10 +113,10 @@ both binaries are signed with the same identity + identifier (capturer first,
 then the bundle), so the DR is unchanged from the capturer-only bundle and
 existing TCC grants carry over.
 
-Day-to-day usage (Start/Flush/Stop, mic picker, Settings, status, log
-location, first-run TCC prompts) lives in the top-level
-[Menu bar (macOS)](../README.md#menu-bar-macos) section. The internals behind
-that surface:
+Day-to-day usage (the window panel's Start/Stop/Seminar hierarchy, Flush,
+Settings/Diagnostics, live display telemetry, per-run logs, and first-run TCC
+prompts) lives in the [detailed menu-bar guide](../docs/menu-bar.md). The
+internals behind that surface:
 
 - **Launch from `~/Applications` via the GUI** — that's the point:
   LaunchServices makes `Onoats.app` its own TCC responsible process,
@@ -125,17 +125,48 @@ that surface:
 - **Start** runs `~/.local/bin/onoats bot` with `AUDIO_SOURCE=socket` and
   `ONOATS_CAPTURER_BIN` pointing at the embedded capturer. Override the CLI
   path with `defaults write net.varunsingh.onoats cliPath /abs/path`.
-- **Stop** SIGTERMs the supervisor it spawned (graceful drain) — never the
-  capturer directly.
-- The "Mic (me)" picker sets the macOS **default input device** because the
+- **Stop** asks the supervisor it spawned for a graceful drain — never the
+  capturer directly. A verified external session routes Stop and Flush through
+  the recorder-owned, generation-authenticated control socket; neither command
+  falls back to PID signalling. Control requests and direct compatibility
+  signals enter one Python `RecorderLifecycleController`; the control server and
+  signal handlers are adapters, not independent locks or rotation owners.
+- Quit requests the same owned graceful stop during startup and recording,
+  then waits for the recorder and any in-flight Flush/Stop helper to exit.
+  A 15-second timeout keeps the app open with a cleanup error and retained
+  process handles. Quitting an external session leaves its recorder running.
+- The Settings "Mic (me)" picker sets the macOS **default input device** because the
   capturer binds the system default at start — the only selection that
   actually applies. Named device+STT profiles are a follow-up (need capturer
   `--mic-uid`).
-- The running indicator reads the Phase-5a status file
+- The lifecycle model reads the Phase-5a status file
   (`<data_dir>/.active/onoats.status.json`, schema-guarded) with the pid file
-  as liveness backstop. Data dir resolves from `~/.config/onoats/config.toml`
-  `[storage].data_dir`, else `~/.local/share/onoats` (a GUI app sees no shell
-  env, so `ONOATS_DATA_DIR`/XDG exports don't apply here).
+  as liveness backstop. Display-only live data comes from the separate,
+  versioned `<data_dir>/.active/onoats.ui.json`: fresh per-branch levels,
+  branch/aggregate STT state, locked category, and the optional bounded
+  transcript preview. The consumer rejects stale ownership, freshness, schema,
+  numeric, and aggregate mismatches; missing telemetry degrades the panel and
+  never changes recorder liveness or success. Snapshot writes and cleanup use
+  one daemon I/O worker with bounded coalescing, so a slow data volume cannot
+  block capture or app-requested recorder shutdown. If initial running-status
+  publication fails after PID/control publication, recording and control remain
+  live, UI telemetry is disabled for that run, and the app derives the result
+  from the owned process exit and run log.
+- Native liveness caches use the complete recorder generation: PID, stored
+  command fingerprint, and positive start epoch. Incomplete or changed
+  generations miss the cache. A requested Stop does not turn a non-zero owned
+  process exit into success; diagnostic status is consumed only when its
+  generation, spawn floor, and active directory match.
+- The recorder captures one immutable `RecorderSessionConfig` per Start. Both
+  STT arms, banner, telemetry, recovery/kickstart policy, diarization, and
+  shutdown diagnostics retain that snapshot until exit; configuration edits
+  are next-session changes.
+- Data dir resolves from `~/.config/onoats/config.toml` `[storage].data_dir`,
+  else `~/.local/share/onoats` (a GUI app sees no shell env, so
+  `ONOATS_DATA_DIR`/XDG exports don't apply here). The model snapshots this path
+  at Start and uses it for launch, status/PID/telemetry reads, Stop/Flush, and
+  exit handling until that run ends. A mid-run config change is shown as the
+  next recording directory rather than silently moving the active run.
 - **First Start after a fresh install / permission reset:** the system-audio
   TCC prompt fires at tap creation. Since release-plan Phase 7 the capturer
   creates the tap **before** its sockets exist (announced by `ONOATS-EVENT
@@ -156,6 +187,183 @@ that surface:
   `docs/audio-socket-contract.md` "Capturer event lines".
 - **Settings** writes go through a surgical single-key TOML editor — every
   other line of `config.toml`, comments included, stays byte-identical.
+- **Diagnostics and logs:** every app-owned Start reserves one
+  `~/Library/Logs/Onoats/onoats-bot-<spawnEpoch>.log` with exclusive creation;
+  the recorder and app-owned Flush helpers receive duplicates of that retained
+  append descriptor and the newest ten are kept. App-owned Stop terminates the
+  retained supervisor and does not spawn a Stop writer. The descriptor, not the
+  replaceable pathname, remains the output and diagnostic-read authority until
+  the recorder and every duplicate writer have exited.
+  Open Log resolves the current app process's latest run first; Show Logs Folder
+  always reveals the containing directory. External-session Stop and Flush
+  output is not written to an app-owned run log, and no log tail is displayed
+  in the panel.
+- **Brand resources:** `../assets/brand/` owns the canonical grain-wave SVG mark,
+  wordmark, palette, spacing, and export map. `onoats-menubar/Resources/` contains
+  only the required native exports: header art, `.icns`, and state-specific
+  monochrome template icons. `make app` starts from a clean bundle and copies
+  each named resource explicitly; `make verify-resources` equality-checks that
+  allowlist before `make sign`. After the gauntlet, run
+  `make -C native app-tree-hash`
+  and smoke the already-signed staged bundle before installation:
+
+  The smoke watches `--data-dir` but does not tell the app where to record: it
+  launches the app with a plain `open`, and the app writes to its configured
+  `[storage].data_dir` (`~/.config/onoats/config.toml`). The two must be the same
+  directory, and it must be empty of other files: before launch the smoke reads
+  every `*.jsonl` under it and fails closed on anything that is not an onoats
+  transcript (a real data directory with indexes or backups never passes). Use a
+  short throwaway directory (at most 75 bytes, so the control socket fits) and
+  point the app at it for the run:
+
+  ```sh
+  SMOKE_DATA_DIR="$HOME/onoats-smoke"; mkdir -p "$SMOKE_DATA_DIR"
+  cp ~/.config/onoats/config.toml ~/.config/onoats/config.toml.bak-smoke
+  # set data_dir = "<that path>" in ~/.config/onoats/config.toml (or Settings →
+  # Data directory), and quit Onoats: the smoke refuses to start while it runs
+  ```
+
+  Restore the config afterwards
+  (`cp ~/.config/onoats/config.toml.bak-smoke ~/.config/onoats/config.toml`).
+
+  First create the mandatory release identity from the signed staged bundle and
+  the clean CLI checkout revision:
+
+  ```sh
+  python3 native/install_staged.py release-identity native/Onoats.app \
+    --cli-git-identity "$(git rev-parse HEAD)" \
+    --output /tmp/onoats-release-identity.json
+  ```
+
+  `--output` is written privately (mode `0600`) and atomically, and the write
+  refuses a symlinked or non-regular target instead of following it.
+
+  Pass that same immutable record to smoke. It contains the canonical bundle
+  identifier, designated requirement, cdhash, tree hash, main-executable hash,
+  canonical CLI path, CLI entrypoint hash, interpreter path/hash, and clean CLI
+  git identity. The smoke re-derives it before and after recording and
+  verifies the running app PID's designated requirement and cdhash through
+  Security.framework; static path/signature checks alone are insufficient.
+
+  ```sh
+  python3 native/installed_recording_smoke.py \
+    --app native/Onoats.app --data-dir "$SMOKE_DATA_DIR" \
+    --release-identity /tmp/onoats-release-identity.json \
+    --smoke-receipt /tmp/onoats-smoke-receipt.json
+  ```
+
+  The smoke is interactive: speak when prompted. It passes only after fresh Me
+  telemetry and a durable Me utterance from the attested recorder run. Its
+  TERM/KILL cleanup rechecks the captured macOS process birth immediately before
+  delivery, but the userspace check and signal are not generation-atomic; that
+  residual race is accepted. Cleanup signals only identities the run captured
+  itself: if `open` fails or times out before the app's pid is captured, a process
+  found afterwards is never signalled, because a login item or the user could have
+  launched it. It is asked to quit (AppleScript, addressed by the exact installed
+  app path) only when no recorder is provably live, under a lock held until the app
+  is gone so a Start racing the quit is refused: a pid record, a held
+  single-instance lock, or an unreadable lock leaf all keep it running, and it is
+  reported with its pid so you can quit it by hand. The CLI shim target is read through a
+  bounded, non-blocking regular-file read, so a target replaced by a FIFO fails
+  closed instead of hanging the installer or smoke. For an explicit clean install from the repository
+  root, run:
+
+  ```sh
+  ONOATS_INSTALL_EXPECTED_IDENTITY=<app-tree-hash-output> \
+    ONOATS_INSTALL_RELEASE_IDENTITY=/tmp/onoats-release-identity.json \
+    ONOATS_INSTALL_SMOKE_RECEIPT=/tmp/onoats-smoke-receipt.json \
+    ONOATS_INSTALL_ROLLBACK_APPROVED=0 \
+    make -C native install-staged
+  ```
+
+  This installs an immutable verified snapshot without rebuilding or
+  re-signing it. Every `make app sign` produces different bytes (a new
+  signature), so build and sign once, then create the identity, smoke and install
+  that same bundle; a later `make install` rebuilds and replaces it, voiding the
+  receipt. The smoke's `open` leaves `native/Onoats.app` registered with
+  LaunchServices; `install-staged` unregisters the verified staged bundle itself,
+  but if it reports a duplicate registration, run
+  `lsregister -u "$PWD/native/Onoats.app"` and retry. The canonical identity
+  includes paths, entry types, executable modes, and file bytes. Private install
+  and rollback copies reject unsupported entry types and group/other-writable
+  modes, strip ACLs, retain code-signing metadata, and require every allowlisted
+  resource to be a regular non-symlink file. Do not fix
+  or otherwise mutate the bundle after signing; any fix requires rebuilding,
+  re-running the gauntlet, and signing again.
+
+Rollback-capable publication is a separate, fail-closed command. Before using
+it, verify and record the prior app's designated-requirement hash and cdhash,
+plus the prior CLI SHA, branch/detached state, exact `install-cli` command and
+`EXTRAS`, shim path, and checkout-owned import path. Then, from the repository
+root, run:
+
+```sh
+ONOATS_INSTALL_EXPECTED_IDENTITY=<smoked-app-tree-hash> \
+  ONOATS_INSTALL_RELEASE_IDENTITY=/tmp/onoats-release-identity.json \
+  ONOATS_INSTALL_SMOKE_RECEIPT=/tmp/onoats-smoke-receipt.json \
+  ONOATS_INSTALL_ROLLBACK_APPROVED=1 \
+  ONOATS_INSTALL_BASELINE_DR_HASH=<verified-sha256> \
+  ONOATS_INSTALL_BASELINE_CDHASH=<verified-cdhash> \
+  make -C native install-staged
+```
+
+Only that approved mode publishes a rollback record. Restore it with
+`make -C native rollback`; rollback copies and extracts one immutable
+descriptor-backed archive snapshot and verifies it before atomically publishing
+the canonical `~/Applications/Onoats.app`. Restore verification uses the
+archive's recorded tree hash, designated-requirement hash, cdhash, and archive
+hash rather than the current checkout's resource allowlist, so an approved older
+bundle remains restorable after the allowlist changes. Rollback eligibility is
+run-specific: use it only when that release's pre-change record contains every
+required app and CLI baseline field and passes preflight. When the release plan
+records an incomplete baseline, use `ONOATS_INSTALL_ROLLBACK_APPROVED=0` and do
+not invoke rollback for that run.
+
+Publication is one transaction (`_replace_verified`, with its contract table in
+the docstring). `install` and `rollback` each hold an exclusive lock on the install
+directory for the whole transaction, so a second one started meanwhile fails with
+"already running" instead of interleaving. The new bundle is swapped in atomically and verified; any
+failure, including an interrupt, swaps the previous app back. Every installer
+child process (`make`, `codesign`, `ditto`, `git`, `lsregister`) runs in its own
+process group under a 300 s deadline; a timeout or interrupt kills that whole
+group, so ordinary helpers do not outlive the failure (a descendant that
+deliberately leaves the group with its own `setsid` is not reached), and a
+timeout is an install error that takes the same swap-back path. Rollback additionally requires the archived
+bundle's own `CFBundleIdentifier` to be the canonical one before it publishes.
+
+If the swap-back itself fails or is interrupted, the previous app is the only
+copy and the installer keeps it: the error names the retained
+`.onoats-install-*` (or `.onoats-rollback-*`) directory inside the install
+directory. Inspect both that directory's `candidate` and the installed
+`Onoats.app`, then move the previous app back by hand. A failed *fresh* install
+has no previous app; if its unverified bundle cannot be withdrawn the error says
+so and the bundle at the install path must be removed manually. A failure after
+the rollback record is published keeps the baseline archive the record names.
+
+All staged-installer operator input is environment-only data read directly by
+`install_staged.py`: `ONOATS_INSTALL_APP`, `ONOATS_INSTALL_DIR`,
+`ONOATS_INSTALL_BACKUP_DIR`, `ONOATS_INSTALL_ROLLBACK_RECORD`,
+`ONOATS_INSTALL_EXPECTED_IDENTITY`, `ONOATS_INSTALL_ROLLBACK_APPROVED`,
+`ONOATS_INSTALL_BASELINE_DR_HASH`, `ONOATS_INSTALL_BASELINE_CDHASH`, and
+`ONOATS_INSTALL_BUNDLE_ID`, plus mandatory
+`ONOATS_INSTALL_RELEASE_IDENTITY` and mandatory
+`ONOATS_INSTALL_SMOKE_RECEIPT`. The smoke invalidates any prior receipt before
+launch and atomically publishes a receipt only after recording, identity
+re-verification, and cleanup succeed. The installer binds that receipt to the
+canonical release-identity digest before any LaunchServices query or mutation.
+`ONOATS_INSTALL_BUNDLE_ID`, when supplied, may only redundantly name the
+canonical identifier; it is rejected before any LaunchServices query or
+installation mutation otherwise.
+Python owns defaults and derives the app name. The former Make-variable names
+are rejected for `app-tree-hash`, `install-staged`, and `rollback`; staged
+inputs must use the `NAME=value make ...` environment-prefix form shown above.
+Their values are never expanded by Make.
+The build-local `APP` staging path is also fixed to `native/Onoats.app` and
+cannot be overridden from the Make command line or environment; `app` removes
+only that quoted repository-local path before assembly.
+
+Release CI runs the full suite on Python 3.12 and a separate recorder-contract
+lane on Python 3.13. PyPI publication depends on both jobs.
 
 ## Phase 4: production capturer (`onoats-capturer/`)
 
@@ -176,12 +384,13 @@ AUDIO_SOURCE=socket ONOATS_CAPTURER_BIN="$(make -s print-bin)" onoats bot
 Design notes baked into the capturer (each learned the hard way — see the dev
 plan `## Findings` for the evidence):
 
-- **Startup order is load-bearing:** mic TCC grant → system-tap preflight
-  (emit `waiting-for-permission`, start the tap/aggregate/IOProc chain — the
-  TCC-prompting call, before any socket exists) → create both sockets →
-  accept both → write both handshakes → attach the system writer + start the
-  mic engine (strictly after the tap; pre-socket system frames are dropped as
-  pre-session audio).
+- **Startup order is load-bearing:** mic TCC grant → emit
+  `waiting-for-permission` → start the mic engine → start the
+  system-tap/aggregate/IOProc chain (the system-audio TCC-prompting call) →
+  create both sockets → accept both → write both handshakes → attach both
+  writers. Starting the mic before creating the process tap avoids a known
+  `AudioDeviceStart` stall; pre-socket frames from either branch are dropped as
+  pre-session audio.
 - **Copy-only IOProc.** Doing AVAudioConverter work in the Core Audio realtime
   callback makes the HAL silently stop calling it after ~5 cycles. The IOProc
   memcpys into a bounded queue; a worker thread resamples and chunks.
