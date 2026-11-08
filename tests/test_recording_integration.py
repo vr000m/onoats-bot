@@ -871,39 +871,88 @@ def test_installed_smoke_never_signals_an_app_it_did_not_capture_and_quits_it_on
         assert "it is gone" in err and "NOT signalled" not in err
 
 
-def test_recorder_idle_is_true_only_when_provably_no_recorder(tmp_path):
+def test_recorder_idle_lease_is_true_only_when_provably_no_recorder(tmp_path):
     import fcntl
     import os
 
     active = tmp_path / ".active"
-    # No directory, or no lock leaf: the recorder never ran here.
-    assert SMOKE._recorder_idle(active) is True
-    active.mkdir()
-    assert SMOKE._recorder_idle(active) is True
-    # An unlocked lock leaf: a previous recorder exited.
+    # No directory yet: the lease creates the lock leaf as the recorder would.
+    with SMOKE._recorder_idle_lease(active) as idle:
+        assert idle is True
     lock = active / SMOKE.LOCK_FILENAME
-    lock.write_text("")
-    assert SMOKE._recorder_idle(active) is True
+    assert lock.is_file()
+    # An unlocked leaf: a previous recorder exited.
+    with SMOKE._recorder_idle_lease(active) as idle:
+        assert idle is True
     # A held exclusive lock is a live recorder.
     holder = os.open(lock, os.O_RDWR)
     try:
         fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert SMOKE._recorder_idle(active) is False
+        with SMOKE._recorder_idle_lease(active) as idle:
+            assert idle is False
     finally:
         os.close(holder)
-    assert SMOKE._recorder_idle(active) is True
-    # Any pid record means unprovable, even an unlocked lock.
+    # Any pid record means unprovable, even with an unlocked lock.
     pid_record = active / SMOKE.PID_FILENAME
     pid_record.write_text("1\n")
-    assert SMOKE._recorder_idle(active) is False
+    with SMOKE._recorder_idle_lease(active) as idle:
+        assert idle is False
     pid_record.unlink()
     # A symlink or FIFO in the lock leaf is never a safe "idle" answer.
     lock.unlink()
     lock.symlink_to(tmp_path / "elsewhere")
-    assert SMOKE._recorder_idle(active) is False
+    with SMOKE._recorder_idle_lease(active) as idle:
+        assert idle is False
     lock.unlink()
     os.mkfifo(lock)
-    assert SMOKE._recorder_idle(active) is False
+    with SMOKE._recorder_idle_lease(active) as idle:
+        assert idle is False
+
+
+def test_idle_lease_blocks_a_recorder_start_until_the_app_is_gone(
+    tmp_path, monkeypatch
+):
+    """A Start pressed after the idle proof must not begin a session the quit stops."""
+    import fcntl
+    import os
+
+    active = tmp_path / ".active"
+    app = tmp_path / "Onoats.app"
+    seen: dict[str, object] = {}
+    state = {"pid": 77}
+
+    def start_recorder() -> bool:
+        """What ``runtime._acquire_instance_lock`` does: exclusive, non-blocking."""
+        fd = os.open(active / SMOKE.LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        seen["fd"] = fd
+        return True
+
+    def ask(_path):
+        # The gap Codex described: after the proof, before the quit lands.
+        seen["start_during_quit_request"] = start_recorder()
+        return True
+
+    def one_app_pid(_app):
+        if seen.get("polled"):
+            seen["start_during_wait"] = start_recorder()
+            state["pid"] = None
+        seen["polled"] = True
+        return state["pid"]
+
+    monkeypatch.setattr(SMOKE, "_ask_app_to_quit", ask)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", one_app_pid)
+    monkeypatch.setattr(SMOKE.time, "sleep", lambda _s: None)
+    assert SMOKE._quit_unproven_app(app, 77, active_dir=active) is None
+    assert seen["start_during_quit_request"] is False
+    assert seen["start_during_wait"] is False
+    # Once the lease is released the recorder can start normally.
+    assert start_recorder() is True
+    os.close(seen["fd"])
 
 
 @pytest.mark.parametrize(
@@ -922,7 +971,13 @@ def test_quit_unproven_app_guards_each_precondition(
     app = tmp_path / "Onoats.app"
     state = {"pid": pid_now}
     asked: list[Path] = []
-    monkeypatch.setattr(SMOKE, "_recorder_idle", lambda _active: idle)
+    import contextlib
+
+    @contextlib.contextmanager
+    def lease(_active):
+        yield idle
+
+    monkeypatch.setattr(SMOKE, "_recorder_idle_lease", lease)
     monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: state["pid"])
 
     def ask(path):

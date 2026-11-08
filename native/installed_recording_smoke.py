@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import fcntl
 import importlib.util
@@ -17,7 +18,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple, TypeVar
 
 T = TypeVar("T")
@@ -1098,33 +1099,43 @@ def _verify_signed_app(app: Path) -> None:
     )
 
 
-def _recorder_idle(active_dir: Path) -> bool:
-    """True only when provably no recorder holds this data directory.
+@contextlib.contextmanager
+def _recorder_idle_lease(active_dir: Path) -> Iterator[bool]:
+    """Yield True only while no recorder can start or is live in this data dir.
 
-    Unprovable is False: a pid record, a lock that is held, or a lock leaf that
-    is not a plain regular file all keep the answer "not idle". A missing lock
-    leaf is the only "never ran" answer. The probe is a non-blocking shared
-    ``flock`` (a live recorder holds the exclusive lock for its whole life) and
-    is released at once.
+    The proof is a shared ``flock`` on ``onoats.lock`` that is HELD for the whole
+    ``with`` body, not probed and released: a live recorder holds the exclusive
+    lock for its entire life, so while this lease is held a recorder that is
+    already running makes the answer False, and one that tries to start is
+    refused by the single-instance gate instead of beginning a session that the
+    caller's quit would then stop. The pid record is rechecked after the lock is
+    held. Anything unprovable (a pid record, an unsafe or unopenable lock leaf, a
+    held lock) yields False. The lock leaf is created if absent, exactly as the
+    recorder would, so a first run is still covered.
     """
+    lock_path = active_dir / LOCK_FILENAME
     if os.path.lexists(active_dir / PID_FILENAME):
-        return False
+        yield False
+        return
     try:
+        active_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(
-            active_dir / LOCK_FILENAME,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
         )
-    except FileNotFoundError:
-        return True
     except OSError:
-        return False
+        yield False
+        return
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return False
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
+        held = False
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                held = not os.path.lexists(active_dir / PID_FILENAME)
+        except OSError:
+            held = False
+        yield held
     finally:
         os.close(fd)
 
@@ -1159,20 +1170,24 @@ def _quit_unproven_app(
 
     Returns None when the app was asked to quit and is gone; otherwise the
     reason it was left running. Safe means: the executable path is exactly this
-    smoke's installed app (re-read just now) and no recorder is provably live,
-    so a quit cannot drain and stop somebody's real recording.
+    smoke's installed app (re-read just now) and no recorder is provably live
+    under a lease held until the app is gone, so a quit cannot drain and stop a
+    real recording, including one whose Start races the quit.
     """
-    if not _recorder_idle(active_dir):
-        return "a recorder may be live in the data directory"
-    if _one_app_pid(app) != pid:
-        return "the process no longer matches the installed app"
-    if not _ask_app_to_quit(app):
-        return "the quit request failed"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _one_app_pid(app) is None:
-            return None
-        time.sleep(0.2)
+    with _recorder_idle_lease(active_dir) as idle:
+        if not idle:
+            return "a recorder may be live in the data directory"
+        if _one_app_pid(app) != pid:
+            return "the process no longer matches the installed app"
+        if not _ask_app_to_quit(app):
+            return "the quit request failed"
+        # The lease stays held until the app is gone, so no recorder can begin
+        # between the proof and the quit taking effect.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _one_app_pid(app) is None:
+                return None
+            time.sleep(0.2)
     return "it did not quit in time"
 
 
