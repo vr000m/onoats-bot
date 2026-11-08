@@ -57,6 +57,11 @@ Annotated tags exist from `v0.9.0` forward.
 - `install-staged` and `rollback` hold an exclusive lock on the install directory
   for the whole transaction, so two runs at once can no longer undo a reported
   install; the second fails with "already running".
+- The release identity now works on a real `uv tool` install. Its CLI check ran
+  the venv's `python` after resolving the symlink to the base interpreter, which
+  cannot see the venv's packages, so `import onoats` failed and no identity could
+  be created. It now launches the shebang path and still hashes the resolved
+  interpreter.
 
 ### Changed
 

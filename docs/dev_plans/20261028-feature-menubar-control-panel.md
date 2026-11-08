@@ -683,6 +683,22 @@ sequenceDiagram
 
 ## Findings
 
+### Manual release gates, run 2026-11-07 (build `032b36c5…e4259`, CLI `efec856`)
+
+- Signed build, release identity, installed-app smoke and `install-staged` passed
+  on the same bytes; the installed tree hash equals the smoked one and codesign
+  verifies. Rollback was not run: no baseline backup existed, so it is not
+  applicable to this release.
+- The first live run found a bug the fixture tests could not: the identity's CLI
+  probe ran the symlink-resolved base interpreter, which cannot import a venv's
+  packages (fixed in `efec856`, regression test uses a real venv).
+- Operator gaps, now in `native/README.md`: the smoke needs an empty data
+  directory that the app is configured to record to (`--data-dir` is only what it
+  watches), every `app sign` changes the bytes so a later `make install` voids the
+  receipt, and a leftover LaunchServices registration of the staged app can fail
+  `install-staged` once.
+- The Manual Native Smoke Matrix (interaction, visual, VoiceOver) is not yet run.
+
 - 2026-11-05 — Round 8 makes force exit a complete process contract. Lifecycle
   continuation and terminal rotations, accepted control handlers, direct
   recorder event loops, and the socket supervisor all share bounded settlement;

@@ -207,10 +207,24 @@ internals behind that surface:
   `make -C native app-tree-hash`
   and smoke the already-signed staged bundle before installation:
 
+  The smoke watches `--data-dir` but does not tell the app where to record: it
+  launches the app with a plain `open`, and the app writes to its configured
+  `[storage].data_dir` (`~/.config/onoats/config.toml`). The two must be the same
+  directory, and it must be empty of other files: before launch the smoke reads
+  every `*.jsonl` under it and fails closed on anything that is not an onoats
+  transcript (a real data directory with indexes or backups never passes). Use a
+  short throwaway directory (at most 75 bytes, so the control socket fits) and
+  point the app at it for the run:
+
   ```sh
-  SMOKE_DATA_DIR="$(mktemp -d)"
-  trap 'rm -rf "$SMOKE_DATA_DIR"' EXIT
+  SMOKE_DATA_DIR="$HOME/onoats-smoke"; mkdir -p "$SMOKE_DATA_DIR"
+  cp ~/.config/onoats/config.toml ~/.config/onoats/config.toml.bak-smoke
+  # set data_dir = "<that path>" in ~/.config/onoats/config.toml (or Settings →
+  # Data directory), and quit Onoats: the smoke refuses to start while it runs
   ```
+
+  Restore the config afterwards
+  (`cp ~/.config/onoats/config.toml.bak-smoke ~/.config/onoats/config.toml`).
 
   First create the mandatory release identity from the signed staged bundle and
   the clean CLI checkout revision:
@@ -263,7 +277,13 @@ internals behind that surface:
   ```
 
   This installs an immutable verified snapshot without rebuilding or
-  re-signing it. The canonical identity
+  re-signing it. Every `make app sign` produces different bytes (a new
+  signature), so build and sign once, then create the identity, smoke and install
+  that same bundle; a later `make install` rebuilds and replaces it, voiding the
+  receipt. The smoke's `open` leaves `native/Onoats.app` registered with
+  LaunchServices; `install-staged` unregisters the verified staged bundle itself,
+  but if it reports a duplicate registration, run
+  `lsregister -u "$PWD/native/Onoats.app"` and retry. The canonical identity
   includes paths, entry types, executable modes, and file bytes. Private install
   and rollback copies reject unsupported entry types and group/other-writable
   modes, strip ACLs, retain code-signing metadata, and require every allowlisted
