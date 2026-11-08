@@ -25,6 +25,16 @@ swiftc \
   "$script_dir/onoats-capturer/Tests/FrameChunkerSuspensionHarness.swift" \
   -o "$tmp_dir/frame-chunker-suspension-harness"
 
+append_after_stop=$(
+  "$tmp_dir/frame-chunker-suspension-harness" --append-after-stop
+)
+if [[ "$append_after_stop" != "APPEND_AFTER_STOP_OK" ]]; then
+  echo "FAIL: stopped FrameChunker accepted queued capture data" >&2
+  exit 1
+fi
+
+echo "PASS: stopped FrameChunker rejects queued capture data"
+
 python3 - "$tmp_dir/frame-chunker-suspension-harness" <<'PY'
 import os
 import signal

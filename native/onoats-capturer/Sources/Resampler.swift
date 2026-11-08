@@ -152,6 +152,11 @@ final class FrameChunker {
         if n == 0 { return }
         lock.lock()
         defer { lock.unlock() }
+        // A heartbeat fault stops the whole generation before Core Audio
+        // teardown begins. A worker may already hold one queued callback, so
+        // reject it here rather than emitting real audio after terminal
+        // admission.
+        if stopped { return }
         lastRealDataWallNs = MonotonicClock.nowNanos()
         let samples = UnsafeBufferPointer(start: data[0], count: n)
         // Worker thread (never the RT IOProc): a linear scan of ≤ a few
