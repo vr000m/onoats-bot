@@ -1,6 +1,6 @@
 # Task: Recover or Fail Loud When the System Tap Stalls After Process Resume
 
-**Status**: In Progress
+**Status**: Complete
 **Component**: macos, transport, recorder
 **Assigned to**: Codex
 **Priority**: High
@@ -390,7 +390,7 @@ Context lifecycle — what each process owns:
   audio under the production CLI supervisor.
 - [x] App-owned menu-bar Start/Stop smoke on the same signed bundle.
 - [x] App-owned heartbeat recovery state-space harness.
-- [ ] App-owned automatic restart live smoke on the signed bundle.
+- [x] App-owned automatic restart live smoke on the signed bundle.
 
 ### Test Results
 
@@ -402,7 +402,7 @@ Context lifecycle — what each process owns:
 - [x] Live embedded signed-capturer verification records a bounded fail-loud
   restart, clean residue checks, and fresh-generation `them` recovery.
 - [x] App-owned signed-app smoke passes.
-- [ ] Automatic replacement generation publishes healthy `them` without a
+- [x] Automatic replacement generation publishes healthy `them` without a
   manual Start.
 
 ### Edge Cases Tested
@@ -440,7 +440,7 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ e2474ebc1d369061090497e707cb4bfa76aa9c9b -->
+<!-- reviewed: 2026-11-08 @ 3ddca3e9bc6381e2c388ea13ded33f8311129083 -->
 
 ## Progress
 
@@ -449,7 +449,7 @@ Context lifecycle — what each process owns:
 - [x] Phase 3: Contract Documentation and Live Verification
 - [x] Phase 4: App-Owned Automatic Generation Recovery implementation and
   automated verification
-- [ ] Phase 4 acceptance: signed-app automatic replacement with healthy `them`
+- [x] Phase 4 acceptance: signed-app automatic replacement with healthy `them`
 
 ## Findings
 
@@ -503,6 +503,19 @@ Context lifecycle — what each process owns:
   exited. The completed fail-loud plan was reopened with Phase 4: the menu-bar
   app will automatically launch one fresh generation after an authenticated
   app-owned heartbeat failure, with a stability-window loop guard.
+- 2026-11-08: the signed-app automatic-replacement acceptance passed. The first
+  generation logged a 10,023 ms system-pacer heartbeat stall, rotated its
+  partial session, completed shutdown, and preserved
+  `capture-heartbeat-stalled`. About one second later the app spawned a new
+  supervisor with a fresh socket directory and nonce; both STT arms connected,
+  the system branch created a new session, and repeated `them` utterances were
+  recorded without a manual Start. The menu bar showed Recording plus the
+  automatic-recovery notice while publishing live `them` text.
+- 2026-11-08: the acceptance screenshot exposed a collapsed warning scroll
+  region that clipped the recovery notice. The panel now reserves 36 pt,
+  prefers 48 pt, and remains scroll-bounded at 128 pt; the native contract test
+  pins both the visible minimum and bounded maximum. The full parity file (52
+  tests), RecorderModel harness, native build, and Ruff checks pass.
 - 2026-11-08: the Phase 4 red-first RecorderModel harness failed before
   production edits because `RecorderModel.heartbeatStallExitReason` and
   `automaticRecoveryActive` did not exist. The harness already required a
@@ -585,10 +598,9 @@ Context lifecycle — what each process owns:
   gap greater than 2 s. Each supervisor remains the sole owner of one generation;
   the app owns the bounded transition to a fresh supervisor.
 - Automated implementation and contract verification are complete. Live
-  signed-capturer STOP/CONT, residue cleanup, and manual fresh-generation
-  recovery are verified through both the production CLI supervisor and an
-  app-owned menu-bar Start. Automatic replacement is implemented and remains
-  open only for the signed-app acceptance smoke.
+  signed-capturer STOP/CONT, residue cleanup, manual fresh-generation recovery,
+  and app-owned automatic replacement with healthy `them` are verified through
+  the signed menu-bar app and production CLI supervisor.
 
 ### Outcomes
 
@@ -600,6 +612,11 @@ Context lifecycle — what each process owns:
 - An exact app-owned heartbeat failure now creates at most one fresh supervisor
   generation. Authority loss restarts the 60-second stability window; Stop,
   Quit, external successors, and replacement setup failures settle visibly.
+- The signed-app acceptance transitioned from the failed generation to a new
+  recording generation in about one second and resumed `them` transcription
+  without user action.
+- Recovery and failure notices now reserve enough vertical space to render
+  wrapped text while remaining bounded and scrollable.
 
 ### Learnings
 
@@ -611,5 +628,3 @@ Context lifecycle — what each process owns:
 
 - Verify a real host sleep/wake separately; the uptime clock excludes sleep,
   but this work does not claim the Core Audio tap itself survives that event.
-- Run the signed-app automatic replacement smoke and confirm the new generation
-  publishes healthy `them` without a manual Start.
