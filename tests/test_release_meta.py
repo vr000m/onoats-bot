@@ -2908,3 +2908,66 @@ def test_oversized_rollback_record_counts_as_possibly_naming_the_archive(tmp_pat
         encoding="utf-8",
     )
     assert INSTALL_STAGED._record_names_archive(record, archive) is True
+
+
+def test_cli_authority_probe_runs_through_the_venv_interpreter_path(tmp_path: Path):
+    """A uv tool env's ``python`` is a symlink to the base interpreter.
+
+    Resolving it before launching the probe drops the venv (Python finds its
+    site-packages only through the venv path), so ``import onoats`` failed on a
+    real install while a fake-interpreter fixture passed. The probe must launch
+    the shebang path; the hashed identity stays the resolved interpreter.
+    """
+    checkout = tmp_path / "checkout"
+    package = checkout / "src" / "onoats"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    env = tmp_path / "tool-env"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(env)], check=True
+    )
+    venv_python = env / "bin" / "python"
+    site = next((env / "lib").glob("python*/site-packages"))
+    (site / "onoats.pth").write_text(f"{checkout / 'src'}\n", encoding="utf-8")
+    dist = site / "onoats-0.0.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: onoats\nVersion: 0.0.0\n", encoding="utf-8"
+    )
+    (dist / "direct_url.json").write_text(
+        json.dumps({"url": checkout.as_uri(), "dir_info": {"editable": True}}),
+        encoding="utf-8",
+    )
+    entry = env / "bin" / "onoats"
+    entry.write_text(f"#!{venv_python}\n", encoding="utf-8")
+    entry.chmod(0o755)
+    shim = tmp_path / "home" / ".local" / "bin" / "onoats"
+    shim.parent.mkdir(parents=True)
+    shim.symlink_to(entry)
+    for argv in (
+        ["init", "-q"],
+        ["add", "src/onoats/__init__.py"],
+        [
+            "-c",
+            "user.name=Onoats Test",
+            "-c",
+            "user.email=onoats-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+    ):
+        subprocess.run(["git", *argv], cwd=checkout, check=True)
+    assert venv_python.is_symlink(), "fixture must model a symlinked venv python"
+
+    _path, _hash, interpreter, interpreter_hash, head = (
+        RELEASE_IDENTITY.observed_cli_authority(checkout=checkout, shim=shim)
+    )
+
+    assert interpreter == str(venv_python.resolve())
+    assert (
+        interpreter_hash
+        == hashlib.sha256(venv_python.resolve().read_bytes()).hexdigest()
+    )
+    assert len(head) == 40

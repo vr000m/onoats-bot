@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import plistlib
 import signal
 import stat
 import subprocess
 import tempfile
-from typing import Callable, NamedTuple
+from collections.abc import Callable
+from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import unquote, urlparse
 from xml.parsers.expat import ExpatError
 
@@ -136,7 +137,7 @@ class ReleaseIdentity(NamedTuple):
         return json.dumps(self._asdict(), sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, raw: str) -> "ReleaseIdentity":
+    def from_json(cls, raw: str) -> ReleaseIdentity:
         try:
             value = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -176,7 +177,7 @@ class SmokeReceipt(NamedTuple):
         return json.dumps(self._asdict(), sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, raw: str) -> "SmokeReceipt":
+    def from_json(cls, raw: str) -> SmokeReceipt:
         try:
             value = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -380,8 +381,9 @@ def observed_cli_authority(
         first_line = read_interpreter_line(target)
         if not first_line.startswith(b"#!"):
             raise InstallError("CLI shim target has no interpreter authority")
-        interpreter = Path(os.fsdecode(first_line[2:])).resolve(strict=True)
-        if not interpreter.is_absolute() or not interpreter.is_file():
+        launch = Path(os.fsdecode(first_line[2:]))
+        interpreter = launch.resolve(strict=True)
+        if not launch.is_absolute() or not interpreter.is_file():
             raise InstallError("CLI shim interpreter is unavailable")
         probe = (
             "import importlib.metadata as m,json,onoats,sys;"
@@ -391,7 +393,11 @@ def observed_cli_authority(
         )
         observed = json.loads(
             run(
-                [str(interpreter), "-I", "-c", probe],
+                # Launch the shebang path, not its resolved target: a venv's
+                # ``python`` is a symlink to the base interpreter and finds its
+                # site-packages (and so ``onoats``) only through the venv path.
+                # ``interpreter`` stays the resolved identity that is hashed.
+                [str(launch), "-I", "-c", probe],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -501,7 +507,7 @@ def _cdhash(app: Path) -> str:
     raise InstallError(f"app bundle has no cdhash: {app}")
 
 
-def _field(digest: "hashlib._Hash", value: bytes) -> None:
+def _field(digest: hashlib._Hash, value: bytes) -> None:
     digest.update(len(value).to_bytes(8, "big"))
     digest.update(value)
 
