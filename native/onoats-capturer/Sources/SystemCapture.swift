@@ -247,8 +247,12 @@ final class SystemCapture {
 
     /// Full teardown in the contract-mandated order; idempotent and safe on a
     /// partially-constructed state.
-    func stop() {
+    func quiesce() {
         chunker.stop()
+    }
+
+    func stop() {
+        quiesce()
         if aggregateID != kAudioObjectUnknown, let proc = ioProcID {
             AudioDeviceStop(aggregateID, proc)
             AudioDeviceDestroyIOProcID(aggregateID, proc)

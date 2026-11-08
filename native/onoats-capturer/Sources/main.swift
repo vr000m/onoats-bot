@@ -92,9 +92,12 @@ final class Teardown {
 
         if logAsError { logLine("ERROR: \(reason)") }
         logLine("shutting down (\(reason))")
-        // Stop producers first so nothing enqueues mid-teardown, then drop the
-        // Core Audio chain (the lifecycle invariant lives in SystemCapture.stop),
-        // then the sockets.
+        // Quiesce both producers before either branch enters blocking Core
+        // Audio teardown. A heartbeat fault already stopped the system pacer,
+        // but the mic worker can still hold queued data at this point.
+        mic?.quiesce()
+        system?.quiesce()
+        // Then drop the Core Audio chains and sockets.
         mic?.stop()
         system?.stop()
         for writer in writers { writer.shutdown() }

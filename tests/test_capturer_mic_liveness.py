@@ -101,6 +101,18 @@ def test_losing_startup_failure_cannot_replace_terminal_owner():
     assert "logLine(" not in fail
 
 
+def test_terminal_admission_quiesces_both_branches_before_cleanup():
+    """No branch may emit queued audio while the other branch blocks in Core Audio."""
+    trigger = _body(MAIN, "    func trigger(")
+    mic_quiesce = trigger.index("mic?.quiesce()")
+    system_quiesce = trigger.index("system?.quiesce()")
+    mic_stop = trigger.index("mic?.stop()")
+    system_stop = trigger.index("system?.stop()")
+    assert max(mic_quiesce, system_quiesce) < min(mic_stop, system_stop)
+    assert "quiesce()" in _body(MIC, "    func stop() {")
+    assert "quiesce()" in _body(SYSTEM, "    func stop() {")
+
+
 def test_mic_starts_before_the_system_tap() -> None:
     """AudioDeviceStart on the mic stalls for minutes when a process tap already
     exists in the same process (2026-09-26 bisect); the mic must start first in
