@@ -739,7 +739,7 @@ final class RecorderModel: ObservableObject {
         heartbeatRecoveryReady = false
         automaticRecoveryActive = true
         state = .starting
-        flushNote = "Capture stalled; restarting automatically…"
+        flushNote = "Capture ended; checking recovery status…"
         heartbeatRecoveryClassification?.cancel()
         heartbeatRecoveryClassification = ops.schedule(
             after: Self.heartbeatRecoveryClassificationDelay

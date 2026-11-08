@@ -1419,8 +1419,8 @@ private func testHeartbeatAutomaticRecovery(_ root: URL) throws {
 
     try require(model.automaticRecoveryActive, "heartbeat exit did not admit recovery")
     try require(ops.processes.count == 1, "replacement spawned before classification delay")
-    try require(model.flushNote?.contains("restarting automatically") == true,
-                "pending recovery notice was not visible")
+    try require(model.flushNote?.contains("checking recovery status") == true,
+                "pending recovery classification notice was not visible")
     model.refresh()
     try require(model.state == .starting && model.automaticRecoveryActive,
                 "lifecycle polling hid an admitted recovery")
@@ -1528,6 +1528,19 @@ private func testHeartbeatRecoveryFailureAndCancellationMatrix(_ root: URL) thro
                     "generic capturer failure admitted automatic recovery")
         try require(owned.ops.oneShotActions.isEmpty,
                     "generic capturer failure scheduled recovery work")
+    }
+
+    do {
+        let owned = makeCase("fatal-not-heartbeat")
+        try finish(owned, reason: "fatal_error_frame")
+        try require(
+            owned.model.flushNote?.contains("checking recovery status") == true,
+            "unclassified fatal exit claimed that a restart was certain")
+        try owned.ops.fireNextOneShot()
+        try require(!owned.model.automaticRecoveryActive,
+                    "plain fatal exit admitted automatic recovery")
+        try require(owned.model.flushNote == nil,
+                    "plain fatal exit retained the classification notice")
     }
 
     do {
