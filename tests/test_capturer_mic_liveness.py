@@ -14,6 +14,7 @@ MIC = (SOURCES / "MicCapture.swift").read_text()
 RESAMPLER = (SOURCES / "Resampler.swift").read_text()
 SYSTEM = (SOURCES / "SystemCapture.swift").read_text()
 MAIN = (SOURCES / "main.swift").read_text()
+WRITER = (SOURCES / "FrameWriter.swift").read_text()
 WATCHDOG = (SOURCES / "ProcessSuspensionWatchdog.swift").read_text()
 
 
@@ -106,11 +107,18 @@ def test_terminal_admission_quiesces_both_branches_before_cleanup():
     trigger = _body(MAIN, "    func trigger(")
     mic_quiesce = trigger.index("mic?.quiesce()")
     system_quiesce = trigger.index("system?.quiesce()")
+    writers_quiesce = trigger.index("for writer in writers { writer.shutdown() }")
     mic_stop = trigger.index("mic?.stop()")
     system_stop = trigger.index("system?.stop()")
-    assert max(mic_quiesce, system_quiesce) < min(mic_stop, system_stop)
+    assert max(mic_quiesce, system_quiesce, writers_quiesce) < min(
+        mic_stop, system_stop
+    )
     assert "quiesce()" in _body(MIC, "    func stop() {")
     assert "quiesce()" in _body(SYSTEM, "    func stop() {")
+    shutdown = _body(WRITER, "    func shutdown() {")
+    assert "closed = true" in shutdown
+    assert "queue.removeAll()" in shutdown
+    assert "Darwin.shutdown(fd, SHUT_RDWR)" in shutdown
 
 
 def test_mic_starts_before_the_system_tap() -> None:

@@ -5,6 +5,7 @@
 // object {"seq","captured_monotonic_ns","pcm_b64"}. The PCM inside pcm_b64 is
 // 16 kHz PCM16 LE mono; ~640 bytes / 20 ms per frame.
 
+import Darwin
 import Foundation
 
 let WIRE_VERSION = 1
@@ -85,13 +86,17 @@ final class FrameWriter {
         lock.signal()
     }
 
-    /// Stop accepting frames (teardown path). The fd is closed by the owner.
+    /// Stop accepting frames and disable socket writes. `shutdown(2)` is the
+    /// cross-thread barrier for a writer that already dequeued a frame: it
+    /// prevents a blocked or pending write from surviving terminal admission.
+    /// The owner still closes the fd after ordered resource cleanup.
     func shutdown() {
         lock.lock()
         closed = true
         queue.removeAll()
         lock.signal()
         lock.unlock()
+        _ = Darwin.shutdown(fd, SHUT_RDWR)
     }
 
     private func run() {

@@ -92,15 +92,17 @@ final class Teardown {
 
         if logAsError { logLine("ERROR: \(reason)") }
         logLine("shutting down (\(reason))")
-        // Quiesce both producers before either branch enters blocking Core
-        // Audio teardown. A heartbeat fault already stopped the system pacer,
-        // but the mic worker can still hold queued data at this point.
+        // Quiesce both producers and both socket writers before either branch
+        // enters blocking Core Audio teardown. A heartbeat fault already
+        // stopped the system pacer, but workers and writers can still hold
+        // queued data at this point. Writer shutdown(2) also unblocks any
+        // in-flight socket write before cleanup can stall.
         mic?.quiesce()
         system?.quiesce()
+        for writer in writers { writer.shutdown() }
         // Then drop the Core Audio chains and sockets.
         mic?.stop()
         system?.stop()
-        for writer in writers { writer.shutdown() }
         for fd in connectionFds { close(fd) }
         for fd in listenFds { close(fd) }
         for path in socketPaths { unlink(path) }
