@@ -130,7 +130,10 @@ registry dep, not a git pin).
   Audio content, absent tap callbacks, exactly 2 s, and host sleep do not decide
   this. The first terminal event wins: graceful SIGINT/SIGTERM admitted first
   stays rc 0; the heartbeat fault admitted first arms an independent 2 s hard
-  exit before best-effort ordered Core Audio cleanup. Never rebuild the tap or
+  exit before best-effort ordered Core Audio cleanup. Terminal admission
+  quiesces both branch chunkers before either branch enters blocking Core Audio
+  cleanup, so no queued mic or system frame leaves the invalid generation.
+  Never rebuild the tap or
   reconnect sockets in-process; only a later supervisor-owned Start creates a
   fresh generation. For an app-owned session, `RecorderModel` waits 0.5 s after
   supervisor rc 1, re-reads the exact failed generation's status, and starts a
@@ -139,7 +142,11 @@ registry dep, not a git pin).
   to rearm it. Missing or replaced PID publication cancels that stability
   window and requires a fresh full 60 s; a live external successor cancels the
   app replacement. A manual Start resets the cluster. Stop, Cancel Recovery,
-  Quit, stale timers, generic failures, and external sessions never auto-restart.
+  Quit, stale timers, missing replacement prerequisites, generic failures, and
+  external sessions never auto-restart. If recorder EOF wins the process-exit
+  race, the supervisor waits within the native hard-exit bound for a mapped
+  capturer rc, preserving `capture-heartbeat-stalled` instead of flattening it
+  to `fatal_error_frame`.
   Direct CLI sessions remain stopped. Pinned by
   `native/test_capturer_watchdog.sh`, `native/test_recorder_model.sh`,
   `tests/test_capturer_mic_liveness.py`, and contract-parity tests.

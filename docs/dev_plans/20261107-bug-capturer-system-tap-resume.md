@@ -397,7 +397,7 @@ Context lifecycle — what each process owns:
 - [x] Pre-fix regression fails.
 - [x] Focused tests pass: 308 tests.
 - [x] Full post-remediation validation passes: native build; Ruff format/check;
-  review-marker check; watchdog plus real-pacer harness; 8,142 tests passed and
+  review-marker check; watchdog plus real-pacer harness; 8,144 tests passed and
   13 skipped.
 - [x] Live embedded signed-capturer verification records a bounded fail-loud
   restart, clean residue checks, and fresh-generation `them` recovery.
@@ -440,7 +440,7 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ 8fc6f443bc3b665e10dd9fe48922bb7ac3a1befa -->
+<!-- reviewed: 2026-11-08 @ e2474ebc1d369061090497e707cb4bfa76aa9c9b -->
 
 ## Progress
 
@@ -528,6 +528,14 @@ Context lifecycle — what each process owns:
   All were fixed with production state-space regressions. Final verification
   passed: both native harnesses, native app build, Ruff format/check, and the
   full suite (8,142 passed, 13 skipped).
+- 2026-11-08: the remediation continuation found four final ordering gaps. A
+  missing CLI could leave recovery latched; a queued stability callback needed
+  its own window token; mic output could continue while system cleanup blocked;
+  and recorder-first EOF could flatten native rc 14. The fixes now settle
+  missing prerequisites, invalidate every stale window, quiesce both branch
+  chunkers before cleanup, and preserve mapped capturer rc within the native
+  hard-exit bound. Final gates passed: native build, both native harnesses,
+  Ruff format/check, marker validation, and 8,144 tests (13 skipped).
 
 ## Issues & Solutions
 
@@ -551,6 +559,12 @@ Context lifecycle — what each process owns:
 - Automatic recovery uses one failure finalizer for spawn and log setup, keeps
   Stop intent across a queued exit callback, preserves admitted recovery across
   lifecycle polls, and requires a continuously authoritative replacement.
+- Each stability window carries a distinct token, so an already-queued callback
+  cannot rearm a newer window. Missing CLI authority settles as a visible
+  failure and permits a later manual Start after the CLI returns.
+- Both capture branch chunkers quiesce before ordered Core Audio cleanup. The
+  supervisor also preserves mapped rc 14 when recorder EOF wins by waiting only
+  within the capturer's independent hard-exit bound.
 
 ## Final Results
 

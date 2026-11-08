@@ -211,9 +211,13 @@ chunker lock. The first terminal event wins. A previously admitted graceful
 SIGINT/SIGTERM remains rc 0; otherwise the capturer reports rc 14 /
 `capture-heartbeat-stalled`, arms an independent 2 s hard-exit deadline, and
 attempts the normal ordered Core Audio cleanup. The deadline is a process
-boundary if `AudioDeviceStop` or another cleanup call blocks. There is no
-in-process tap rebuild or socket reconnect: the supervisor rotates the partial
-session and exits non-zero.
+boundary if `AudioDeviceStop` or another cleanup call blocks. Both branch
+chunkers quiesce before either Core Audio chain begins that cleanup, so queued
+mic and system callbacks cannot emit another frame. There is no in-process tap
+rebuild or socket reconnect: the supervisor rotates the partial session and
+exits non-zero. If socket EOF lets the recorder finish first, the supervisor
+waits within the native deadline for a mapped capturer rc so the final status
+still records `capture-heartbeat-stalled`.
 
 For an app-owned session, the menu-bar lifecycle may then mint a fresh
 generation. It waits 0.5 s for the exact generation's final status, requires
