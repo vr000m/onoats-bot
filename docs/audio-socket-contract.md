@@ -195,6 +195,26 @@ establishes. The transport never latches a live branch back onto a respawned
 capturer — this is the single-lifecycle-owner rule that keeps the two layers from
 racing.
 
+### Capturer heartbeat stall
+
+The native system branch has a 20 ms pacer independent of tap callback content.
+After activation, a `mach_absolute_time` gap **strictly greater than 2 s**
+between pacer wakes invalidates the current native generation. Exactly 2 s is
+allowed and a regressed clock resets the baseline. Because this clock excludes
+host sleep, ordinary sleep/wake is not classified by this rule. Scheduler,
+debugger, process suspension, or an internal pacer stall can all produce the
+same operator-visible heartbeat failure; the capturer does not claim which one
+occurred.
+
+On a trip the pacer stops emitting and dispatches terminal action outside its
+chunker lock. The first terminal event wins. A previously admitted graceful
+SIGINT/SIGTERM remains rc 0; otherwise the capturer reports rc 14 /
+`capture-heartbeat-stalled`, arms an independent 2 s hard-exit deadline, and
+attempts the normal ordered Core Audio cleanup. The deadline is a process
+boundary if `AudioDeviceStop` or another cleanup call blocks. There is no
+in-process tap rebuild or socket reconnect: the supervisor rotates the partial
+session, and only a later Start mints a fresh generation.
+
 ## Capturer launch contract (supervisor → capturer)
 
 When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor

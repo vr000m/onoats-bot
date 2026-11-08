@@ -11,9 +11,11 @@
 ## Objective
 
 Ensure the native system-audio capturer cannot remain apparently healthy after
-its process was suspended long enough that the Core Audio tap generation is no
-longer trustworthy. The capturer must terminate non-zero so the supervisor
-rotates the partial session; a later Start creates a wholly fresh generation.
+its active pacer misses more than two seconds of process uptime. That heartbeat
+stall makes the Core Audio tap generation untrustworthy: the capturer must stop
+emitting, attempt ordered cleanup, and terminate with a distinct non-zero code
+within two further seconds so the supervisor rotates the partial session. A
+later Start creates a wholly fresh generation.
 
 ## Context
 
@@ -24,6 +26,11 @@ branch remained silent and emitted `zero-run-warning` without
 rendering application can legitimately output digital silence. Audio content
 therefore cannot be the fatal signal. The reproducible independent signal is
 the multi-second gap in the capturer's own 20 ms pacer after the process resumes.
+That signal is deliberately named a **capturer heartbeat stall**, not proof of
+`SIGSTOP`: scheduler starvation or a debugger pause can produce the same
+process-uptime gap. `mach_absolute_time` does not advance during host sleep, so
+ordinary sleep/wake is outside this detector and remains covered by the
+existing device and socket contracts.
 
 ## Requirements
 
@@ -31,16 +38,27 @@ the multi-second gap in the capturer's own 20 ms pacer after the process resumes
   `them` STT session.
 - Preserve legitimate idle playback and digital silence; no watchdog may infer
   a fatal tap failure merely from the absence of callbacks or all-zero samples.
-- A multi-second process-suspension gap after capture activation terminates the
-  capturer non-zero without waiting for audio-content heuristics.
+- After activation, a pacer wake gap **strictly greater than 2,000,000,000 ns**
+  terminates the capturer without waiting for audio-content heuristics. A gap
+  exactly equal to that threshold is allowed; a regressed clock resets the
+  baseline and does not trigger.
 - Preserve the supervisor as the sole owner of whole-generation restart; the
   native capturer must not reconnect sockets or silently create a second tap
   generation behind the recorder.
-- Retain teardown ordering: stop device, destroy IOProc, destroy aggregate,
-  destroy tap, then close sockets through the existing single exit path.
-- Add a deterministic regression that fails against the pre-fix implementation
-  and covers ordinary 20 ms wakes, the exact threshold, a multi-second gap,
-  re-arming, clock regression, one-shot teardown, and a stop race.
+- Retain teardown ordering as best-effort cleanup: stop device, destroy IOProc,
+  destroy aggregate, destroy tap, then close sockets through the existing
+  single exit path. The heartbeat-fault path arms an independent hard-exit
+  deadline before cleanup so a blocked Core Audio stop cannot exceed two
+  seconds from fault admission to process exit.
+- Preserve the existing first-terminal-event-wins rule. If SIGTERM/SIGINT is
+  admitted first, graceful rc=0 remains authoritative; if the heartbeat fault
+  is admitted first, its distinct non-zero code and hard deadline remain
+  authoritative.
+- Add and run a deterministic regression **before production edits**, record
+  that red result below the review marker, then cover ordinary 20 ms wakes, the
+  exact threshold, an over-threshold gap, re-arming, clock regression, one-shot
+  terminal admission, both stop-race orderings, and the independent hard-exit
+  deadline.
 - Verify the signed-app scenario with the supplied YouTube video as real
   system output after automated gates pass.
 
@@ -50,7 +68,7 @@ the multi-second gap in the capturer's own 20 ms pacer after the process resumes
   silence must not cause a restart; only a process heartbeat gap may escalate.
 - Core Audio lifecycle: no duplicate IOProc, aggregate, tap, worker, or socket
   ownership during recovery.
-- Process boundary: a failed recovery must be non-zero and bounded so the
+- Process boundary: a detected stall must be non-zero and bounded so the
   supervisor reports truncation and owns the next generation.
 - Realtime safety: the IOProc remains copy-only; no logging, Core Audio API
   call, allocation-heavy recovery, or contended recovery lock runs there.
@@ -59,34 +77,48 @@ the multi-second gap in the capturer's own 20 ms pacer after the process resumes
 
 ### Phase 1: Suspension Watchdog and Deterministic Harness
 
-**Impl files:** `native/onoats-capturer/Sources/ProcessSuspensionWatchdog.swift, native/onoats-capturer/Sources/Resampler.swift, native/Makefile`
-**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/test_capturer_watchdog.sh, tests/test_capturer_mic_liveness.py`
-**Test command:** `bash native/test_capturer_watchdog.sh && uv run pytest tests/test_capturer_mic_liveness.py -q`
-**Goal:** Detect only a multi-second process heartbeat gap. Audio content, absent callbacks, and ordinary pacer cadence never trigger the watchdog.
+**Impl files:** `native/onoats-capturer/Sources/ProcessSuspensionWatchdog.swift`
+**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/test_capturer_watchdog.sh`
+**Test command:** `bash native/test_capturer_watchdog.sh`
+**Validation cmd:** `make -C native build`
+**Goal:** Create the previously absent `Tests/` directory and prove the pure
+heartbeat and terminal-admission state space before wiring it into capture.
 
-- Add a pure monotonic-gap state machine with an explicit threshold, safe
-  handling for a regressed clock, and one result per observed gap.
-- Feed it from the existing pacer thread after capture activation.
-- Invoke the suspension callback after releasing the chunker lock.
+- Create the new native harness directory and first land/run the harness and
+  shell driver without the production type, recording the expected compile
+  failure below the marker before adding production code.
+- Add a pure monotonic-gap state machine with a 2,000,000,000 ns threshold,
+  strict-greater-than comparison, clock-regression reset, and one result per
+  observed gap.
 - Build a direct Swift harness for normal cadence, exact-boundary, over-boundary,
-  re-arm, clock-regression, and one-shot callback cases.
-- Add Python source-shape pins that fail if system suspension detection is
-  removed, moved into the IOProc, or dispatched while the chunker lock is held.
+  re-arm, clock-regression, first-terminal-event admission, and both race
+  orderings. Compile the new pure source in the normal native build too.
 
 ### Phase 2: Fail-Loud Native-to-Supervisor Boundary
 
-**Impl files:** `native/onoats-capturer/Sources/SystemCapture.swift, native/onoats-capturer/Sources/main.swift`
-**Test files:** `tests/test_capturer_mic_liveness.py, tests/test_socket_supervisor.py, tests/test_native_contract_parity.py`
-**Test command:** `uv run pytest tests/test_capturer_mic_liveness.py tests/test_socket_supervisor.py tests/test_native_contract_parity.py -q`
+**Impl files:** `native/onoats-capturer/Sources/Resampler.swift, native/onoats-capturer/Sources/SystemCapture.swift, native/onoats-capturer/Sources/Support.swift, native/onoats-capturer/Sources/main.swift, src/onoats/cli.py, native/Makefile`
+**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/test_capturer_watchdog.sh, tests/test_capturer_mic_liveness.py, tests/test_socket_supervisor.py, tests/test_native_contract_parity.py`
+**Test command:** `bash native/test_capturer_watchdog.sh && uv run pytest tests/test_capturer_mic_liveness.py tests/test_socket_supervisor.py tests/test_native_contract_parity.py -q`
 **Validation cmd:** `make -C native build`
-**Goal:** A suspension gap invalidates the entire native capture generation and exits non-zero through the one ordered teardown owner; no socket reconnect or in-process tap rebuild occurs.
+**Goal:** An over-threshold heartbeat gap invalidates the entire native capture
+generation and exits with `capture-heartbeat-stalled` through the one ordered
+teardown owner; no socket reconnect or in-process tap rebuild occurs.
 
+- Sample the pacer wake before taking the chunker lock, feed that timestamp to
+  the watchdog after activation, stop the pacer on a trip, and invoke its
+  terminal callback only after releasing the chunker lock. The IOProc remains
+  copy-only and audio samples never enter the decision.
 - Give production `SystemCapture` a terminal callback while leaving self-tests
-  callback-free.
-- Route the suspension callback into `Teardown.shared.trigger` with a stable
-  non-zero code and diagnostic reason.
-- Preserve idempotence when the watchdog races SIGTERM, socket failure, or a
-  second branch failure.
+  callback-free, and add Python source-shape pins for off-lock dispatch and the
+  absence of system stale-data rebind.
+- Add a distinct native exit code and Python supervisor mapping for
+  `capture-heartbeat-stalled`; route the callback into `Teardown.shared.trigger`.
+- Arm a separate two-second hard-exit timer before ordered cleanup on this
+  non-zero fault path. Add an executable child-process self-test that blocks
+  after arming the production deadline helper and proves the expected code is
+  observed within the bound.
+- Preserve idempotence with an explicit first-event admission gate and exercise
+  watchdog-first and graceful-stop-first orderings in the Swift harness.
 - Reuse the existing supervisor early-exit contract tests to prove partial
   rotation, non-zero status, and no transport self-reconnect.
 
@@ -104,8 +136,14 @@ the multi-second gap in the capturer's own 20 ms pacer after the process resumes
 - Re-run the full local gates and inspect explicitly staged paths for secrets,
   PII, private transcripts, audio, credentials, and unintended binaries.
 - Build and sign the app, play the supplied YouTube video, start recording,
-  confirm `them` activity, apply four seconds of STOP/CONT to the exact owned
-  capturer generation, and verify bounded non-zero failure plus partial rotation.
+  seek to the continuously audible interval starting at `00:30` in video ID
+  `wykPErJ8M-8`, select the intended output route, set audible volume, confirm
+  `them` activity, apply four seconds of STOP/CONT to the exact owned capturer
+  generation, and verify the distinct bounded non-zero failure plus partial
+  rotation.
+- Before a fresh Start, run `native/residue_check.sh`, the capturer
+  `list-taps`/`list-aggregates` maintenance commands, process/socket checks, and
+  verify the failed generation left no tap, aggregate, capturer, or socket.
 - Start a new recording and confirm the fresh tap again captures non-zero
   `them` audio from the same video.
 
@@ -114,13 +152,18 @@ the multi-second gap in the capturer's own 20 ms pacer after the process resumes
 ### Files to Modify
 
 - `native/onoats-capturer/Sources/Resampler.swift` — feed the existing 20 ms
-  pacer heartbeat into a process-suspension watchdog and invoke its callback
-  outside the chunker lock.
+  pacer wake (sampled before its lock) into a process-suspension watchdog, stop
+  emitting on a trip, and invoke its callback outside the chunker lock.
 - `native/onoats-capturer/Sources/SystemCapture.swift` — accept a terminal
   callback for a suspension-detected, no-longer-trustworthy tap generation.
+- `native/onoats-capturer/Sources/Support.swift` — own the new exit code, the
+  first-terminal-event admission helper, and the independently scheduled
+  hard-exit deadline helper used by production and its child-process self-test.
 - `native/onoats-capturer/Sources/main.swift` — connect the system-capture
-  terminal callback to the existing `Teardown.shared.trigger` non-zero path;
-  keep self-tests callback-free.
+  terminal callback to the existing `Teardown.shared.trigger` non-zero path,
+  arm the fault deadline before cleanup, and keep capture self-tests callback-free.
+- `src/onoats/cli.py` — map the distinct native code to the stable
+  `capture-heartbeat-stalled` status reason.
 - `native/Makefile` — expose the direct Swift harness as a repeatable native
   test target while retaining wildcard production compilation.
 - `tests/test_capturer_mic_liveness.py` — replace the old source pin requiring
@@ -144,13 +187,25 @@ the multi-second gap in the capturer's own 20 ms pacer after the process resumes
   Swift state-space harness for normal cadence, boundary, resume gap, re-arm,
   and clock-regression cases.
 - `native/test_capturer_watchdog.sh` — compiles and runs the standalone watchdog
-  harness without introducing a Swift package.
+  harness without introducing a Swift package, then runs the production
+  hard-exit helper in a child process and checks its code and elapsed bound.
 
 ### Architecture Decisions
 
-- Detect process suspension, not silence. `FrameChunker` already owns a 20 ms
-  pacer and observes a multi-second cursor jump after the process resumes;
-  bit-exact audio content remains warning-only.
+- Detect a process heartbeat stall, not silence. `FrameChunker` already owns a
+  20 ms pacer and observes a process-uptime gap after a long pause; bit-exact
+  audio content remains warning-only. This policy does not claim the underlying
+  cause and deliberately excludes host sleep time.
+- **Decision (grilled):** fail the generation unconditionally for a wake gap
+  strictly greater than two seconds; do not attempt in-process tap recovery.
+  The supervisor already owns whole-generation restart.
+- **Decision (grilled):** preserve first-terminal-event-wins. Graceful stop
+  admitted before the watchdog keeps rc=0; a watchdog fault admitted first
+  keeps its non-zero outcome and independent hard deadline.
+- **Decision (grilled):** ordered Core Audio cleanup is best effort after a
+  heartbeat fault. A separately scheduled hard exit caps the process at two
+  seconds because cleanup calls can block and supervisor observation requires
+  actual process/socket termination.
 - Fail the generation instead of rebuilding Core Audio in place. The process
   tap is created once per session, socket transports never reconnect, and the
   Python supervisor already treats every premature capturer exit as non-zero,
@@ -180,8 +235,8 @@ commit `2e1c7b6cc647b8e9cd1b8c9002fcf9c1411bd17b` is an ancestor of that base.
 
 | Seam | Writer (task) | Caller (task) | Contract |
 |------|---------------|---------------|----------|
-| Pacer heartbeat to watchdog | `FrameChunker` | `ProcessSuspensionWatchdog` | A normal 20 ms wake and audio content never trip; only a monotonic gap above the reviewed threshold trips. |
-| Watchdog to native teardown | `SystemCapture` | `main.swift` / `Teardown` | Callback runs outside the chunker lock, is one-shot per process generation, and exits with a non-zero capturer code. |
+| Pacer heartbeat to watchdog | `FrameChunker` | `ProcessSuspensionWatchdog` | Wake time is sampled before the chunker lock. A normal 20 ms wake, exactly 2 s, host sleep, and audio content never trip; only a process-uptime gap greater than 2 s trips. |
+| Watchdog to native teardown | `SystemCapture` | `main.swift` / `Teardown` | Callback runs outside the chunker lock, first terminal admission wins, and a fault exits with the distinct code within a separate 2 s deadline. |
 | Capturer exit to session failure | native capturer | Python socket supervisor | Existing early-exit path stops both branches, rotates partial output, reports failure, and never reconnects the transport. |
 | New generation | menu-bar app or CLI Start | Python supervisor | A later explicit Start mints a new socket directory and nonce and creates a new tap; no in-process tap replacement is attempted. |
 
@@ -250,19 +305,20 @@ Context lifecycle — what each process owns:
 
 - [ ] No rendered audio / no tap callbacks.
 - [ ] Active callbacks with deliberate digital silence.
-- [ ] Non-zero audio returns before escalation.
-- [ ] Recovery attempt succeeds.
-- [ ] Recovery attempt fails or blocks.
-- [ ] Stop races the watchdog or recovery path.
+- [ ] Non-zero audio does not affect escalation.
+- [ ] Exact 2 s gap is allowed; a greater gap fails the generation.
+- [ ] Ordered cleanup completes before the hard deadline.
+- [ ] Ordered cleanup blocks and the hard deadline exits non-zero.
+- [ ] SIGTERM/SIGINT first and watchdog first race orderings.
 
 ## Acceptance Criteria
 
-- After a four-second capturer suspension, active system playback either returns
-  as non-zero `them` audio or the capturer exits non-zero within the documented
-  bound; indefinite warning-only silence is impossible.
+- After a four-second capturer suspension, the capturer stops emitting and exits
+  with the distinct non-zero reason no later than two seconds after its first
+  resumed pacer wake; indefinite warning-only silence is impossible.
 - A normal paused player or digital-silence stream does not force a restart.
 - The supervisor remains the only whole-generation restart owner, and every
-  failed recovery rotates the partial session through existing fail-loud logic.
+  heartbeat fault rotates the partial session through existing fail-loud logic.
 - No resource residue, duplicate tap chain, branch mixing, or unbounded wait is
   introduced.
 - Focused tests, full tests, Ruff format/check, review-marker validation, and
@@ -270,7 +326,7 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: YYYY-MM-DD @ <hash> -->
+<!-- reviewed: 2026-11-08 @ 31ef9cee7a0e70c673a2e61d5f29335e4674cf0c -->
 
 ## Progress
 
@@ -283,6 +339,10 @@ Context lifecycle — what each process owns:
 - 2026-11-07: live checkout was clean `main` at `c233efe`, the regular merge of
   PR #36. The older feature branch recorded the manual finding in `a721480`,
   but that commit was not part of the merged PR.
+- 2026-11-08: the red-first native regression failed as intended before the
+  production watchdog existed: `swiftc` could not open
+  `Sources/ProcessSuspensionWatchdog.swift`. This proves the new harness does
+  not pass against the pre-fix implementation.
 
 ## Issues & Solutions
 

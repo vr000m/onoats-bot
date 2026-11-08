@@ -185,6 +185,12 @@ internals behind that surface:
   (`zero-run-clear`). Warning only, never a failure: an app rendering digital
   silence (paused player) triggers it benignly. Event format:
   `docs/audio-socket-contract.md` "Capturer event lines".
+- **Pacer heartbeat failure:** a system-pacer wake gap greater than 2 s of
+  process uptime invalidates the current tap generation independently of audio
+  content. The capturer exits rc 14 (`capture-heartbeat-stalled`) within a
+  separate 2 s fault deadline; ordered Core Audio teardown is best effort
+  inside that bound. Exactly 2 s and host sleep do not trip this uptime clock.
+  Start again to create a fresh tap; the capturer never rebuilds one in-process.
 - **Settings** writes go through a surgical single-key TOML editor — every
   other line of `config.toml`, comments included, stays byte-identical.
 - **Diagnostics and logs:** every app-owned Start reserves one
@@ -397,6 +403,10 @@ plan `## Findings` for the evidence):
 - **The tap delivers data only while something renders audio.** Each branch
   runs a 20 ms silence pacer so a quiet system doesn't trip the recorder's
   read-idle watchdog and the me/them timeline stays continuous.
+- **A stalled system pacer fails the generation.** A wake gap greater than 2 s
+  stops emission and exits rc 14 behind an independent 2 s hard deadline. Test
+  the deterministic state space and process boundary with
+  `make -C native test-capturer-watchdog`.
 - **`AudioHardwareCreateProcessTap` is intermittently flaky** (instant
   `noErr` + `kAudioObjectUnknown`) even signed — retried ×3, 500 ms apart.
 - Full teardown on every exit path: `AudioDeviceStop` → IOProc → aggregate →

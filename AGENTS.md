@@ -122,6 +122,16 @@ registry dep, not a git pin).
   sockets that never appear, capturer death mid-session, STT preflight) yields a
   non-zero exit + a WARNING/ERROR log, and a partial session still rotates into
   `pending/` — never a hang.
+- **A native heartbeat stall invalidates the whole generation.** The system
+  branch's 20 ms pacer samples `mach_absolute_time`; a wake gap strictly greater
+  than 2 s stops that pacer and admits `capture-heartbeat-stalled` (rc 14).
+  Audio content, absent tap callbacks, exactly 2 s, and host sleep do not decide
+  this. The first terminal event wins: graceful SIGINT/SIGTERM admitted first
+  stays rc 0; the heartbeat fault admitted first arms an independent 2 s hard
+  exit before best-effort ordered Core Audio cleanup. Never rebuild the tap or
+  reconnect sockets in-process; only a later supervisor-owned Start creates a
+  fresh generation. Pinned by `native/test_capturer_watchdog.sh`,
+  `tests/test_capturer_mic_liveness.py`, and contract-parity tests.
 - **Capturer-exit-before-recorder is always fail-loud, even on `rc=0`** — the
   recording is truncated regardless of exit code. The one exemption is a stop
   the recorder itself asked for: once `runtime.graceful_shutdown_requested()`

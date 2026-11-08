@@ -63,6 +63,14 @@ Annotated tags exist from `v0.9.0` forward.
   be created. It now launches the shebang path and still hashes the resolved
   interpreter.
 
+### Fixed
+
+- The native system-audio tap can no longer remain silently dead after the
+  capturer is suspended and resumed. A system-pacer heartbeat gap greater than
+  2 s now exits with `capture-heartbeat-stalled` (rc 14) behind a separate 2 s
+  hard deadline; the supervisor rotates the partial session, and the next Start
+  creates a fresh tap generation.
+
 ### Changed
 
 - **`onoats flush` and `onoats stop` use a recorder-owned control socket**
