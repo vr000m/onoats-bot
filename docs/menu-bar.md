@@ -134,6 +134,10 @@ earlier, the panel remains visibly failed instead of entering a restart loop. A
 manual Start begins a new cluster. Direct CLI and externally started recordings
 do not use this app-owned recovery path.
 
+After 60 seconds of authoritative health, a recurring intermittent fault can
+trigger another automatic recovery; this release has no per-hour cap. The panel
+notice is transient, while each app-owned generation retains its own run log.
+
 ### Login item warning
 
 `[app].launch_at_login` accepts TOML `true` or `false`. Invalid values,

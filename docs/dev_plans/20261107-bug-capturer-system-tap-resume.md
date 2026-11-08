@@ -526,6 +526,17 @@ Context lifecycle — what each process owns:
   changelog is cut for 2026-11-08 and the pyproject, lockfile, and app version
   move together; tagging remains a separate post-merge action guarded by
   `scripts/release_check.sh v1.6.0 <merge-commit>`.
+- 2026-11-08: Claude independently reran the native watchdog, RecorderModel
+  harness, full Python suite, Ruff, and review-marker gate with no blocking
+  findings. Its notice-flash observation exposed that a provisional
+  `fatal_error_frame` claimed a restart before the delayed status check. The
+  provisional notice now says the app is checking recovery status; only an
+  authenticated heartbeat reason advances to recovery. The menu-bar guide also
+  records the deliberate residual that a recurring intermittent fault can
+  recover again after each 60-second authoritative-health window because this
+  release has no per-hour cap. STOP/CONT remains the live trigger proxy, real
+  host sleep/wake remains separate, and writer-first quiescence on graceful stop
+  is the documented terminal-admission policy rather than an unresolved defect.
 - 2026-11-08: the Phase 4 red-first RecorderModel harness failed before
   production edits because `RecorderModel.heartbeatStallExitReason` and
   `automaticRecoveryActive` did not exist. The harness already required a
