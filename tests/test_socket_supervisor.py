@@ -876,6 +876,26 @@ def test_heartbeat_stall_mid_session_maps_distinct_exit_reason(
     assert _pending_files(pending_dir)
 
 
+def test_recorder_first_heartbeat_race_preserves_distinct_exit_reason(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """EOF may finish the recorder before the rc-14 process wait resolves."""
+    data_dir, pending_dir = sup_env
+    set_capturer_behaviour("crash", nframes=5, rc=14)
+    _install_fake_recorder(monkeypatch, post_eof_drain=0, write_running=True)
+
+    rc = _run_supervisor_bounded()
+
+    from onoats import status as status_file
+
+    record = status_file.read_status(data_dir)
+    assert rc != 0
+    assert record is not None
+    assert record.exit_reason == "capture-heartbeat-stalled"
+    assert record.supervisor_rc == 1
+    assert _pending_files(pending_dir)
+
+
 # ---------------------------------------------------------------------------
 # HUNG-BUT-ALIVE: capturer connects but never sends a frame -> watchdog + rotate
 # ---------------------------------------------------------------------------
