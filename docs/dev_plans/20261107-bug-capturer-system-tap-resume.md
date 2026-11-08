@@ -78,7 +78,7 @@ existing device and socket contracts.
 ### Phase 1: Suspension Watchdog and Deterministic Harness
 
 **Impl files:** `native/onoats-capturer/Sources/ProcessSuspensionWatchdog.swift`
-**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/test_capturer_watchdog.sh`
+**Test files:** `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift, native/onoats-capturer/Tests/FrameChunkerSuspensionHarness.swift, native/test_capturer_watchdog.sh`
 **Test command:** `bash native/test_capturer_watchdog.sh`
 **Validation cmd:** `make -C native build`
 **Goal:** Create the previously absent `Tests/` directory and prove the pure
@@ -93,6 +93,9 @@ heartbeat and terminal-admission state space before wiring it into capture.
 - Build a direct Swift harness for normal cadence, exact-boundary, over-boundary,
   re-arm, clock-regression, first-terminal-event admission, and both race
   orderings. Compile the new pure source in the normal native build too.
+- Drive the production `FrameChunker` pacer in a child process: a real 1.5 s
+  STOP/CONT stays alive, while a real 2.5 s STOP/CONT reaches the terminal
+  callback and exits rc 14.
 
 ### Phase 2: Fail-Loud Native-to-Supervisor Boundary
 
@@ -121,16 +124,20 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
   watchdog-first and graceful-stop-first orderings in the Swift harness.
 - Reuse the existing supervisor early-exit contract tests to prove partial
   rotation, non-zero status, and no transport self-reconnect.
+- Exercise rc 14 through the mid-session capturer-death watcher, not only the
+  pre-socket startup path, and assert `capture-heartbeat-stalled` is stamped.
 
 ### Phase 3: Contract Documentation and Live Verification
 
-**Impl files:** `AGENTS.md, docs/audio-socket-contract.md, native/README.md, docs/dev_plans/20261028-feature-menubar-control-panel.md, docs/dev_plans/20261107-bug-capturer-system-tap-resume.md`
-**Test files:** `scripts/check_review_markers.py`
+**Impl files:** `AGENTS.md, docs/audio-socket-contract.md, native/README.md, scripts/release_check.sh, docs/dev_plans/20261028-feature-menubar-control-panel.md, docs/dev_plans/20261107-bug-capturer-system-tap-resume.md`
+**Test files:** `scripts/check_review_markers.py, tests/test_release_meta.py`
 **Test command:** `python3 scripts/check_review_markers.py && uv run ruff format && uv run ruff check && uv run pytest`
 **Validation cmd:** `bash native/test_capturer_watchdog.sh && make -C native build`
 **Goal:** Documentation and live behavior state the same boundary: process suspension fails the current generation; only a later explicit Start creates a new one.
 
 - Update the native and socket contracts plus the root maintainer invariant.
+- Gate the macOS-native heartbeat and real-pacer harness in the pre-tag release
+  check; non-macOS release checks fail rather than silently skipping it.
 - Append a dated correction to the historic control-panel plan without
   rewriting its original finding.
 - Re-run the full local gates and inspect explicitly staged paths for secrets,
@@ -186,6 +193,9 @@ teardown owner; no socket reconnect or in-process tap rebuild occurs.
 - `native/onoats-capturer/Tests/ProcessSuspensionWatchdogHarness.swift` — direct
   Swift state-space harness for normal cadence, boundary, resume gap, re-arm,
   and clock-regression cases.
+- `native/onoats-capturer/Tests/FrameChunkerSuspensionHarness.swift` — child
+  process that runs the production pacer without Core Audio input so the shell
+  gate can apply real SIGSTOP/SIGCONT pauses around the threshold.
 - `native/test_capturer_watchdog.sh` — compiles and runs the standalone watchdog
   harness without introducing a Swift package, then runs the production
   hard-exit helper in a child process and checks its code and elapsed bound.
@@ -292,15 +302,20 @@ Context lifecycle — what each process owns:
 - [x] Deterministic native/source contract regression for the watchdog state space.
 - [x] Focused Python/native contract and supervisor tests.
 - [x] Native build and full Python validation.
-- [ ] Signed-app STOP/CONT manual verification using the supplied system audio.
+- [x] Embedded signed-capturer STOP/CONT verification using the supplied system
+  audio under the production CLI supervisor.
+- [ ] App-owned menu-bar Start/Stop smoke on the same signed bundle.
 
 ### Test Results
 
 - [x] Pre-fix regression fails.
 - [x] Focused tests pass: 308 tests.
-- [x] Full validation passes: native build; Ruff format/check; review-marker
-  check; watchdog harness; 8,139 tests passed and 13 skipped.
-- [ ] Manual verification passes or records a bounded fail-loud restart.
+- [x] Full post-remediation validation passes: native build; Ruff format/check;
+  review-marker check; watchdog plus real-pacer harness; 8,142 tests passed and
+  13 skipped.
+- [x] Live embedded signed-capturer verification records a bounded fail-loud
+  restart, clean residue checks, and fresh-generation `them` recovery.
+- [ ] App-owned signed-app smoke passes.
 
 ### Edge Cases Tested
 
@@ -308,9 +323,12 @@ Context lifecycle — what each process owns:
 - [x] Active callbacks with deliberate digital silence do not enter the decision.
 - [x] Non-zero audio does not affect escalation.
 - [x] Exact 2 s gap is allowed; a greater gap fails the generation.
-- [ ] Ordered cleanup completes before the hard deadline.
+- [x] Ordered cleanup completes before the hard deadline in the live
+  STOP/CONT run; the process exited 75.8 ms after resume and left no residue.
 - [x] A resistant fault path is cut off by the hard deadline with rc 14.
 - [x] SIGTERM/SIGINT first and watchdog first race orderings.
+- [ ] Host sleep/wake leaves the tap usable; `mach_absolute_time` excluding
+  sleep is known, but tap survival has not been verified live.
 
 ## Acceptance Criteria
 
@@ -327,7 +345,7 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ 8cb694d582c6939f8d9d825ffdbd90d65baa7877 -->
+<!-- reviewed: 2026-11-08 @ 628951f153fc92173f519c42b7d8b2ae41b3db3a -->
 
 ## Progress
 
@@ -352,6 +370,28 @@ Context lifecycle — what each process owns:
   shell deadline check used integer seconds; and this evidence section was
   stale. All four were fixed; the watchdog harness, Ruff, marker check, and 309
   focused tests passed after remediation.
+- 2026-11-08: follow-up review supplied a scratch real-pacer proof and found it
+  absent from the repository. The proof is now committed as a production
+  `FrameChunker` child test (1.5 s stays alive; 2.5 s exits rc 14), rc 14 is
+  asserted on the mid-session supervisor path, and the macOS pre-tag check runs
+  the native suite. Sleep/wake tap survival remains a manual unknown.
+- 2026-11-08: the final full suite passed after every remediation and added
+  regression: 8,142 passed, 13 skipped. A restricted attempt failed where the
+  sandbox denied Unix sockets, GPG fixture commits, and Metal; the identical
+  unrestricted run passed.
+- 2026-11-08: live verification used the exact capturer embedded in the signed
+  `native/Onoats.app` and the supplied YouTube system audio. Before suspension,
+  `them` telemetry was fresh and non-zero (`0.00177001953125`) with STT ready.
+  A four-second STOP/CONT produced a 4,010 ms heartbeat error; the capturer
+  exited rc 14 within 75.8 ms of resume, the supervisor stamped
+  `capture-heartbeat-stalled` with rc 1 and rotated 43 partial utterances.
+  Maintenance checks then reported `RESIDUE: none` and `TAPS: none`, the socket
+  directory and owned processes were gone, and a fresh generation immediately
+  reported fresh non-zero `them` (`0.0003662109375`) before a clean stop.
+- 2026-11-08: this live run exercised the signed embedded capturer through the
+  production CLI supervisor, not an app-owned menu-bar Start. The accessibility
+  bridge could launch the signed app but could not reliably address its
+  `MenuBarExtra`; the app-owned smoke therefore remains explicitly open.
 
 ## Issues & Solutions
 
@@ -363,6 +403,9 @@ Context lifecycle — what each process owns:
 - The restricted sandbox could compile the capturer but not execute Xcode's
   SwiftUI macro plugin. The complete native build passed with compiler access
   outside that sandbox.
+- The live signed-capturer run required `AUDIO_SOURCE=socket` and disabled the
+  unrelated optional diarization feature because this checkout does not have
+  `mlx_audio`; neither override changes the heartbeat or supervisor path.
 
 ## Final Results
 
@@ -370,14 +413,17 @@ Context lifecycle — what each process owns:
 
 - The current generation now fails with rc 14 after a system-pacer heartbeat
   gap greater than 2 s. The supervisor remains the only restart owner.
-- Automated implementation and contract verification are complete. Signed-app
-  STOP/CONT and residue verification remain before this plan can be completed.
+- Automated implementation and contract verification are complete. Live
+  signed-capturer STOP/CONT, residue cleanup, and fresh-generation recovery are
+  also verified; only the app-owned menu-bar smoke remains before completion.
 
 ### Outcomes
 
 - Audio content and callback silence remain non-terminal.
 - The first terminal event keeps its rc and logging authority.
 - A heartbeat fault arms a separate 2 s process boundary before ordered cleanup.
+- The observed live fault exited in 75.8 ms, rotated the partial session, and
+  left no aggregate, tap, socket directory, capturer, or recorder residue.
 
 ### Learnings
 
@@ -387,6 +433,7 @@ Context lifecycle — what each process owns:
 
 ### Follow-up Work
 
-- Run the signed app against video `wykPErJ8M-8` from `00:30`, reproduce the
-  four-second STOP/CONT, verify rc 14 within the bound, prove no native residue,
-  and confirm a fresh Start captures `them` again.
+- Repeat the now-passing signed-capturer scenario from an app-owned menu-bar
+  Start when the macOS accessibility bridge can address the `MenuBarExtra`.
+- Verify a real host sleep/wake separately; the uptime clock excludes sleep,
+  but this work does not claim the Core Audio tap itself survives that event.

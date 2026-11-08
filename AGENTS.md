@@ -67,7 +67,9 @@ surfaces** that must agree — `pyproject.toml`, the `uv.lock` onoats entry
 (regenerate via `uv lock`), and the menu-bar Info.plist
 `CFBundleShortVersionString` — pinned by the same test file and gated at
 tag time by `scripts/release_check.sh vX.Y.Z <commit>` (run before pushing
-any release tag).
+any release tag). That pre-tag gate also runs the macOS-only capturer heartbeat
+suite, including real STOP/CONT against the production `FrameChunker`; it fails
+on non-macOS rather than silently skipping the native contract.
 
 Releasing to PyPI (v1.1.0+): pushing a `v*` tag triggers
 `.github/workflows/release.yml` — full suite + two guards (tag must equal
