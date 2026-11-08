@@ -15,18 +15,32 @@ swiftc \
 "$tmp_dir/watchdog-harness"
 
 make -C "$script_dir" build/onoats-capturer >/dev/null
-SECONDS=0
-set +e
-"$script_dir/build/onoats-capturer" --selftest-heartbeat-hard-exit
-rc=$?
-set -e
-if [[ $rc -ne 14 ]]; then
-  echo "FAIL: hard-exit self-test returned $rc, expected 14" >&2
-  exit 1
-fi
-if [[ $SECONDS -gt 2 ]]; then
-  echo "FAIL: hard-exit self-test exceeded 2 seconds" >&2
-  exit 1
-fi
+python3 - "$script_dir/build/onoats-capturer" <<'PY'
+import subprocess
+import sys
+import time
+
+started = time.monotonic()
+try:
+    completed = subprocess.run(
+        [sys.argv[1], "--selftest-heartbeat-hard-exit"],
+        check=False,
+        timeout=2.0,
+    )
+except subprocess.TimeoutExpired:
+    print("FAIL: hard-exit self-test exceeded 2 seconds", file=sys.stderr)
+    raise SystemExit(1)
+
+elapsed = time.monotonic() - started
+if completed.returncode != 14:
+    print(
+        f"FAIL: hard-exit self-test returned {completed.returncode}, expected 14",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if elapsed >= 2.0:
+    print(f"FAIL: hard-exit self-test took {elapsed:.3f}s", file=sys.stderr)
+    raise SystemExit(1)
+PY
 
 echo "PASS: capturer heartbeat hard-exit deadline"

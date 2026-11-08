@@ -83,6 +83,23 @@ def test_system_heartbeat_stall_is_content_independent_and_off_lock():
         "try systemCapture.start()"
     )
 
+    heartbeat = MAIN[MAIN.index("onHeartbeatStall:") : MAIN.index("emit: { pcm, ns in")]
+    assert "logLine(" not in heartbeat
+    trigger = _body(MAIN, "    func trigger(")
+    assert trigger.index("guard terminalAdmission.admit()") < trigger.index(
+        'if logAsError { logLine("ERROR:'
+    )
+
+
+def test_losing_startup_failure_cannot_replace_terminal_owner():
+    """A startup fail racing an admitted terminal event must wait for that
+    owner. It may not call exit with its losing rc or emit a losing ERROR."""
+    fail = MAIN[MAIN.index("func fail(") : MAIN.index("// MARK: - arguments")]
+    assert "if !Teardown.shared.trigger" in fail
+    assert "while true" in fail
+    assert "exit(rc)" not in fail
+    assert "logLine(" not in fail
+
 
 def test_mic_starts_before_the_system_tap() -> None:
     """AudioDeviceStart on the mic stalls for minutes when a process tap already

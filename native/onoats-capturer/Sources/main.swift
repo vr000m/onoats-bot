@@ -69,8 +69,14 @@ final class Teardown {
     /// First caller wins; runs the full teardown and exits the process.
     /// Subsequent callers (e.g. the second writer noticing its peer vanished
     /// while the first is tearing down) return and let the winner finish.
-    func trigger(rc: Int32, reason: String, hardExitAfterSeconds: Double? = nil) {
-        guard terminalAdmission.admit() else { return }
+    @discardableResult
+    func trigger(
+        rc: Int32,
+        reason: String,
+        hardExitAfterSeconds: Double? = nil,
+        logAsError: Bool = false
+    ) -> Bool {
+        guard terminalAdmission.admit() else { return false }
         // Keep registration serialized behind the winning teardown. The
         // heartbeat callback can fire during startup, before sockets/writers
         // are fully registered; no losing startup thread may append a resource
@@ -84,6 +90,7 @@ final class Teardown {
             armHardExit(rc: rc, afterSeconds: deadline)
         }
 
+        if logAsError { logLine("ERROR: \(reason)") }
         logLine("shutting down (\(reason))")
         // Stop producers first so nothing enqueues mid-teardown, then drop the
         // Core Audio chain (the lifecycle invariant lives in SystemCapture.stop),
@@ -146,9 +153,13 @@ final class Teardown {
 }
 
 func fail(_ rc: Int32, _ message: String) -> Never {
-    logLine("ERROR: \(message)")
-    Teardown.shared.trigger(rc: rc, reason: message)
-    exit(rc)  // unreachable (trigger exits); satisfies Never
+    if !Teardown.shared.trigger(rc: rc, reason: message, logAsError: true) {
+        // Another terminal event owns rc and cleanup. Do not replace it with
+        // this startup failure. The winning path exits the process; a blocked
+        // graceful winner remains bounded by the supervisor's TERM/KILL path.
+        while true { Thread.sleep(forTimeInterval: 1.0) }
+    }
+    fatalError("Teardown.trigger returned after winning terminal admission")
 }
 
 // MARK: - arguments
@@ -399,11 +410,11 @@ let systemWriterBox = LateBoundWriter()
 let systemCapture = SystemCapture(
     onHeartbeatStall: { gapNs in
         let gapMs = gapNs / 1_000_000
-        logLine("ERROR: system pacer heartbeat stalled for \(gapMs)ms")
         Teardown.shared.trigger(
             rc: ExitCode.captureHeartbeatStalled,
             reason: "system pacer heartbeat stalled for \(gapMs)ms",
-            hardExitAfterSeconds: 2.0)
+            hardExitAfterSeconds: 2.0,
+            logAsError: true)
     },
     emit: { pcm, ns in
         systemWriterBox.enqueue(pcm: pcm, capturedMonotonicNs: ns)
