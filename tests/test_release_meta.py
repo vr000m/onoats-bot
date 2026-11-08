@@ -2426,6 +2426,64 @@ def test_failed_swap_back_retains_the_previous_app_tree(
     )
 
 
+def test_installer_lock_serialises_install_and_rollback_per_install_dir(tmp_path):
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    with INSTALL_STAGED._installer_lock(install_dir):
+        with pytest.raises(INSTALL_STAGED.InstallError, match="already running"):
+            with INSTALL_STAGED._installer_lock(install_dir):
+                raise AssertionError("a second installer must not enter")
+    # Released: the next installer proceeds, and a failure inside releases it too.
+    with pytest.raises(RuntimeError, match="boom"):
+        with INSTALL_STAGED._installer_lock(install_dir):
+            raise RuntimeError("boom")
+    with INSTALL_STAGED._installer_lock(install_dir):
+        pass
+    # The lock is the directory itself: nothing is left behind in it.
+    assert list(install_dir.iterdir()) == []
+
+
+def test_install_and_rollback_refuse_while_another_transaction_holds_the_lock(
+    tmp_path,
+):
+    """A concurrent entrypoint fails before reading a baseline or touching the app."""
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    record = backup_dir / "approved-rollback.txt"
+    record.write_text("existing\n", encoding="utf-8")
+    installed = install_dir / "Onoats.app"
+    installed.mkdir()
+    (installed / "sentinel").write_text("current", encoding="utf-8")
+    with INSTALL_STAGED._installer_lock(install_dir):
+        with pytest.raises(INSTALL_STAGED.InstallError, match="already running"):
+            INSTALL_STAGED.rollback(
+                argparse.Namespace(
+                    install_dir=str(install_dir),
+                    backup_dir=str(backup_dir),
+                    record=str(record),
+                    app_name="Onoats.app",
+                    bundle_id=INSTALL_STAGED.BUNDLE_ID,
+                )
+            )
+        with pytest.raises(INSTALL_STAGED.InstallError, match="already running"):
+            INSTALL_STAGED.install(
+                argparse.Namespace(
+                    app=str(tmp_path / "Staged" / "Onoats.app"),
+                    install_dir=str(install_dir),
+                    backup_dir=str(backup_dir),
+                    record=str(record),
+                    bundle_id=INSTALL_STAGED.BUNDLE_ID,
+                    expected_identity="a" * 64,
+                    approved=0,
+                    makefile_dir=str(tmp_path),
+                )
+            )
+    assert (installed / "sentinel").read_text(encoding="utf-8") == "current"
+    assert record.read_text(encoding="utf-8") == "existing\n"
+
+
 def test_rollback_rejects_a_non_canonical_bundle_id_before_mutation(tmp_path):
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()

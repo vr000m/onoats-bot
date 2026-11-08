@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import subprocess
 import tempfile
 import time
 import warnings
+from collections.abc import Iterator
 
 from release_identity import (
     BUNDLE_ID,
@@ -540,6 +543,32 @@ def _archive_baseline(
     }, archive
 
 
+@contextlib.contextmanager
+def _installer_lock(install_dir: Path) -> Iterator[None]:
+    """Hold one exclusive, non-blocking lock on the install directory.
+
+    ``install`` and ``rollback`` both read a baseline, exchange the installed app
+    and publish or remove the rollback record. Two of them interleaving can undo a
+    reported success (one sees the other's committed app, treats it as a failed
+    verification and exchanges the old bundle back), so the whole transaction,
+    cleanup included, runs under this lock. The directory itself is locked, so no
+    lock file is left in ``/Applications`` and a replaced leaf cannot split the
+    authority. ``O_CLOEXEC`` keeps it out of every child process. A second
+    installer fails at once instead of waiting.
+    """
+    fd = os.open(install_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise InstallError(
+                f"another install or rollback is already running for {install_dir}"
+            ) from exc
+        yield
+    finally:
+        os.close(fd)
+
+
 def install(args: argparse.Namespace) -> None:
     if args.bundle_id != BUNDLE_ID:
         raise InstallError(
@@ -582,177 +611,185 @@ def install(args: argparse.Namespace) -> None:
         raise InstallError("tree hash and release identity disagree")
 
     install_dir.mkdir(parents=True, exist_ok=True)
-    _clear_verified_staged_registration(
-        staged,
-        installed,
-        args.bundle_id,
-        expected,
-        Path(args.makefile_dir),
-    )
-    _verify_single_registration(installed, args.bundle_id)
-    parent, candidate = _copy_snapshot(staged, install_dir, staged.name)
-    archive: Path | None = None
-    committed = False
-    swap = SwapState()
-    try:
-        candidate_identity, candidate_dr, _candidate_cdhash = _verify_app(
-            candidate, expected_identity=expected
+    with _installer_lock(install_dir):
+        _clear_verified_staged_registration(
+            staged,
+            installed,
+            args.bundle_id,
+            expected,
+            Path(args.makefile_dir),
         )
-        if expected_release is not None:
-            assert approved_cli_authority is not None
-            candidate_release = release_identity(
-                candidate, cli_authority=approved_cli_authority
-            )
-            if candidate_release != expected_release:
-                raise InstallError("installed copy candidate changed release identity")
-        _verify_resources(candidate, Path(args.makefile_dir))
-        record_fields = None
-        if args.approved:
-            if not args.baseline_dr_hash or not args.baseline_cdhash:
-                raise InstallError(
-                    "approved rollback requires ROLLBACK_BASELINE_DR_HASH and "
-                    "ROLLBACK_BASELINE_CDHASH"
-                )
-            record_fields, archive = _archive_baseline(
-                installed, backup_dir, args.baseline_dr_hash, args.baseline_cdhash
-            )
-            if record_fields["dr_hash"] != candidate_dr:
-                raise InstallError(
-                    "installed baseline designated requirement differs from staged app"
-                )
-
-        def verify(path: Path) -> tuple[str, str, str]:
-            verified = _verify_app(
-                path,
-                expected_identity=candidate_identity,
-                makefile_dir=Path(args.makefile_dir),
+        _verify_single_registration(installed, args.bundle_id)
+        parent, candidate = _copy_snapshot(staged, install_dir, staged.name)
+        archive: Path | None = None
+        committed = False
+        swap = SwapState()
+        try:
+            candidate_identity, candidate_dr, _candidate_cdhash = _verify_app(
+                candidate, expected_identity=expected
             )
             if expected_release is not None:
                 assert approved_cli_authority is not None
-                installed_release = release_identity(
-                    path, cli_authority=approved_cli_authority
+                candidate_release = release_identity(
+                    candidate, cli_authority=approved_cli_authority
                 )
-                if installed_release != expected_release:
-                    raise InstallError("installed app changed release identity")
-            return verified
+                if candidate_release != expected_release:
+                    raise InstallError(
+                        "installed copy candidate changed release identity"
+                    )
+            _verify_resources(candidate, Path(args.makefile_dir))
+            record_fields = None
+            if args.approved:
+                if not args.baseline_dr_hash or not args.baseline_cdhash:
+                    raise InstallError(
+                        "approved rollback requires ROLLBACK_BASELINE_DR_HASH and "
+                        "ROLLBACK_BASELINE_CDHASH"
+                    )
+                record_fields, archive = _archive_baseline(
+                    installed, backup_dir, args.baseline_dr_hash, args.baseline_cdhash
+                )
+                if record_fields["dr_hash"] != candidate_dr:
+                    raise InstallError(
+                        "installed baseline designated requirement differs from staged app"
+                    )
 
-        def commit() -> None:
-            nonlocal archive, committed
-            # Installed identity verification has already succeeded inside
-            # _replace_verified.  Registration uniqueness and rollback-record
-            # publication are part of that same rollback-capable boundary.
-            _verify_single_registration(installed, args.bundle_id)
-            if record_fields is not None:
-                _write_record(record, record_fields)
-                archive = None
-            else:
-                record.unlink(missing_ok=True)
-            committed = True
+            def verify(path: Path) -> tuple[str, str, str]:
+                verified = _verify_app(
+                    path,
+                    expected_identity=candidate_identity,
+                    makefile_dir=Path(args.makefile_dir),
+                )
+                if expected_release is not None:
+                    assert approved_cli_authority is not None
+                    installed_release = release_identity(
+                        path, cli_authority=approved_cli_authority
+                    )
+                    if installed_release != expected_release:
+                        raise InstallError("installed app changed release identity")
+                return verified
 
-        _replace_verified(candidate, installed, verify, commit, swap)
-        print(f"✓ installed exact staged app at {installed}")
-    finally:
-        # The previous app lives only inside ``parent`` while the flag is set
-        # (and in the baseline archive, when approved); never clean up the
-        # sole copy, whatever exception got us here.
-        retain_parent = swap.previous_at_candidate
-        if retain_parent:
-            print(
-                f"✗ retained previous app tree under {parent}"
-                + (f" and baseline archive {archive}" if archive else ""),
-                file=os.sys.stderr,
-            )
-        elif archive is not None and _record_names_archive(record, archive):
-            print(
-                f"✗ retained baseline archive {archive}: the rollback record names it",
-                file=os.sys.stderr,
-            )
-        elif archive is not None:
+            def commit() -> None:
+                nonlocal archive, committed
+                # Installed identity verification has already succeeded inside
+                # _replace_verified.  Registration uniqueness and rollback-record
+                # publication are part of that same rollback-capable boundary.
+                _verify_single_registration(installed, args.bundle_id)
+                if record_fields is not None:
+                    _write_record(record, record_fields)
+                    archive = None
+                else:
+                    record.unlink(missing_ok=True)
+                committed = True
+
+            _replace_verified(candidate, installed, verify, commit, swap)
+            print(f"✓ installed exact staged app at {installed}")
+        finally:
+            # The previous app lives only inside ``parent`` while the flag is set
+            # (and in the baseline archive, when approved); never clean up the
+            # sole copy, whatever exception got us here.
+            retain_parent = swap.previous_at_candidate
+            if retain_parent:
+                print(
+                    f"✗ retained previous app tree under {parent}"
+                    + (f" and baseline archive {archive}" if archive else ""),
+                    file=os.sys.stderr,
+                )
+            elif archive is not None and _record_names_archive(record, archive):
+                print(
+                    f"✗ retained baseline archive {archive}: the rollback record names it",
+                    file=os.sys.stderr,
+                )
+            elif archive is not None:
+                try:
+                    archive.unlink(missing_ok=True)
+                except Exception as exc:
+                    if committed:
+                        warnings.warn(
+                            f"installed app committed; archive cleanup failed: {exc}"
+                        )
+                    else:
+                        raise
             try:
-                archive.unlink(missing_ok=True)
+                if not retain_parent:
+                    shutil.rmtree(parent)
+            except FileNotFoundError:
+                pass
             except Exception as exc:
                 if committed:
                     warnings.warn(
-                        f"installed app committed; archive cleanup failed: {exc}"
+                        f"installed app committed; temporary cleanup failed: {exc}"
                     )
                 else:
                     raise
-        try:
-            if not retain_parent:
-                shutil.rmtree(parent)
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            if committed:
-                warnings.warn(
-                    f"installed app committed; temporary cleanup failed: {exc}"
-                )
-            else:
-                raise
 
 
 def rollback(args: argparse.Namespace) -> None:
     install_dir = Path(args.install_dir)
     backup_dir = Path(args.backup_dir)
-    fields = _read_record(Path(args.record), backup_dir)
-    archive = Path(fields["archive"])
     install_dir.mkdir(parents=True, exist_ok=True)
-    installed = install_dir / args.app_name
-    bundle_id = getattr(args, "bundle_id", BUNDLE_ID)
-    if bundle_id != BUNDLE_ID:
-        # Same gate as install(): the registration-uniqueness check is only
-        # meaningful for the canonical LaunchServices namespace.
-        raise InstallError(
-            "ONOATS_INSTALL_BUNDLE_ID may only redundantly name the canonical bundle"
-        )
-    _verify_single_registration(installed, bundle_id)
-    parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
-    candidate = parent / "candidate"
-    committed = False
-    swap = SwapState()
-    try:
-        archive = _copy_archive_snapshot(archive, parent, fields["hash"])
-        _run(DITTO, "-x", "-k", str(archive), str(parent))
-        extracted = parent / args.app_name
-        _normalise_private_tree(extracted)
-        os.rename(extracted, candidate)
-        # The record's fields are attestations; the archived bundle itself must
-        # independently carry the canonical identifier before it is published.
-        require_canonical_bundle(candidate)
-        observed = _verify_app(candidate, expected_identity=fields["tree_hash"])
-        if observed[1:] != (fields["dr_hash"], fields["cdhash"]):
-            raise InstallError("restored app identity mismatch")
-
-        def commit() -> None:
-            nonlocal committed
-            _verify_single_registration(installed, bundle_id)
-            committed = True
-
-        _replace_verified(
-            candidate,
-            installed,
-            lambda path: _verify_app(
-                path,
-                expected_identity=fields["tree_hash"],
-            ),
-            commit,
-            swap,
-        )
-        print(f"✓ restored approved app archive {archive}")
-    finally:
-        retain_parent = swap.previous_at_candidate
-        if retain_parent:
-            print(f"✗ retained previous app tree under {parent}", file=os.sys.stderr)
+    with _installer_lock(install_dir):
+        fields = _read_record(Path(args.record), backup_dir)
+        archive = Path(fields["archive"])
+        installed = install_dir / args.app_name
+        bundle_id = getattr(args, "bundle_id", BUNDLE_ID)
+        if bundle_id != BUNDLE_ID:
+            # Same gate as install(): the registration-uniqueness check is only
+            # meaningful for the canonical LaunchServices namespace.
+            raise InstallError(
+                "ONOATS_INSTALL_BUNDLE_ID may only redundantly name the canonical bundle"
+            )
+        _verify_single_registration(installed, bundle_id)
+        parent = Path(tempfile.mkdtemp(prefix=".onoats-rollback-", dir=install_dir))
+        candidate = parent / "candidate"
+        committed = False
+        swap = SwapState()
         try:
-            if not retain_parent:
-                shutil.rmtree(parent)
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            if committed:
-                warnings.warn(f"rollback committed; temporary cleanup failed: {exc}")
-            else:
-                raise
+            archive = _copy_archive_snapshot(archive, parent, fields["hash"])
+            _run(DITTO, "-x", "-k", str(archive), str(parent))
+            extracted = parent / args.app_name
+            _normalise_private_tree(extracted)
+            os.rename(extracted, candidate)
+            # The record's fields are attestations; the archived bundle itself must
+            # independently carry the canonical identifier before it is published.
+            require_canonical_bundle(candidate)
+            observed = _verify_app(candidate, expected_identity=fields["tree_hash"])
+            if observed[1:] != (fields["dr_hash"], fields["cdhash"]):
+                raise InstallError("restored app identity mismatch")
+
+            def commit() -> None:
+                nonlocal committed
+                _verify_single_registration(installed, bundle_id)
+                committed = True
+
+            _replace_verified(
+                candidate,
+                installed,
+                lambda path: _verify_app(
+                    path,
+                    expected_identity=fields["tree_hash"],
+                ),
+                commit,
+                swap,
+            )
+            print(f"✓ restored approved app archive {archive}")
+        finally:
+            retain_parent = swap.previous_at_candidate
+            if retain_parent:
+                print(
+                    f"✗ retained previous app tree under {parent}", file=os.sys.stderr
+                )
+            try:
+                if not retain_parent:
+                    shutil.rmtree(parent)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                if committed:
+                    warnings.warn(
+                        f"rollback committed; temporary cleanup failed: {exc}"
+                    )
+                else:
+                    raise
 
 
 def _parser() -> argparse.ArgumentParser:
