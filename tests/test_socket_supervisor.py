@@ -296,7 +296,7 @@ _FAKE_CAPTURER_SRC = textwrap.dedent(
                 # Serve the frames, then exit so the supervisor observes capturer
                 # PROCESS death (its capturer-wait watcher fires).
                 await asyncio.sleep(0.5)
-                return
+                os._exit(int(_control.get("rc") or 0))
             await asyncio.Event().wait()
 
 
@@ -853,6 +853,27 @@ def test_crash_fails_loud_and_rotates_partial_session(
     # private-dir sockets through to the recorder.
     assert state["connected"] >= 1, "fake recorder never connected to a socket"
     assert state["frames_read"] > 0, "no capturer frames reached the recorder"
+
+
+def test_heartbeat_stall_mid_session_maps_distinct_exit_reason(
+    sup_env, monkeypatch, set_capturer_behaviour
+):
+    """The real stall exits after streaming starts, so rc 14 must survive the
+    mid-session watcher and stamp its distinct status reason."""
+    data_dir, pending_dir = sup_env
+    set_capturer_behaviour("crash", nframes=5, rc=14)
+    _install_fake_recorder(monkeypatch, post_eof_drain=1.5, write_running=True)
+
+    rc = _run_supervisor_bounded()
+
+    from onoats import status as status_file
+
+    record = status_file.read_status(data_dir)
+    assert rc != 0
+    assert record is not None
+    assert record.exit_reason == "capture-heartbeat-stalled"
+    assert record.supervisor_rc == 1
+    assert _pending_files(pending_dir)
 
 
 # ---------------------------------------------------------------------------

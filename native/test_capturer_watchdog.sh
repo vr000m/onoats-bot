@@ -14,6 +14,69 @@ swiftc \
   -o "$tmp_dir/watchdog-harness"
 "$tmp_dir/watchdog-harness"
 
+swiftc \
+  -module-cache-path "$tmp_dir/swift-module-cache" \
+  -framework AVFoundation \
+  -framework CoreAudio \
+  -framework AudioToolbox \
+  "$script_dir/onoats-capturer/Sources/Support.swift" \
+  "$script_dir/onoats-capturer/Sources/ProcessSuspensionWatchdog.swift" \
+  "$script_dir/onoats-capturer/Sources/Resampler.swift" \
+  "$script_dir/onoats-capturer/Tests/FrameChunkerSuspensionHarness.swift" \
+  -o "$tmp_dir/frame-chunker-suspension-harness"
+
+python3 - "$tmp_dir/frame-chunker-suspension-harness" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+def run_pause(seconds: float, *, should_trip: bool) -> None:
+    child = subprocess.Popen(
+        [sys.argv[1]],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        ready = child.stdout.readline().strip()
+        if ready != "READY":
+            raise AssertionError(f"FrameChunker harness did not become ready: {ready!r}")
+
+        os.kill(child.pid, signal.SIGSTOP)
+        time.sleep(seconds)
+        resumed = time.monotonic()
+        os.kill(child.pid, signal.SIGCONT)
+
+        if should_trip:
+            rc = child.wait(timeout=2.0)
+            elapsed = time.monotonic() - resumed
+            if rc != 14:
+                raise AssertionError(f"{seconds}s pause returned {rc}, expected 14")
+            if elapsed >= 2.0:
+                raise AssertionError(
+                    f"{seconds}s pause took {elapsed:.3f}s to terminate after resume"
+                )
+        else:
+            time.sleep(0.3)
+            if child.poll() is not None:
+                raise AssertionError(
+                    f"{seconds}s pause tripped with rc {child.returncode}"
+                )
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=2.0)
+
+
+run_pause(1.5, should_trip=False)
+run_pause(2.5, should_trip=True)
+PY
+
+echo "PASS: production FrameChunker detects real process suspension"
+
 make -C "$script_dir" build/onoats-capturer >/dev/null
 python3 - "$script_dir/build/onoats-capturer" <<'PY'
 import subprocess
