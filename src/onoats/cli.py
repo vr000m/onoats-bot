@@ -210,6 +210,7 @@ _CAPTURER_RC_REASONS = {
     # delivers zeros (verified 2026-06-11), so denial never exits the capturer;
     # its only observable is the zero-run WARNING.
     11: "system-audio-failed",
+    14: "capture-heartbeat-stalled",  # ExitCode.captureHeartbeatStalled
 }
 
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +

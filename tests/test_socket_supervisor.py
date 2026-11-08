@@ -763,7 +763,12 @@ def test_recorder_handshake_failure_maps_to_clean_nonzero(log_sink, monkeypatch)
 
 @pytest.mark.parametrize(
     ("cap_rc", "expected_reason"),
-    [(10, "mic-denied"), (11, "system-audio-failed"), (7, "capturer-start-failed")],
+    [
+        (10, "mic-denied"),
+        (11, "system-audio-failed"),
+        (14, "capture-heartbeat-stalled"),
+        (7, "capturer-start-failed"),
+    ],
 )
 def test_prestart_capturer_death_writes_fresh_failure_status(
     sup_env, log_sink, set_capturer_behaviour, cap_rc, expected_reason

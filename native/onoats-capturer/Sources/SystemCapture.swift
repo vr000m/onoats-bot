@@ -50,12 +50,16 @@ final class SystemCapture {
     private var droppedChunks: UInt64 = 0
     private let maxQueuedChunks = 128
 
-    init(emit: @escaping (Data, UInt64) -> Void) {
+    init(
+        onHeartbeatStall: ((UInt64) -> Void)? = nil,
+        emit: @escaping (Data, UInt64) -> Void
+    ) {
         chunker = FrameChunker(
             label: "system",
             zeroHint: "if you expect system audio, check System Settings ▸ "
                 + "Privacy & Security ▸ Screen & System Audio Recording — a "
                 + "DENIED grant still delivers callbacks, but all-zero",
+            onHeartbeatStall: onHeartbeatStall,
             emit: emit)
     }
 

@@ -55,7 +55,7 @@ import Foundation
 final class Teardown {
     static let shared = Teardown()
     private let lock = NSLock()
-    private var triggered = false
+    private let terminalAdmission = TerminalAdmission()
 
     // All resources are private and registered through the methods below, so
     // partial/bypassed registration is structurally impossible at call sites.
@@ -69,14 +69,20 @@ final class Teardown {
     /// First caller wins; runs the full teardown and exits the process.
     /// Subsequent callers (e.g. the second writer noticing its peer vanished
     /// while the first is tearing down) return and let the winner finish.
-    func trigger(rc: Int32, reason: String) {
+    func trigger(rc: Int32, reason: String, hardExitAfterSeconds: Double? = nil) {
+        guard terminalAdmission.admit() else { return }
+        // Keep registration serialized behind the winning teardown. The
+        // heartbeat callback can fire during startup, before sockets/writers
+        // are fully registered; no losing startup thread may append a resource
+        // after the winner has already passed that cleanup stage.
         lock.lock()
-        if triggered {
-            lock.unlock()
-            return
+
+        // Arm the independent process boundary before any ordered Core Audio
+        // stop can block. Normal teardown exits first; a stuck teardown is cut
+        // off with the same authoritative rc selected by the first caller.
+        if let deadline = hardExitAfterSeconds {
+            armHardExit(rc: rc, afterSeconds: deadline)
         }
-        triggered = true
-        lock.unlock()
 
         logLine("shutting down (\(reason))")
         // Stop producers first so nothing enqueues mid-teardown, then drop the
@@ -182,6 +188,15 @@ if cliArgs.count > 1 {
     case "clean-taps": cleanTaps(); exit(0)
     default: break
     }
+}
+
+// Hidden deterministic child-process probe for the production hard-exit
+// helper. The watchdog harness expects this process to die with rc=14 well
+// before the deliberately resistant main thread finishes sleeping.
+if cliArgs.contains("--selftest-heartbeat-hard-exit") {
+    armHardExit(rc: ExitCode.captureHeartbeatStalled, afterSeconds: 0.2)
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(1)
 }
 
 // Hidden debug mode: run ONLY the system tap chain for N seconds (no sockets,
@@ -381,9 +396,18 @@ do {
 }
 
 let systemWriterBox = LateBoundWriter()
-let systemCapture = SystemCapture { pcm, ns in
-    systemWriterBox.enqueue(pcm: pcm, capturedMonotonicNs: ns)
-}
+let systemCapture = SystemCapture(
+    onHeartbeatStall: { gapNs in
+        let gapMs = gapNs / 1_000_000
+        logLine("ERROR: system pacer heartbeat stalled for \(gapMs)ms")
+        Teardown.shared.trigger(
+            rc: ExitCode.captureHeartbeatStalled,
+            reason: "system pacer heartbeat stalled for \(gapMs)ms",
+            hardExitAfterSeconds: 2.0)
+    },
+    emit: { pcm, ns in
+        systemWriterBox.enqueue(pcm: pcm, capturedMonotonicNs: ns)
+    })
 // Register BEFORE start(): every failure path from here on (tap failure,
 // socket creation, accept barrier, mic start) must find the system chain in
 // Teardown so the tap/aggregate are destroyed on the way out.

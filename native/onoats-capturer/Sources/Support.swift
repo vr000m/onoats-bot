@@ -6,6 +6,7 @@
 // dev plan docs/dev_plans/20260609-feature-milestone-b-macos-capture-menubar.md).
 
 import Foundation
+import Darwin
 
 func logLine(_ s: String) {
     FileHandle.standardError.write(("onoats-capturer: " + s + "\n").data(using: .utf8)!)
@@ -41,6 +42,34 @@ enum ExitCode {
     static let systemAudioFailed: Int32 = 11
     static let socketFailed: Int32 = 12
     static let captureFailed: Int32 = 13
+    static let captureHeartbeatStalled: Int32 = 14
+}
+
+/// Process-lifetime first-terminal-event gate. The caller that receives true
+/// owns teardown and its rc/reason; every later caller must leave that outcome
+/// untouched. Kept separate from Teardown so both race orderings are directly
+/// executable in the native harness.
+final class TerminalAdmission {
+    private let lock = NSLock()
+    private var admitted = false
+
+    func admit() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !admitted else { return false }
+        admitted = true
+        return true
+    }
+}
+
+/// Arm a process boundary that is independent of the thread performing ordered
+/// Core Audio cleanup. The thread is intentionally not cancellable: successful
+/// cleanup exits the process first; blocked cleanup is cut off with the same rc.
+func armHardExit(rc: Int32, afterSeconds: Double) {
+    Thread.detachNewThread {
+        Thread.sleep(forTimeInterval: afterSeconds)
+        Darwin._exit(rc)
+    }
 }
 
 func fourCC(_ s: Int32) -> String {
