@@ -131,6 +131,7 @@ final class RecorderModel: ObservableObject {
     private var heartbeatRecoveryGeneration: RecorderGeneration?
     private var heartbeatRecoveryReady = false
     private var heartbeatRecoveryToken: UInt64 = 0
+    private var heartbeatRecoveryStabilityToken: UInt64 = 0
     private var heartbeatRecoveryBudgetConsumed = false
 
     private struct ControlAuthority: Equatable {
@@ -531,6 +532,7 @@ final class RecorderModel: ObservableObject {
         heartbeatRecoveryClassification = nil
         heartbeatRecoveryStability?.cancel()
         heartbeatRecoveryStability = nil
+        heartbeatRecoveryStabilityToken &+= 1
         heartbeatRecoveryGeneration = nil
         heartbeatRecoveryRequest = nil
         automaticRecoveryActive = false
@@ -777,7 +779,13 @@ final class RecorderModel: ObservableObject {
             refresh()
             return
         }
-        guard canSpawnRecorder else { return }
+        guard proc == nil, mostRecentRunLogSink == nil else { return }
+        guard cliAvailable else {
+            settleAutomaticRecoveryFailure(
+                reason: "automatic-restart-cli-unavailable", detail: nil,
+                note: "Automatic capture recovery failed: the onoats CLI is unavailable")
+            return
+        }
         heartbeatRecoveryReady = false
         beginStart(
             directory: request.directory, seminar: request.seminarMode, automatic: true)
@@ -790,16 +798,22 @@ final class RecorderModel: ObservableObject {
         flushNote = "Capture recovered automatically in a new recording"
         let token = heartbeatRecoveryRequest?.token ?? heartbeatRecoveryToken
         heartbeatRecoveryStability?.cancel()
+        heartbeatRecoveryStabilityToken &+= 1
+        let stabilityToken = heartbeatRecoveryStabilityToken
         heartbeatRecoveryStability = ops.schedule(
             after: Self.heartbeatRecoveryStabilityWindow
         ) { [weak self] in
             guard let self, self.automaticRecoveryActive,
                   self.heartbeatRecoveryRequest?.token == token,
+                  self.heartbeatRecoveryStabilityToken == stabilityToken,
                   self.heartbeatRecoveryGeneration == generation,
                   self.ownedRecorderGeneration == generation,
-                  self.proc?.isRunning == true,
-                  self.hasExactPublication(generation)
+                  self.proc?.isRunning == true
             else { return }
+            guard self.hasExactPublication(generation) else {
+                self.suspendAutomaticRecoveryStability()
+                return
+            }
             self.heartbeatRecoveryStability = nil
             self.heartbeatRecoveryRequest = nil
             self.heartbeatRecoveryGeneration = nil
@@ -812,6 +826,7 @@ final class RecorderModel: ObservableObject {
         guard automaticRecoveryActive, heartbeatRecoveryGeneration != nil else { return }
         heartbeatRecoveryStability?.cancel()
         heartbeatRecoveryStability = nil
+        heartbeatRecoveryStabilityToken &+= 1
         heartbeatRecoveryGeneration = nil
         flushNote = "Capture recovery is waiting for recorder authority"
     }
@@ -838,6 +853,7 @@ final class RecorderModel: ObservableObject {
         heartbeatRecoveryClassification = nil
         heartbeatRecoveryStability?.cancel()
         heartbeatRecoveryStability = nil
+        heartbeatRecoveryStabilityToken &+= 1
         heartbeatRecoveryRequest = nil
         heartbeatRecoveryGeneration = nil
         heartbeatRecoveryReady = false
@@ -852,6 +868,7 @@ final class RecorderModel: ObservableObject {
         heartbeatRecoveryClassification = nil
         heartbeatRecoveryStability?.cancel()
         heartbeatRecoveryStability = nil
+        heartbeatRecoveryStabilityToken &+= 1
         heartbeatRecoveryRequest = nil
         heartbeatRecoveryGeneration = nil
         heartbeatRecoveryReady = false

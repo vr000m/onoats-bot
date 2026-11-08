@@ -1444,15 +1444,19 @@ private func testHeartbeatAutomaticRecovery(_ root: URL) throws {
     try require(model.flushNote?.contains("recovered automatically") == true,
                 "confirmed recovery notice was not visible")
 
+    let staleStabilityAction = ops.oneShotActions[0].2
     // A missing or replaced publication cancels the current stability window.
     // The same owned generation must publish authoritatively for a fresh full
     // window before the one-restart budget rearms.
     removePid(ops, directory: directory, pid: replacement.pid)
-    model.refresh()
-    try require(model.state == .starting && model.automaticRecoveryActive,
-                "publication loss did not suspend recovery stability")
+    staleStabilityAction()
+    try require(model.automaticRecoveryActive,
+                "final authority check wedged or rearmed recovery")
     putPid(ops, directory: directory, pid: replacement.pid, epoch: replacementEpoch)
     model.refresh()
+    staleStabilityAction()
+    try require(model.automaticRecoveryActive,
+                "stale queued stability callback rearmed recovery")
     let foreignPid = replacement.pid + 100
     putPid(ops, directory: directory, pid: foreignPid, epoch: replacementEpoch + 1)
     model.refresh()
@@ -1624,6 +1628,20 @@ private func testHeartbeatRecoveryFailureAndCancellationMatrix(_ root: URL) thro
                     "automatic log failure permanently disabled manual Start")
         try require(owned.ops.processes.count == 1,
                     "automatic log failure created an unexpected replacement")
+    }
+
+    do {
+        let owned = makeCase("cli-unavailable")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        owned.ops.executable = false
+        try owned.ops.fireNextOneShot()
+        try require(!owned.model.automaticRecoveryActive,
+                    "missing CLI left automatic recovery latched")
+        try require(owned.ops.processes.count == 1,
+                    "missing CLI created an unexpected replacement")
+        owned.ops.executable = true
+        try require(owned.model.canStart,
+                    "restored CLI did not re-enable manual Start")
     }
 
     do {
