@@ -68,8 +68,10 @@ Annotated tags exist from `v0.9.0` forward.
 - The native system-audio tap can no longer remain silently dead after the
   capturer is suspended and resumed. A system-pacer heartbeat gap greater than
   2 s now exits with `capture-heartbeat-stalled` (rc 14) behind a separate 2 s
-  hard deadline; the supervisor rotates the partial session, and the next Start
-  creates a fresh tap generation.
+  hard deadline; the supervisor rotates the partial session. The menu-bar app
+  automatically creates one fresh generation for the verified failure, with a
+  60-second stability guard against restart loops; direct CLI sessions remain
+  explicitly restarted.
 
 ### Changed
 

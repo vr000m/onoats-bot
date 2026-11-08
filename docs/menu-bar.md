@@ -113,6 +113,25 @@ warning badge and the panel names the likely cause, such as denied system-audio
 permission or a hardware-muted microphone. Recording continues, and the warning
 clears when real audio arrives.
 
+### Automatic recovery from a stalled capture
+
+If the native system-audio pacer stalls for more than two seconds of process
+uptime, the current capture generation is no longer trusted. The supervisor
+rotates the partial session and exits with a matching
+`capture-heartbeat-stalled` status. The menu-bar app then shows **Recovering…**
+and starts a wholly fresh recorder/capturer generation automatically.
+
+Recovery preserves the recording's pinned data directory and Seminar choice,
+but it creates a new session and run log. **Cancel Recovery** stops a pending or
+starting replacement. Stop and Quit remain authoritative and never trigger a
+replacement.
+
+The app permits one automatic restart per failure cluster. The replacement must
+remain authoritatively running for 60 seconds before another automatic recovery
+is allowed. If it stalls earlier, the panel remains visibly failed instead of
+entering a restart loop. A manual Start begins a new cluster. Direct CLI and
+externally started recordings do not use this app-owned recovery path.
+
 ### Login item warning
 
 `[app].launch_at_login` accepts TOML `true` or `false`. Invalid values,

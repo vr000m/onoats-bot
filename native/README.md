@@ -190,7 +190,11 @@ internals behind that surface:
   content. The capturer exits rc 14 (`capture-heartbeat-stalled`) within a
   separate 2 s fault deadline; ordered Core Audio teardown is best effort
   inside that bound. Exactly 2 s and host sleep do not trip this uptime clock.
-  Start again to create a fresh tap; the capturer never rebuilds one in-process.
+  The menu-bar app automatically starts one fresh generation after it verifies
+  the matching final status; direct CLI sessions require another Start. The app
+  preserves the directory and category, shows recovery progress, and permits
+  cancellation. A second stall within the replacement's first 60 s stays
+  failed to prevent a restart loop. The capturer never rebuilds in-process.
 - **Settings** writes go through a surgical single-key TOML editor — every
   other line of `config.toml`, comments included, stays byte-identical.
 - **Diagnostics and logs:** every app-owned Start reserves one

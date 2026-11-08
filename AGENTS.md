@@ -132,7 +132,14 @@ registry dep, not a git pin).
   stays rc 0; the heartbeat fault admitted first arms an independent 2 s hard
   exit before best-effort ordered Core Audio cleanup. Never rebuild the tap or
   reconnect sockets in-process; only a later supervisor-owned Start creates a
-  fresh generation. Pinned by `native/test_capturer_watchdog.sh`,
+  fresh generation. For an app-owned session, `RecorderModel` waits 0.5 s after
+  supervisor rc 1, re-reads the exact failed generation's status, and starts a
+  fresh generation only for `capture-heartbeat-stalled`. One restart is allowed
+  per failure cluster; the exact replacement must remain authoritative for 60 s
+  to rearm it, while a manual Start resets the cluster. Stop, Cancel Recovery,
+  Quit, stale timers, generic failures, and external sessions never auto-restart.
+  Direct CLI sessions remain stopped. Pinned by
+  `native/test_capturer_watchdog.sh`, `native/test_recorder_model.sh`,
   `tests/test_capturer_mic_liveness.py`, and contract-parity tests.
 - **Capturer-exit-before-recorder is always fail-loud, even on `rc=0`** — the
   recording is truncated regardless of exit code. The one exemption is a stop

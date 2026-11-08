@@ -213,7 +213,18 @@ SIGINT/SIGTERM remains rc 0; otherwise the capturer reports rc 14 /
 attempts the normal ordered Core Audio cleanup. The deadline is a process
 boundary if `AudioDeviceStop` or another cleanup call blocks. There is no
 in-process tap rebuild or socket reconnect: the supervisor rotates the partial
-session, and only a later Start mints a fresh generation.
+session and exits non-zero.
+
+For an app-owned session, the menu-bar lifecycle may then mint a fresh
+generation. It waits 0.5 s for the exact generation's final status, requires
+`capture-heartbeat-stalled`, retires the failed process and log, and launches a
+new supervisor with a new process, run log, socket directory, nonce, sockets,
+aggregate, and tap. It preserves the pinned data directory and category. One
+automatic restart is allowed per failure cluster; 60 s of authoritative health
+rearms it, and a manual app-owned Start begins a new cluster. A second early
+stall stays visibly failed. Stop, Cancel Recovery, Quit, generic failures, stale
+status/timers, external recorders, and direct CLI sessions never enter this
+app-owned recovery path.
 
 ## Capturer launch contract (supervisor → capturer)
 

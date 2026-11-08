@@ -170,9 +170,9 @@ menu-bar app may own a bounded automatic fresh Start.
 
 ### Phase 4: App-Owned Automatic Generation Recovery
 
-**Impl files:** `native/onoats-menubar/Sources/RecorderModel.swift, native/onoats-menubar/Sources/RecorderSystemOps.swift, AGENTS.md, docs/audio-socket-contract.md, docs/menu-bar.md, native/README.md, docs/dev_plans/20261028-feature-menubar-control-panel.md, docs/dev_plans/20261107-bug-capturer-system-tap-resume.md`
-**Test files:** `native/onoats-menubar/Tests/RecorderModelHarness.swift`
-**Test command:** `bash native/test_recorder_model.sh`
+**Impl files:** `native/onoats-menubar/Sources/RecorderModel.swift, native/onoats-menubar/Sources/RecorderSystemOps.swift, native/onoats-menubar/Sources/RecordingPanelView.swift, AGENTS.md, CHANGELOG.md, docs/audio-socket-contract.md, docs/menu-bar.md, native/README.md, docs/dev_plans/20261028-feature-menubar-control-panel.md, docs/dev_plans/20261107-bug-capturer-system-tap-resume.md`
+**Test files:** `native/onoats-menubar/Tests/RecorderModelHarness.swift, tests/test_native_contract_parity.py`
+**Test command:** `bash native/test_recorder_model.sh && uv run pytest tests/test_native_contract_parity.py -q`
 **Validation cmd:** `python3 scripts/check_review_markers.py && uv run ruff format && uv run ruff check && uv run pytest && bash native/test_capturer_watchdog.sh && make -C native build`
 **Goal:** Recover an app-owned heartbeat fault by creating one fresh, fully
 isolated recorder/capturer generation while user Stop/Quit and loop prevention
@@ -238,10 +238,15 @@ remain authoritative.
   user-visible recovery notice.
 - `native/onoats-menubar/Sources/RecorderSystemOps.swift` — expose an injected
   one-shot scheduling boundary for restart and stability timers.
+- `native/onoats-menubar/Sources/RecordingPanelView.swift` — show recovery
+  progress and let the user cancel a pending or starting automatic replacement.
 - `native/onoats-menubar/Tests/RecorderModelHarness.swift` — pin the complete
   recovery admission and cancellation state space with a fake clock/scheduler.
+- `tests/test_native_contract_parity.py` — keep the shared manual/automatic
+  start path pinned to the canonical Seminar category argument.
 - `docs/menu-bar.md` — describe automatic recovery, session splitting, and the
   visible second-failure behavior.
+- `CHANGELOG.md` — record automatic app-owned recovery and its loop guard.
 - `docs/dev_plans/20261028-feature-menubar-control-panel.md` — append a dated
   correction below its review marker and cross-link this plan.
 
@@ -435,7 +440,7 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ cc837769ec15645825ca67a767636a5d8e82d020 -->
+<!-- reviewed: 2026-11-08 @ 465559c27328fd323a36096a09d108ace9e1c70a -->
 
 ## Progress
 
@@ -496,6 +501,23 @@ Context lifecycle — what each process owns:
   exited. The completed fail-loud plan was reopened with Phase 4: the menu-bar
   app will automatically launch one fresh generation after an authenticated
   app-owned heartbeat failure, with a stability-window loop guard.
+- 2026-11-08: the Phase 4 red-first RecorderModel harness failed before
+  production edits because `RecorderModel.heartbeatStallExitReason` and
+  `automaticRecoveryActive` did not exist. The harness already required a
+  delayed fresh process/log generation, preserved directory/category, visible
+  recovery notices, and stability-window retirement.
+- 2026-11-08: the fresh five-lens plan review returned 15 findings. The updated
+  contract now distinguishes native rc 14 from app-observed supervisor rc 1,
+  captures immutable recovery context before cleanup, defines manual and
+  60-second stability rearming, moves production pacer tests behind their
+  wiring, cites Apple's uptime-clock contract, and requires Stop/Quit/status/
+  timer/spawn race coverage.
+- 2026-11-08: Phase 4 automated validation passed. The RecorderModel harness
+  covers exact-generation admission, delayed final status, retirement ordering,
+  directory/category preservation, notices, cancellation, replacement failure,
+  early second-stall suppression, stale timers, and stable rearming. The native
+  app build, watchdog harness, Ruff, marker check, and full suite also passed:
+  8,142 tests passed and 13 skipped.
 
 ## Issues & Solutions
 
@@ -510,6 +532,10 @@ Context lifecycle — what each process owns:
 - The live signed-capturer run required `AUDIO_SOURCE=socket` and disabled the
   unrelated optional diarization feature because this checkout does not have
   `mlx_audio`; neither override changes the heartbeat or supervisor path.
+- App recovery waits 0.5 seconds after supervisor exit so the authoritative
+  heartbeat status can replace the recorder's transient generic failure. The
+  immutable request retains only the exact failed generation, directory,
+  category, and budget token; every native/process identity is minted anew.
 
 ## Final Results
 
