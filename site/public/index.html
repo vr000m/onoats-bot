@@ -61,6 +61,7 @@
   .features{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
   .features .card h3{font-size:17px}
   .features .card p{font-size:15.5px}
+  .card p a{color:var(--gold-ink)}
 
   /* flow */
   .flow{display:grid;grid-template-columns:repeat(4,1fr);gap:0;counter-reset:s;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--paper)}
@@ -180,7 +181,7 @@
     <p class="sub">A menu-bar app on Apple Silicon, a CLI everywhere.</p>
     <div class="features">
       <div class="card"><h3>Menu-bar app</h3><p>Start, Stop and Flush from the menu bar, with live level meters and STT health.</p></div>
-      <div class="card"><h3>Your choice of STT</h3><p>Local Whisper-MLX on Apple Silicon, or a hosted or local WebSocket server.</p></div>
+      <div class="card"><h3>Your choice of STT</h3><p>Local Whisper-MLX on Apple Silicon, or a hosted or local WebSocket server such as <a href="https://github.com/vr000m/pipecat-local-stt-server">pipecat-local-stt-server</a>.</p></div>
       <div class="card"><h3>Speaker diarization</h3><p>Opt-in labels (S1, S2…) on the <em>them</em> channel. Off by default, and a failure never loses a transcript.</p></div>
       <div class="card"><h3>Fail loud</h3><p>Capture, STT and storage errors exit non-zero and say why. No silent hangs.</p></div>
       <div class="card"><h3>Local-first</h3><p>Config, queue and transcripts live in your own directories. Process env overrides config files.</p></div>
@@ -232,7 +233,9 @@ onoats bot</pre>
       <a href="https://github.com/vr000m/onoats-bot">GitHub</a> ·
       <a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a> ·
       <a href="https://pypi.org/project/onoats/">PyPI</a> ·
-      <a href="https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md">Changelog</a> ·
+      <a href="https://github.com/vr000m/pipecat-local-stt-server">pipecat-local-stt-server</a> ·
+      <a href="https://github.com/vr000m/pipecat-local-tts-server">pipecat-local-tts-server</a>
     </span>
   </div>
 </footer>
