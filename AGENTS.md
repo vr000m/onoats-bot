@@ -131,8 +131,9 @@ registry dep, not a git pin).
   this. The first terminal event wins: graceful SIGINT/SIGTERM admitted first
   stays rc 0; the heartbeat fault admitted first arms an independent 2 s hard
   exit before best-effort ordered Core Audio cleanup. Terminal admission
-  quiesces both branch chunkers before either branch enters blocking Core Audio
-  cleanup, so no queued mic or system frame leaves the invalid generation.
+  quiesces both branch chunkers and disables both writer sockets before either
+  branch enters blocking Core Audio cleanup, so no queued mic or system frame
+  leaves the invalid generation.
   Never rebuild the tap or
   reconnect sockets in-process; only a later supervisor-owned Start creates a
   fresh generation. For an app-owned session, `RecorderModel` waits 0.5 s after
