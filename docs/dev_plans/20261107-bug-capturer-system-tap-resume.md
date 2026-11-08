@@ -539,9 +539,13 @@ Context lifecycle — what each process owns:
 - 2026-11-08: the final convergence pass found one remaining boundary: capture
   producers stopped before cleanup, but writer queues could still drain while
   Core Audio blocked. Writer shutdown now clears both queues and calls
-  `shutdown(2)` before either capture stop, preventing in-flight socket sends
-  from surviving terminal admission. The focused source contract, native
+  `shutdown(2)` before either capture stop, preventing queue drain during
+  blocking cleanup. A write already in its syscall may complete between
+  admission and shutdown. The focused source contract, native
   watchdog suite, and final full suite pass: 8,144 tests, 13 skipped.
+- 2026-11-08: the documentation convergence pass corrected an overclaim: socket
+  shutdown prevents later sends and queue draining before blocking cleanup, but
+  one write already inside its syscall at admission may complete.
 
 ## Issues & Solutions
 
@@ -569,8 +573,9 @@ Context lifecycle — what each process owns:
   cannot rearm a newer window. Missing CLI authority settles as a visible
   failure and permits a later manual Start after the CLI returns.
 - Both capture branch chunkers and writer sockets quiesce before ordered Core
-  Audio cleanup. The supervisor also preserves mapped rc 14 when recorder EOF
-  wins by waiting only within the capturer's independent hard-exit bound.
+  Audio cleanup. Queued writer frames are discarded; one syscall already in
+  flight may complete before socket shutdown. The supervisor also preserves
+  mapped rc 14 when recorder EOF wins within the independent hard-exit bound.
 
 ## Final Results
 
