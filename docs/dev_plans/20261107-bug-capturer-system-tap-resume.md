@@ -516,6 +516,16 @@ Context lifecycle — what each process owns:
   prefers 48 pt, and remains scroll-bounded at 128 pt; the native contract test
   pins both the visible minimum and bounded maximum. The full parity file (52
   tests), RecorderModel harness, native build, and Ruff checks pass.
+- 2026-11-08: the same screenshot showed Flush orphaned below the full-width
+  Stop action. The running panel now presents one lifecycle-action row: Flush
+  is the bordered secondary action and Stop Recording is the expanding
+  prominent action. The parity test pins their shared row and ordering.
+- 2026-11-08: release preparation targets v1.6.0 because the accumulated
+  Unreleased changes include the menu-bar control panel, UI telemetry, the
+  recorder control socket, staged installation, and heartbeat recovery. The
+  changelog is cut for 2026-11-08 and the pyproject, lockfile, and app version
+  move together; tagging remains a separate post-merge action guarded by
+  `scripts/release_check.sh v1.6.0 <merge-commit>`.
 - 2026-11-08: the Phase 4 red-first RecorderModel harness failed before
   production edits because `RecorderModel.heartbeatStallExitReason` and
   `automaticRecoveryActive` did not exist. The harness already required a
