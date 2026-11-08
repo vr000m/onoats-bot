@@ -1421,6 +1421,9 @@ private func testHeartbeatAutomaticRecovery(_ root: URL) throws {
     try require(ops.processes.count == 1, "replacement spawned before classification delay")
     try require(model.flushNote?.contains("restarting automatically") == true,
                 "pending recovery notice was not visible")
+    model.refresh()
+    try require(model.state == .starting && model.automaticRecoveryActive,
+                "lifecycle polling hid an admitted recovery")
 
     try ops.fireNextOneShot()
     try require(ops.processes.count == 2, "classified heartbeat did not spawn replacement")
@@ -1441,9 +1444,27 @@ private func testHeartbeatAutomaticRecovery(_ root: URL) throws {
     try require(model.flushNote?.contains("recovered automatically") == true,
                 "confirmed recovery notice was not visible")
 
+    // A missing or replaced publication cancels the current stability window.
+    // The same owned generation must publish authoritatively for a fresh full
+    // window before the one-restart budget rearms.
+    removePid(ops, directory: directory, pid: replacement.pid)
+    model.refresh()
+    try require(model.state == .starting && model.automaticRecoveryActive,
+                "publication loss did not suspend recovery stability")
+    putPid(ops, directory: directory, pid: replacement.pid, epoch: replacementEpoch)
+    model.refresh()
+    let foreignPid = replacement.pid + 100
+    putPid(ops, directory: directory, pid: foreignPid, epoch: replacementEpoch + 1)
+    model.refresh()
+    putPid(ops, directory: directory, pid: replacement.pid, epoch: replacementEpoch)
+    model.refresh()
+    try ops.fireNextOneShot()
+    try ops.fireNextOneShot()
+    try require(model.automaticRecoveryActive,
+                "cancelled stability timer rearmed after authority loss")
     try ops.fireNextOneShot()
     try require(!model.automaticRecoveryActive,
-                "stable replacement did not rearm and retire recovery state")
+                "fresh stable authority window did not rearm recovery")
 
     removePid(ops, directory: directory, pid: replacement.pid)
     try ops.putJSON(
@@ -1536,6 +1557,23 @@ private func testHeartbeatRecoveryFailureAndCancellationMatrix(_ root: URL) thro
     }
 
     do {
+        let owned = makeCase("stop-after-process-exit-before-callback")
+        removePid(owned.ops, directory: owned.directory, pid: owned.process.pid)
+        try owned.ops.putJSON(
+            stoppedStatus(
+                pid: owned.process.pid, epoch: owned.epoch,
+                reason: RecorderModel.heartbeatStallExitReason),
+            active(owned.directory, "onoats.status.json"))
+        owned.process.isRunning = false
+        owned.model.stop()
+        owned.ops.finish(owned.process, status: 1)
+        try require(!owned.model.automaticRecoveryActive,
+                    "queued exit callback discarded Stop intent")
+        try require(owned.ops.processes.count == 1,
+                    "queued exit callback spawned a replacement after Stop")
+    }
+
+    do {
         let owned = makeCase("cancel-delay")
         try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
         owned.model.cancelAutomaticRecovery()
@@ -1573,6 +1611,34 @@ private func testHeartbeatRecoveryFailureAndCancellationMatrix(_ root: URL) thro
                     "automatic replacement spawn failure entered a retry loop")
         try require(owned.ops.processes.count == 1,
                     "spawn failure created an unexpected replacement")
+    }
+
+    do {
+        let owned = makeCase("log-reservation-failure")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        owned.ops.failReservation = true
+        try owned.ops.fireNextOneShot()
+        try require(!owned.model.automaticRecoveryActive,
+                    "automatic log failure left recovery latched")
+        try require(owned.model.canStart,
+                    "automatic log failure permanently disabled manual Start")
+        try require(owned.ops.processes.count == 1,
+                    "automatic log failure created an unexpected replacement")
+    }
+
+    do {
+        let owned = makeCase("external-successor")
+        try finish(owned, reason: RecorderModel.heartbeatStallExitReason)
+        putPid(
+            owned.ops, directory: owned.directory, pid: 7_777,
+            epoch: owned.ops.nowValue.timeIntervalSince1970 + 1)
+        try owned.ops.fireNextOneShot()
+        try require(owned.ops.processes.count == 1,
+                    "automatic recovery launched beside an external successor")
+        try require(!owned.model.automaticRecoveryActive,
+                    "external successor left automatic recovery latched")
+        try require(owned.model.state == .running(ours: false),
+                    "external successor was not adopted as recorder authority")
     }
 
     do {
