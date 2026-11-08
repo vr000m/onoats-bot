@@ -12,14 +12,14 @@ consume the same filesystem queue without depending on onoats internals.
 <table>
   <tr>
     <td width="69%" valign="top">
-      <img src="https://raw.githubusercontent.com/vr000m/onoats-bot/main/assets/screenshots/onoats-menu-bar-panel.png" alt="Onoats menu-bar panel ready to record">
+      <img src="https://raw.githubusercontent.com/vr000m/onoats-bot/main/assets/screenshots/onoats-1.6.0-2-recording.png" alt="Onoats menu-bar panel recording, with live Me and Them levels">
     </td>
     <td width="31%" valign="top">
-      <img src="https://raw.githubusercontent.com/vr000m/onoats-bot/main/assets/screenshots/onoats-settings-panel.png" alt="Onoats settings panel">
+      <img src="https://raw.githubusercontent.com/vr000m/onoats-bot/main/assets/screenshots/onoats-1.6.0-3-settings.png" alt="Onoats settings panel">
     </td>
   </tr>
   <tr>
-    <td align="center"><em>Start a recording and set the Seminar label.</em></td>
+    <td align="center"><em>Watch both channels live, then Flush or Stop.</em></td>
     <td align="center"><em>Choose audio, STT, storage, and privacy settings.</em></td>
   </tr>
 </table>

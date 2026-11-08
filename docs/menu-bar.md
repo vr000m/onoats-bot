@@ -11,6 +11,8 @@ its stateful menu-bar icon opens a compact control panel.
 
 ### Start, Stop, and Flush
 
+![Menu-bar panel while recording](../assets/screenshots/onoats-1.6.0-2-recording.png)
+
 Start launches `onoats bot` through the socket supervisor and native
 capturer. Stop asks the recorder to drain in-flight audio and rotate its final
 buffer. Flush rotates the current buffer without ending the session.
@@ -29,6 +31,8 @@ termination signal has latched even if its Stop has not yet been processed. See 
 
 ### Seminar
 
+![Menu-bar panel ready to record, with the Seminar toggle](../assets/screenshots/onoats-1.6.0-1-ready.png)
+
 Before Start, Seminar adds `--category seminars` to the next app-owned
 recording. During that session it becomes a read-only lock badge and resets
 after exit.
@@ -37,6 +41,8 @@ Add `seminars` to `[categories] set` in `config.toml` first. If it is
 missing, the failed-Start panel explains the problem and offers **Open Config**.
 
 ## Settings
+
+![Settings panel](../assets/screenshots/onoats-1.6.0-3-settings.png)
 
 The gear opens:
 
@@ -158,6 +164,8 @@ Every app-owned Start creates:
 The app keeps the newest ten logs. Failure surfaces can open the current log;
 **Settings → Diagnostics** can also reveal the logs folder. External sessions
 are labelled as not captured by the menu bar.
+
+![Diagnostics panel](../assets/screenshots/onoats-1.6.0-4-diagnostics.png)
 
 ## First-run permissions
 
