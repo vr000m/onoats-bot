@@ -540,12 +540,12 @@ Context lifecycle — what each process owns:
   producers stopped before cleanup, but writer queues could still drain while
   Core Audio blocked. Writer shutdown now clears both queues and calls
   `shutdown(2)` before either capture stop, preventing queue drain during
-  blocking cleanup. A write already in its syscall may complete between
-  admission and shutdown. The focused source contract, native
+  blocking cleanup. Bytes accepted by the kernel before shutdown takes effect
+  may still arrive. The focused source contract, native
   watchdog suite, and final full suite pass: 8,144 tests, 13 skipped.
-- 2026-11-08: the documentation convergence pass corrected an overclaim: socket
-  shutdown prevents later sends and queue draining before blocking cleanup, but
-  one write already inside its syscall at admission may complete.
+- 2026-11-08: documentation convergence corrected two overclaims. Socket
+  shutdown prevents later successful sends and queue draining before blocking
+  cleanup, but bytes accepted by the kernel before it takes effect may arrive.
 
 ## Issues & Solutions
 
@@ -565,7 +565,7 @@ Context lifecycle — what each process owns:
   immutable request retains only the exact failed generation, directory,
   category, and budget token; every native/process identity is minted anew.
 - Terminal `FrameChunker.stop()` now rejects a queued worker append under the
-  same lock, so neither filler nor captured audio leaves an invalid generation.
+  same lock, so no later append creates filler or captured frames after stop.
 - Automatic recovery uses one failure finalizer for spawn and log setup, keeps
   Stop intent across a queued exit callback, preserves admitted recovery across
   lifecycle polls, and requires a continuously authoritative replacement.
@@ -573,9 +573,9 @@ Context lifecycle — what each process owns:
   cannot rearm a newer window. Missing CLI authority settles as a visible
   failure and permits a later manual Start after the CLI returns.
 - Both capture branch chunkers and writer sockets quiesce before ordered Core
-  Audio cleanup. Queued writer frames are discarded; one syscall already in
-  flight may complete before socket shutdown. The supervisor also preserves
-  mapped rc 14 when recorder EOF wins within the independent hard-exit bound.
+  Audio cleanup. Queued writer frames are discarded; bytes accepted by the
+  kernel before socket shutdown takes effect may arrive. The supervisor also
+  preserves mapped rc 14 when recorder EOF wins within the hard-exit bound.
 
 ## Final Results
 

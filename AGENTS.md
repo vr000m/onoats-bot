@@ -133,8 +133,8 @@ registry dep, not a git pin).
   exit before best-effort ordered Core Audio cleanup. Terminal admission
   quiesces both branch chunkers and disables both writer sockets before either
   branch enters blocking Core Audio cleanup. This clears queued frames and
-  prevents later sends; one socket write already in its syscall at admission
-  may complete before `shutdown(2)` takes effect.
+  prevents successful sends after `shutdown(2)` takes effect. Bytes a writer
+  handed to the kernel before that point may still arrive.
   Never rebuild the tap or
   reconnect sockets in-process; only a later supervisor-owned Start creates a
   fresh generation. For an app-owned session, `RecorderModel` waits 0.5 s after

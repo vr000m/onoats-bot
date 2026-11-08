@@ -213,12 +213,12 @@ SIGINT/SIGTERM remains rc 0; otherwise the capturer reports rc 14 /
 attempts the normal ordered Core Audio cleanup. The deadline is a process
 boundary if `AudioDeviceStop` or another cleanup call blocks. Both branch
 chunkers quiesce and both writer sockets disable sends before either Core Audio
-chain begins that cleanup. Queued frames are discarded and no later send starts;
-a socket write already inside its syscall at terminal admission may complete
-before `shutdown(2)` takes effect. There is no in-process tap rebuild or socket
-reconnect: the supervisor rotates the partial session and exits non-zero. If
-socket EOF lets the recorder finish first, the supervisor waits within the
-native deadline for a mapped capturer rc so the final status still records
+chain begins that cleanup. Queued frames are discarded, and after `shutdown(2)`
+takes effect no new send can succeed. Bytes accepted by the kernel before that
+point may still arrive. There is no in-process tap rebuild or socket reconnect:
+the supervisor rotates the partial session and exits non-zero. If socket EOF
+lets the recorder finish first, the supervisor waits within the native deadline
+for a mapped capturer rc so the final status still records
 `capture-heartbeat-stalled`.
 
 For an app-owned session, the menu-bar lifecycle may then mint a fresh
