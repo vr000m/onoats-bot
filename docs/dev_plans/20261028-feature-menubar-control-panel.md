@@ -709,6 +709,21 @@ sequenceDiagram
   and the interaction, accessibility and visual bullets. The matrix wording is above
   the review marker and is unchanged; narrowing it needs `/review-plan`.
 
+- 2026-11-08 correction: the warning-only system-tap stall above is superseded
+  by `20261107-bug-capturer-system-tap-resume.md`. A system-pacer wake gap
+  greater than 2 s now fails the current native generation as
+  `capture-heartbeat-stalled` behind a separate 2 s hard-exit deadline. The
+  supervisor remains the only restart owner; a later Start creates the fresh
+  tap rather than attempting in-process recovery.
+- 2026-11-08 follow-up: the menu-bar lifecycle now initiates that later Start
+  automatically for an exact app-owned `capture-heartbeat-stalled` generation.
+  The supervisor still owns each individual generation; the app waits for the
+  failed supervisor to exit, then launches a new supervisor with fresh process,
+  log, socket, nonce, and tap identities. One restart per failure cluster plus
+  a 60-second authoritative stability window prevents restart loops. CLI,
+  external, generic-failure, Stop, Cancel Recovery, and Quit paths remain
+  manual or terminal.
+
 - 2026-11-05 — Round 8 makes force exit a complete process contract. Lifecycle
   continuation and terminal rotations, accepted control handlers, direct
   recorder event loops, and the socket supervisor all share bounded settlement;

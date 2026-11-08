@@ -20,6 +20,9 @@
 #      (deliberate waiver: nothing downloads in a test; see AGENTS.md Review
 #      Checklist), so pre-cache the weights on the release machine:
 #        hf download mlx-community/Nemotron-3-Diarization
+#   6. native capturer heartbeat contract (working tree, macOS only):
+#      native/test_capturer_watchdog.sh, including a real FrameChunker child
+#      stopped and resumed across both sides of the 2 s threshold.
 set -euo pipefail
 
 tag="${1:?usage: release_check.sh vX.Y.Z [commit-ish]}"
@@ -95,6 +98,21 @@ elif ONOATS_REQUIRE_DIARIZATION_CONTRACT=1 \
     check "mlx_audio diarization contract" 1 ""
 else
     check "mlx_audio diarization contract" 0 "tests/test_diarization_contract.py failed under ONOATS_REQUIRE_DIARIZATION_CONTRACT=1"
+fi
+
+# The native pacer and hard-exit contract can only compile and run on macOS.
+# Like check 5, it vouches for the working tree and therefore refuses a dirty
+# or different checkout instead of testing bytes other than <commit-ish>.
+if [ "$head_sha" != "$target_sha" ]; then
+    check "native capturer heartbeat contract" 0 "working tree HEAD ($head_sha) is not ${commit} ($target_sha); run release_check.sh from a clean checkout of ${commit}"
+elif [ -n "$(git status --porcelain)" ]; then
+    check "native capturer heartbeat contract" 0 "working tree is dirty; run release_check.sh from a clean checkout of ${commit}"
+elif [ "$(uname -s)" != "Darwin" ]; then
+    check "native capturer heartbeat contract" 0 "requires macOS to compile the Core Audio FrameChunker harness"
+elif bash native/test_capturer_watchdog.sh; then
+    check "native capturer heartbeat contract" 1 ""
+else
+    check "native capturer heartbeat contract" 0 "native/test_capturer_watchdog.sh failed"
 fi
 
 if [ "$fail" -ne 0 ]; then

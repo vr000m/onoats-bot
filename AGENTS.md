@@ -67,7 +67,9 @@ surfaces** that must agree — `pyproject.toml`, the `uv.lock` onoats entry
 (regenerate via `uv lock`), and the menu-bar Info.plist
 `CFBundleShortVersionString` — pinned by the same test file and gated at
 tag time by `scripts/release_check.sh vX.Y.Z <commit>` (run before pushing
-any release tag).
+any release tag). That pre-tag gate also runs the macOS-only capturer heartbeat
+suite, including real STOP/CONT against the production `FrameChunker`; it fails
+on non-macOS rather than silently skipping the native contract.
 
 Releasing to PyPI (v1.1.0+): pushing a `v*` tag triggers
 `.github/workflows/release.yml` — full suite + two guards (tag must equal
@@ -122,6 +124,34 @@ registry dep, not a git pin).
   sockets that never appear, capturer death mid-session, STT preflight) yields a
   non-zero exit + a WARNING/ERROR log, and a partial session still rotates into
   `pending/` — never a hang.
+- **A native heartbeat stall invalidates the whole generation.** The system
+  branch's 20 ms pacer samples `mach_absolute_time`; a wake gap strictly greater
+  than 2 s stops that pacer and admits `capture-heartbeat-stalled` (rc 14).
+  Audio content, absent tap callbacks, exactly 2 s, and host sleep do not decide
+  this. The first terminal event wins: graceful SIGINT/SIGTERM admitted first
+  stays rc 0; the heartbeat fault admitted first arms an independent 2 s hard
+  exit before best-effort ordered Core Audio cleanup. Terminal admission
+  quiesces both branch chunkers and disables both writer sockets before either
+  branch enters blocking Core Audio cleanup. This clears queued frames and
+  prevents successful sends after `shutdown(2)` takes effect. Bytes a writer
+  handed to the kernel before that point may still arrive.
+  Never rebuild the tap or
+  reconnect sockets in-process; only a later supervisor-owned Start creates a
+  fresh generation. For an app-owned session, `RecorderModel` waits 0.5 s after
+  supervisor rc 1, re-reads the exact failed generation's status, and starts a
+  fresh generation only for `capture-heartbeat-stalled`. One restart is allowed
+  per failure cluster; the exact replacement must remain authoritative for 60 s
+  to rearm it. Missing or replaced PID publication cancels that stability
+  window and requires a fresh full 60 s; a live external successor cancels the
+  app replacement. A manual Start resets the cluster. Stop, Cancel Recovery,
+  Quit, stale timers, missing replacement prerequisites, generic failures, and
+  external sessions never auto-restart. If recorder EOF wins the process-exit
+  race, the supervisor waits within the native hard-exit bound for a mapped
+  capturer rc, preserving `capture-heartbeat-stalled` instead of flattening it
+  to `fatal_error_frame`.
+  Direct CLI sessions remain stopped. Pinned by
+  `native/test_capturer_watchdog.sh`, `native/test_recorder_model.sh`,
+  `tests/test_capturer_mic_liveness.py`, and contract-parity tests.
 - **Capturer-exit-before-recorder is always fail-loud, even on `rc=0`** — the
   recording is truncated regardless of exit code. The one exemption is a stop
   the recorder itself asked for: once `runtime.graceful_shutdown_requested()`

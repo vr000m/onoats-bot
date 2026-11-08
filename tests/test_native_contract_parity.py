@@ -613,9 +613,14 @@ def test_seminars_toggle_passes_a_category_the_cli_accepts():
     assert category, "RecorderModel.seminarCategory literal not found"
     assert category.group(1) == SEMINAR_CATEGORY
     assert re.search(
-        r'if seminarMode \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
+        r"beginStart\(directory: dataDirResolver\(\), seminar: seminarMode, "
+        r"automatic: false\)",
         swift,
-    ), "start() no longer passes --category when seminarMode is on"
+    ), "manual start no longer snapshots the Seminar selection"
+    assert re.search(
+        r'if seminar \{ p\.arguments\? \+= \["--category", Self\.seminarCategory\] \}',
+        swift,
+    ), "the shared start path no longer passes --category for Seminar"
 
     configured = OnoatsConfig(
         {"categories": {"set": ["uncategorized", category.group(1)]}}
@@ -988,8 +993,18 @@ def test_recording_panel_keeps_primary_actions_and_live_distinctions_visible():
     ):
         assert label in recording, f"main panel lost {label!r}"
 
-    # Start/Stop are the one prominent, full-width action; Flush remains
-    # secondary. Enablement stays tied to the existing model authorities.
+    running = recording.split("case .running(let ours):", 1)[1].split(
+        "case .starting:", 1
+    )[0]
+    assert re.search(
+        r'HStack\s*\([^)]*\)\s*\{.*Button\("Flush"\).*'
+        r'Button\("Stop Recording"\)',
+        running,
+        re.S,
+    ), "Flush must be the secondary action beside the prominent Stop action"
+
+    # Start/Stop stay prominent; Flush shares the recording action row as the
+    # secondary action. Enablement remains tied to the model authorities.
     assert recording.count(".buttonStyle(.borderedProminent)") >= 1
     assert ".frame(maxWidth: .infinity)" in recording
     assert re.search(r"\.disabled\s*\(\s*!model\.canStart\s*\)", recording)
@@ -1092,9 +1107,16 @@ def test_panel_keyboard_focus_and_icon_accessibility_contracts_are_explicit():
 def test_warning_region_is_bounded_and_panel_does_not_render_log_contents():
     _, recording, settings = _panel_sources()
     assert "hintCaptionLines" in recording
-    assert re.search(r"maxHeight\s*:\s*\d+", recording), (
-        "warning/failure text must have a bounded wrapping region"
+    height_bounds = re.search(
+        r"\.frame\s*\(\s*minHeight:\s*(\d+),\s*idealHeight:\s*(\d+),"
+        r"\s*maxHeight:\s*(\d+)",
+        recording,
     )
+    assert height_bounds, (
+        "warning/failure text must reserve visible wrapped height and remain bounded"
+    )
+    minimum, ideal, maximum = map(int, height_bounds.groups())
+    assert 28 <= minimum <= ideal <= maximum <= 160
     assert re.search(r"\.fixedSize\s*\(\s*horizontal:\s*false", recording)
 
     combined = recording + settings

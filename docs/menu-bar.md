@@ -11,6 +11,8 @@ its stateful menu-bar icon opens a compact control panel.
 
 ### Start, Stop, and Flush
 
+![Menu-bar panel while recording](../assets/screenshots/onoats-1.6.0-2-recording.png)
+
 Start launches `onoats bot` through the socket supervisor and native
 capturer. Stop asks the recorder to drain in-flight audio and rotate its final
 buffer. Flush rotates the current buffer without ending the session.
@@ -29,6 +31,8 @@ termination signal has latched even if its Stop has not yet been processed. See 
 
 ### Seminar
 
+![Menu-bar panel ready to record, with the Seminar toggle](../assets/screenshots/onoats-1.6.0-1-ready.png)
+
 Before Start, Seminar adds `--category seminars` to the next app-owned
 recording. During that session it becomes a read-only lock badge and resets
 after exit.
@@ -37,6 +41,8 @@ Add `seminars` to `[categories] set` in `config.toml` first. If it is
 missing, the failed-Start panel explains the problem and offers **Open Config**.
 
 ## Settings
+
+![Settings panel](../assets/screenshots/onoats-1.6.0-3-settings.png)
 
 The gear opens:
 
@@ -113,6 +119,31 @@ warning badge and the panel names the likely cause, such as denied system-audio
 permission or a hardware-muted microphone. Recording continues, and the warning
 clears when real audio arrives.
 
+### Automatic recovery from a stalled capture
+
+If the native system-audio pacer stalls for more than two seconds of process
+uptime, the current capture generation is no longer trusted. The supervisor
+rotates the partial session and exits with a matching
+`capture-heartbeat-stalled` status. The menu-bar app then shows **Recovering…**
+and starts a wholly fresh recorder/capturer generation automatically.
+
+Recovery preserves the recording's pinned data directory and Seminar choice,
+but it creates a new session and run log. **Cancel Recovery** stops a pending or
+starting replacement. Stop and Quit remain authoritative and never trigger a
+replacement.
+
+The app permits one automatic restart per failure cluster. The replacement must
+remain authoritatively running for 60 seconds before another automatic recovery
+is allowed. Missing or replaced PID authority restarts that full window, and a
+live external successor cancels the app replacement. If the replacement stalls
+earlier, the panel remains visibly failed instead of entering a restart loop. A
+manual Start begins a new cluster. Direct CLI and externally started recordings
+do not use this app-owned recovery path.
+
+After 60 seconds of authoritative health, a recurring intermittent fault can
+trigger another automatic recovery; this release has no per-hour cap. The panel
+notice is transient, while each app-owned generation retains its own run log.
+
 ### Login item warning
 
 `[app].launch_at_login` accepts TOML `true` or `false`. Invalid values,
@@ -133,6 +164,8 @@ Every app-owned Start creates:
 The app keeps the newest ten logs. Failure surfaces can open the current log;
 **Settings → Diagnostics** can also reveal the logs folder. External sessions
 are labelled as not captured by the menu bar.
+
+![Diagnostics panel](../assets/screenshots/onoats-1.6.0-4-diagnostics.png)
 
 ## First-run permissions
 

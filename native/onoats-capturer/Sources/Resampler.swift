@@ -79,6 +79,8 @@ final class FrameChunker {
     private var pacer: Thread?
     private var stopped = false
     private var silenceFramesTotal: UInt64 = 0
+    private var heartbeatWatchdog: ProcessSuspensionWatchdog?
+    private let onHeartbeatStall: ((UInt64) -> Void)?
 
     // All-zero-input detector (TCC-denial observable). A *denied* system-audio
     // tap still fires callbacks but delivers only zero samples (verified live
@@ -111,9 +113,16 @@ final class FrameChunker {
     private var lastStaleFireNs: UInt64 = 0
     private static let silentFrame = Data(count: BYTES_PER_FRAME)
 
-    init(label: String, zeroHint: String, emit: @escaping (Data, UInt64) -> Void) {
+    init(
+        label: String,
+        zeroHint: String,
+        onHeartbeatStall: ((UInt64) -> Void)? = nil,
+        emit: @escaping (Data, UInt64) -> Void
+    ) {
         self.label = label
         self.zeroHint = zeroHint
+        self.onHeartbeatStall = onHeartbeatStall
+        heartbeatWatchdog = onHeartbeatStall == nil ? nil : ProcessSuspensionWatchdog()
         self.emit = emit
     }
 
@@ -123,6 +132,7 @@ final class FrameChunker {
         let now = MonotonicClock.nowNanos()
         lastRealDataWallNs = now
         lastEmittedEndNs = now
+        heartbeatWatchdog?.activate(at: now)
         lock.unlock()
         let t = Thread { [weak self] in self?.runPacer() }
         t.name = "pacer-\(label)"
@@ -142,6 +152,11 @@ final class FrameChunker {
         if n == 0 { return }
         lock.lock()
         defer { lock.unlock() }
+        // A heartbeat fault stops the whole generation before Core Audio
+        // teardown begins. A worker may already hold one queued callback, so
+        // reject it here rather than emitting real audio after terminal
+        // admission.
+        if stopped { return }
         lastRealDataWallNs = MonotonicClock.nowNanos()
         let samples = UnsafeBufferPointer(start: data[0], count: n)
         // Worker thread (never the RT IOProc): a linear scan of ≤ a few
@@ -203,12 +218,26 @@ final class FrameChunker {
     private func runPacer() {
         while true {
             Thread.sleep(forTimeInterval: 0.02)
+            // Sample the wake before acquiring the chunker lock. The terminal
+            // callback is still dispatched only after that lock is released.
+            let now = MonotonicClock.nowNanos()
             lock.lock()
             if stopped {
                 lock.unlock()
                 return
             }
-            let now = MonotonicClock.nowNanos()
+            if let gap = heartbeatWatchdog?.observe(wakeNs: now),
+                let callback = onHeartbeatStall
+            {
+                // Stop this producer immediately. Teardown may block in a Core
+                // Audio call, but this pacer must never emit another filler
+                // frame from an invalid generation while the hard-exit timer
+                // owns the outer process bound.
+                stopped = true
+                lock.unlock()
+                callback(gap)
+                return
+            }
             var staleFire: (() -> Void)?
             if let cb = onStale, now > lastRealDataWallNs + staleAfterNs,
                 now > lastStaleFireNs + staleCooldownNs

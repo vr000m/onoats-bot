@@ -16,6 +16,7 @@
 #   make cdhash   print the cdhash (expected to change every rebuild)
 #   make rebuild  build + app + sign + dr in one go
 #   make print-bin  print the signed capturer path (for ONOATS_CAPTURER_BIN)
+#   make test-capturer-watchdog  run the native heartbeat + hard-exit harness
 #   make install-cli  uv tool install --editable the repo → ~/.local/bin/onoats
 #                     (idempotent; re-run after dependency changes = the update;
 #                      EXTRAS=macos,diarization keeps the diarization extra)
@@ -84,7 +85,10 @@ INSTALL_DIR := $(HOME)/Applications
 
 .PHONY: build app verify-resources sign dr cdhash rebuild print-bin clean \
 	check-identity cert install-cli install app-tree-hash install-staged rollback setup \
-	sign-cli setup-cli
+	sign-cli setup-cli test-capturer-watchdog
+
+test-capturer-watchdog:
+	bash test_capturer_watchdog.sh
 
 build: $(BUILD)/onoats-capturer $(BUILD)/Onoats
 

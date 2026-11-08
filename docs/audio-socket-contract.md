@@ -195,6 +195,43 @@ establishes. The transport never latches a live branch back onto a respawned
 capturer — this is the single-lifecycle-owner rule that keeps the two layers from
 racing.
 
+### Capturer heartbeat stall
+
+The native system branch has a 20 ms pacer independent of tap callback content.
+After activation, a `mach_absolute_time` gap **strictly greater than 2 s**
+between pacer wakes invalidates the current native generation. Exactly 2 s is
+allowed and a regressed clock resets the baseline. Because this clock excludes
+host sleep, ordinary sleep/wake is not classified by this rule. Scheduler,
+debugger, process suspension, or an internal pacer stall can all produce the
+same operator-visible heartbeat failure; the capturer does not claim which one
+occurred.
+
+On a trip the pacer stops emitting and dispatches terminal action outside its
+chunker lock. The first terminal event wins. A previously admitted graceful
+SIGINT/SIGTERM remains rc 0; otherwise the capturer reports rc 14 /
+`capture-heartbeat-stalled`, arms an independent 2 s hard-exit deadline, and
+attempts the normal ordered Core Audio cleanup. The deadline is a process
+boundary if `AudioDeviceStop` or another cleanup call blocks. Both branch
+chunkers quiesce and both writer sockets disable sends before either Core Audio
+chain begins that cleanup. Queued frames are discarded, and after `shutdown(2)`
+takes effect no new send can succeed. Bytes accepted by the kernel before that
+point may still arrive. There is no in-process tap rebuild or socket reconnect:
+the supervisor rotates the partial session and exits non-zero. If socket EOF
+lets the recorder finish first, the supervisor waits within the native deadline
+for a mapped capturer rc so the final status still records
+`capture-heartbeat-stalled`.
+
+For an app-owned session, the menu-bar lifecycle may then mint a fresh
+generation. It waits 0.5 s for the exact generation's final status, requires
+`capture-heartbeat-stalled`, retires the failed process and log, and launches a
+new supervisor with a new process, run log, socket directory, nonce, sockets,
+aggregate, and tap. It preserves the pinned data directory and category. One
+automatic restart is allowed per failure cluster; 60 s of authoritative health
+rearms it, and a manual app-owned Start begins a new cluster. A second early
+stall stays visibly failed. Stop, Cancel Recovery, Quit, generic failures, stale
+status/timers, external recorders, and direct CLI sessions never enter this
+app-owned recovery path.
+
 ## Capturer launch contract (supervisor → capturer)
 
 When `AUDIO_SOURCE=socket`, `onoats bot` runs the supervisor

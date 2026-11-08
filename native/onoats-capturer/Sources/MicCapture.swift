@@ -512,7 +512,12 @@ final class MicCapture {
         }
     }
 
+    func quiesce() {
+        chunker.stop()
+    }
+
     func stop() {
+        quiesce()
         bindLock.lock()
         bindClosed = true
         bindLock.unlock()
@@ -530,7 +535,6 @@ final class MicCapture {
                 AudioObjectID(kAudioObjectSystemObject), &addr, rebindQueue, deviceListener)
             listenerInstalled = false
         }
-        chunker.stop()
         // Serialize the final unbind with any in-flight rebind() — both touch
         // deviceID/ioProcID, and an unbind racing a rebind on another thread
         // could double-destroy the IOProcID or act on a stale device.

@@ -153,6 +153,8 @@ class StatusRecord:
     # e.g. "graceful", "fatal_error_frame", "capturer-crash", "mic-denied",
     # "system-audio-failed" (genuine tap API failure — a TCC denial never
     # exits the capturer; denied taps deliver zeros and surface as `warning`),
+    # "capture-heartbeat-stalled" (the native 20 ms pacer missed >2 s of
+    # process uptime and invalidated the whole capture generation),
     # "recorder-drain-timeout" (a requested stop's drain overran the supervisor's
     # grace and the recorder was force-cancelled).
     # Free-form but stable across producers.

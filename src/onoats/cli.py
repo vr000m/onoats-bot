@@ -210,11 +210,16 @@ _CAPTURER_RC_REASONS = {
     # delivers zeros (verified 2026-06-11), so denial never exits the capturer;
     # its only observable is the zero-run WARNING.
     11: "system-audio-failed",
+    14: "capture-heartbeat-stalled",  # ExitCode.captureHeartbeatStalled
 }
 
 # Grace for the recorder to drain its own ErrorFrame-driven shutdown (flush +
 # rotate) after the capturer dies, before the supervisor force-cancels it.
 _RECORDER_DRAIN_GRACE_SEC = 30.0
+# A heartbeat fault arms a native 2 s hard exit. If socket EOF lets the recorder
+# finish first, preserve the capturer's distinct rc instead of immediately
+# cancelling its wait task and flattening the final status to fatal_error_frame.
+_CAPTURER_REASON_GRACE_SEC = 2.25
 _SUPERVISOR_HARD_EXIT = os._exit
 
 # Stable prefix for machine-parseable capturer stderr lines (mirrored by
@@ -1261,13 +1266,40 @@ async def _run_recorder_with_capturer(
             # non-zero supervisor exit per the fail-loud contract — the capturer
             # process is still alive (capturer_task pending), so we cannot infer
             # success from "recorder finished first".
+            recorder_rc = recorder_task.result()  # re-raise before delaying teardown
+            if recorder_rc not in (None, 0):
+                try:
+                    late_capturer_rc = await asyncio.wait_for(
+                        asyncio.shield(capturer_task),
+                        timeout=_CAPTURER_REASON_GRACE_SEC,
+                    )
+                except TimeoutError:
+                    late_capturer_rc = None
+                if late_capturer_rc in _CAPTURER_RC_REASONS:
+                    exit_reason = _CAPTURER_RC_REASONS[late_capturer_rc]
+                    logger.error(
+                        "Socket supervisor: recorder ended on a fatal ErrorFrame "
+                        f"just before capturer rc={late_capturer_rc}; preserving "
+                        f"the distinct {exit_reason} reason."
+                    )
+                    status_file.stamp_supervisor_failure(
+                        data_dir,
+                        exit_reason=exit_reason,
+                        supervisor_rc=1,
+                        last_error=(
+                            "capturer exited during recorder error drain; partial "
+                            "recording rotated to pending/"
+                        ),
+                        not_before=stamp_floor,
+                    )
+                    return 1
             capturer_task.cancel()
             try:
                 await capturer_task
             except (asyncio.CancelledError, ProcessLookupError):
                 pass
             return _settle_recorder_rc(
-                recorder_task.result(),  # re-raise if the recorder failed
+                recorder_rc,
                 logger,
                 data_dir,
                 stamp_floor,

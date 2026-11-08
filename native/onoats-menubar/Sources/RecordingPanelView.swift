@@ -186,7 +186,9 @@ struct RecordingPanelView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 104)
+                .frame(
+                    minHeight: 36, idealHeight: 48, maxHeight: 128,
+                    alignment: .topLeading)
 
                 HStack {
                     if model.canOpenLogForCurrentSurface {
@@ -252,23 +254,35 @@ struct RecordingPanelView: View {
                 .help(!model.cliAvailable ? "CLI unavailable; see Settings, Diagnostics"
                       : model.canStart ? "Start recording" : "Finishing previous recording")
         case .running(let ours):
-            Button("Stop Recording") {
-                if ours { model.stop() } else { model.stopExternal() }
+            HStack(spacing: 10) {
+                Button("Flush") { model.flush() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .focused($focus, equals: .flush)
+                    .help("Rotate the current transcript and keep recording")
+                Button("Stop Recording") {
+                    if ours { model.stop() } else { model.stopExternal() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .focused($focus, equals: .primary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.stopRequested)
+                .help("Stop recording and drain pending transcripts")
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .frame(maxWidth: .infinity)
-            .focused($focus, equals: .primary)
-            .keyboardShortcut(.defaultAction)
-            .disabled(model.stopRequested)
-            .help("Stop recording and drain pending transcripts")
-            Button("Flush") { model.flush() }
-                .focused($focus, equals: .flush)
-                .help("Rotate the current transcript and keep recording")
         case .starting:
-            Button("Starting…") {}
-                .buttonStyle(.borderedProminent).controlSize(.large)
-                .frame(maxWidth: .infinity).disabled(true)
+            if model.automaticRecoveryActive {
+                Button("Cancel Recovery") { model.cancelAutomaticRecovery() }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    .frame(maxWidth: .infinity)
+                    .focused($focus, equals: .primary)
+                    .help("Cancel the automatic fresh-generation restart")
+            } else {
+                Button("Starting…") {}
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    .frame(maxWidth: .infinity).disabled(true)
+            }
         case .stopping:
             Button("Stopping and draining…") {}
                 .buttonStyle(.borderedProminent).controlSize(.large)
@@ -307,7 +321,7 @@ struct RecordingPanelView: View {
     private var statusTitle: String {
         switch model.state {
         case .stopped: return model.cliAvailable ? "Ready to record" : "Recorder unavailable"
-        case .starting: return "Starting…"
+        case .starting: return model.automaticRecoveryActive ? "Recovering…" : "Starting…"
         case .running: return model.stopRequested ? "Stopping (draining)…" : "Recording"
         case .stopping: return "Stopping (draining)…"
         case .failed: return "Recording failed"

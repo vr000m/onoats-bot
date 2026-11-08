@@ -2071,6 +2071,12 @@ def test_release_check_runs_diarization_contract_hard_fail():
     assert CONTRACT_ENV in script
 
 
+def test_release_check_runs_native_capturer_heartbeat_contract():
+    script = (REPO_ROOT / "scripts/release_check.sh").read_text(encoding="utf-8")
+    assert "native/test_capturer_watchdog.sh" in script
+    assert "native capturer heartbeat contract" in script
+
+
 def _run_contract_with_mlx_blocked(tmp_path: Path, env_value: str | None):
     import os
     import subprocess
@@ -2148,6 +2154,10 @@ def _release_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "native/onoats-menubar").mkdir(parents=True)
+    (repo / "native/test_capturer_watchdog.sh").write_text(
+        "#!/bin/sh\nexit 0\n", encoding="utf-8"
+    )
+    (repo / "native/test_capturer_watchdog.sh").chmod(0o755)
     script = (REPO_ROOT / "scripts/release_check.sh").read_text(encoding="utf-8")
     (repo / "scripts/release_check.sh").write_text(script, encoding="utf-8")
     (repo / "pyproject.toml").write_text(
@@ -2180,6 +2190,9 @@ def _run_release_check(tmp_path: Path, repo: Path, *commit: str):
     fake_uv = bindir / "uv"
     fake_uv.write_text('#!/bin/sh\necho "$@" >> "$UV_LOG"\nexit 0\n', encoding="utf-8")
     fake_uv.chmod(0o755)
+    fake_uname = bindir / "uname"
+    fake_uname.write_text("#!/bin/sh\necho Darwin\n", encoding="utf-8")
+    fake_uname.chmod(0o755)
     env = dict(os.environ)
     env.update(
         PATH=f"{bindir}{os.pathsep}{env.get('PATH', '')}",
@@ -2205,6 +2218,7 @@ def test_release_check_runs_contract_from_clean_checkout_of_commit(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert ran_contract
     assert "ok:   mlx_audio diarization contract" in proc.stdout
+    assert "ok:   native capturer heartbeat contract" in proc.stdout
 
 
 def test_release_check_contract_fails_when_head_is_not_commit(tmp_path):

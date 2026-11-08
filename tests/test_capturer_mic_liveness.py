@@ -1,9 +1,7 @@
-"""Source pins for the capturer's mic liveness/recovery invariants.
+"""Source pins for the capturer's liveness/recovery invariants.
 
-There is no Swift test harness, so — like tests/test_native_contract_parity.py —
-these grep the Swift source for the load-bearing structure. They pin *shape*,
-not runtime behaviour: the stall itself (a CoreAudio ``AudioDeviceStart`` that
-blocks for 60+ s in coreaudiod) cannot be triggered deterministically.
+The heartbeat state space also has a direct Swift harness. These source checks
+pin the load-bearing integration shape that the pure harness cannot see.
 """
 
 from __future__ import annotations
@@ -15,6 +13,9 @@ SOURCES = Path(__file__).resolve().parents[1] / "native" / "onoats-capturer" / "
 MIC = (SOURCES / "MicCapture.swift").read_text()
 RESAMPLER = (SOURCES / "Resampler.swift").read_text()
 SYSTEM = (SOURCES / "SystemCapture.swift").read_text()
+MAIN = (SOURCES / "main.swift").read_text()
+WRITER = (SOURCES / "FrameWriter.swift").read_text()
+WATCHDOG = (SOURCES / "ProcessSuspensionWatchdog.swift").read_text()
 
 
 def _body(src: str, header: str) -> str:
@@ -59,6 +60,65 @@ def test_stale_data_rebind_is_mic_only_and_requires_a_committed_bind():
     hook = MIC[MIC.index("chunker.onStale = ") :].split("chunker.activate()")[0]
     assert "ioProcID != nil" in hook
     assert "guard bound else { return }" in hook
+
+
+def test_system_heartbeat_stall_is_content_independent_and_off_lock():
+    """The system branch may not infer failure from silence or its IOProc.
+    The pacer samples process uptime before locking and dispatches terminal
+    action only after releasing the chunker lock."""
+    assert "static let thresholdNs: UInt64 = 2_000_000_000" in WATCHDOG
+    assert "gap > Self.thresholdNs" in WATCHDOG
+    assert "onHeartbeatStall" in SYSTEM
+
+    pacer = _body(RESAMPLER, "    private func runPacer() {")
+    assert pacer.index("let now = MonotonicClock.nowNanos()") < pacer.index(
+        "lock.lock()"
+    )
+    callback = pacer.index("callback(gap)")
+    assert pacer.rfind("lock.unlock()", 0, callback) != -1
+    assert "samples.contains" not in pacer
+
+    assert "captureHeartbeatStalled" in MAIN
+    assert "hardExitAfterSeconds: 2.0" in MAIN
+    assert MAIN.index("hardExitAfterSeconds: 2.0") < MAIN.index(
+        "try systemCapture.start()"
+    )
+
+    heartbeat = MAIN[MAIN.index("onHeartbeatStall:") : MAIN.index("emit: { pcm, ns in")]
+    assert "logLine(" not in heartbeat
+    trigger = _body(MAIN, "    func trigger(")
+    assert trigger.index("guard terminalAdmission.admit()") < trigger.index(
+        'if logAsError { logLine("ERROR:'
+    )
+
+
+def test_losing_startup_failure_cannot_replace_terminal_owner():
+    """A startup fail racing an admitted terminal event must wait for that
+    owner. It may not call exit with its losing rc or emit a losing ERROR."""
+    fail = MAIN[MAIN.index("func fail(") : MAIN.index("// MARK: - arguments")]
+    assert "if !Teardown.shared.trigger" in fail
+    assert "while true" in fail
+    assert "exit(rc)" not in fail
+    assert "logLine(" not in fail
+
+
+def test_terminal_admission_quiesces_both_branches_before_cleanup():
+    """No branch may emit queued audio while the other branch blocks in Core Audio."""
+    trigger = _body(MAIN, "    func trigger(")
+    mic_quiesce = trigger.index("mic?.quiesce()")
+    system_quiesce = trigger.index("system?.quiesce()")
+    writers_quiesce = trigger.index("for writer in writers { writer.shutdown() }")
+    mic_stop = trigger.index("mic?.stop()")
+    system_stop = trigger.index("system?.stop()")
+    assert max(mic_quiesce, system_quiesce, writers_quiesce) < min(
+        mic_stop, system_stop
+    )
+    assert "quiesce()" in _body(MIC, "    func stop() {")
+    assert "quiesce()" in _body(SYSTEM, "    func stop() {")
+    shutdown = _body(WRITER, "    func shutdown() {")
+    assert "closed = true" in shutdown
+    assert "queue.removeAll()" in shutdown
+    assert "Darwin.shutdown(fd, SHUT_RDWR)" in shutdown
 
 
 def test_mic_starts_before_the_system_tap() -> None:
