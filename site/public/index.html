@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onoats · local-first voice recorder and transcripts</title>
+<meta name="description" content="onoats records your microphone (me) and system audio (them) as separate streams, transcribes both, and writes plain JSONL and Markdown. No database, no cloud account.">
+<meta property="og:title" content="onoats">
+<meta property="og:description" content="Local-first voice recorder and transcript converter. Me and them, on separate streams, as plain files.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://onoats.dev/">
+<meta name="theme-color" content="#17233A">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  :root{
+    --midnight:#17233A; --midnight-2:#1f2f4d; --gold:#E9B44C; --gold-ink:#7a5a12;
+    --cream:#FFF8E8; --ink:#17233A; --muted:#5b6579; --line:#e8dfc9; --paper:#fffdf6;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--cream);color:var(--ink);font:17px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+  a{color:inherit}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 20px}
+  code,pre{font-family:var(--mono)}
+
+  /* header + hero */
+  .hero{background:var(--midnight);color:var(--cream);padding-bottom:72px}
+  nav{display:flex;align-items:center;justify-content:space-between;padding:20px 0}
+  .brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:650;font-size:20px;letter-spacing:-.01em}
+  .brand img{width:34px;height:34px}
+  nav .links{display:flex;gap:22px;font-size:15px}
+  nav .links a{text-decoration:none;opacity:.8}
+  nav .links a:hover{opacity:1;color:var(--gold)}
+  .hero-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:48px;align-items:center;padding-top:40px}
+  .eyebrow{font:600 13px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--gold);margin:0 0 18px}
+  h1{font-size:clamp(34px,5.4vw,56px);line-height:1.06;letter-spacing:-.025em;margin:0 0 20px;font-weight:700}
+  h1 em{font-style:normal;color:var(--gold)}
+  .lede{font-size:19px;opacity:.86;margin:0 0 30px;max-width:34em}
+  .cta{display:flex;flex-wrap:wrap;gap:12px}
+  .btn{display:inline-block;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:600;font-size:16px;border:1.5px solid transparent}
+  .btn.primary{background:var(--gold);color:var(--midnight)}
+  .btn.primary:hover{background:#f1c466}
+  .btn.ghost{border-color:rgba(255,248,232,.35);color:var(--cream)}
+  .btn.ghost:hover{border-color:var(--gold);color:var(--gold)}
+  .shot{border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.45),0 0 0 1px rgba(255,255,255,.08);width:100%;height:auto;display:block}
+
+  section{padding:72px 0}
+  h2{font-size:clamp(26px,3.6vw,36px);line-height:1.15;letter-spacing:-.02em;margin:0 0 14px}
+  .sub{color:var(--muted);max-width:40em;margin:0 0 40px}
+
+  /* channels */
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:24px}
+  .card h3{margin:0 0 6px;font-size:19px}
+  .card p{margin:0;color:var(--muted);font-size:16px}
+  .tag{display:inline-block;font:600 12px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:5px 8px;border-radius:6px;background:var(--midnight);color:var(--gold);margin-bottom:12px}
+
+  /* features */
+  .features{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  .features .card h3{font-size:17px}
+  .features .card p{font-size:15.5px}
+
+  /* flow */
+  .flow{display:grid;grid-template-columns:repeat(4,1fr);gap:0;counter-reset:s;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--paper)}
+  .flow div{padding:22px;border-right:1px solid var(--line);counter-increment:s}
+  .flow div:last-child{border-right:0}
+  .flow div::before{content:counter(s);display:block;font:700 13px/1 var(--mono);color:var(--gold-ink);margin-bottom:10px}
+  .flow b{display:block;margin-bottom:4px}
+  .flow span{color:var(--muted);font-size:15px}
+
+  /* output sample */
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:start}
+  pre{margin:0;background:var(--midnight);color:var(--cream);padding:20px;border-radius:14px;overflow:auto;font-size:13.5px;line-height:1.65}
+  pre .k{color:var(--gold)} pre .d{opacity:.55}
+  .label{font:600 12px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+
+  /* install */
+  .install{background:var(--midnight);color:var(--cream)}
+  .install .sub{color:rgba(255,248,232,.72)}
+  .install pre{background:var(--midnight-2)}
+  .install .label{color:rgba(255,248,232,.6)}
+  .install a{color:var(--gold)}
+  .note{font-size:15px;color:rgba(255,248,232,.7);margin-top:18px}
+
+  .privacy{display:flex;gap:18px;align-items:flex-start}
+  .privacy img{width:64px;height:64px;flex:none}
+
+  footer{padding:36px 0 48px;color:var(--muted);font-size:14.5px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:12px 28px;justify-content:space-between;align-items:center}
+  footer a{color:var(--muted)}
+  footer a:hover{color:var(--ink)}
+
+  @media (max-width:860px){
+    .hero-grid,.two,.split{grid-template-columns:1fr}
+    .features{grid-template-columns:1fr}
+    .flow{grid-template-columns:1fr 1fr}
+    .flow div:nth-child(2){border-right:0}
+    .flow div:nth-child(-n+2){border-bottom:1px solid var(--line)}
+    section{padding:52px 0}
+    nav .links{gap:16px}
+  }
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <nav aria-label="Primary">
+      <a class="brand" href="/"><img src="/img/onoats-mark.svg" alt="" width="34" height="34">onoats</a>
+      <div class="links">
+        <a href="#how">How it works</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/vr000m/onoats-bot">GitHub</a>
+      </div>
+    </nav>
+    <div class="hero-grid">
+      <div>
+        <p class="eyebrow">Always-on Organized Audio Transcript System</p>
+        <h1>Record both sides of the call. <em>Keep the files.</em></h1>
+        <p class="lede">onoats captures your microphone (<b>me</b>) and system audio (<b>them</b>) as separate streams, transcribes each, and writes plain JSONL and Markdown. No database, no account, nothing leaves your machine unless you point it at a hosted STT.</p>
+        <div class="cta">
+          <a class="btn primary" href="#install">Install</a>
+          <a class="btn ghost" href="https://github.com/vr000m/onoats-bot">View on GitHub</a>
+        </div>
+      </div>
+      <img class="shot" src="/img/onoats-1.6.0-2-recording.png" width="760" height="516" alt="The onoats menu-bar panel mid-recording, showing live Me and Them levels, STT ready, and Flush and Stop Recording buttons.">
+    </div>
+  </div>
+</header>
+
+<main>
+<section id="channels">
+  <div class="wrap">
+    <h2>Two channels, never mixed</h2>
+    <p class="sub">Each source has its own socket, its own speech-to-text session and its own tag. Who said what is known from the wiring, not guessed from the audio.</p>
+    <div class="two">
+      <div class="card"><span class="tag">me</span><h3>Your microphone</h3><p>Captured from your input device and transcribed on its own branch.</p></div>
+      <div class="card"><span class="tag">them</span><h3>System audio</h3><p>Everyone else on the call, via a native Core Audio tap on macOS 14.4+. No virtual loopback driver needed.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how" style="padding-top:0">
+  <div class="wrap">
+    <h2>From call to plain files</h2>
+    <p class="sub">The queue is just a directory. Anything that can read a file can consume your transcripts.</p>
+    <div class="flow">
+      <div><b>Capture</b><span>Mic and system audio on separate branches.</span></div>
+      <div><b>Transcribe</b><span>One STT session per branch; local or hosted.</span></div>
+      <div><b>Queue</b><span>Finished sessions move atomically into <code>sessions/pending/</code>.</span></div>
+      <div><b>Convert</b><span><code>onoats convert</code> renders Markdown.</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="output" style="padding-top:0">
+  <div class="wrap">
+    <div class="split">
+      <div>
+        <h2>Boring on purpose</h2>
+        <p class="sub" style="margin-bottom:0">Sessions are JSONL, one utterance per line, tagged <code>me</code> or <code>them</code>. The Markdown is rendered from it. Failures are loud and bounded, and a partial session still lands in the queue instead of vanishing.</p>
+      </div>
+      <div>
+        <p class="label">Session JSONL</p>
+        <pre><span class="d">{</span><span class="k">"type"</span>:"session_meta","run_id":"…"<span class="d">}</span>
+<span class="d">{</span><span class="k">"type"</span>:"utterance","time":…,"text":"Shall we start?","source":"me"<span class="d">}</span>
+<span class="d">{</span><span class="k">"type"</span>:"utterance","time":…,"text":"Yes, go ahead.","source":"them"<span class="d">}</span></pre>
+        <p class="label" style="margin-top:18px">Abridged. Full schema in the queue contract.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features" style="padding-top:0">
+  <div class="wrap">
+    <h2>What you get</h2>
+    <p class="sub">A menu-bar app on Apple Silicon, a CLI everywhere.</p>
+    <div class="features">
+      <div class="card"><h3>Menu-bar app</h3><p>Start, Stop and Flush from the menu bar, with live level meters and STT health.</p></div>
+      <div class="card"><h3>Your choice of STT</h3><p>Local Whisper-MLX on Apple Silicon, or a hosted or local WebSocket server.</p></div>
+      <div class="card"><h3>Speaker diarization</h3><p>Opt-in labels (S1, S2…) on the <em>them</em> channel. Off by default, and a failure never loses a transcript.</p></div>
+      <div class="card"><h3>Fail loud</h3><p>Capture, STT and storage errors exit non-zero and say why. No silent hangs.</p></div>
+      <div class="card"><h3>Local-first</h3><p>Config, queue and transcripts live in your own directories. Process env overrides config files.</p></div>
+      <div class="card"><h3>Cross-platform CLI</h3><p>Linux, Windows and Intel Mac use PortAudio capture; native capture needs macOS 14.4+.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="settings" style="padding-top:0">
+  <div class="wrap">
+    <div class="split">
+      <img class="shot" style="max-width:420px;box-shadow:0 12px 36px rgba(23,35,58,.18),0 0 0 1px var(--line)" src="/img/onoats-1.6.0-3-settings.png" width="834" height="1040" loading="lazy" alt="The onoats settings panel with audio, speech-to-text, storage and privacy options.">
+      <div>
+        <h2>Configure once</h2>
+        <p class="sub">Pick your microphone, STT service, data directory and privacy options in the app, or run <code>onoats init</code>. The app and CLI read the same <code>config.toml</code>, and a running session keeps the settings it started with.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install" class="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="sub">Apple Silicon with macOS 14.4+ gets the full menu-bar app and native system-audio capture.</p>
+    <div class="split">
+      <div>
+        <p class="label">macOS 14.4+ — menu bar + native capture</p>
+        <pre>git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+make -C native setup</pre>
+        <p class="note">Needs the Xcode Command Line Tools and <a href="https://docs.astral.sh/uv/">uv</a>. First run asks for microphone and system-audio permission.</p>
+      </div>
+      <div>
+        <p class="label">Any platform — CLI + PortAudio</p>
+        <pre>uv tool install onoats
+onoats init
+onoats bot</pre>
+        <p class="note">System audio on this path needs a loopback device. See the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md">installation guide</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>onoats · BSD-2-Clause</span>
+    <span>
+      <a href="https://github.com/vr000m/onoats-bot">GitHub</a> ·
+      <a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a> ·
+      <a href="https://pypi.org/project/onoats/">PyPI</a> ·
+      <a href="https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md">Changelog</a>
+    </span>
+  </div>
+</footer>
+
+</body>
+</html>
