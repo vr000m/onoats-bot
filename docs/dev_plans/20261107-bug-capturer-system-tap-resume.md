@@ -289,27 +289,28 @@ Context lifecycle — what each process owns:
 
 ### Test Approach
 
-- [ ] Deterministic native/source contract regression for the watchdog state space.
-- [ ] Focused Python/native contract and supervisor tests.
-- [ ] Native build and full Python validation.
+- [x] Deterministic native/source contract regression for the watchdog state space.
+- [x] Focused Python/native contract and supervisor tests.
+- [x] Native build and full Python validation.
 - [ ] Signed-app STOP/CONT manual verification using the supplied system audio.
 
 ### Test Results
 
-- [ ] Pre-fix regression fails.
-- [ ] Focused tests pass.
-- [ ] Full validation passes.
+- [x] Pre-fix regression fails.
+- [x] Focused tests pass: 308 tests.
+- [x] Full validation passes: native build; Ruff format/check; review-marker
+  check; watchdog harness; 8,139 tests passed and 13 skipped.
 - [ ] Manual verification passes or records a bounded fail-loud restart.
 
 ### Edge Cases Tested
 
-- [ ] No rendered audio / no tap callbacks.
-- [ ] Active callbacks with deliberate digital silence.
-- [ ] Non-zero audio does not affect escalation.
-- [ ] Exact 2 s gap is allowed; a greater gap fails the generation.
+- [x] No rendered audio / no tap callbacks do not enter the decision.
+- [x] Active callbacks with deliberate digital silence do not enter the decision.
+- [x] Non-zero audio does not affect escalation.
+- [x] Exact 2 s gap is allowed; a greater gap fails the generation.
 - [ ] Ordered cleanup completes before the hard deadline.
-- [ ] Ordered cleanup blocks and the hard deadline exits non-zero.
-- [ ] SIGTERM/SIGINT first and watchdog first race orderings.
+- [x] A resistant fault path is cut off by the hard deadline with rc 14.
+- [x] SIGTERM/SIGINT first and watchdog first race orderings.
 
 ## Acceptance Criteria
 
@@ -326,12 +327,12 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ 31ef9cee7a0e70c673a2e61d5f29335e4674cf0c -->
+<!-- reviewed: 2026-11-08 @ 8cb694d582c6939f8d9d825ffdbd90d65baa7877 -->
 
 ## Progress
 
-- [ ] Phase 1: Suspension Watchdog and Deterministic Harness
-- [ ] Phase 2: Fail-Loud Native-to-Supervisor Boundary
+- [x] Phase 1: Suspension Watchdog and Deterministic Harness
+- [x] Phase 2: Fail-Loud Native-to-Supervisor Boundary
 - [ ] Phase 3: Contract Documentation and Live Verification
 
 ## Findings
@@ -343,25 +344,49 @@ Context lifecycle — what each process owns:
   production watchdog existed: `swiftc` could not open
   `Sources/ProcessSuspensionWatchdog.swift`. This proves the new harness does
   not pass against the pre-fix implementation.
+- 2026-11-08: automated verification passed: the watchdog/hard-exit harness,
+  complete native build, Ruff format/check, review-marker check, 308 focused
+  tests, and the 8,139-test full suite (13 skipped).
+- 2026-11-08: deep review found four items: a losing `fail()` could override
+  the admitted terminal owner; a losing heartbeat could log a false ERROR; the
+  shell deadline check used integer seconds; and this evidence section was
+  stale. All four were fixed; the watchdog harness, Ruff, marker check, and 309
+  focused tests passed after remediation.
 
 ## Issues & Solutions
 
-- (append as implementation proceeds)
+- `Teardown.trigger` now returns its admission result. Fault-specific logging
+  occurs only after admission, and a losing startup `fail()` waits for the
+  owner instead of calling `exit` with a competing rc.
+- The hard-exit child test now uses Python's monotonic sub-second clock and an
+  actual 2.0 s subprocess timeout instead of Bash's integer `SECONDS` value.
+- The restricted sandbox could compile the capturer but not execute Xcode's
+  SwiftUI macro plugin. The complete native build passed with compiler access
+  outside that sandbox.
 
 ## Final Results
 
 ### Summary
 
-- (fill when complete)
+- The current generation now fails with rc 14 after a system-pacer heartbeat
+  gap greater than 2 s. The supervisor remains the only restart owner.
+- Automated implementation and contract verification are complete. Signed-app
+  STOP/CONT and residue verification remain before this plan can be completed.
 
 ### Outcomes
 
-- (fill when complete)
+- Audio content and callback silence remain non-terminal.
+- The first terminal event keeps its rc and logging authority.
+- A heartbeat fault arms a separate 2 s process boundary before ordered cleanup.
 
 ### Learnings
 
-- (fill when complete)
+- A terminal admission gate must own the exit code and its diagnostic log;
+  guarding cleanup alone is insufficient.
+- Deadline regressions need a sub-second monotonic clock, not Bash `SECONDS`.
 
 ### Follow-up Work
 
-- (fill when complete)
+- Run the signed app against video `wykPErJ8M-8` from `00:30`, reproduce the
+  four-second STOP/CONT, verify rc 14 within the bound, prove no native residue,
+  and confirm a fresh Start captures `them` again.
