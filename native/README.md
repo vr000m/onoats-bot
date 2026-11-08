@@ -246,7 +246,8 @@ internals behind that surface:
   itself: if `open` fails or times out before the app's pid is captured, a process
   found afterwards is never signalled, because a login item or the user could have
   launched it. It is asked to quit (AppleScript, addressed by the exact installed
-  app path) only when no recorder is provably live: a pid record, a held
+  app path) only when no recorder is provably live, under a lock held until the app
+  is gone so a Start racing the quit is refused: a pid record, a held
   single-instance lock, or an unreadable lock leaf all keep it running, and it is
   reported with its pid so you can quit it by hand. The CLI shim target is read through a
   bounded, non-blocking regular-file read, so a target replaced by a FIFO fails
@@ -299,7 +300,9 @@ records an incomplete baseline, use `ONOATS_INSTALL_ROLLBACK_APPROVED=0` and do
 not invoke rollback for that run.
 
 Publication is one transaction (`_replace_verified`, with its contract table in
-the docstring). The new bundle is swapped in atomically and verified; any
+the docstring). `install` and `rollback` each hold an exclusive lock on the install
+directory for the whole transaction, so a second one started meanwhile fails with
+"already running" instead of interleaving. The new bundle is swapped in atomically and verified; any
 failure, including an interrupt, swaps the previous app back. Every installer
 child process (`make`, `codesign`, `ditto`, `git`, `lsregister`) runs in its own
 process group under a 300 s deadline; a timeout or interrupt kills that whole

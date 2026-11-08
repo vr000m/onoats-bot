@@ -340,9 +340,18 @@ which would hand the abandoned task more turns — and the process hard-exits.
   checks before TERM/KILL. A process found after a failed or timed-out `open`
   was not captured and is never signalled; `_quit_unproven_app` may only ask it
   to quit by exact app path (AppleScript, path as argv data), and only when
-  `_recorder_idle` proves no recorder is live (no pid record, shared `flock` on
-  `onoats.lock` succeeds, lock leaf is a regular file). Any unprovable answer
-  leaves it running and reports it.
+  `_recorder_idle_lease` proves no recorder is live: a shared `flock` on
+  `onoats.lock` (regular leaf, no pid record) that is HELD until the app is gone,
+  not probed and released, so a Start racing the quit is refused by the
+  single-instance gate instead of being stopped. Any unprovable answer leaves the
+  app running and reports it.
+- **One installer transaction at a time.** `install_staged._installer_lock` takes
+  an exclusive non-blocking `flock` on the install directory itself (no lock file,
+  `O_CLOEXEC`) for the whole of `install` and `rollback`, cleanup included. Without
+  it, two runs could interleave: one sees the other's committed app, reads that as
+  a failed verification and swaps the old bundle back over a reported success. A
+  second run fails at once with "already running". Pinned by
+  `tests/test_release_meta.py`.
 - **Rollback approval is one immutable read.** `approved-rollback.txt` is read
   through one bounded, no-follow, owner/mode-checked regular-file descriptor;
   the bytes, descriptor metadata, and final pathname identity must agree before

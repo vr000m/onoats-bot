@@ -52,8 +52,11 @@ Annotated tags exist from `v0.9.0` forward.
 - The installed recording smoke no longer signals an Onoats process it did not
   capture itself. After a failed or timed-out `open`, a process it cannot prove it
   launched is asked to quit (AppleScript, by exact app path, never a signal) only
-  when no recorder is provably live in the data directory. Otherwise it reports the
-  pid and asks you to quit the app by hand.
+  when no recorder is provably live in the data directory, under a lock held until
+  the app is gone. Otherwise it reports the pid and asks you to quit the app by hand.
+- `install-staged` and `rollback` hold an exclusive lock on the install directory
+  for the whole transaction, so two runs at once can no longer undo a reported
+  install; the second fails with "already running".
 
 ### Changed
 

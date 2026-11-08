@@ -1421,9 +1421,13 @@ and process boundary. Each was fixed at the contract level:
 - The installed smoke signals only identities it captured itself. A process found
   after a failed or timed-out `open` is never signalled (decided with the owner,
   2026-11-07): it is asked to quit by exact app path through AppleScript only when
-  `_recorder_idle` proves no recorder is live (no pid record, shared `flock` on
-  `onoats.lock` succeeds, regular lock leaf); otherwise it is reported and left
-  running.
+  `_recorder_idle_lease` proves no recorder is live (shared `flock` on
+  `onoats.lock`, regular leaf, no pid record) and holds that lease until the app is
+  gone, so a Start racing the quit is refused rather than stopped; otherwise it is
+  reported and left running.
+- `install` and `rollback` run under one exclusive non-blocking `flock` on the
+  install directory (`_installer_lock`), cleanup included, so two concurrent runs
+  cannot undo a reported success (found by the round-9 confirming review).
 - `run_bounded` leaves a helper that detached and outlived a normally exited
   leader alone (accepted 2026-11-07; recorded as a dismissed finding in
   AGENTS.md).
