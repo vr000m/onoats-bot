@@ -697,7 +697,17 @@ sequenceDiagram
   watches), every `app sign` changes the bytes so a later `make install` voids the
   receipt, and a leftover LaunchServices registration of the staged app can fail
   `install-staged` once.
-- The Manual Native Smoke Matrix (interaction, visual, VoiceOver) is not yet run.
+- Manual Native Smoke Matrix, partial. Me and Them meters respond while speaking and
+  while YouTube plays. **Failed (existing capturer behaviour, not this branch):** after
+  `kill -STOP` then `kill -CONT` on the capturer for 4 s, telemetry staleness and
+  recovery are correct (Them observation age rose to about 4.5 s, back to 0.5 s; STT
+  stayed `ready`; Me kept transcribing), but Them audio from the system tap did not
+  resume, and the next recorder start was also silent until a later restart of the
+  recording. The branch changes nothing under `native/onoats-capturer/`, and a frozen
+  capturer is an artificial fault; no real-world trigger was tested. Not run: the
+  recorder pause (`kill -STOP` on the recorder), the panel's `No signal` rendering,
+  and the interaction, accessibility and visual bullets. The matrix wording is above
+  the review marker and is unchanged; narrowing it needs `/review-plan`.
 
 - 2026-11-05 — Round 8 makes force exit a complete process contract. Lifecycle
   continuation and terminal rotations, accepted control handlers, direct
