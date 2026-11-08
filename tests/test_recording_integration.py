@@ -776,9 +776,10 @@ def test_recording_identity_timeout_recovers_verified_cleanup_targets(
     assert cleaned[0]["groups"] == groups
 
 
+@pytest.mark.parametrize("recorder_live", [False, True])
 @pytest.mark.parametrize("failure", ["open-timeout", "open-interrupt", "launch-wait"])
-def test_installed_smoke_reports_but_never_signals_an_app_it_did_not_capture(
-    tmp_path, monkeypatch, capsys, failure
+def test_installed_smoke_never_signals_an_app_it_did_not_capture_and_quits_it_only_when_idle(
+    tmp_path, monkeypatch, capsys, failure, recorder_live
 ):
     """``open`` timed out before a pid was captured: a process found afterwards is unproven."""
     app = tmp_path / "Onoats.app"
@@ -787,6 +788,8 @@ def test_installed_smoke_reports_but_never_signals_an_app_it_did_not_capture(
     executable.write_bytes(b"fixture")
     data_dir = tmp_path / "data"
     (data_dir / ".active").mkdir(parents=True)
+    if recorder_live:
+        (data_dir / ".active" / SMOKE.PID_FILENAME).write_text("1\n", encoding="utf-8")
     _stub_release_identity(monkeypatch)
     monkeypatch.setattr(SMOKE, "_verify_signed_app", lambda _app: None)
     launched = {"live": False}
@@ -814,6 +817,14 @@ def test_installed_smoke_reports_but_never_signals_an_app_it_did_not_capture(
     monkeypatch.setattr(
         SMOKE, "_cleanup_after_failure", lambda *_args, **kwargs: cleaned.append(kwargs)
     )
+    quits: list[Path] = []
+
+    def ask_to_quit(path):
+        quits.append(path)
+        launched["live"] = False
+        return True
+
+    monkeypatch.setattr(SMOKE, "_ask_app_to_quit", ask_to_quit)
 
     def wait(stage, _timeout, _probe):
         raise SMOKE.SmokeFailure(f"{stage} timed out")
@@ -848,7 +859,112 @@ def test_installed_smoke_reports_but_never_signals_an_app_it_did_not_capture(
         "an uncaptured process must not be signalled"
     )
     err = capsys.readouterr().err
-    assert "pid 1234" in err and "NOT signalled" in err
+    if recorder_live:
+        # A pid record may be a real recording: a quit could drain and stop it.
+        assert quits == []
+        assert "pid 1234" in err and "NOT signalled" in err
+        assert "a recorder may be live" in err
+    else:
+        # No recorder is provably live (no pid record, no lock), so the app was
+        # asked to quit - by path, never by signal - and the run reports it gone.
+        assert quits == [app.resolve()]
+        assert "it is gone" in err and "NOT signalled" not in err
+
+
+def test_recorder_idle_is_true_only_when_provably_no_recorder(tmp_path):
+    import fcntl
+    import os
+
+    active = tmp_path / ".active"
+    # No directory, or no lock leaf: the recorder never ran here.
+    assert SMOKE._recorder_idle(active) is True
+    active.mkdir()
+    assert SMOKE._recorder_idle(active) is True
+    # An unlocked lock leaf: a previous recorder exited.
+    lock = active / SMOKE.LOCK_FILENAME
+    lock.write_text("")
+    assert SMOKE._recorder_idle(active) is True
+    # A held exclusive lock is a live recorder.
+    holder = os.open(lock, os.O_RDWR)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert SMOKE._recorder_idle(active) is False
+    finally:
+        os.close(holder)
+    assert SMOKE._recorder_idle(active) is True
+    # Any pid record means unprovable, even an unlocked lock.
+    pid_record = active / SMOKE.PID_FILENAME
+    pid_record.write_text("1\n")
+    assert SMOKE._recorder_idle(active) is False
+    pid_record.unlink()
+    # A symlink or FIFO in the lock leaf is never a safe "idle" answer.
+    lock.unlink()
+    lock.symlink_to(tmp_path / "elsewhere")
+    assert SMOKE._recorder_idle(active) is False
+    lock.unlink()
+    os.mkfifo(lock)
+    assert SMOKE._recorder_idle(active) is False
+
+
+@pytest.mark.parametrize(
+    ("idle", "pid_now", "asked_ok", "gone_after", "expected"),
+    [
+        (True, 77, True, True, None),
+        (False, 77, True, True, "a recorder may be live in the data directory"),
+        (True, 99, True, True, "the process no longer matches the installed app"),
+        (True, 77, False, True, "the quit request failed"),
+        (True, 77, True, False, "it did not quit in time"),
+    ],
+)
+def test_quit_unproven_app_guards_each_precondition(
+    tmp_path, monkeypatch, idle, pid_now, asked_ok, gone_after, expected
+):
+    app = tmp_path / "Onoats.app"
+    state = {"pid": pid_now}
+    asked: list[Path] = []
+    monkeypatch.setattr(SMOKE, "_recorder_idle", lambda _active: idle)
+    monkeypatch.setattr(SMOKE, "_one_app_pid", lambda _app: state["pid"])
+
+    def ask(path):
+        asked.append(path)
+        if gone_after:
+            state["pid"] = None
+        return asked_ok
+
+    monkeypatch.setattr(SMOKE, "_ask_app_to_quit", ask)
+    monkeypatch.setattr(SMOKE.time, "sleep", lambda _s: None)
+    result = SMOKE._quit_unproven_app(app, 77, active_dir=tmp_path, timeout=0.05)
+    assert result == expected
+    # The quit request is only ever sent once every guard has passed.
+    assert bool(asked) is (
+        expected in (None, "the quit request failed", "it did not quit in time")
+    )
+
+
+def test_ask_app_to_quit_passes_the_path_as_data_and_never_signals(
+    tmp_path, monkeypatch
+):
+    app = tmp_path / 'My "App".app'
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(SMOKE.subprocess, "run", fake_run)
+    assert SMOKE._ask_app_to_quit(app) is True
+    argv = seen["argv"]
+    assert argv[0] == "/usr/bin/osascript"
+    # The path is argv data, never interpolated into the AppleScript text.
+    assert argv[-1] == str(app)
+    assert all(str(app) not in part for part in argv[:-1])
+    assert seen["kwargs"]["timeout"] == 10
+
+    def failing(*_args, **_kwargs):
+        raise SMOKE.subprocess.CalledProcessError(1, "osascript")
+
+    monkeypatch.setattr(SMOKE.subprocess, "run", failing)
+    assert SMOKE._ask_app_to_quit(app) is False
 
 
 @pytest.mark.parametrize("failure_site", ["group-capture", "recorder-discovery"])
@@ -1997,6 +2113,9 @@ def test_native_smoke_recorder_authority_literals_match_their_python_owners():
     assert SMOKE.PID_FILENAME == pid.PID_FILENAME == cli.PID_FILENAME
     assert SMOKE.PID_MARKER == pid.PID_MARKER
     assert SMOKE.ACTIVE_DIRNAME == status._ACTIVE_DIR
+    from onoats import runtime
+
+    assert SMOKE.LOCK_FILENAME == runtime.LOCK_FILENAME
     assert status.status_path(Path("/d")) == (
         Path("/d") / SMOKE.ACTIVE_DIRNAME / SMOKE.STATUS_FILENAME
     )
@@ -2007,6 +2126,7 @@ def test_native_smoke_recorder_authority_literals_match_their_python_owners():
         status.STATUS_FILENAME,
         pid.PID_FILENAME,
         pid.PID_MARKER,
+        runtime.LOCK_FILENAME,
     ):
         assert source.count(f'"{literal}"') == 1, literal
     assert '".active' not in source.replace('ACTIVE_DIRNAME = ".active"', "")

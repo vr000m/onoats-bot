@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import fcntl
 import importlib.util
 import json
 import math
@@ -58,11 +59,13 @@ _TRANSCRIPT_RUN_ID_RE = re.compile(_TELEMETRY_CONTRACT.TRANSCRIPT_RUN_ID_PATTERN
 # Recorder-authority file names and PID marker. The smoke stays free of
 # ``onoats`` imports (it inspects an installed app from outside), so these are
 # local copies pinned to their Python owners (``onoats.status.STATUS_FILENAME``,
-# ``onoats._vendor.pid.PID_FILENAME`` / ``PID_MARKER``) by
+# ``onoats._vendor.pid.PID_FILENAME`` / ``PID_MARKER``, and
+# ``onoats.runtime.LOCK_FILENAME``) by
 # ``tests/test_recording_integration.py``; change them together.
 ACTIVE_DIRNAME = ".active"
 STATUS_FILENAME = "onoats.status.json"
 PID_FILENAME = "onoats.pid"
+LOCK_FILENAME = "onoats.lock"
 PID_MARKER = "onoats-bot"
 
 
@@ -1095,6 +1098,84 @@ def _verify_signed_app(app: Path) -> None:
     )
 
 
+def _recorder_idle(active_dir: Path) -> bool:
+    """True only when provably no recorder holds this data directory.
+
+    Unprovable is False: a pid record, a lock that is held, or a lock leaf that
+    is not a plain regular file all keep the answer "not idle". A missing lock
+    leaf is the only "never ran" answer. The probe is a non-blocking shared
+    ``flock`` (a live recorder holds the exclusive lock for its whole life) and
+    is released at once.
+    """
+    if os.path.lexists(active_dir / PID_FILENAME):
+        return False
+    try:
+        fd = os.open(
+            active_dir / LOCK_FILENAME,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _ask_app_to_quit(app: Path) -> bool:
+    """Ask the app at exactly ``app`` to quit. No signal is ever sent."""
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                "tell application (item 1 of argv) to quit",
+                "-e",
+                "end run",
+                str(app),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _quit_unproven_app(
+    app: Path, pid: int, *, active_dir: Path, timeout: float = 10.0
+) -> str | None:
+    """Politely quit an app this run could not prove it launched, if it is safe.
+
+    Returns None when the app was asked to quit and is gone; otherwise the
+    reason it was left running. Safe means: the executable path is exactly this
+    smoke's installed app (re-read just now) and no recorder is provably live,
+    so a quit cannot drain and stop somebody's real recording.
+    """
+    if not _recorder_idle(active_dir):
+        return "a recorder may be live in the data directory"
+    if _one_app_pid(app) != pid:
+        return "the process no longer matches the installed app"
+    if not _ask_app_to_quit(app):
+        return "the quit request failed"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _one_app_pid(app) is None:
+            return None
+        time.sleep(0.2)
+    return "it did not quit in time"
+
+
 def run(args: argparse.Namespace) -> None:
     _validate_timeout_arguments(args)
     if not math.isfinite(args.me_floor) or not 0.0 <= args.me_floor <= 1.0:
@@ -1293,13 +1374,29 @@ def run(args: argparse.Namespace) -> None:
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
         if unproven_app_pid is not None:
-            cleanup_errors.append(
-                SmokeFailure(
-                    f"an Onoats process (pid {unproven_app_pid}) is running that "
-                    "this smoke run could not prove it launched; it was NOT "
-                    "signalled. Quit it manually before re-running the smoke"
+            try:
+                left_running = _quit_unproven_app(
+                    app, unproven_app_pid, active_dir=pid_path.parent
                 )
-            )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                left_running = "the quit attempt raised"
+            if left_running is None:
+                print(
+                    f"installed recording smoke: asked the Onoats app (pid "
+                    f"{unproven_app_pid}) that this run could not prove it "
+                    "launched to quit; it is gone",
+                    file=sys.stderr,
+                )
+            else:
+                cleanup_errors.append(
+                    SmokeFailure(
+                        f"an Onoats process (pid {unproven_app_pid}) is running "
+                        "that this smoke run could not prove it launched; it was "
+                        f"NOT signalled and was left running ({left_running}). "
+                        "Quit it manually before re-running the smoke"
+                    )
+                )
         if cleanup_errors:
             print(
                 "installed recording smoke cleanup failed: "
