@@ -1,6 +1,6 @@
 # Task: Recover or Fail Loud When the System Tap Stalls After Process Resume
 
-**Status**: In Progress
+**Status**: Complete
 **Component**: macos, transport, recorder
 **Assigned to**: Codex
 **Priority**: High
@@ -304,7 +304,7 @@ Context lifecycle — what each process owns:
 - [x] Native build and full Python validation.
 - [x] Embedded signed-capturer STOP/CONT verification using the supplied system
   audio under the production CLI supervisor.
-- [ ] App-owned menu-bar Start/Stop smoke on the same signed bundle.
+- [x] App-owned menu-bar Start/Stop smoke on the same signed bundle.
 
 ### Test Results
 
@@ -315,7 +315,7 @@ Context lifecycle — what each process owns:
   13 skipped.
 - [x] Live embedded signed-capturer verification records a bounded fail-loud
   restart, clean residue checks, and fresh-generation `them` recovery.
-- [ ] App-owned signed-app smoke passes.
+- [x] App-owned signed-app smoke passes.
 
 ### Edge Cases Tested
 
@@ -345,13 +345,13 @@ Context lifecycle — what each process owns:
 - Documentation, the plan, and PR description reflect the final failure and
   recovery semantics.
 
-<!-- reviewed: 2026-11-08 @ 628951f153fc92173f519c42b7d8b2ae41b3db3a -->
+<!-- reviewed: 2026-11-08 @ 0050e4607ad42e5333cdbac4a603cedc9070d31e -->
 
 ## Progress
 
 - [x] Phase 1: Suspension Watchdog and Deterministic Harness
 - [x] Phase 2: Fail-Loud Native-to-Supervisor Boundary
-- [ ] Phase 3: Contract Documentation and Live Verification
+- [x] Phase 3: Contract Documentation and Live Verification
 
 ## Findings
 
@@ -392,6 +392,14 @@ Context lifecycle — what each process owns:
   production CLI supervisor, not an app-owned menu-bar Start. The accessibility
   bridge could launch the signed app but could not reliably address its
   `MenuBarExtra`; the app-owned smoke therefore remains explicitly open.
+- 2026-11-08: the human-driven app-owned smoke then passed using the installed
+  signed bundle and the supplied YouTube system audio. A four-second STOP/CONT
+  produced a 4,037 ms system-pacer heartbeat error; the production supervisor
+  observed rc 14, rotated the partial session, and the menu bar displayed
+  `capture-heartbeat-stalled`. An immediate `onoats status` read briefly saw the
+  recorder's generic `fatal_error_frame` during ordered drain; after the
+  supervisor's authoritative final stamp, both the UI and CLI reported
+  `capture-heartbeat-stalled` with supervisor rc 1.
 
 ## Issues & Solutions
 
@@ -415,7 +423,8 @@ Context lifecycle — what each process owns:
   gap greater than 2 s. The supervisor remains the only restart owner.
 - Automated implementation and contract verification are complete. Live
   signed-capturer STOP/CONT, residue cleanup, and fresh-generation recovery are
-  also verified; only the app-owned menu-bar smoke remains before completion.
+  verified through both the production CLI supervisor and an app-owned menu-bar
+  Start.
 
 ### Outcomes
 
@@ -433,7 +442,5 @@ Context lifecycle — what each process owns:
 
 ### Follow-up Work
 
-- Repeat the now-passing signed-capturer scenario from an app-owned menu-bar
-  Start when the macOS accessibility bridge can address the `MenuBarExtra`.
 - Verify a real host sleep/wake separately; the uptime clock excludes sleep,
   but this work does not claim the Core Audio tap itself survives that event.
