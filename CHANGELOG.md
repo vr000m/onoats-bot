@@ -31,8 +31,10 @@ Annotated tags exist from `v0.9.0` forward.
 - **Landing-site release safety.** CI and `just check` now verify generated
   prompts, copied assets, shared page chrome, versioned immutable images and
   security headers. Deployment uses an integrity-locked local Wrangler after
-  a credential-free npm install, and the daily digest prompt labels transcript
-  content as untrusted data.
+  a credential-free npm install. Every example prompt that embeds transcript
+  text, or text derived from it, labels that text as untrusted data and fences
+  it. The site's screenshots and social card are quantized with `pngquant`
+  (about 2.1 MB down to 290 KB), and the card is rendered at a fixed 1200x630.
 
 ## [1.6.0] - 2026-11-08
 
