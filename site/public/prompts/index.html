@@ -46,7 +46,7 @@
         <li>
           <h2 class="st">Split a long call by topic</h2>
           <p>Cuts a session into coherent segments with start and end times. It leans towards fewer, larger segments, and does not split on speaker changes or short silences.</p>
-          <p class="meta"><a href="/prompts/segment.txt">segment.txt</a> takes <code>{buffer_jsonl}</code>, the session JSONL from the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md">queue</a>.</p>
+          <p class="meta"><a href="/prompts/segment.txt">segment.txt</a> takes <code>{buffer_jsonl}</code>: one JSON object per line, each an <code>utterance</code> or a <code>silence_gap</code>, with <code>Me:</code> or <code>Them:</code> at the start of each utterance's text. A session file from the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md">queue</a> is not that shape as it stands: drop its first <code>session_meta</code> line and turn each utterance's <code>source</code> into that prefix.</p>
           <!-- prompt:segment.txt -->
           <details>
             <summary>Read the prompt <span class="vh">segment.txt</span></summary>
