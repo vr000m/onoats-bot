@@ -142,7 +142,11 @@ registry dep, not a git pin).
 - **Fail-loud is the contract.** Every failure path (missing/unspawnable capturer,
   sockets that never appear, capturer death mid-session, STT preflight) yields a
   non-zero exit + a WARNING/ERROR log, and a partial session still rotates into
-  `pending/` — never a hang.
+  `pending/` — never a hang. The same holds for transcript writes: a flush whose
+  buffered entries did not all reach disk (`TranscriptBuffer.unpersisted_on_last_flush`
+  > 0, or no session file ever created) makes `flush_and_rotate` return `False` and
+  log the lost count at ERROR. A partial file is still queued; it is never reported
+  as a clean flush (`tests/test_flush_write_failure.py`).
 - **A native heartbeat stall invalidates the whole generation.** The system
   branch's 20 ms pacer samples `mach_absolute_time`; a wake gap strictly greater
   than 2 s stops that pacer and admits `capture-heartbeat-stalled` (rc 14).

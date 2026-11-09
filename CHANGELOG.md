@@ -39,6 +39,18 @@ Annotated tags exist from `v0.9.0` forward.
   each such placeholder separately; `build_prompts.py --check` enforces it. The site's screenshots and social card are quantized with `pngquant`
   (about 2.1 MB down to 290 KB), and the card is rendered at a fixed 1200x630.
 
+### Fixed
+
+- **A flush no longer reports success when buffered transcript never reached
+  disk.** If no session file could be created (unwritable data directory),
+  `flush_and_rotate` logged "buffer was empty" and returned success while the
+  in-memory utterances were discarded. It now logs the number of lost entries at
+  ERROR and returns failure. If some entries failed to write, the partial file is
+  still queued, but the flush is reported as failed with the count. A read-only
+  `.active/` (path assigned, file never created) is reported the same way
+  instead of as a session file that "vanished". The terminal-flush failure log no
+  longer claims the session file was preserved in `.active/`.
+
 ## [1.6.0] - 2026-11-08
 
 ### Added
