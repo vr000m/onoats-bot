@@ -215,6 +215,7 @@ sequenceDiagram
 - The focused mutation suite passes with 9 tests covering the site checker, prompt boundaries, caller wiring, the npm environment boundary, and local Wrangler ownership.
 - The signed-off site operations pass: `just check`, locked dependency installation, Wrangler dry run, and the social-card renderer's exact `--check` mode.
 - The full Python suite passes outside the restricted sandbox: 8,162 passed and 4 skipped.
+- Review rounds widened `check_site.py` past the Phase 1 file list and the Site invariants seam above: it also owns `site/public/.assetsignore`, the social card named by `og:image` (exactly one of each social tag), `aria-current` placement, and every committed `_headers` security header including the CSP. `build_prompts.py` binds each marker pair to its prompt's meta paragraph. `just deploy` exports the Cloudflare values with the shell builtin, so the token is on no argv. The values live in the two scripts' docstrings.
 
 ## Issues & Solutions
 
