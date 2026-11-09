@@ -13,6 +13,7 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 PAGE_PATHS = (
     Path("site/public/index.html"),
     Path("site/public/prompts/index.html"),
+    Path("site/public/local-models/index.html"),
     Path("site/public/404.html"),
 )
 ASSET_COPIES = {

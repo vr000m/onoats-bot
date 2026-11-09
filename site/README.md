@@ -40,6 +40,11 @@ their declared sources under `../assets/brand` and `../assets/screenshots`.
 `just check` verifies them. Copy a new release snapshot under a new versioned
 name instead of replacing a cached file.
 
+The `service-toolbar-*-0.9.0.png` screenshots on `/local-models/` are copies from
+`docs/images/` in `vr000m/pipecat-local-tts-server`; the number is that
+project's version when they were copied, and `check_site.py` cannot compare them
+with a source in this repository.
+
 `scripts/render_social_card.swift` is the source owner for the 1200x630 social
 preview. It reads `../assets/brand/onoats-mark.svg` and writes the versioned PNG.
 Run these commands from `site/` after changing its copy or design:

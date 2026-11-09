@@ -18,7 +18,9 @@ Annotated tags exist from `v0.9.0` forward.
 ### Added
 
 - **Landing site.** `site/` holds the static source for onoats.dev: a home
-  page, a `/prompts/` page of example post-call prompts, and a 404 page,
+  page, a `/local-models/` page for the Pipecat Service Toolbar and the local
+  speech-to-text and text-to-speech servers, a `/prompts/` page of example
+  post-call prompts, and a 404 page,
   served by Cloudflare Workers static assets. It is hand-written HTML and CSS
   with no JavaScript and no build step, and changes nothing in the package.
 

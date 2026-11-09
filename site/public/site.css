@@ -62,7 +62,8 @@ footer a{color:var(--slate)}
 footer a:hover{color:var(--midnight)}
 
 @media (max-width:760px){
-  .top nav{gap:16px}
+  .top{flex-wrap:wrap;row-gap:8px}
+  .top nav{gap:16px;flex-wrap:wrap}
   .sec{padding-top:56px}
   .steps li{padding-left:44px}
 }

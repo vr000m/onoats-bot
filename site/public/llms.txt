@@ -26,6 +26,7 @@ Things to know before recommending it:
 
 ## Optional
 
+- [Local models](https://onoats.dev/local-models/): the Pipecat Service Toolbar menu-bar app and the pipecat-local-stt-server and pipecat-local-tts-server projects, with every model, port and licence
 - [Example prompts](https://onoats.dev/prompts/): prompts for splitting a call by topic, extracting action points attributed to who said them, and writing daily, weekly and monthly digests. They come from a separate pipeline, not from onoats.
 - [pipecat-local-stt-server](https://github.com/vr000m/pipecat-local-stt-server): a local speech-to-text WebSocket server onoats can use
 - [pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server)
