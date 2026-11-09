@@ -179,7 +179,9 @@ else {
 /// skips images over roughly 300 KB). Quantizing with pngquant brings it to
 /// about 40 KB with no visible change. `--check` compares this quantized output,
 /// so it needs the same pngquant major version as the committed file: `brew install pngquant`.
-func quantized(_ data: Data) -> Data {
+/// Returns nil on failure rather than exiting: `exit` skips `defer`, which would
+/// leave the scratch directory behind.
+func quantized(_ data: Data) -> Data? {
     let scratch = FileManager.default.temporaryDirectory
         .appendingPathComponent("onoats-social-\(UUID().uuidString)")
     let source = scratch.appendingPathComponent("in.png")
@@ -195,16 +197,16 @@ func quantized(_ data: Data) -> Data {
         process.waitUntilExit()
         guard process.terminationStatus == 0, let out = try? Data(contentsOf: result) else {
             fputs("pngquant failed (exit \(process.terminationStatus)); install it with: brew install pngquant\n", stderr)
-            exit(1)
+            return nil
         }
         return out
     } catch {
         fputs("could not run pngquant: \(error)\n", stderr)
-        exit(1)
+        return nil
     }
 }
 
-let png = quantized(fullColor)
+guard let png = quantized(fullColor) else { exit(1) }
 
 if checking {
     guard let current = try? Data(contentsOf: outputURL), current == png else {

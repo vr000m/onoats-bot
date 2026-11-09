@@ -6,6 +6,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import zlib
 from pathlib import Path
 
@@ -638,3 +639,41 @@ def test_wrangler_consumers_use_locked_local_binary() -> None:
     assert "deploy: check deps" in justfile
     assert "npx" not in justfile
     assert re.search(r'"wrangler": "\d+\.\d+\.\d+"', package), "pin Wrangler exactly"
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("swift") is None,
+    reason="the social-card renderer needs macOS AppKit and swift",
+)
+def test_social_card_renderer_removes_its_scratch_dir_when_pngquant_fails(
+    tmp_path: Path,
+) -> None:
+    # FileManager.temporaryDirectory is the per-user Darwin temp dir, not $TMPDIR.
+    temp_dir = Path(
+        subprocess.run(
+            ["getconf", "DARWIN_USER_TEMP_DIR"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_pngquant = fake_bin / "pngquant"
+    fake_pngquant.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    fake_pngquant.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+    before = set(temp_dir.glob("onoats-social-*"))
+    result = subprocess.run(
+        ["swift", "scripts/render_social_card.swift", "--check"],
+        cwd=ROOT / "site",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "pngquant failed (exit 3)" in result.stderr
+    assert set(temp_dir.glob("onoats-social-*")) == before
