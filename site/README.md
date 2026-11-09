@@ -10,13 +10,14 @@ site has no runtime build step or JavaScript.
   deny-by-default environment that passes only the process settings npm needs.
 - Commands (run from `site/`):
   `just dev` (plain static preview), `just preview` (`wrangler dev`, serves
-  `_headers` and the 404 page like Cloudflare), `just prompts` / `just check`
-  (regenerate / verify the prompts page), `just dry-run` (validate the Worker
-  config without publishing), `just deploy` (publish; reads
-  `~/.secrets/cf.env` unless `CLOUDFLARE_API_TOKEN` is already set).
+  `_headers` and the 404 page like Cloudflare), `just prompts` (regenerate the
+  prompts page), `just check` (run `build_prompts.py --check` and
+  `check_site.py`), `just dry-run` (validate the Worker config without
+  publishing), `just deploy` (publish; reads `~/.secrets/cf.env` unless
+  `CLOUDFLARE_API_TOKEN` is already set).
 - Wrangler uploads every file under `public/` except those listed in
-  `public/.assetsignore`, which holds exactly `.*` so local dotfiles such as
-  `.DS_Store` are never published; `check_site.py` keeps it that way.
+  `public/.assetsignore`, which keeps local dotfiles such as `.DS_Store` off the
+  site.
 - The token needs Workers Scripts edit, plus Workers Routes and DNS edit on the
   `onoats.dev` zone for the custom domain.
 
@@ -35,9 +36,17 @@ on its own line between `--- BEGIN UNTRUSTED <LABEL> ---` and
 paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 `UNTRUSTED_FIELDS` in the script, and the page must list it.
 
-`site.css` holds everything shared by the pages. `scripts/check_site.py` finds
-every `*.html` file under `public/` and ensures its navigation and footer match
-the home page's, apart from an `aria-current="page"` state.
+`site.css` holds everything shared by the pages.
+
+## Site checks
+
+`scripts/check_site.py` owns every site contract the prompts script does not:
+shared navigation and footer on every `*.html` page (with `aria-current="page"`
+only on the link to the page itself), the copied assets, versioned image names
+and `/img/` references, the social card named by `og:image`, the
+`public/.assetsignore` rule, and the `_headers` rules (security headers and the
+Content-Security-Policy in `/*`, immutable caching only in `/img/*`). The exact
+values live in its module docstring and constants, not here.
 
 ## Images
 

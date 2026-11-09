@@ -196,6 +196,134 @@ def test_social_card_url_is_the_site_image(tmp_path: Path, case: str) -> None:
         assert errors == []
 
 
+OG_IMAGE = f'<meta property="og:image" content="{SOCIAL}">\n'
+TWITTER_IMAGE = f'<meta name="twitter:image" content="{SOCIAL}">\n'
+OG_WIDTH = '<meta property="og:image:width" content="1200">\n'
+OG_HEIGHT = '<meta property="og:image:height" content="630">\n'
+STALE = SOCIAL.replace("1.6.0", "1.5.0")
+
+# (edits to the home page, expected error fragment or None). A crawler may read
+# the first of several tags, so every social tag must appear exactly once.
+SOCIAL_META_CASES = {
+    "committed": ([], None),
+    "attribute order swapped": (
+        [(OG_IMAGE, f'<meta content="{SOCIAL}" property="og:image">\n')],
+        None,
+    ),
+    "stale og:image first (reported)": (
+        [(OG_IMAGE, OG_IMAGE.replace(SOCIAL, STALE) + OG_IMAGE)],
+        "needs exactly one og:image meta tag, found 2",
+    ),
+    "stale twitter:image first": (
+        [(TWITTER_IMAGE, TWITTER_IMAGE.replace(SOCIAL, STALE) + TWITTER_IMAGE)],
+        "needs exactly one twitter:image meta tag, found 2",
+    ),
+    "twitter:image missing": (
+        [(TWITTER_IMAGE, "")],
+        "needs exactly one twitter:image meta tag, found 0",
+    ),
+    "declared width 600": (
+        [(OG_WIDTH, OG_WIDTH.replace("1200", "600"))],
+        "og:image:width/height must be 1200 and 630",
+    ),
+    "declared height missing": (
+        [(OG_HEIGHT, "")],
+        "needs exactly one og:image:height meta tag, found 0",
+    ),
+    "declared width twice": (
+        [(OG_WIDTH, OG_WIDTH.replace("1200", "600") + OG_WIDTH)],
+        "needs exactly one og:image:width meta tag, found 2",
+    ),
+    "alias tag with another card": (
+        [
+            (
+                OG_IMAGE,
+                OG_IMAGE + f'<meta property="og:image:secure_url" content="{STALE}">\n',
+            )
+        ],
+        "og:image:secure_url must not be set",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SOCIAL_META_CASES))
+def test_social_meta_tags_appear_exactly_once(tmp_path: Path, case: str) -> None:
+    edits, expected = SOCIAL_META_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    home = checkout / "site/public/index.html"
+    for old, new in edits:
+        _edit(home, old, new)
+    errors = CHECKER.collect_errors(checkout)
+    if expected is None:
+        assert errors == []
+    else:
+        assert any(
+            e.startswith("site/public/index.html: ") and expected in e for e in errors
+        ), errors
+
+
+LOCAL = "site/public/local-models/index.html"
+LOCAL_CURRENT = '<a href="/local-models/" aria-current="page">'
+LOCAL_PLAIN = '<a href="/local-models/">'
+PROMPTS_PLAIN = '<a href="/prompts/">Prompts</a>'
+PROMPTS_CURRENT = '<a href="/prompts/" aria-current="page">Prompts</a>'
+OWN_ONLY = 'aria-current="page" must mark only the link to /local-models/'
+NONE_HERE = 'aria-current="page" must mark no link on this page'
+
+# (page, edits, expected error fragment or None). aria-current="page" is the one
+# allowed nav difference, and only on the link to the page's own path.
+ARIA_CURRENT_CASES = {
+    "committed": (LOCAL, [], None),
+    "attribute order swapped": (
+        LOCAL,
+        [(LOCAL_CURRENT, '<a aria-current="page" href="/local-models/">')],
+        None,
+    ),
+    "on the wrong link (reported)": (
+        LOCAL,
+        [(LOCAL_CURRENT, LOCAL_PLAIN), (PROMPTS_PLAIN, PROMPTS_CURRENT)],
+        OWN_ONLY,
+    ),
+    "on two links (reported)": (LOCAL, [(PROMPTS_PLAIN, PROMPTS_CURRENT)], OWN_ONLY),
+    "missing on its own page": (LOCAL, [(LOCAL_CURRENT, LOCAL_PLAIN)], OWN_ONLY),
+    "on a page the nav does not list (404)": (
+        "site/public/404.html",
+        [(PROMPTS_PLAIN, PROMPTS_CURRENT)],
+        NONE_HERE,
+    ),
+    "on the home page": (
+        "site/public/index.html",
+        [(PROMPTS_PLAIN, PROMPTS_CURRENT)],
+        NONE_HERE,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ARIA_CURRENT_CASES))
+def test_aria_current_marks_only_the_page_itself(tmp_path: Path, case: str) -> None:
+    page, edits, expected = ARIA_CURRENT_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    for old, new in edits:
+        _edit(checkout / page, old, new)
+    errors = CHECKER.collect_errors(checkout)
+    if expected is None:
+        assert errors == []
+    else:
+        assert f"{page}: {expected}" in errors, errors
+
+
+@pytest.mark.parametrize("block", ["navigation", "footer"])
+def test_a_second_shared_block_fails(tmp_path: Path, block: str) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    page = checkout / "site/public/404.html"
+    text = page.read_text(encoding="utf-8")
+    pattern = CHECKER.NAV if block == "navigation" else CHECKER.FOOTER
+    copy = pattern.search(text).group(0)
+    page.write_text(text.replace("</main>", copy + "</main>"), encoding="utf-8")
+    errors = CHECKER.collect_errors(checkout)
+    assert f"site/public/404.html: 2 copies of the shared {block}" in errors, errors
+
+
 def _chunk(kind: bytes, body: bytes) -> bytes:
     return (
         struct.pack(">I", len(body))
@@ -306,15 +434,55 @@ def test_copied_asset_drift_fails(tmp_path: Path) -> None:
     assert any("differs from assets/brand/onoats-mark.svg" in error for error in errors)
 
 
-def test_unversioned_public_image_fails_even_when_unreferenced(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name", ["unversioned.svg", "sub/unversioned.svg"])
+def test_unversioned_public_image_fails_even_when_unreferenced(
+    tmp_path: Path, name: str
+) -> None:
     checkout = _copy_site_tree(tmp_path)
-    (checkout / "site/public/img/unversioned.svg").write_text(
-        "<svg/>", encoding="utf-8"
+    image = checkout / "site/public/img" / name
+    image.parent.mkdir(exist_ok=True)
+    image.write_text("<svg/>", encoding="utf-8")
+    errors = CHECKER.collect_errors(checkout)
+    assert f"site/public/img/{name}: filename is not versioned" in errors, errors
+
+
+def test_cache_overlap_reaches_images_in_subdirectories(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    image = checkout / "site/public/img/sub/onoats-mark-1.6.0.svg"
+    image.parent.mkdir()
+    image.write_text("<svg/>", encoding="utf-8")
+    headers = checkout / "site/public/_headers"
+    _edit(headers, LLMS_RULE, LLMS_RULE + "\n/img/sub/*\n  Cache-Control: no-store\n")
+    errors = CHECKER.collect_errors(checkout)
+    assert errors == [
+        "site/public/_headers: /img/sub/* also sets Cache-Control on"
+        " /img/sub/onoats-mark-1.6.0.svg"
+    ]
+
+
+REFERENCE_CASES = {
+    "versioned and present": ("onoats-mark-1.6.0.svg", None),
+    "versioned but missing": ("missing-1.0.0.png", "missing /img/missing-1.0.0.png"),
+    "unversioned": ("onoats-mark.svg", "unversioned /img/onoats-mark.svg"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(REFERENCE_CASES))
+def test_every_image_reference_is_versioned_and_present(
+    tmp_path: Path, case: str
+) -> None:
+    name, expected = REFERENCE_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    _edit(
+        checkout / "site/public/404.html",
+        "</main>",
+        f'<img src="/img/{name}" alt=""></main>',
     )
     errors = CHECKER.collect_errors(checkout)
-    assert any(
-        "unversioned.svg: filename is not versioned" in error for error in errors
-    )
+    if expected is None:
+        assert errors == []
+    else:
+        assert f"site/public/404.html: {expected}" in errors, errors
 
 
 HSTS_LINE = "  Strict-Transport-Security: max-age=31536000\n"
@@ -322,6 +490,14 @@ IMG_CACHE = "/img/*\n  Cache-Control: public, max-age=31536000, immutable\n"
 LLMS_RULE = "/llms.txt\n  Content-Type: text/plain; charset=utf-8\n"
 HSTS_ERROR = "the /* rule, and only it, must set"
 IMG_ERROR = "/img/* must set one immutable Cache-Control"
+IMG_OVERLAP = "also sets Cache-Control on /img/"
+CSP_LINE = f"  Content-Security-Policy: {CHECKER.REQUIRED_CSP}\n"
+CSP_ERROR = "the /* rule, and only it, must set Content-Security-Policy"
+
+
+def _csp(policy: str) -> list[tuple[str, str]]:
+    return [(CSP_LINE, f"  Content-Security-Policy: {policy}\n")]
+
 
 # (edit to the committed _headers, expected error fragment or None for "still valid").
 # Every cell is about which rule a header sits in, since Cloudflare applies each
@@ -361,7 +537,81 @@ HEADER_CASES = {
     ),
     "global cache-control reaches img": (
         [(HSTS_LINE, HSTS_LINE + "  Cache-Control: no-cache\n")],
-        "/* also sets Cache-Control on /img/*",
+        "/* " + IMG_OVERLAP,
+    ),
+    "extension rule reaches img (reported)": (
+        [(LLMS_RULE, LLMS_RULE + "\n/*.png\n  Cache-Control: no-cache\n")],
+        "/*.png " + IMG_OVERLAP,
+    ),
+    "placeholder rule reaches img": (
+        [(LLMS_RULE, LLMS_RULE + "\n/img/:name\n  Cache-Control: no-store\n")],
+        "/img/:name " + IMG_OVERLAP,
+    ),
+    "absolute-url rule reaches img": (
+        [
+            (
+                LLMS_RULE,
+                LLMS_RULE + "\nhttps://onoats.dev/*\n  Cache-Control: no-store\n",
+            )
+        ],
+        "https://onoats.dev/* " + IMG_OVERLAP,
+    ),
+    "cache-control that misses every image": (
+        [(LLMS_RULE, LLMS_RULE + "  Cache-Control: no-cache\n")],
+        None,
+    ),
+    "csp missing (reported)": ([(CSP_LINE, "")], CSP_ERROR),
+    "csp only under another path": (
+        [(CSP_LINE, ""), (LLMS_RULE, LLMS_RULE + CSP_LINE)],
+        CSP_ERROR,
+    ),
+    "csp also under another path": ([(LLMS_RULE, LLMS_RULE + CSP_LINE)], CSP_ERROR),
+    "csp reordered": (
+        _csp(
+            "frame-ancestors 'none'; form-action 'none'; base-uri 'none';"
+            " style-src 'unsafe-inline' 'self'; img-src 'self'; default-src 'none'"
+        ),
+        None,
+    ),
+    "csp adds a non-fetch directive": (
+        _csp(CHECKER.REQUIRED_CSP + "; upgrade-insecure-requests"),
+        None,
+    ),
+    "csp drops frame-ancestors": (
+        _csp(CHECKER.REQUIRED_CSP.replace("; frame-ancestors 'none'", "")),
+        "must keep frame-ancestors 'none'",
+    ),
+    "csp drops base-uri": (
+        _csp(CHECKER.REQUIRED_CSP.replace(" base-uri 'none';", "")),
+        "must keep base-uri 'none'",
+    ),
+    "csp widens default-src": (
+        _csp(CHECKER.REQUIRED_CSP.replace("default-src 'none'", "default-src *")),
+        "must keep default-src 'none'",
+    ),
+    "csp widens img-src": (
+        _csp(CHECKER.REQUIRED_CSP.replace("img-src 'self'", "img-src 'self' https:")),
+        "must keep img-src 'self'",
+    ),
+    "csp adds script-src": (
+        _csp(CHECKER.REQUIRED_CSP + "; script-src 'self'"),
+        "adds script-src, which widens",
+    ),
+    "csp repeats a directive": (
+        _csp("default-src *; " + CHECKER.REQUIRED_CSP),
+        "repeats default-src",
+    ),
+    "nosniff missing": (
+        [("  X-Content-Type-Options: nosniff\n", "")],
+        HSTS_ERROR + " X-Content-Type-Options: nosniff",
+    ),
+    "frame options weakened": (
+        [("X-Frame-Options: DENY", "X-Frame-Options: SAMEORIGIN")],
+        HSTS_ERROR + " X-Frame-Options: DENY",
+    ),
+    "referrer policy missing": (
+        [("  Referrer-Policy: strict-origin-when-cross-origin\n", "")],
+        HSTS_ERROR + " Referrer-Policy",
     ),
     "duplicate path rule": (
         [(LLMS_RULE, LLMS_RULE + "\n/img/*\n  X-Extra: 1\n")],

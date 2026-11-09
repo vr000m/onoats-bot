@@ -29,8 +29,9 @@ Annotated tags exist from `v0.9.0` forward.
 ### Changed
 
 - **Landing-site release safety.** CI and `just check` now verify generated
-  prompts, copied assets, shared page chrome, versioned immutable images and
-  security headers. Deployment uses an integrity-locked local Wrangler after
+  prompts, copied assets, shared page chrome (including where
+  `aria-current` sits), versioned immutable images, the social-card tags, and
+  the security headers and Content-Security-Policy. Deployment uses an integrity-locked local Wrangler after
   a credential-free npm install, and `public/.assetsignore` keeps local
   dotfiles out of the upload. Every example prompt that embeds transcript
   text, or text derived from it, labels that text as untrusted data and fences

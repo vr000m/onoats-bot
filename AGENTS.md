@@ -23,16 +23,14 @@ non-obvious parts; the code and `docs/` cover the rest.
   package. Use Node 24, npm 11.19 and `just`; `just deps` installs the locked
   Wrangler graph in a deny-by-default environment, and `just deploy` loads
   Cloudflare credentials only after installation. The prompt text in
-  `site/public/prompts/*.txt` is canonical; `build_prompts.py --check` owns its
-  generated-page parity (one marker pair per prompt) and the untrusted-data
-  rules: every placeholder is classified trusted or untrusted in the script, and
-  each untrusted one sits alone in its own `--- BEGIN/END UNTRUSTED` fence after
-  the `## Instruction boundary` paragraph. `check_site.py` owns
-  copied-asset, shared-chrome (every `public/**/*.html`), versioned-image,
-  per-rule `_headers` and `public/.assetsignore` (exactly `.*`) contracts, and
-  derives the social card from `og:image` (it must be
-  `https://onoats.dev/img/<file>.png`, exist, be a complete 1200x630 PNG and be
-  the file the renderer writes). `just check` and CI run both. Files in
+  `site/public/prompts/*.txt` is canonical. Two scripts own the site contracts
+  and their module docstrings hold the rule values; do not restate them here.
+  `build_prompts.py` owns the generated prompts page and the untrusted-data
+  fences. `check_site.py` owns shared chrome and `aria-current`, copied assets,
+  versioned image names and references, the social card named by `og:image`,
+  `public/.assetsignore` and the `_headers` rules (security headers and CSP,
+  cache scope). Each check covers the whole set (every page, tag, link, image
+  and rule), not "some match exists". `just check` and CI run both. Files in
   `site/public/img/` are immutable and therefore versioned and quantized with
   `pngquant`; regenerate the social PNG with
   `swift scripts/render_social_card.swift` from `site/` (needs `pngquant`).
