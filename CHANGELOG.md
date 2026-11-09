@@ -23,7 +23,8 @@ Annotated tags exist from `v0.9.0` forward.
   post-call prompts, and a 404 page,
   served by Cloudflare Workers static assets. It is hand-written HTML and CSS
   with no JavaScript and no runtime build step (the prompts page is generated
-  from its `.txt` files), and changes nothing in the package.
+  from its `.txt` files), and changes nothing in the package; `site/` is
+  excluded from the source distribution.
 
 ### Changed
 

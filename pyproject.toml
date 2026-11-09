@@ -84,8 +84,10 @@ packages = ["src/onoats", "src/onoats_contracts"]
 
 [tool.hatch.build.targets.sdist]
 # Scratch experiments (and any local clips/logs under them) stay in the repo
-# for future work but never ship in the source distribution.
-exclude = ["/experiments"]
+# for future work but never ship in the source distribution. The landing site
+# (`site/`, a Node project with its own lockfile and images) is not part of the
+# package either; its tests skip when the directory is absent.
+exclude = ["/experiments", "/site"]
 
 [dependency-groups]
 # ruff is pinned to a minor range so CI's `ruff format --check` matches the

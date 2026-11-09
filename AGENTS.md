@@ -887,3 +887,5 @@ should NOT re-flag go here, one per line:
   spawns (`codesign`, `ps`, `hdiutil`-style tools) do not detach; a leaked helper is
   the smaller failure than a signal to a recycled group. Documented in the
   function's docstring. (2026-11-07)
+- **[Performance] won't-fix**: `just deps` reinstalls `site/node_modules` from the lockfile on every `preview`, `dry-run` and `deploy`. The clean `npm ci` is deliberate: `deploy` runs Wrangler from `node_modules` with Cloudflare credentials, so it must run exactly the locked graph, and a stamp that skips the install would trust whatever is already on disk. The cost is a few seconds per run. (2026-11-08)
+- **[Testing] won't-fix**: `swift scripts/render_social_card.swift --check` byte-compares system-font AppKit output after `pngquant`, so it depends on the macOS and `pngquant` versions and does not run in CI. It is a maintainer command for regenerating the card; CI's `check_site.py` gates what can be checked portably (the card named by `og:image` exists, is 1200x630 and is the file the renderer writes). (2026-11-08)

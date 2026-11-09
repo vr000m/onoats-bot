@@ -6,7 +6,7 @@
 **Priority**: High
 **Branch**: feat/landing-page
 **Created**: 2026-11-08
-**Review Gates**: review-plan complete; follow-up deep review pending
+**Review Gates**: full
 
 ## Objective
 
@@ -201,7 +201,7 @@ sequenceDiagram
 - Focused tests, site validations, npm dry run, Ruff, and the full test suite pass.
 - A follow-up deep review reports no blocking findings.
 
-<!-- reviewed: 2026-11-09 @ 8dfac9cf069213e2e40cc4b97188734f771848a4 -->
+<!-- reviewed: 2026-11-09 @ e202fef665a53bb6e99243ad4c54239cb5a9ae43 -->
 
 ## Progress
 
