@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Local models · onoats</title>
-<meta name="description" content="Run speech-to-text and text-to-speech models on your Mac with no cloud API: the Pipecat Service Toolbar menu-bar app, pipecat-local-stt-server and pipecat-local-tts-server, with every model, port and licence.">
+<meta name="description" content="Run speech-to-text and text-to-speech models on your Mac with no cloud API. This page covers the Pipecat Service Toolbar, local STT and TTS servers, and their models, ports, and licences.">
 <meta name="theme-color" content="#17233A">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/site.css">
@@ -16,6 +16,8 @@
   .shots figure{margin:0;max-width:300px}
   .shots figure.wide{max-width:260px}
   .shots img{display:block;width:100%;height:auto;border-radius:12px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
+  .lane-shot{margin:0 0 22px;max-width:300px}
+  .lane-shot img{display:block;width:100%;height:auto;border-radius:12px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
   figcaption{font-size:14.5px;color:var(--slate);margin-top:10px}
 
   /* the left/right split: speech to text | text to speech */
@@ -105,6 +107,10 @@ just app-open</pre></li>
             <li>One final transcript per utterance. Your pipeline supplies voice-activity detection.</li>
             <li>Unix sockets with a same-user check, or loopback TCP with an optional token.</li>
           </ul>
+          <figure class="lane-shot">
+            <img src="/img/service-toolbar-panel-0.9.0-stt.png" width="764" height="1104" loading="lazy" alt="The toolbar's Add Models view on the Speech to Text tab. Nemotron is running on port 9865, Apple Speech is installed and ready to start, and Whisper, Kyutai STT and Parakeet are available to get.">
+            <figcaption>Add Models, Speech to Text tab: running, installed and available models.</figcaption>
+          </figure>
 <pre># in a checkout of the repository
 uv sync --extra mlx
 uv run --no-sync python -m stt_server serve \
@@ -132,6 +138,10 @@ uv run --no-sync python -m stt_server serve \
             <li>Finished segments stream as they are ready, and a cancel message stops speech for barge-in.</li>
             <li>Unix sockets or loopback TCP. It mirrors the STT server's design, with a protocol inspired by OpenAI Realtime.</li>
           </ul>
+          <figure class="lane-shot">
+            <img src="/img/service-toolbar-panel-0.9.0-tts.png" width="750" height="1100" loading="lazy" alt="The toolbar's Add Models view on the Text to Speech tab, listing Tone, Kokoro, Phonon, Pocket TTS, Qwen3 TTS, Voxtral TTS, Dia and Fish S2 Pro with download sizes. Voxtral is marked CC-BY-NC and Fish S2 Pro is marked research only.">
+            <figcaption>Add Models, Text to Speech tab, with download sizes and licence badges.</figcaption>
+          </figure>
 <pre>uv add "pipecat-local-tts-server[kokoro]"
 uv run python -m tts_server prefetch --backend kokoro
 uv run python -m tts_server serve --backend kokoro \
