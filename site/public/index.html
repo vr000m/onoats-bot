@@ -20,33 +20,11 @@
 <meta name="twitter:image:alt" content="onoats — Record both sides. Keep the files.">
 <meta name="theme-color" content="#17233A">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/site.css">
 <style>
-  :root{
-    --midnight:#17233A; --deep:#101a2d; --gold:#E9B44C; --oat:#FFF8E8; --straw:#F1E6C6;
-    --slate:#566078; --them:#9db4e0; --gold-ink:#7a5a12;
-    --serif:ui-serif,"New York","Iowan Old Style",Charter,Georgia,serif;
-    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--oat);color:var(--midnight);font:17px/1.65 var(--sans);-webkit-font-smoothing:antialiased}
-  a{color:inherit;text-underline-offset:3px}
-  :focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:3px}
-  code,pre{font-family:var(--mono)}
-  code{font-size:.88em;background:var(--straw);padding:.1em .35em;border-radius:4px}
-  .wrap{max-width:1040px;margin:0 auto;padding:0 20px}
-
   /* ---------- hero ---------- */
-  .hero{background:var(--midnight);color:var(--oat);padding-bottom:72px}
-  .hero code{background:rgba(255,248,232,.12)}
-  .top{display:flex;align-items:center;justify-content:space-between;padding:22px 0}
-  .brand{display:flex;align-items:center;gap:10px;text-decoration:none;font:600 22px/1 var(--serif);letter-spacing:-.01em}
-  .brand img{width:34px;height:34px}
-  .top nav{display:flex;gap:24px;font-size:15px}
-  .top nav a{text-decoration:none;color:rgba(255,248,232,.78)}
-  .top nav a:hover{color:var(--gold)}
-  h1{font:600 clamp(38px,6.2vw,72px)/1.03 var(--serif);letter-spacing:-.025em;margin:56px 0 22px;max-width:12em;text-wrap:balance}
-  .lede{font-size:19px;color:rgba(255,248,232,.84);max-width:34em;margin:0 0 30px}
+  .hero{padding-bottom:72px}
+  .hero h1{font-size:clamp(38px,6.2vw,72px);line-height:1.03;margin:56px 0 22px;max-width:12em}
   .cta{display:flex;flex-wrap:wrap;gap:12px 22px;align-items:center;margin-bottom:64px}
   .btn{display:inline-block;background:var(--gold);color:var(--midnight);font-weight:650;padding:12px 22px;border-radius:8px;text-decoration:none}
   .btn:hover{background:#f2c76a}
@@ -87,11 +65,6 @@
   .s-them{color:var(--them);font-weight:600}
 
   /* ---------- prose sections ---------- */
-  .sec{padding:72px 0 0}
-  h2.t{font:600 clamp(28px,4vw,40px)/1.12 var(--serif);letter-spacing:-.018em;margin:0 0 18px;max-width:18em}
-  .prose{max-width:38em}
-  .prose p{margin:0 0 1em}
-  .muted{color:var(--slate)}
 
   dl{margin:34px 0 0;display:grid;grid-template-columns:1fr 1fr;gap:34px 56px}
   dt{font:600 20px/1.25 var(--serif);margin-bottom:6px}
@@ -105,28 +78,14 @@
   figure img{display:block;width:100%;height:auto;border-radius:14px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
   figcaption{font-size:14.5px;color:var(--slate);margin-top:12px}
 
-  /* after the call: a real sequence */
-  .steps{list-style:none;margin:30px 0 0;padding:0;counter-reset:step;max-width:44em}
-  .steps li{counter-increment:step;position:relative;padding:0 0 26px 54px}
-  .steps li::before{content:counter(step);position:absolute;left:0;top:-2px;font:600 30px/1 var(--serif);color:var(--gold-ink)}
-  .steps b{display:block;font:600 20px/1.25 var(--serif);margin-bottom:4px}
-  .steps span{color:var(--slate)}
-  .aside{max-width:38em;margin-top:6px;padding-left:16px;border-left:3px solid var(--gold);color:var(--slate);font-size:15.5px}
-
   /* ---------- install ---------- */
-  .install{background:var(--midnight);color:var(--oat);margin-top:88px;padding:72px 0}
-  .install .prose{color:rgba(255,248,232,.8)}
+  .install{margin-top:88px;padding:72px 0}
   .install a{color:var(--gold)}
+  .install .prose{color:rgba(255,248,232,.8)}
   .cols{display:grid;grid-template-columns:1fr 1fr;gap:32px;margin-top:32px}
   .install h3{font:600 18px/1.3 var(--serif);margin:0 0 10px}
   .install pre{background:var(--deep);border-radius:8px;padding:16px 18px;border:1px solid rgba(255,248,232,.1)}
   .install .note{font-size:15px;color:rgba(255,248,232,.7);margin:12px 0 0}
-
-  footer{padding:36px 0 52px;font-size:14.5px;color:var(--slate)}
-  footer .wrap{display:flex;flex-wrap:wrap;gap:10px 32px;justify-content:space-between}
-  footer ul{display:flex;flex-wrap:wrap;gap:8px 22px;list-style:none;margin:0;padding:0}
-  footer a{color:var(--slate)}
-  footer a:hover{color:var(--midnight)}
 
   /* ---------- small screens ---------- */
   @media (max-width:760px){
@@ -142,20 +101,18 @@
     dl,.files,.cols{grid-template-columns:1fr}
     dl{gap:26px}
     figure{justify-self:start}
-    .sec{padding-top:56px}
     .install{padding:56px 0;margin-top:64px}
-    .top nav{gap:16px}
   }
 </style>
 </head>
 <body>
 
-<header class="hero">
+<header class="band hero">
   <div class="wrap">
     <div class="top">
       <a class="brand" href="/"><img src="/img/onoats-mark.svg" alt="" width="34" height="34">onoats</a>
       <nav aria-label="Primary">
-        <a href="#install">Install</a>
+        <a href="/#install">Install</a>
         <a href="/prompts/">Prompts</a>
         <a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a>
         <a href="https://github.com/vr000m/onoats-bot">GitHub</a>
@@ -245,16 +202,16 @@
         <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">the prompts I use for each step</a>.</p>
       </div>
       <ol class="steps">
-        <li><b>Pull out action points</b><span>Every line is tagged <code>me</code> or <code>them</code>, and S1, S2 when speakers are labelled. A model can read who said what and assign each commitment to the person who made it.</span></li>
-        <li><b>Split long calls by topic</b><span>Run a model such as Gemini, Claude Haiku or ChatGPT's Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
-        <li><b>Consolidate into living documents</b><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
-        <li><b>Build the digests</b><span>An agent such as Hermes or pi.dev can build weekly, monthly or per-topic summaries from those folders.</span></li>
+        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>, and S1, S2 when speakers are labelled. A model can read who said what and assign each commitment to the person who made it.</span></li>
+        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku or ChatGPT's Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
+        <li><h3 class="st">Consolidate into living documents</h3><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
+        <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly or per-topic summaries from those folders.</span></li>
       </ol>
       <p class="aside">onoats stops at the files. These steps run in your own tools, on the queue and the Markdown it writes.</p>
     </div>
   </section>
 
-  <section class="install" id="install">
+  <section class="band install" id="install">
     <div class="wrap">
       <h2 class="t">Install</h2>
       <div class="prose"><p>Apple Silicon with macOS 14.4 or later gets the menu-bar app and native system-audio capture. The first run asks for microphone and system-audio permission.</p></div>

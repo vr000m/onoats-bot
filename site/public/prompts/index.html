@@ -7,117 +7,86 @@
 <meta name="description" content="Prompts for splitting, classifying and summarising onoats transcripts: topic segmentation, action points with who-said-what attribution, and daily, weekly and monthly digests.">
 <meta name="theme-color" content="#17233A">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<style>
-  :root{
-    --midnight:#17233A; --deep:#101a2d; --gold:#E9B44C; --oat:#FFF8E8; --straw:#F1E6C6;
-    --slate:#566078; --gold-ink:#7a5a12;
-    --serif:ui-serif,"New York","Iowan Old Style",Charter,Georgia,serif;
-    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--oat);color:var(--midnight);font:17px/1.65 var(--sans);-webkit-font-smoothing:antialiased}
-  a{color:inherit;text-underline-offset:3px}
-  :focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:3px}
-  code{font:.88em var(--mono);background:var(--straw);padding:.1em .35em;border-radius:4px}
-  .wrap{max-width:820px;margin:0 auto;padding:0 20px}
-
-  .top-band{background:var(--midnight);color:var(--oat)}
-  .top{display:flex;align-items:center;justify-content:space-between;padding:22px 0}
-  .brand{display:flex;align-items:center;gap:10px;text-decoration:none;font:600 22px/1 var(--serif)}
-  .brand img{width:34px;height:34px}
-  .top nav{display:flex;gap:24px;font-size:15px}
-  .top nav a{text-decoration:none;color:rgba(255,248,232,.78)}
-  .top nav a:hover{color:var(--gold)}
-  .intro{padding:44px 0 56px}
-  h1{font:600 clamp(34px,5.4vw,54px)/1.05 var(--serif);letter-spacing:-.022em;margin:0 0 18px;text-wrap:balance}
-  .intro p{margin:0 0 .9em;max-width:36em;color:rgba(255,248,232,.84);font-size:18px}
-  .intro code{background:rgba(255,248,232,.12)}
-
-  main{padding:48px 0 24px}
-  ol{list-style:none;margin:0;padding:0;counter-reset:p}
-  li{counter-increment:p;position:relative;padding:0 0 44px 56px}
-  li::before{content:counter(p);position:absolute;left:0;top:-3px;font:600 34px/1 var(--serif);color:var(--gold-ink)}
-  h2{font:600 24px/1.2 var(--serif);margin:0 0 6px}
-  li p{margin:0 0 10px;color:var(--slate);max-width:38em}
-  .meta{font-size:15px;color:var(--slate)}
-  .meta a{color:var(--midnight);font-weight:600}
-  .gap{margin:6px 0 0;padding-left:16px;border-left:3px solid var(--gold);color:var(--slate);font-size:15.5px;max-width:38em}
-
-  footer{padding:20px 0 52px;font-size:14.5px;color:var(--slate)}
-  footer a{color:var(--slate)}
-
-  @media (max-width:640px){
-    li{padding-left:44px}
-    .top nav{gap:16px}
-  }
-</style>
+<link rel="stylesheet" href="/site.css">
 </head>
 <body>
 
-<div class="top-band">
+<header class="band">
   <div class="wrap">
     <div class="top">
       <a class="brand" href="/"><img src="/img/onoats-mark.svg" alt="" width="34" height="34">onoats</a>
       <nav aria-label="Primary">
         <a href="/#install">Install</a>
+        <a href="/prompts/" aria-current="page">Prompts</a>
         <a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a>
         <a href="https://github.com/vr000m/onoats-bot">GitHub</a>
       </nav>
     </div>
     <div class="intro">
       <h1>Example prompts for after the call</h1>
-      <p>onoats writes the transcripts. These are the prompts I use to turn them into topics, action points and digests. They come from my own pipeline, not from onoats, and are here as working examples to adapt.</p>
-      <p>Each file is a Python <code>str.format</code> template: <code>{name}</code> is a placeholder you fill in, and <code>{{</code> and <code>}}</code> are literal braces in the JSON examples. They expect transcripts with <code>Me:</code> and <code>Them:</code> lines, which is how onoats tags its two channels.</p>
+      <p class="lede">onoats writes the transcripts. These are the prompts I use to turn them into topics, action points and digests. They come from my own pipeline, not from onoats, and are here as working examples to adapt.</p>
+      <p class="lede" style="margin-top:14px">Each file is a Python <code>str.format</code> template: <code>{name}</code> is a placeholder you fill in, and <code>{{</code> and <code>}}</code> are literal braces in the JSON examples. They expect transcripts with <code>Me:</code> and <code>Them:</code> lines, which is how onoats tags its two channels.</p>
     </div>
   </div>
-</div>
+</header>
 
 <main>
-  <div class="wrap">
-    <ol>
-      <li>
-        <h2>Split a long call by topic</h2>
-        <p>Cuts a session into coherent segments with start and end times. It leans towards fewer, larger segments, and does not split on speaker changes or short silences.</p>
-        <p class="meta"><a href="/prompts/segment.txt">segment.txt</a> · placeholder <code>{buffer_jsonl}</code>, the session JSONL from the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md">queue</a></p>
-      </li>
-      <li>
-        <h2>Classify a transcript</h2>
-        <p>Picks one category, with a confidence score, a short summary and tags. It handles transcripts with only <code>Them</code> lines (usually a talk you listened to) and refuses to invent a summary when there's too little text. The categories in the file are mine; replace them with your own <code>[categories]</code>.</p>
-        <p class="meta"><a href="/prompts/classify_topics.txt">classify_topics.txt</a> · placeholder <code>{transcript}</code></p>
-      </li>
-      <li>
-        <h2>Extract action points, with who said what</h2>
-        <p>Pulls out specific future commitments and marks each as <code>self_commit</code> (you took it on), <code>delegated</code> (you asked someone else) or <code>ambiguous</code>. The <code>Me:</code> and <code>Them:</code> tags decide this, which is why onoats keeps the channels apart. It lists the kinds of line to skip, such as narrating what you're doing right now.</p>
-        <p class="meta"><a href="/prompts/classify_ap.txt">classify_ap.txt</a> · placeholders <code>{category}</code>, <code>{transcript}</code>, <code>{existing_action_items_section}</code> (leave empty on the first pass; later, a list of items already tracked so the model doesn't repeat them)</p>
-      </li>
-      <li>
-        <h2>Merge repeated action points</h2>
-        <p>A second pass for long transcripts. It clusters items that belong to one workstream, keeps the strictest attribution, and caps the list at 15.</p>
-        <p class="meta"><a href="/prompts/consolidate_action_items.txt">consolidate_action_items.txt</a> · placeholders <code>{category}</code>, <code>{summary}</code>, <code>{items_json}</code>, <code>{existing_action_items_section}</code></p>
-      </li>
-      <li>
-        <h2>Daily digest</h2>
-        <p>Summarises one day of transcripts in under 800 words, with a metadata block that a weekly pass can use to decide which days deserve more detail.</p>
-        <p class="meta"><a href="/prompts/digest_daily.txt">digest_daily.txt</a> · placeholders <code>{target_date}</code>, <code>{transcripts}</code></p>
-      </li>
-      <li>
-        <h2>Weekly digest</h2>
-        <p>Reduces the daily digests into a weekly report: major threads, decisions, open action items, change since last week, accomplishments and persistent blockers.</p>
-        <p class="meta"><a href="/prompts/digest_weekly.txt">digest_weekly.txt</a> · placeholders <code>{week_start}</code>, <code>{week_end}</code>, <code>{short_dailies}</code>, <code>{topic_signal}</code>, <code>{expansions}</code>, <code>{previous_week_context}</code>, <code>{expansion_budget_explanation}</code></p>
-      </li>
-      <li>
-        <h2>Monthly digest</h2>
-        <p>Reduces the weekly digests into a month-level overview.</p>
-        <p class="meta"><a href="/prompts/digest_monthly.txt">digest_monthly.txt</a> · placeholders <code>{month}</code>, <code>{weeks_count}</code>, <code>{short_weeklies}</code></p>
-      </li>
-    </ol>
-    <p class="gap">The digest prompts reference things the files don't contain: a per-day expansion budget, a topic-recurrence signal and <code>[tid]</code> transcript citations. Fill those placeholders however your own pipeline works, or delete the sections that use them.</p>
-  </div>
+  <section class="sec">
+    <div class="wrap">
+      <ol class="steps">
+        <li>
+          <h2 class="st">Split a long call by topic</h2>
+          <p>Cuts a session into coherent segments with start and end times. It leans towards fewer, larger segments, and does not split on speaker changes or short silences.</p>
+          <p class="meta"><a href="/prompts/segment.txt">segment.txt</a> takes <code>{buffer_jsonl}</code>, the session JSONL from the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md">queue</a>.</p>
+        </li>
+        <li>
+          <h2 class="st">Classify a transcript</h2>
+          <p>Picks one category, with a confidence score, a short summary and tags. It handles transcripts with only <code>Them</code> lines (usually a talk you listened to) and refuses to invent a summary when there's too little text. The categories in the file are mine; replace them with your own <code>[categories]</code>.</p>
+          <p class="meta"><a href="/prompts/classify_topics.txt">classify_topics.txt</a> takes <code>{transcript}</code>.</p>
+        </li>
+        <li>
+          <h2 class="st">Extract action points, with who said what</h2>
+          <p>Pulls out specific future commitments and marks each as <code>self_commit</code> (you took it on), <code>delegated</code> (you asked someone else) or <code>ambiguous</code>. The <code>Me:</code> and <code>Them:</code> tags decide this, which is why onoats keeps the channels apart. It lists the kinds of line to skip, such as narrating what you're doing right now.</p>
+          <p class="meta"><a href="/prompts/classify_ap.txt">classify_ap.txt</a> takes <code>{category}</code>, <code>{transcript}</code> and <code>{existing_action_items_section}</code>. Leave the last one empty on the first pass; later, fill it with the items already tracked so the model doesn't repeat them.</p>
+        </li>
+        <li>
+          <h2 class="st">Merge repeated action points</h2>
+          <p>A second pass for long transcripts. It clusters items that belong to one workstream, keeps the strictest attribution, and caps the list at 15.</p>
+          <p class="meta"><a href="/prompts/consolidate_action_items.txt">consolidate_action_items.txt</a> takes <code>{category}</code>, <code>{summary}</code>, <code>{items_json}</code> and <code>{existing_action_items_section}</code>.</p>
+        </li>
+        <li>
+          <h2 class="st">Daily digest</h2>
+          <p>Summarises one day of transcripts in under 800 words, with a metadata block that a weekly pass can use to decide which days deserve more detail.</p>
+          <p class="meta"><a href="/prompts/digest_daily.txt">digest_daily.txt</a> takes <code>{target_date}</code> and <code>{transcripts}</code>.</p>
+        </li>
+        <li>
+          <h2 class="st">Weekly digest</h2>
+          <p>Reduces the daily digests into a weekly report: major threads, decisions, open action items, change since last week, accomplishments and persistent blockers.</p>
+          <p class="meta"><a href="/prompts/digest_weekly.txt">digest_weekly.txt</a> takes <code>{week_start}</code>, <code>{week_end}</code>, <code>{short_dailies}</code>, <code>{topic_signal}</code>, <code>{expansions}</code>, <code>{previous_week_context}</code> and <code>{expansion_budget_explanation}</code>.</p>
+        </li>
+        <li>
+          <h2 class="st">Monthly digest</h2>
+          <p>Reduces the weekly digests into a month-level overview.</p>
+          <p class="meta"><a href="/prompts/digest_monthly.txt">digest_monthly.txt</a> takes <code>{month}</code>, <code>{weeks_count}</code> and <code>{short_weeklies}</code>.</p>
+        </li>
+      </ol>
+      <p class="aside">The digest prompts reference things the files don't contain: a per-day expansion budget, a topic-recurrence signal and <code>[tid]</code> transcript citations. Fill those placeholders however your own pipeline works, or delete the sections that use them.</p>
+    </div>
+  </section>
 </main>
 
 <footer>
-  <div class="wrap"><a href="/">Back to onoats.dev</a></div>
+  <div class="wrap">
+    <span>onoats, the Always-on Organized Audio Transcript System. BSD-2-Clause.</span>
+    <ul>
+      <li><a href="https://github.com/vr000m/onoats-bot">GitHub</a></li>
+      <li><a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a></li>
+      <li><a href="https://pypi.org/project/onoats/">PyPI</a></li>
+      <li><a href="https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md">Changelog</a></li>
+      <li><a href="https://github.com/vr000m/pipecat-local-stt-server">pipecat-local-stt-server</a></li>
+      <li><a href="https://github.com/vr000m/pipecat-local-tts-server">pipecat-local-tts-server</a></li>
+    </ul>
+  </div>
 </footer>
 
 </body>
