@@ -18,3 +18,5 @@ secrets.env
 .review-plan/
 .gauntlet/
 .DS_Store
+/site/.wrangler
+/site/node_modules

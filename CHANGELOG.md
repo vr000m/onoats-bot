@@ -15,6 +15,15 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A flush no longer reports success when buffered transcript never reached
+  disk.** If no session file could be created (unwritable data directory),
+  `flush_and_rotate` logged "buffer was empty" and returned success while the
+  in-memory utterances were discarded. It now logs the number of lost entries at
+  ERROR and returns failure. If some entries failed to write, the partial file is
+  still queued, but the flush is reported as failed with the count.
+
 ## [1.6.0] - 2026-11-08
 
 ### Added
