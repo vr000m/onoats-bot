@@ -18,6 +18,9 @@ a{color:inherit;text-underline-offset:3px}
 code,pre{font-family:var(--mono)}
 code{font-size:.88em;background:var(--straw);padding:.1em .35em;border-radius:4px;overflow-wrap:anywhere}
 pre code{overflow-wrap:normal}
+/* dark code blocks and captions; each page keeps its own spacing and type size */
+pre{background:var(--midnight);color:var(--oat);border-radius:8px}
+figcaption{font-size:14.5px;color:var(--slate)}
 .wrap{max-width:1040px;margin:0 auto;padding:0 20px}
 .muted{color:var(--slate)}
 
