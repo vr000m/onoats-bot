@@ -19,6 +19,13 @@ non-obvious parts; the code and `docs/` cover the rest.
   check locally with `git config core.hooksPath .githooks`. To clear a failure:
   re-run `/review-plan`, or recompute the hash for a purely administrative
   above-marker edit (`head -n <marker_line-1> plan.md | git hash-object --stdin`).
+- **The landing site lives in `site/`** and shares no code or tests with the
+  package. Deploy from that directory with `npx wrangler deploy`. The prompt
+  text in `site/public/prompts/*.txt` is the source of truth;
+  `site/public/prompts/index.html` is generated from it, so run
+  `python3 site/scripts/build_prompts.py` after editing a prompt
+  (`--check` exits 1 when the page is stale; CI does not run it yet). Pages
+  share `site/public/site.css`; keep page-specific rules inline.
 
 ## Audio capture: PortAudio vs socket (`AUDIO_SOURCE`)
 
