@@ -7,15 +7,11 @@ import argparse
 import re
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
-PAGE_PATHS = (
-    Path("site/public/index.html"),
-    Path("site/public/prompts/index.html"),
-    Path("site/public/local-models/index.html"),
-    Path("site/public/404.html"),
-)
+HOME_PAGE = Path("site/public/index.html")  # shared-chrome reference
 ASSET_COPIES = {
     Path("site/public/favicon.svg"): Path("assets/brand/onoats-mark.svg"),
     Path("site/public/img/onoats-mark-1.6.0.svg"): Path("assets/brand/onoats-mark.svg"),
@@ -30,6 +26,8 @@ VERSIONED_IMAGE = re.compile(
     r"[a-z0-9][a-z0-9-]*-\d+\.\d+\.\d+(?:-[a-z0-9-]+)?\.(?:avif|gif|jpe?g|png|svg|webp)"
 )
 IMAGE_REFERENCE = re.compile(r"/img/(?P<name>[a-zA-Z0-9._-]+)")
+SOCIAL_URL = re.compile(r"https://onoats\.dev/img/(?P<name>[a-zA-Z0-9._-]+\.png)")
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SOCIAL_SOURCE = Path("site/scripts/render_social_card.swift")
 META_IMAGE = re.compile(
     r'<meta (?:property|name)="(?P<key>og:image|twitter:image)" content="(?P<url>[^"]*)"'
@@ -55,11 +53,35 @@ def _normalise_nav(block: str) -> str:
     return block.replace(' aria-current="page"', "")
 
 
-def _png_size(path: Path) -> tuple[int, int] | None:
-    data = path.read_bytes()
-    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    """Return a PNG's width and height, or None unless the whole file is sound.
+
+    Walks every chunk: IHDR first, each CRC valid, at least one IDAT, and IEND
+    as the last bytes. A truncated or padded file is not a usable card even
+    when its header still names the right size.
+    """
+
+    if data[:8] != PNG_SIGNATURE:
         return None
-    return struct.unpack(">II", data[16:24])
+    position, size, has_data = 8, None, False
+    while position + 12 <= len(data):
+        length, kind = struct.unpack(">I4s", data[position : position + 8])
+        body_end = position + 8 + length
+        if body_end + 4 > len(data):
+            return None
+        body = data[position + 8 : body_end]
+        (crc,) = struct.unpack(">I", data[body_end : body_end + 4])
+        if zlib.crc32(kind + body) != crc:
+            return None
+        if position == 8:
+            if kind != b"IHDR" or length != 13:
+                return None
+            size = struct.unpack(">II", body[:8])
+        has_data = has_data or kind == b"IDAT"
+        position = body_end + 4
+        if kind == b"IEND":
+            return size if has_data and position == len(data) else None
+    return None
 
 
 def _social_card_errors(repo_root: Path, home: Path) -> list[str]:
@@ -77,16 +99,16 @@ def _social_card_errors(repo_root: Path, home: Path) -> list[str]:
     urls = {m["key"]: m["url"] for m in META_IMAGE.finditer(text)}
     if set(urls) != {"og:image", "twitter:image"} or len(set(urls.values())) != 1:
         return [f"{label}: og:image and twitter:image must name one social card"]
-    reference = IMAGE_REFERENCE.search(urls["og:image"])
+    reference = SOCIAL_URL.fullmatch(urls["og:image"])
     if reference is None:
-        return [f"{label}: the social card must live under /img/"]
+        return [f"{label}: the social card URL must be https://onoats.dev/img/<file>"]
 
     name = reference["name"]
     errors: list[str] = []
     card = repo_root / "site/public/img" / name
     if card.is_file():  # a missing card is already reported by the reference scan
         declared = {m["axis"]: int(m["pixels"]) for m in META_SIZE.finditer(text)}
-        if _png_size(card) != (1200, 630):
+        if _png_size(card.read_bytes()) != (1200, 630):
             errors.append(f"site/public/img/{name}: must be a 1200x630 PNG")
         if declared != {"width": 1200, "height": 630}:
             errors.append(f"{label}: og:image:width/height must be 1200 and 630")
@@ -184,7 +206,12 @@ def collect_errors(repo_root: Path) -> list[str]:
     """Return every site-contract violation below *repo_root*."""
 
     errors: list[str] = []
-    pages = [repo_root / path for path in PAGE_PATHS]
+    home = repo_root / HOME_PAGE
+    # Every published page carries the shared chrome, so a new page cannot be
+    # left out of the comparison by forgetting to list it.
+    pages = [home] + sorted(
+        page for page in (repo_root / "site/public").rglob("*.html") if page != home
+    )
 
     try:
         expected_nav = _normalise_nav(_block(pages[0], NAV, "navigation"))

@@ -25,9 +25,9 @@ inlines each one between `<!-- prompt:NAME -->` markers. After editing a prompt:
     python3 scripts/build_prompts.py          # rewrite the page
     python3 scripts/build_prompts.py --check  # exit 1 if stale
 
-`site.css` holds everything shared by the home page, `/prompts/` and `404.html`.
-`scripts/check_site.py` ensures their navigation and footer remain identical,
-apart from the prompts page's `aria-current="page"` state.
+`site.css` holds everything shared by the pages. `scripts/check_site.py` finds
+every `*.html` file under `public/` and ensures its navigation and footer match
+the home page's, apart from an `aria-current="page"` state.
 
 ## Images
 

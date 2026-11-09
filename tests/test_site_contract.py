@@ -5,7 +5,9 @@ import os
 import re
 import shutil
 import string
+import struct
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
@@ -109,6 +111,108 @@ def test_social_card_follows_the_home_page_metadata(tmp_path: Path) -> None:
     )
     errors = CHECKER.collect_errors(checkout)
     assert any("must name one social card" in error for error in errors)
+
+
+SOCIAL = "https://onoats.dev/img/onoats-social-1.6.0.png"
+SOCIAL_URL_CASES = {
+    "committed": (SOCIAL, True),
+    "off-site host": ("https://evil.example/img/onoats-social-1.6.0.png", False),
+    "look-alike host": (
+        "https://onoats.dev.evil.example/img/onoats-social-1.6.0.png",
+        False,
+    ),
+    "plain http": ("http://onoats.dev/img/onoats-social-1.6.0.png", False),
+    "relative": ("/img/onoats-social-1.6.0.png", False),
+    "query string": (SOCIAL + "?v=2", False),
+    "outside img": ("https://onoats.dev/onoats-social-1.6.0.png", False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SOCIAL_URL_CASES))
+def test_social_card_url_is_the_site_image(tmp_path: Path, case: str) -> None:
+    url, valid = SOCIAL_URL_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    home = checkout / "site/public/index.html"
+    text = home.read_text(encoding="utf-8")
+    assert text.count(SOCIAL) == 2  # og:image and twitter:image
+    home.write_text(text.replace(SOCIAL, url), encoding="utf-8")
+
+    errors = CHECKER.collect_errors(checkout)
+    url_errors = [e for e in errors if "social card URL must be" in e]
+    assert (url_errors == []) is valid, errors
+    if valid:
+        assert errors == []
+
+
+def _chunk(kind: bytes, body: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(body))
+        + kind
+        + body
+        + struct.pack(">I", zlib.crc32(kind + body))
+    )
+
+
+def _png(width: int = 1200, height: int = 630) -> bytes:
+    header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    pixels = zlib.compress(b"\x00" + b"\x00" * width)
+    return (
+        CHECKER.PNG_SIGNATURE
+        + _chunk(b"IHDR", header)
+        + _chunk(b"IDAT", pixels)
+        + _chunk(b"IEND", b"")
+    )
+
+
+GOOD_PNG = _png()
+PNG_CASES = {
+    "valid": (GOOD_PNG, (1200, 630)),
+    "other size": (_png(600, 315), (600, 315)),
+    "signature only": (CHECKER.PNG_SIGNATURE, None),
+    "header only": (GOOD_PNG[:33], None),
+    "truncated data": (GOOD_PNG[:-20], None),
+    "missing iend": (GOOD_PNG[:-12], None),
+    "trailing bytes": (GOOD_PNG + b"x", None),
+    "bad crc": (GOOD_PNG[:29] + b"\x00\x00\x00\x00" + GOOD_PNG[33:], None),
+    "wrong signature": (b"\x89PNX" + GOOD_PNG[5:], None),
+    "no idat": (GOOD_PNG[:33] + _chunk(b"IEND", b""), None),
+    "ihdr not first": (
+        CHECKER.PNG_SIGNATURE + _chunk(b"tEXt", b"a\x00b") + GOOD_PNG[8:],
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(PNG_CASES))
+def test_png_size_requires_a_whole_png(case: str) -> None:
+    data, expected = PNG_CASES[case]
+    assert CHECKER._png_size(data) == expected
+
+
+def test_truncated_social_card_fails(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    card = checkout / "site/public/img/onoats-social-1.6.0.png"
+    card.write_bytes(card.read_bytes()[:4096])
+    errors = CHECKER.collect_errors(checkout)
+    assert "site/public/img/onoats-social-1.6.0.png: must be a 1200x630 PNG" in errors
+
+
+def test_every_published_page_carries_the_shared_chrome(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    public = checkout / "site/public"
+    home = (public / "index.html").read_text(encoding="utf-8")
+
+    (public / "changelog").mkdir()
+    (public / "changelog/index.html").write_text(home, encoding="utf-8")
+    assert CHECKER.collect_errors(checkout) == []
+
+    (public / "changelog/index.html").write_text(
+        "<!doctype html><title>x</title><main></main>", encoding="utf-8"
+    )
+    errors = CHECKER.collect_errors(checkout)
+    assert any(
+        "changelog/index.html: missing shared navigation" in error for error in errors
+    )
 
 
 def test_copied_asset_drift_fails(tmp_path: Path) -> None:
