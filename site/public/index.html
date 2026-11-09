@@ -151,12 +151,18 @@
 
 <main>
   <section class="sec">
-    <div class="wrap">
+    <div class="wrap files">
+      <div>
       <h2 class="t">Two sources, never mixed</h2>
       <div class="prose">
         <p>Each source has its own socket, its own speech-to-text session and its own tag. Nothing sends one source to both. Who spoke is a fact of how the audio was captured, not a guess from the sound.</p>
         <p class="muted">On macOS 14.4 or later, system audio comes from a native Core Audio tap, so you don't need a virtual loopback driver. On other platforms the CLI uses PortAudio, and system audio needs a loopback device.</p>
       </div>
+      </div>
+      <figure>
+        <img src="/img/onoats-1.6.0-2-recording.png" width="760" height="516" loading="lazy" alt="The onoats menu-bar panel mid-recording, with separate live levels for Me and Them, speech-to-text ready, and Flush and Stop Recording buttons.">
+        <figcaption>Recording: separate live levels for Me and Them, with Flush and Stop.</figcaption>
+      </figure>
     </div>
   </section>
 
