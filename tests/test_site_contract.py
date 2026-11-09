@@ -968,20 +968,135 @@ def test_stale_page_fails_check_and_write_mode_repairs_it(tmp_path: Path) -> Non
     assert BUILDER.collect_errors(checkout) == []
 
 
-def test_local_and_ci_call_both_check_owners() -> None:
-    justfile = (ROOT / "site/justfile").read_text(encoding="utf-8")
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+def _recipe(name: str) -> list[str]:
+    """The dedented body lines of one recipe in site/justfile."""
 
-    for command in (
+    lines = (ROOT / "site/justfile").read_text(encoding="utf-8").splitlines()
+    header = next(
+        i for i, line in enumerate(lines) if re.match(rf"{re.escape(name)}\b.*:", line)
+    )
+    body = []
+    for line in lines[header + 1 :]:
+        if line and not line.startswith("    "):
+            break
+        body.append(line[4:])
+    while body and not body[-1]:
+        body.pop()
+    return body
+
+
+def test_local_and_ci_call_both_check_owners() -> None:
+    # The commands must be what the `check` recipe and the CI step run, not
+    # text that merely appears somewhere in the file.
+    assert _recipe("check") == [
         "python3 scripts/build_prompts.py --check",
         "python3 scripts/check_site.py",
-    ):
-        assert command in justfile
-    for command in (
+    ]
+    for dependent in ("dry-run", "deploy"):
+        assert re.search(
+            rf"^{dependent}: check deps$",
+            (ROOT / "site/justfile").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+
+    # The CI step is a literal block; read it without a YAML dependency.
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    step = re.search(
+        r"^ +- name: Landing-site contracts\n +run: \|\n((?: {10}.*\n)+)",
+        workflow,
+        re.MULTILINE,
+    )
+    assert step is not None
+    assert workflow.count("Landing-site contracts") == 1
+    assert [line.strip() for line in step[1].splitlines()] == [
         "python3 site/scripts/build_prompts.py --check",
         "python3 site/scripts/check_site.py",
-    ):
-        assert command in workflow
+    ]
+
+
+@pytest.mark.parametrize("source", ["secrets file", "environment"])
+def test_deploy_passes_only_the_two_values_and_no_token_on_argv(
+    tmp_path: Path, source: str
+) -> None:
+    token, account = "tok-must-stay-off-argv", "acct-1234"
+    fake_bin, fake_home, fake_tmp, work = (
+        tmp_path / name for name in ("bin", "home", "tmp", "work")
+    )
+    for directory in (fake_bin, fake_home / ".secrets", fake_tmp, work):
+        directory.mkdir(parents=True)
+    record = tmp_path / "record"
+    # A PATH `env` that logs its argv, so routing the token through env(1) fails.
+    (fake_bin / "env").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{record}/env-argv"\nexec /usr/bin/env "$@"\n',
+        encoding="utf-8",
+    )
+    wrangler = work / "node_modules/.bin/wrangler"
+    wrangler.parent.mkdir(parents=True)
+    wrangler.write_text(
+        "#!/bin/sh\n"
+        f'/usr/bin/env | /usr/bin/sort > "{record}/wrangler-env"\n'
+        f'printf "%s\\n" "$@" > "{record}/wrangler-argv"\n'
+        f'/bin/ps -o args= -p "$PPID" > "{record}/parent-argv"\n',
+        encoding="utf-8",
+    )
+    for executable in (fake_bin / "env", wrangler):
+        executable.chmod(0o755)
+    record.mkdir()
+
+    env = {
+        "HOME": str(fake_home),
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TMPDIR": str(fake_tmp),
+        "UNRELATED_SECRET": "must-not-reach-wrangler",
+        "CLOUDFLARE_API_KEY": "must-not-reach-wrangler",
+        "CLOUDFLARE_EMAIL": "must-not-reach-wrangler",
+    }
+    secrets = f"OTHER_SECRET=must-not-reach-wrangler\nCLOUDFLARE_ACCOUNT_ID={account}\n"
+    if source == "environment":
+        env["CLOUDFLARE_API_TOKEN"] = token
+    else:
+        secrets += f'CLOUDFLARE_API_TOKEN="{token}"\n'
+    (fake_home / ".secrets/cf.env").write_text(secrets, encoding="utf-8")
+
+    justfile = (ROOT / "site/justfile").read_text(encoding="utf-8")
+    binary = re.search(r'^wrangler := "(.+)"$', justfile, re.MULTILINE)[1]
+    script = tmp_path / "deploy.sh"
+    script.write_text(
+        "\n".join(_recipe("deploy")).replace("{{wrangler}}", binary) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["bash", str(script)], cwd=work, env=env, check=True, timeout=60)
+
+    child_env = dict(
+        line.split("=", 1)
+        for line in (record / "wrangler-env").read_text(encoding="utf-8").splitlines()
+    )
+    assert child_env["CLOUDFLARE_API_TOKEN"] == token
+    assert child_env["CLOUDFLARE_ACCOUNT_ID"] == account
+    assert child_env["HOME"] == str(fake_home)
+    assert child_env["PATH"] == env["PATH"]
+    assert child_env["TMPDIR"] == str(fake_tmp)
+    assert set(child_env) <= {
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_API_TOKEN",
+        "HOME",
+        "PATH",
+        "PWD",
+        "SHLVL",
+        "TMPDIR",
+        "_",
+    }, child_env
+    assert (record / "wrangler-argv").read_text(encoding="utf-8").splitlines() == [
+        "deploy"
+    ]
+    for argv in ("parent-argv", "env-argv"):
+        logged = record / argv
+        assert not logged.exists() or token not in logged.read_text(encoding="utf-8")
+    # The token is never an argument in the recipe text either: only the test
+    # and export builtins and assignments name it.
+    for line in _recipe("deploy"):
+        if "$token" in line or "$account" in line:
+            assert re.match(r"\s*(\[ |if \[ |export )", line), line
 
 
 def test_locked_install_uses_deny_by_default_environment(tmp_path: Path) -> None:

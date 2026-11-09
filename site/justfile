@@ -50,6 +50,14 @@ deploy: check deps
         exit 1
     fi
     clean_tmp="${TMPDIR:-/tmp}"
-    env -i HOME="$HOME" PATH="$PATH" TMPDIR="$clean_tmp" \
-        CLOUDFLARE_API_TOKEN="$token" CLOUDFLARE_ACCOUNT_ID="$account" \
-        {{wrangler}} deploy
+    # Deny by default without putting the token on any argv (env -i would show
+    # it in ps): drop every exported variable but HOME and PATH, export the
+    # three values with the export builtin, then exec Wrangler in place.
+    for name in $(compgen -e); do
+        case "$name" in
+            HOME | PATH) ;;
+            *) unset "$name" 2>/dev/null || { echo "cannot clear $name" >&2; exit 1; } ;;
+        esac
+    done
+    export TMPDIR="$clean_tmp" CLOUDFLARE_API_TOKEN="$token" CLOUDFLARE_ACCOUNT_ID="$account"
+    exec {{wrangler}} deploy

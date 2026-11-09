@@ -14,7 +14,8 @@ site has no runtime build step or JavaScript.
   prompts page), `just check` (run `build_prompts.py --check` and
   `check_site.py`), `just dry-run` (validate the Worker config without
   publishing), `just deploy` (publish; reads `~/.secrets/cf.env` unless
-  `CLOUDFLARE_API_TOKEN` is already set).
+  `CLOUDFLARE_API_TOKEN` is already set, and gives Wrangler only the token,
+  account id, `HOME`, `PATH` and `TMPDIR`, never on a command line).
 - Wrangler uploads every file under `public/` except those listed in
   `public/.assetsignore`, which keeps local dotfiles such as `.DS_Store` off the
   site.

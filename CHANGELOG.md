@@ -31,8 +31,9 @@ Annotated tags exist from `v0.9.0` forward.
 - **Landing-site release safety.** CI and `just check` now verify generated
   prompts, copied assets, shared page chrome (including where
   `aria-current` sits), versioned immutable images, the social-card tags, and
-  the security headers and Content-Security-Policy. Deployment uses an integrity-locked local Wrangler after
-  a credential-free npm install, and `public/.assetsignore` keeps local
+  the security headers and Content-Security-Policy. Deployment uses an
+  integrity-locked local Wrangler after a credential-free npm install, passes
+  it only the two Cloudflare values and never puts the token on a command line, and `public/.assetsignore` keeps local
   dotfiles out of the upload. Every example prompt that embeds transcript
   text, or text derived from it, labels that text as untrusted data and fences
   each such placeholder separately; `build_prompts.py --check` enforces it. The site's screenshots and social card are quantized with `pngquant`

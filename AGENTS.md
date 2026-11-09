@@ -22,7 +22,10 @@ non-obvious parts; the code and `docs/` cover the rest.
 - **The landing site lives in `site/`** and shares no runtime code with the
   package. Use Node 24, npm 11.19 and `just`; `just deps` installs the locked
   Wrangler graph in a deny-by-default environment, and `just deploy` loads
-  Cloudflare credentials only after installation. The prompt text in
+  Cloudflare credentials only after installation, then clears every exported
+  variable but `HOME`/`PATH` and `export`s `TMPDIR` plus the token and account
+  id before `exec`ing Wrangler, so the token never sits on an argv (`env -i`
+  would show it in `ps`). The prompt text in
   `site/public/prompts/*.txt` is canonical. Two scripts own the site contracts
   and their module docstrings hold the rule values; do not restate them here.
   `build_prompts.py` owns the generated prompts page and the untrusted-data
