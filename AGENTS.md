@@ -19,13 +19,15 @@ non-obvious parts; the code and `docs/` cover the rest.
   check locally with `git config core.hooksPath .githooks`. To clear a failure:
   re-run `/review-plan`, or recompute the hash for a purely administrative
   above-marker edit (`head -n <marker_line-1> plan.md | git hash-object --stdin`).
-- **The landing site lives in `site/`** and shares no code or tests with the
-  package. Commands are in `site/justfile`; deploy with `just deploy` from that directory. The prompt
-  text in `site/public/prompts/*.txt` is the source of truth;
-  `site/public/prompts/index.html` is generated from it, so run
-  `python3 site/scripts/build_prompts.py` after editing a prompt
-  (`--check` exits 1 when the page is stale; CI does not run it yet). Pages
-  share `site/public/site.css`; keep page-specific rules inline.
+- **The landing site lives in `site/`** and shares no runtime code with the
+  package. Use Node 24, npm 11.19 and `just`; `just deps` installs the locked
+  Wrangler graph in a deny-by-default environment, and `just deploy` loads
+  Cloudflare credentials only after installation. The prompt text in
+  `site/public/prompts/*.txt` is canonical; `build_prompts.py --check` owns its
+  generated-page parity. `check_site.py` owns copied-asset, shared-chrome,
+  versioned-image and header contracts. `just check` and CI run both. Files in
+  `site/public/img/` are immutable and therefore versioned; regenerate the
+  social PNG with `swift scripts/render_social_card.swift` from `site/`.
 
 ## Audio capture: PortAudio vs socket (`AUDIO_SOURCE`)
 

@@ -22,6 +22,14 @@ Annotated tags exist from `v0.9.0` forward.
   served by Cloudflare Workers static assets. It is hand-written HTML and CSS
   with no JavaScript and no build step, and changes nothing in the package.
 
+### Changed
+
+- **Landing-site release safety.** CI and `just check` now verify generated
+  prompts, copied assets, shared page chrome, versioned immutable images and
+  security headers. Deployment uses an integrity-locked local Wrangler after
+  a credential-free npm install, and the daily digest prompt labels transcript
+  content as untrusted data.
+
 ## [1.6.0] - 2026-11-08
 
 ### Added
