@@ -130,17 +130,85 @@ def test_unversioned_public_image_fails_even_when_unreferenced(tmp_path: Path) -
     )
 
 
-def test_hsts_is_required(tmp_path: Path) -> None:
+HSTS_LINE = "  Strict-Transport-Security: max-age=31536000\n"
+IMG_CACHE = "/img/*\n  Cache-Control: public, max-age=31536000, immutable\n"
+LLMS_RULE = "/llms.txt\n  Content-Type: text/plain; charset=utf-8\n"
+HSTS_ERROR = "the /* rule, and only it, must set"
+IMG_ERROR = "/img/* must set one immutable Cache-Control"
+
+# (edit to the committed _headers, expected error fragment or None for "still valid").
+# Every cell is about which rule a header sits in, since Cloudflare applies each
+# matching rule and joins repeated headers.
+HEADER_CASES = {
+    "committed": ([], None),
+    "comments and blank lines": ([("/img/*\n", "# cache\n\n/img/*\n")], None),
+    "header names are case-insensitive": (
+        [(HSTS_LINE, HSTS_LINE.lower())],
+        None,
+    ),
+    "hsts missing": ([(HSTS_LINE, "")], HSTS_ERROR),
+    "hsts with subdomains": (
+        [(HSTS_LINE, HSTS_LINE.replace("31536000", "31536000; includeSubDomains"))],
+        HSTS_ERROR,
+    ),
+    "hsts only under another path": (
+        [(HSTS_LINE, ""), (LLMS_RULE, LLMS_RULE + HSTS_LINE)],
+        HSTS_ERROR,
+    ),
+    "hsts also under another path": ([(LLMS_RULE, LLMS_RULE + HSTS_LINE)], HSTS_ERROR),
+    "img no-store, immutable text elsewhere": (
+        [
+            (IMG_CACHE, "/img/*\n  Cache-Control: no-store\n"),
+            (LLMS_RULE, LLMS_RULE + "  X-Note: immutable\n"),
+        ],
+        IMG_ERROR,
+    ),
+    "img rule missing": ([(IMG_CACHE, "")], IMG_ERROR),
+    "img cache twice": (
+        [(IMG_CACHE, IMG_CACHE + "  Cache-Control: no-store\n")],
+        IMG_ERROR,
+    ),
+    "immutable outside img": (
+        [(LLMS_RULE, LLMS_RULE + "  Cache-Control: max-age=60, immutable\n")],
+        "/llms.txt sets an immutable Cache-Control",
+    ),
+    "global cache-control reaches img": (
+        [(HSTS_LINE, HSTS_LINE + "  Cache-Control: no-cache\n")],
+        "/* also sets Cache-Control on /img/*",
+    ),
+    "duplicate path rule": (
+        [(LLMS_RULE, LLMS_RULE + "\n/img/*\n  X-Extra: 1\n")],
+        "/img/* has more than one rule",
+    ),
+    "header before any rule": (
+        [("/*\n  X-Content", "  X-Orphan: 1\n/*\n  X-Content")],
+        "header line before any path rule",
+    ),
+    "malformed header line": (
+        [(HSTS_LINE, HSTS_LINE + "  not a header\n")],
+        "not a 'Name: value' header line",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(HEADER_CASES))
+def test_headers_rules_are_scoped_to_their_path_block(
+    tmp_path: Path, case: str
+) -> None:
+    edits, expected = HEADER_CASES[case]
     checkout = _copy_site_tree(tmp_path)
     headers = checkout / "site/public/_headers"
-    headers.write_text(
-        headers.read_text(encoding="utf-8").replace(
-            "  Strict-Transport-Security: max-age=31536000\n", ""
-        ),
-        encoding="utf-8",
-    )
+    text = headers.read_text(encoding="utf-8")
+    for old, new in edits:
+        assert text.count(old) == 1, (case, old)
+        text = text.replace(old, new)
+    headers.write_text(text, encoding="utf-8")
+
     errors = CHECKER.collect_errors(checkout)
-    assert "site/public/_headers: missing one-year HSTS" in errors
+    if expected is None:
+        assert errors == []
+    else:
+        assert any(expected in error for error in errors), errors
 
 
 def test_prompt_boundaries_are_fixed() -> None:
@@ -176,7 +244,7 @@ def test_prompt_templates_format_with_the_fields_the_page_documents() -> None:
         meta = re.search(
             rf'<p class="meta"><a href="/prompts/{re.escape(path.name)}">.*?</p>',
             page,
-            re.S,
+            re.DOTALL,
         )
         assert meta is not None, f"{path.name}: no placeholder paragraph on the page"
         documented = set(re.findall(r"<code>\{(\w+)\}</code>", meta.group(0)))

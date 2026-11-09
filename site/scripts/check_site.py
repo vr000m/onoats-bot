@@ -37,8 +37,11 @@ META_IMAGE = re.compile(
 META_SIZE = re.compile(
     r'<meta property="og:image:(?P<axis>width|height)" content="(?P<pixels>\d+)"'
 )
-NAV = re.compile(r'<nav aria-label="Primary">.*?</nav>', re.S)
-FOOTER = re.compile(r"<footer>.*?</footer>", re.S)
+HEADERS = "site/public/_headers"
+HEADER_LINE = re.compile(r"(?P<name>[A-Za-z0-9-]+):[ \t]*(?P<value>\S.*)")
+IMAGE_PROBE = "/img/onoats-mark-1.6.0.svg"  # any URL served from public/img/
+NAV = re.compile(r'<nav aria-label="Primary">.*?</nav>', re.DOTALL)
+FOOTER = re.compile(r"<footer>.*?</footer>", re.DOTALL)
 
 
 def _block(page: Path, pattern: re.Pattern[str], label: str) -> str:
@@ -92,6 +95,88 @@ def _social_card_errors(repo_root: Path, home: Path) -> list[str]:
         errors.append(f"{SOCIAL_SOURCE}: missing social-card source")
     elif name not in source.read_text(encoding="utf-8"):
         errors.append(f"{SOCIAL_SOURCE}: does not write {name}")
+    return errors
+
+
+def _parse_headers(
+    text: str,
+) -> tuple[list[tuple[str, list[tuple[str, str]]]], list[str]]:
+    """Split Cloudflare ``_headers`` text into ``(path pattern, headers)`` rules.
+
+    A line that starts in column 0 opens a rule; an indented ``Name: value``
+    line belongs to the rule above it. Header names are lower-cased. Anything
+    else (an indented line before the first rule, a line that is not
+    ``Name: value``, a detach ``! Name``) is reported, never skipped.
+    """
+
+    rules: list[tuple[str, list[tuple[str, str]]]] = []
+    errors: list[str] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not line[0].isspace():
+            rules.append((stripped, []))
+            continue
+        match = HEADER_LINE.fullmatch(stripped)
+        if not rules:
+            errors.append(f"{HEADERS}:{number}: header line before any path rule")
+        elif match is None:
+            errors.append(f"{HEADERS}:{number}: not a 'Name: value' header line")
+        else:
+            rules[-1][1].append((match["name"].lower(), match["value"]))
+    return rules, errors
+
+
+def _pattern_matches(pattern: str, path: str) -> bool:
+    """Whether a ``_headers`` URL pattern (``*`` splat, ``:name`` placeholder) matches."""
+
+    regex = re.escape(pattern).replace(r"\*", ".*")
+    regex = re.sub(r":[A-Za-z]\w*", "[^/]+", regex)
+    return re.fullmatch(regex, path) is not None
+
+
+def _headers_errors(text: str) -> list[str]:
+    """HSTS lives only in the global rule; immutable caching only under /img/*.
+
+    Cloudflare applies every rule whose pattern matches a request and joins
+    repeated headers, so each check is about the rule a header sits in, not
+    whether the text appears somewhere in the file.
+    """
+
+    rules, errors = _parse_headers(text)
+    patterns = [pattern for pattern, _ in rules]
+    for pattern in sorted({p for p in patterns if patterns.count(p) > 1}):
+        errors.append(f"{HEADERS}: {pattern} has more than one rule")
+
+    hsts = [
+        (pattern, value)
+        for pattern, headers in rules
+        for name, value in headers
+        if name == "strict-transport-security"
+    ]
+    if hsts != [("/*", "max-age=31536000")]:
+        errors.append(
+            f"{HEADERS}: the /* rule, and only it, must set"
+            " Strict-Transport-Security: max-age=31536000"
+        )
+
+    cache = [
+        (pattern, value)
+        for pattern, headers in rules
+        for name, value in headers
+        if name == "cache-control"
+    ]
+    image_cache = [value for pattern, value in cache if pattern == "/img/*"]
+    if len(image_cache) != 1 or "immutable" not in image_cache[0].lower():
+        errors.append(f"{HEADERS}: /img/* must set one immutable Cache-Control")
+    for pattern, value in cache:
+        if pattern == "/img/*":
+            continue
+        if "immutable" in value.lower():
+            errors.append(f"{HEADERS}: {pattern} sets an immutable Cache-Control")
+        elif _pattern_matches(pattern, IMAGE_PROBE):
+            errors.append(f"{HEADERS}: {pattern} also sets Cache-Control on /img/*")
     return errors
 
 
@@ -153,11 +238,7 @@ def collect_errors(repo_root: Path) -> list[str]:
     except OSError as exc:
         errors.append(str(exc))
     else:
-        if "  Strict-Transport-Security: max-age=31536000\n" not in headers:
-            errors.append("site/public/_headers: missing one-year HSTS")
-        image_rule = re.search(r"(?ms)^/img/\*\n(?P<body>(?:  .+\n?)+)", headers)
-        if image_rule is None or "immutable" not in image_rule.group("body"):
-            errors.append("site/public/_headers: /img/* must remain immutable")
+        errors.extend(_headers_errors(headers))
 
     return errors
 
