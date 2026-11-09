@@ -11,7 +11,9 @@ import zlib
 from pathlib import Path
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
-HOME_PAGE = Path("site/public/index.html")  # shared-chrome reference
+PUBLIC_DIR = Path("site/public")
+IMAGE_DIR = PUBLIC_DIR / "img"
+HOME_PAGE = PUBLIC_DIR / "index.html"  # shared-chrome reference
 ASSET_COPIES = {
     Path("site/public/favicon.svg"): Path("assets/brand/onoats-mark.svg"),
     Path("site/public/img/onoats-mark-1.6.0.svg"): Path("assets/brand/onoats-mark.svg"),
@@ -35,18 +37,23 @@ META_IMAGE = re.compile(
 META_SIZE = re.compile(
     r'<meta property="og:image:(?P<axis>width|height)" content="(?P<pixels>\d+)"'
 )
-HEADERS = "site/public/_headers"
-ASSETSIGNORE = "site/public/.assetsignore"
+HEADERS = PUBLIC_DIR / "_headers"
+ASSETSIGNORE = PUBLIC_DIR / ".assetsignore"
+REFERENCE_SUFFIXES = frozenset({".css", ".html", ".txt"})
 HEADER_LINE = re.compile(r"(?P<name>[A-Za-z0-9-]+):[ \t]*(?P<value>\S.*)")
 IMAGE_PROBE = "/img/onoats-mark-1.6.0.svg"  # any URL served from public/img/
 NAV = re.compile(r'<nav aria-label="Primary">.*?</nav>', re.DOTALL)
 FOOTER = re.compile(r"<footer>.*?</footer>", re.DOTALL)
 
 
-def _block(page: Path, pattern: re.Pattern[str], label: str) -> str:
+def _rel(repo_root: Path, path: Path) -> Path:
+    return path.relative_to(repo_root)
+
+
+def _block(repo_root: Path, page: Path, pattern: re.Pattern[str], label: str) -> str:
     match = pattern.search(page.read_text(encoding="utf-8"))
     if match is None:
-        raise ValueError(f"{page}: missing shared {label}")
+        raise ValueError(f"{_rel(repo_root, page)}: missing shared {label}")
     return match.group(0)
 
 
@@ -96,7 +103,7 @@ def _social_card_errors(repo_root: Path, home: Path) -> list[str]:
     try:
         text = home.read_text(encoding="utf-8")
     except OSError as exc:
-        return [str(exc)]
+        return [f"{label}: cannot read ({exc.strerror})"]
     urls = {m["key"]: m["url"] for m in META_IMAGE.finditer(text)}
     if set(urls) != {"og:image", "twitter:image"} or len(set(urls.values())) != 1:
         return [f"{label}: og:image and twitter:image must name one social card"]
@@ -106,11 +113,11 @@ def _social_card_errors(repo_root: Path, home: Path) -> list[str]:
 
     name = reference["name"]
     errors: list[str] = []
-    card = repo_root / "site/public/img" / name
+    card = repo_root / IMAGE_DIR / name
     if card.is_file():  # a missing card is already reported by the reference scan
         declared = {m["axis"]: int(m["pixels"]) for m in META_SIZE.finditer(text)}
         if _png_size(card.read_bytes()) != (1200, 630):
-            errors.append(f"site/public/img/{name}: must be a 1200x630 PNG")
+            errors.append(f"{IMAGE_DIR / name}: must be a 1200x630 PNG")
         if declared != {"width": 1200, "height": 630}:
             errors.append(f"{label}: og:image:width/height must be 1200 and 630")
     source = repo_root / SOCIAL_SOURCE
@@ -224,79 +231,117 @@ def _assetsignore_errors(repo_root: Path) -> list[str]:
     return []
 
 
-def collect_errors(repo_root: Path) -> list[str]:
-    """Return every site-contract violation below *repo_root*."""
+def _published_pages(repo_root: Path) -> list[Path]:
+    """The home page first, then every other ``*.html`` under ``site/public``.
 
-    errors: list[str] = []
+    Every published page carries the shared chrome, so a new page cannot be
+    left out of the comparison by forgetting to list it.
+    """
+
     home = repo_root / HOME_PAGE
-    # Every published page carries the shared chrome, so a new page cannot be
-    # left out of the comparison by forgetting to list it.
-    pages = [home] + sorted(
-        page for page in (repo_root / "site/public").rglob("*.html") if page != home
-    )
+    others = (repo_root / PUBLIC_DIR).rglob("*.html")
+    return [home] + sorted(page for page in others if page != home)
+
+
+def _chrome_errors(repo_root: Path, pages: list[Path]) -> list[str]:
+    """Each page's navigation and footer match the home page's."""
 
     try:
-        expected_nav = _normalise_nav(_block(pages[0], NAV, "navigation"))
-        expected_footer = _block(pages[0], FOOTER, "footer")
-    except (OSError, ValueError) as exc:
-        errors.append(str(exc))
-    else:
-        for page in pages[1:]:
-            try:
-                if _normalise_nav(_block(page, NAV, "navigation")) != expected_nav:
-                    errors.append(
-                        f"{page}: shared navigation differs beyond aria-current=page"
-                    )
-                if _block(page, FOOTER, "footer") != expected_footer:
-                    errors.append(f"{page}: shared footer differs")
-            except (OSError, ValueError) as exc:
-                errors.append(str(exc))
-
-    for public_path, canonical_path in ASSET_COPIES.items():
-        public = repo_root / public_path
-        canonical = repo_root / canonical_path
-        try:
-            if public.read_bytes() != canonical.read_bytes():
-                errors.append(f"{public_path}: differs from {canonical_path}")
-        except OSError as exc:
-            errors.append(str(exc))
-
-    image_dir = repo_root / "site/public/img"
-    for image in sorted(path for path in image_dir.iterdir() if path.is_file()):
-        if VERSIONED_IMAGE.fullmatch(image.name) is None:
-            errors.append(f"site/public/img/{image.name}: filename is not versioned")
-
-    public_dir = repo_root / "site/public"
-    for source in sorted(public_dir.rglob("*")):
-        if source.suffix not in {".css", ".html", ".txt"}:
-            continue
-        for match in IMAGE_REFERENCE.finditer(source.read_text(encoding="utf-8")):
-            name = match.group("name")
-            if VERSIONED_IMAGE.fullmatch(name) is None:
-                errors.append(
-                    f"{source.relative_to(repo_root)}: unversioned /img/{name}"
-                )
-            if not (image_dir / name).is_file():
-                errors.append(f"{source.relative_to(repo_root)}: missing /img/{name}")
-
-    errors.extend(_social_card_errors(repo_root, pages[0]))
-    errors.extend(_assetsignore_errors(repo_root))
-
-    headers_path = repo_root / "site/public/_headers"
-    try:
-        headers = headers_path.read_text(encoding="utf-8")
+        expected_nav = _normalise_nav(_block(repo_root, pages[0], NAV, "navigation"))
+        expected_footer = _block(repo_root, pages[0], FOOTER, "footer")
     except OSError as exc:
-        errors.append(str(exc))
-    else:
-        errors.extend(_headers_errors(headers))
-
+        return [f"{_rel(repo_root, pages[0])}: cannot read ({exc.strerror})"]
+    except ValueError as exc:
+        return [str(exc)]
+    errors: list[str] = []
+    for page in pages[1:]:
+        label = _rel(repo_root, page)
+        try:
+            nav = _block(repo_root, page, NAV, "navigation")
+            if _normalise_nav(nav) != expected_nav:
+                errors.append(
+                    f"{label}: shared navigation differs beyond aria-current=page"
+                )
+            if _block(repo_root, page, FOOTER, "footer") != expected_footer:
+                errors.append(f"{label}: shared footer differs")
+        except OSError as exc:
+            errors.append(f"{label}: cannot read ({exc.strerror})")
+        except ValueError as exc:
+            errors.append(str(exc))
     return errors
 
 
-def main() -> int:
+def _asset_copy_errors(repo_root: Path) -> list[str]:
+    """Each declared public copy is byte-identical to its canonical source."""
+
+    errors: list[str] = []
+    for public_path, canonical_path in ASSET_COPIES.items():
+        try:
+            public = (repo_root / public_path).read_bytes()
+            canonical = (repo_root / canonical_path).read_bytes()
+        except OSError as exc:
+            missing = Path(exc.filename).relative_to(repo_root)
+            errors.append(f"{missing}: cannot read ({exc.strerror})")
+            continue
+        if public != canonical:
+            errors.append(f"{public_path}: differs from {canonical_path}")
+    return errors
+
+
+def _image_name_errors(repo_root: Path) -> list[str]:
+    """Every file served from /img/ (immutable cache) has a versioned name."""
+
+    return [
+        f"{_rel(repo_root, image)}: filename is not versioned"
+        for image in sorted((repo_root / IMAGE_DIR).iterdir())
+        if image.is_file() and VERSIONED_IMAGE.fullmatch(image.name) is None
+    ]
+
+
+def _reference_errors(repo_root: Path) -> list[str]:
+    """Every /img/ reference in a published text file is versioned and exists."""
+
+    errors: list[str] = []
+    for source in sorted((repo_root / PUBLIC_DIR).rglob("*")):
+        if source.suffix not in REFERENCE_SUFFIXES:
+            continue
+        label = _rel(repo_root, source)
+        for match in IMAGE_REFERENCE.finditer(source.read_text(encoding="utf-8")):
+            name = match["name"]
+            if VERSIONED_IMAGE.fullmatch(name) is None:
+                errors.append(f"{label}: unversioned /img/{name}")
+            if not (repo_root / IMAGE_DIR / name).is_file():
+                errors.append(f"{label}: missing /img/{name}")
+    return errors
+
+
+def _headers_file_errors(repo_root: Path) -> list[str]:
+    try:
+        text = (repo_root / HEADERS).read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"{HEADERS}: cannot read ({exc.strerror})"]
+    return _headers_errors(text)
+
+
+def collect_errors(repo_root: Path) -> list[str]:
+    """Return every site-contract violation below *repo_root*."""
+
+    pages = _published_pages(repo_root)
+    return [
+        *_chrome_errors(repo_root, pages),
+        *_asset_copy_errors(repo_root),
+        *_image_name_errors(repo_root),
+        *_reference_errors(repo_root),
+        *_social_card_errors(repo_root, pages[0]),
+        *_assetsignore_errors(repo_root),
+        *_headers_file_errors(repo_root),
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, default=DEFAULT_REPO_ROOT)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     errors = collect_errors(args.repo_root.resolve())
     if errors:
         for error in errors:

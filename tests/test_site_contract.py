@@ -47,6 +47,56 @@ def test_committed_site_contracts_pass() -> None:
     assert CHECKER.collect_errors(ROOT) == []
 
 
+def _run_script(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.parametrize("script", [CHECKER_PATH, BUILDER_PATH], ids=lambda p: p.name)
+def test_ci_exit_code_follows_the_contracts(tmp_path: Path, script: Path) -> None:
+    # CI and `just check` rely on the process exit code, not on collect_errors.
+    checkout = _copy_site_tree(tmp_path)
+    flags = ["--check"] if script == BUILDER_PATH else []
+    clean = _run_script(script, *flags, "--repo-root", str(checkout))
+    assert clean.returncode == 0, clean.stderr
+    module = BUILDER if script == BUILDER_PATH else CHECKER
+    assert (
+        module.main([*flags, "--repo-root", str(checkout)]) == 0
+    )  # argv, not sys.argv
+
+    if script == BUILDER_PATH:
+        _edit(checkout / "site/public/prompts/segment.txt", "segmenter", "splitter")
+    else:
+        _edit(checkout / "site/public/favicon.svg", "<svg", "<svg data-drift='1'")
+    broken = _run_script(script, *flags, "--repo-root", str(checkout))
+    assert broken.returncode == 1
+    assert broken.stderr.strip()
+
+
+def test_site_errors_name_repo_relative_paths(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    public = checkout / "site/public"
+    (public / "changelog").mkdir()
+    (public / "changelog/index.html").write_text("<main></main>", encoding="utf-8")
+    _edit(public / "404.html", "BSD-2-Clause.", "MIT.")
+    _edit(
+        public / "local-models/index.html",
+        '<a href="/prompts/">Prompts</a>',
+        '<a href="/prompt/">Prompts</a>',
+    )
+    (public / "img/onoats-mark-1.6.0.svg").unlink()
+    (public / "_headers").unlink()
+
+    errors = CHECKER.collect_errors(checkout)
+    assert len(errors) >= 6, errors
+    assert not [error for error in errors if str(checkout) in error], errors
+    assert all(error.startswith(("site/", "assets/")) for error in errors), errors
+
+
 def test_shared_chrome_allows_only_aria_current(tmp_path: Path) -> None:
     checkout = _copy_site_tree(tmp_path)
     assert CHECKER.collect_errors(checkout) == []
