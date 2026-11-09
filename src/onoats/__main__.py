@@ -424,7 +424,8 @@ async def run_onoats(
                 ended_by_error = True
                 logger.error(
                     f"Shutdown: flush rotation failed ({exc}). "
-                    "Session file preserved in .active/ for crash recovery."
+                    "See the preceding Flush errors for what reached disk; a "
+                    "session file left in .active/ is recovered on the next start."
                 )
             # _topic_pipeline_tasks is no longer populated by the bot, but
             # drain it defensively in case a legacy task is still pending.

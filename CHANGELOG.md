@@ -22,7 +22,10 @@ Annotated tags exist from `v0.9.0` forward.
   `flush_and_rotate` logged "buffer was empty" and returned success while the
   in-memory utterances were discarded. It now logs the number of lost entries at
   ERROR and returns failure. If some entries failed to write, the partial file is
-  still queued, but the flush is reported as failed with the count.
+  still queued, but the flush is reported as failed with the count. A read-only
+  `.active/` (path assigned, file never created) is reported the same way
+  instead of as a session file that "vanished". The terminal-flush failure log no
+  longer claims the session file was preserved in `.active/`.
 
 ## [1.6.0] - 2026-11-08
 
