@@ -8,6 +8,9 @@
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--oat);color:var(--midnight);font:17px/1.65 var(--sans);-webkit-font-smoothing:antialiased}
+/* short pages (the 404) keep the footer at the bottom of the window; it scrolls with long ones */
+body{min-height:100vh;display:flex;flex-direction:column}
+main{flex:1 0 auto}
 a{color:inherit;text-underline-offset:3px}
 :focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:3px}
 code,pre{font-family:var(--mono)}
@@ -54,8 +57,9 @@ h2.t{font:600 clamp(28px,4vw,40px)/1.12 var(--serif);letter-spacing:-.018em;marg
 /* a note set apart from the flow */
 .aside{max-width:38em;margin-top:6px;padding-left:16px;border-left:3px solid var(--gold);color:var(--slate);font-size:15.5px}
 
-/* footer */
-footer{padding:36px 0 52px;font-size:14.5px;color:var(--slate)}
+/* footer: a straw band, so it reads as a footer on pages that do not end in a dark section */
+main>.sec:last-child{padding-bottom:72px}
+footer{padding:36px 0 52px;font-size:14.5px;color:var(--slate);background:var(--straw);border-top:1px solid #e3d8b8}
 footer .wrap{display:flex;flex-wrap:wrap;gap:10px 32px;justify-content:space-between}
 footer ul{display:flex;flex-wrap:wrap;gap:8px 22px;list-style:none;margin:0;padding:0}
 footer a{color:var(--slate)}
