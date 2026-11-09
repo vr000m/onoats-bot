@@ -2,9 +2,13 @@
 """Inline each prompts/*.txt into site/public/prompts/index.html.
 
 The .txt files are the source of truth. Each prompt's <li> carries exactly one
-pair of markers; this script rewrites everything between them:
+meta paragraph, ``<p class="meta"><a href="/prompts/NAME">``, followed in the
+same <li> by exactly one pair of markers; this script rewrites everything
+between them:
 
     <!-- prompt:segment.txt -->...<!-- /prompt:segment.txt -->
+
+Prompt file names use only letters, digits, ``_``, ``.`` and ``-``.
 
 Run `python3 site/scripts/build_prompts.py` after editing a prompt, or with
 `--check` to fail (exit 1) when the page is out of date. Both modes also fail
@@ -24,12 +28,16 @@ from pathlib import Path
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_DIR = Path("site/public/prompts")
 PAGE = PROMPT_DIR / "index.html"
+NAME = r"[\w.-]+"  # one grammar for file names and all three marker patterns
+PROMPT_NAME = re.compile(NAME)
 MARKER = re.compile(
-    r"(<!-- prompt:(?P<name>[\w.]+) -->)(?P<body>.*?)(<!-- /prompt:(?P=name) -->)",
+    rf"(<!-- prompt:(?P<name>{NAME}) -->)(?P<body>.*?)(<!-- /prompt:(?P=name) -->)",
     re.DOTALL,
 )
-OPEN_MARKER = re.compile(r"<!-- prompt:(?P<name>[\w.]+) -->")
-CLOSE_MARKER = re.compile(r"<!-- /prompt:(?P<name>[\w.]+) -->")
+OPEN_MARKER = re.compile(rf"<!-- prompt:(?P<name>{NAME}) -->")
+CLOSE_MARKER = re.compile(rf"<!-- /prompt:(?P<name>{NAME}) -->")
+ITEM_OPEN = re.compile(r"<li\b")
+ITEM_CLOSE = "</li>"
 
 # Every placeholder in every prompt is classified once, by name. Untrusted ones
 # carry transcript text or text derived from it (summaries, extracted items,
@@ -79,22 +87,66 @@ def render(page: str, prompt_dir: Path) -> str:
     return MARKER.sub(sub, page)
 
 
+def meta_paragraphs(page: str, name: str) -> list[re.Match[str]]:
+    """Every ``<p class="meta">`` paragraph that introduces prompt *name*."""
+
+    pattern = rf'<p class="meta"><a href="/prompts/{re.escape(name)}">.*?</p>'
+    return list(re.finditer(pattern, page, re.DOTALL))
+
+
+def _item_end(page: str, meta: re.Match[str]) -> int | None:
+    """Where the <li> holding *meta* closes, or None if *meta* is in no <li>."""
+
+    opens = [m.start() for m in ITEM_OPEN.finditer(page, 0, meta.start())]
+    if not opens or page.find(ITEM_CLOSE, opens[-1], meta.start()) != -1:
+        return None
+    end = page.find(ITEM_CLOSE, meta.end())
+    return None if end == -1 else end
+
+
 def marker_errors(page: str, on_disk: set[str]) -> list[str]:
-    """Each prompt file needs exactly one ordered open/close marker pair, and
-    every marker must name a prompt file."""
+    """Bind each prompt file to exactly one marker pair in its own <li>.
+
+    Every file name fits ``NAME``; every marker names a prompt file; each file
+    has exactly one ordered open/close pair and exactly one meta paragraph, and
+    the pair follows that paragraph inside the same <li>, so swapping two
+    items' markers cannot embed the wrong prompt under a description.
+    """
 
     opens = Counter(m["name"] for m in OPEN_MARKER.finditer(page))
     closes = Counter(m["name"] for m in CLOSE_MARKER.finditer(page))
-    pairs = Counter(m["name"] for m in MARKER.finditer(page))
+    pairs = {m["name"]: m for m in MARKER.finditer(page)}
+    paired = Counter(m["name"] for m in MARKER.finditer(page))
     errors = []
     for name in sorted(set(opens) | set(closes) | on_disk):
         if name not in on_disk:
             errors.append(f"{PAGE}: marker names {name}, which is not a prompt file")
-        elif (opens[name], closes[name], pairs[name]) != (1, 1, 1):
+            continue
+        if PROMPT_NAME.fullmatch(name) is None:
+            errors.append(
+                f"{PROMPT_DIR / name}: a prompt file name may use only letters,"
+                " digits, '_', '.' and '-'"
+            )
+            continue
+        if (opens[name], closes[name], paired[name]) != (1, 1, 1):
             errors.append(
                 f"{PAGE}: {name} needs exactly one <!-- prompt:{name} --> ..."
                 f" <!-- /prompt:{name} --> pair (found {opens[name]} open,"
-                f" {closes[name]} close, {pairs[name]} paired)"
+                f" {closes[name]} close, {paired[name]} paired)"
+            )
+            continue
+        metas = meta_paragraphs(page, name)
+        if len(metas) != 1:
+            errors.append(
+                f'{PAGE}: {name} needs exactly one <p class="meta"><a'
+                f' href="/prompts/{name}"> paragraph (found {len(metas)})'
+            )
+            continue
+        end, pair = _item_end(page, metas[0]), pairs[name]
+        if end is None or not metas[0].end() <= pair.start() < pair.end() <= end:
+            errors.append(
+                f"{PAGE}: the {name} markers must follow its meta paragraph"
+                " inside the same <li>"
             )
     return errors
 
@@ -124,13 +176,11 @@ def prompt_errors(name: str, text: str, page: str) -> list[str]:
         return [f"{label}: not a str.format template ({exc})"]
 
     errors = []
-    meta = re.search(
-        rf'<p class="meta"><a href="/prompts/{re.escape(name)}">.*?</p>',
-        page,
-        re.DOTALL,
-    )
+    metas = meta_paragraphs(page, name)  # marker_errors reports a count other than 1
     documented = (
-        set(re.findall(r"<code>\{(\w+)\}</code>", meta.group(0))) if meta else None
+        set(re.findall(r"<code>\{(\w+)\}</code>", metas[0].group(0)))
+        if len(metas) == 1
+        else None
     )
     if documented != fields:
         errors.append(

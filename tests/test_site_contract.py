@@ -805,6 +805,14 @@ def test_page_must_document_exactly_the_template_fields(tmp_path: Path) -> None:
     )
 
 
+SEGMENT_META = next(
+    m.group(0)
+    for m in BUILDER.meta_paragraphs(
+        (ROOT / "site/public/prompts/index.html").read_text(encoding="utf-8"),
+        "segment.txt",
+    )
+)
+
 MARKER_CASES = {
     "one pair each": ([], None),
     "duplicate pair": (
@@ -847,6 +855,36 @@ MARKER_CASES = {
         ],
         "segment.txt needs exactly one",
     ),
+    "markers swapped between items (reported)": (
+        [
+            ("<!-- prompt:segment.txt -->", "@@open@@"),
+            ("<!-- /prompt:segment.txt -->", "@@close@@"),
+            ("<!-- prompt:classify_topics.txt -->", "<!-- prompt:segment.txt -->"),
+            ("<!-- /prompt:classify_topics.txt -->", "<!-- /prompt:segment.txt -->"),
+            ("@@open@@", "<!-- prompt:classify_topics.txt -->"),
+            ("@@close@@", "<!-- /prompt:classify_topics.txt -->"),
+        ],
+        "the segment.txt markers must follow its meta paragraph inside the same <li>",
+    ),
+    "markers before their meta paragraph": (
+        [
+            (SEGMENT_META, ""),
+            (
+                "<!-- /prompt:segment.txt -->",
+                "<!-- /prompt:segment.txt -->\n" + SEGMENT_META,
+            ),
+        ],
+        "the segment.txt markers must follow its meta paragraph",
+    ),
+    "second meta paragraph for one prompt": (
+        [
+            (
+                "<!-- prompt:classify_topics.txt -->",
+                SEGMENT_META + "<!-- prompt:classify_topics.txt -->",
+            )
+        ],
+        'segment.txt needs exactly one <p class="meta">',
+    ),
     "marker for a missing file": (
         [
             (
@@ -879,6 +917,42 @@ def test_prompt_markers_pair_once_per_file(tmp_path: Path, case: str) -> None:
     assert BUILDER.main(["--check", "--repo-root", str(checkout)]) == (
         0 if expected is None else 1
     )
+    # Write mode shares the binding rule and must not render over a broken page.
+    assert BUILDER.main(["--repo-root", str(checkout)]) == (
+        0 if expected is None else 1
+    )
+    if expected is not None:
+        assert page.read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize(
+    ("new_name", "expected"),
+    [
+        ("classify-ap.txt", None),
+        ("classify ap.txt", "a prompt file name may use only letters"),
+    ],
+)
+def test_prompt_file_names_follow_one_grammar(
+    tmp_path: Path, new_name: str, expected: str | None
+) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    prompts = checkout / "site/public/prompts"
+    (prompts / "classify_ap.txt").rename(prompts / new_name)
+    page = prompts / "index.html"
+    text = page.read_text(encoding="utf-8")
+    assert (
+        text.count("classify_ap.txt") == 5
+    )  # href, link text, two markers, summary label
+    page.write_text(text.replace("classify_ap.txt", new_name), encoding="utf-8")
+
+    errors = BUILDER.collect_errors(checkout)
+    if expected is None:
+        assert errors == []
+        assert BUILDER.main(["--check", "--repo-root", str(checkout)]) == 0
+    else:
+        assert f"site/public/prompts/{new_name}: {expected}" in [
+            e.split(", digits")[0] for e in errors
+        ], errors
 
 
 def test_stale_page_fails_check_and_write_mode_repairs_it(tmp_path: Path) -> None:

@@ -24,7 +24,9 @@ site has no runtime build step or JavaScript.
 ## Prompts page
 
 `public/prompts/*.txt` are the source of truth. `public/prompts/index.html`
-inlines each one between `<!-- prompt:NAME -->` markers. After editing a prompt:
+inlines each one between `<!-- prompt:NAME -->` markers, which must follow that
+prompt's `<p class="meta">` paragraph in the same `<li>` (the binding rule is
+in the script's docstring). After editing a prompt:
 
     python3 scripts/build_prompts.py          # rewrite the page
     python3 scripts/build_prompts.py --check  # exit 1 if stale
