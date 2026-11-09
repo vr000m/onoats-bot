@@ -185,6 +185,10 @@ class TranscriptBuffer(FrameProcessor):
         # In-memory buffer of JSONL entry dicts
         self._buffer: list[dict] = []
 
+        # How many entries the last ``flush()`` could not write to disk. The
+        # caller reads it to tell a complete session file from a partial one.
+        self.unpersisted_on_last_flush = 0
+
         # Wall-clock time of last VADUserStoppedSpeakingFrame (or None).
         # In source-aware mode, updated only when *all* known branches
         # have gone idle — otherwise a brief pause on one branch while
@@ -259,7 +263,8 @@ class TranscriptBuffer(FrameProcessor):
 
         Returns:
             Tuple of (entries, session_path). session_path may be None if no
-            entries were written to disk.
+            entries were written to disk. ``unpersisted_on_last_flush`` holds
+            how many entries could not be written (0 when the file is complete).
         """
         async with self._write_lock:
             # Materialize any entries that never made it to disk
@@ -268,14 +273,17 @@ class TranscriptBuffer(FrameProcessor):
                 for i, entry in enumerate(self._buffer)
                 if i not in self._persisted_indices
             ]
+            failed = 0
             for i, entry in unpersisted:
                 if await self._write_entry(entry):
                     self._persisted_indices.add(i)
                 else:
+                    failed += 1
                     logger.warning(
                         "TranscriptBuffer: entry materialization failed — "
                         "session file may be incomplete for crash recovery"
                     )
+            self.unpersisted_on_last_flush = failed
 
             contents = list(self._buffer)
             session_path = self._session_file

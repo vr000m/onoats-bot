@@ -1825,6 +1825,18 @@ async def flush_and_rotate(
     buffer_contents, session_path = await transcript_buffer.flush(
         next_session_file=next_active_path
     )
+    # Read the loss count now: it describes the flush that just returned, and
+    # every branch below (rotation failure included) must report it.
+    lost = transcript_buffer.unpersisted_on_last_flush
+    if buffer_contents and session_path is None:
+        # Entries were captured but no session file ever existed (storage was
+        # unwritable), so there is nothing to rotate. This is data loss, not an
+        # empty buffer: fail the flush so the recorder exits non-zero.
+        logger.error(
+            f"Flush: {len(buffer_contents)} buffered entries could not be written "
+            "to disk; this transcript is lost"
+        )
+        return False
     if not buffer_contents or session_path is None:
         logger.info("Flush: buffer was empty, nothing to rotate")
         # Persist any unpersisted in-memory entries (defensive — flush()
@@ -1860,12 +1872,27 @@ async def flush_and_rotate(
             session_path, data_dir=data_dir
         )
     except FileNotFoundError:
-        logger.warning(
-            f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
-        )
+        if lost:
+            # The path was assigned but every write failed before the file
+            # could be created (read-only .active/, ENOSPC on create): data
+            # loss, not a file that went missing.
+            logger.error(
+                f"Flush: {lost} of {len(buffer_contents)} buffered entries could not "
+                f"be written to disk ({session_path.name} was never created); "
+                "this transcript is lost"
+            )
+        else:
+            logger.warning(
+                f"Flush: session file {session_path.name} vanished before rotation — nothing to queue"
+            )
         return False
     except OSError as exc:
         logger.error(f"Flush: could not rotate {session_path.name} to pending/: {exc}")
+        if lost:
+            logger.error(
+                f"Flush: {lost} of {len(buffer_contents)} buffered entries were "
+                f"never written to {session_path.name}"
+            )
         return False
 
     # File-only: no DB row. The category travels in the session_meta first
@@ -1877,6 +1904,14 @@ async def flush_and_rotate(
         logger.debug(
             f"Flush: buffer swapped to fresh active session {next_active_path.name} under lock"
         )
+    if lost:
+        # The partial file is queued so the lines that were written survive,
+        # but the session is incomplete, so report the flush as failed.
+        logger.error(
+            f"Flush: {lost} of {len(buffer_contents)} entries could not be written "
+            f"to {session_path.name}; the queued transcript is incomplete"
+        )
+        return False
     return True
 
 
