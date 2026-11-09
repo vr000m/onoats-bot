@@ -1,5 +1,8 @@
 # onoats.dev site commands. Run from site/ (or any directory below it).
 
+# Pinned: `deploy` runs this with your Cloudflare token, so it must not float to "latest".
+wrangler := "wrangler@4.158.0"
+
 [private]
 default:
     @just --list
@@ -10,7 +13,7 @@ dev:
 
 # Preview the way Cloudflare serves it: _headers, 404 page, asset routing.
 preview:
-    npx --yes wrangler dev --port 8788
+    npx --yes {{wrangler}} dev --port 8788
 
 # Rewrite prompts/index.html from the prompt .txt files.
 prompts:
@@ -22,13 +25,17 @@ check:
 
 # Validate the Worker config and bundle the assets without publishing anything.
 dry-run: check
-    npx --yes wrangler deploy --dry-run
+    npx --yes {{wrangler}} deploy --dry-run
 
 # Publish to onoats.dev (reads ~/.secrets/cf.env unless CLOUDFLARE_API_TOKEN is set).
 deploy: check
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -f "$HOME/.secrets/cf.env" ]; then
-        set -a; . "$HOME/.secrets/cf.env"; set +a
+    f="$HOME/.secrets/cf.env"
+    # Export only the two values wrangler needs, never the whole file.
+    pick() { sed -n "s/^$1=//p" "$f" | head -n 1 | tr -d "\"'"; }
+    if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -f "$f" ]; then
+        export CLOUDFLARE_API_TOKEN="$(pick CLOUDFLARE_API_TOKEN)"
+        export CLOUDFLARE_ACCOUNT_ID="$(pick CLOUDFLARE_ACCOUNT_ID)"
     fi
-    npx --yes wrangler deploy
+    npx --yes {{wrangler}} deploy
