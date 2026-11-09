@@ -12,17 +12,22 @@
   .lead{max-width:40em}
   .quick{margin:22px 0 0;max-width:40em}
   .quick li{margin:0 0 6px}
-  .shots{display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start;margin-top:36px}
-  .shots figure{margin:0;max-width:300px}
-  .shots figure.wide{max-width:260px}
+  /* toolbar: text and steps on the left, its two screenshots on the right */
+  .tool{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:48px;align-items:start}
+  .tool>*{min-width:0}
+  .shots{display:flex;gap:20px;align-items:flex-start;padding-top:8px}
+  .shots figure{margin:0;flex:1 1 150px;max-width:190px}
   .shots img{display:block;width:100%;height:auto;border-radius:12px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
-  .lane-shot{margin:0 0 22px;max-width:300px}
-  .lane-shot img{display:block;width:100%;height:auto;border-radius:12px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
+  .quick pre{margin:12px 0 0}
+  /* screenshot with its caption beside it, or under it when the lane is narrow */
+  .lane-shot{margin:0 0 22px;display:flex;flex-wrap:wrap;gap:12px 20px;align-items:flex-end}
+  .lane-shot figcaption{flex:1 1 170px;margin:0}
+  .lane-shot img{display:block;flex:0 0 260px;width:260px;max-width:100%;height:auto;border-radius:12px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
   figcaption{font-size:14.5px;color:var(--slate);margin-top:10px}
 
   /* the left/right split: speech to text | text to speech */
   .split{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:start}
-  .split>*{min-width:0}
+  .split>*,.lane>*{min-width:0}
   .lane h3{font:600 26px/1.2 var(--serif);margin:0 0 6px}
   .lane .sub{color:var(--slate);margin:0 0 18px}
   .facts{margin:0 0 20px;padding-left:1.1em;color:var(--slate)}
@@ -38,7 +43,13 @@
   .variants{margin:14px 0 0;color:var(--slate);font-size:15px}
   td:nth-child(2){font-family:var(--mono);font-size:13.5px;white-space:nowrap}
 
+  /* side by side, the two lanes share rows so their parts line up across the page */
+  @media (min-width:861px){
+    .split{grid-template-rows:repeat(6,auto);row-gap:0;align-items:stretch}
+    .lane{display:grid;grid-template-rows:subgrid;grid-row:span 6}
+  }
   @media (max-width:860px){
+    .tool{grid-template-columns:1fr;gap:36px}
     .split{grid-template-columns:1fr;gap:48px}
   }
 </style>
@@ -66,28 +77,30 @@
 
 <main>
   <section class="sec">
-    <div class="wrap">
-      <h2 class="t">Pipecat Service Toolbar</h2>
-      <div class="prose lead">
-        <p>A native macOS menu-bar app that downloads speech models and serves each one on its own port on <code>127.0.0.1</code>. Point a Pipecat app at the port and it uses the model. The app has no Dock icon. It stops servers it started when it quits and leaves other servers running.</p>
-        <p class="muted">The toolbar is a separate project from onoats. It lives in the <a href="https://github.com/vr000m/pipecat-local-tts-server/tree/main/macos">pipecat-local-tts-server</a> repository.</p>
-      </div>
-      <ol class="steps quick">
-        <li><span class="st">Build and open it</span><span>Needs Apple Silicon, macOS 15 or later, Xcode 16+, and <a href="https://docs.astral.sh/uv/">uv</a>. Apple Speech needs macOS 26 or later.</span>
+    <div class="wrap tool">
+      <div>
+        <h2 class="t">Pipecat Service Toolbar</h2>
+        <div class="prose lead">
+          <p>A native macOS menu-bar app that downloads speech models and serves each one on its own port on <code>127.0.0.1</code>. Point a Pipecat app at the port and it uses the model. The app has no Dock icon. It stops servers it started when it quits and leaves other servers running.</p>
+          <p class="muted">The toolbar is a separate project from onoats. It lives in the <a href="https://github.com/vr000m/pipecat-local-tts-server/tree/main/macos">pipecat-local-tts-server</a> repository.</p>
+        </div>
+        <ol class="steps quick">
+          <li><span class="st">Build and open it</span><span>Needs Apple Silicon, macOS 15 or later, Xcode 16+, and <a href="https://docs.astral.sh/uv/">uv</a>. Apple Speech needs macOS 26 or later.</span>
 <pre>git clone https://github.com/vr000m/pipecat-local-tts-server.git
 cd pipecat-local-tts-server
 just app-open</pre></li>
-        <li><span class="st">Add a model</span><span>Click the cat in the menu bar, choose <b>Add Models</b>, then click <b>Get</b> on a model and <b>Start</b>.</span></li>
-        <li><span class="st">Point your app at it</span><span>Each running service shows its address, such as <code>127.0.0.1:9365</code>, with a button to copy it.</span></li>
-      </ol>
+          <li><span class="st">Add a model</span><span>Click the cat in the menu bar, choose <b>Add Models</b>, then click <b>Get</b> on a model and <b>Start</b>.</span></li>
+          <li><span class="st">Point your app at it</span><span>Each running service shows its address, such as <code>127.0.0.1:9365</code>, with a button to copy it.</span></li>
+        </ol>
+      </div>
       <div class="shots">
         <figure>
           <img src="/img/service-toolbar-panel-0.9.0.png" width="718" height="1076" loading="lazy" alt="The Pipecat Service Toolbar panel listing Phonon for text to speech on 127.0.0.1:9365 and Nemotron for speech to text on 127.0.0.1:9865, both running.">
-          <figcaption>Two services running, each with its port, a copy button, and a stop button.</figcaption>
+          <figcaption>Two services running, each with its port.</figcaption>
         </figure>
-        <figure class="wide">
+        <figure>
           <img src="/img/service-toolbar-settings-0.9.0.png" width="790" height="1540" loading="lazy" alt="The Pipecat Service Toolbar settings and quit menu.">
-          <figcaption>Settings and the Stop All &amp; Quit command.</figcaption>
+          <figcaption>Settings, and Stop All &amp; Quit.</figcaption>
         </figure>
       </div>
     </div>
@@ -116,6 +129,7 @@ uv sync --extra mlx
 uv run --no-sync python -m stt_server serve \
   --backend mlx \
   --socket-path ~/Library/Caches/pipecat-stt/stt.sock</pre>
+          <div class="models">
           <table>
             <caption>Models in the toolbar</caption>
             <thead><tr><th scope="col">Model</th><th scope="col">Port</th><th scope="col">Licence</th></tr></thead>
@@ -128,6 +142,7 @@ uv run --no-sync python -m stt_server serve \
             </tbody>
           </table>
           <p class="variants">Also in the toolbar: Whisper Large v3, Medium, Small, Base, and Tiny on ports 9566 to 9570, and Kyutai STT 2.6B (English) on 9666.</p>
+          </div>
         </div>
 
         <div class="lane" id="tts">
@@ -146,6 +161,7 @@ uv run --no-sync python -m stt_server serve \
 uv run python -m tts_server prefetch --backend kokoro
 uv run python -m tts_server serve --backend kokoro \
   --socket-path ~/Library/Caches/pipecat-tts/tts.sock</pre>
+          <div class="models">
           <table>
             <caption>Models in the toolbar</caption>
             <thead><tr><th scope="col">Model</th><th scope="col">Port</th><th scope="col">Licence</th></tr></thead>
@@ -161,6 +177,7 @@ uv run python -m tts_server serve --backend kokoro \
             </tbody>
           </table>
           <p class="variants">Also in the toolbar: Phonon 8-bit and 4-bit on ports 9366 and 9367.</p>
+          </div>
         </div>
 
       </div>
