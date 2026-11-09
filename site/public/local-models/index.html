@@ -59,7 +59,7 @@
     </div>
     <div class="intro">
       <h1>Run speech models on your Mac</h1>
-      <p class="lede">onoats works with a local speech-to-text server. Two open-source servers, one for speech-to-text and one for text-to-speech, and a menu-bar app that starts them, put models on your Mac with no cloud API.</p>
+      <p class="lede">Use the Pipecat Service Toolbar to run local speech-to-text and text-to-speech models on your Mac without a cloud API.</p>
     </div>
   </div>
 </header>
@@ -69,11 +69,11 @@
     <div class="wrap">
       <h2 class="t">Pipecat Service Toolbar</h2>
       <div class="prose lead">
-        <p>A native macOS menu-bar app that downloads speech models and serves each one on its own port on <code>127.0.0.1</code>. Point a Pipecat app at the port and it uses the model. The app has no Dock icon. Servers it starts stop when it quits, and servers it didn't start are left running.</p>
+        <p>A native macOS menu-bar app that downloads speech models and serves each one on its own port on <code>127.0.0.1</code>. Point a Pipecat app at the port and it uses the model. The app has no Dock icon. It stops servers it started when it quits and leaves other servers running.</p>
         <p class="muted">The toolbar is a separate project from onoats. It lives in the <a href="https://github.com/vr000m/pipecat-local-tts-server/tree/main/macos">pipecat-local-tts-server</a> repository.</p>
       </div>
       <ol class="steps quick">
-        <li><span class="st">Build and open it</span><span>Needs Apple Silicon, macOS 15 or later, Xcode 16+ and <a href="https://docs.astral.sh/uv/">uv</a>. Apple Speech needs macOS 26 or later.</span>
+        <li><span class="st">Build and open it</span><span>Needs Apple Silicon, macOS 15 or later, Xcode 16+, and <a href="https://docs.astral.sh/uv/">uv</a>. Apple Speech needs macOS 26 or later.</span>
 <pre>git clone https://github.com/vr000m/pipecat-local-tts-server.git
 cd pipecat-local-tts-server
 just app-open</pre></li>
@@ -83,11 +83,11 @@ just app-open</pre></li>
       <div class="shots">
         <figure>
           <img src="/img/service-toolbar-panel-0.9.0.png" width="718" height="1076" loading="lazy" alt="The Pipecat Service Toolbar panel listing Phonon for text to speech on 127.0.0.1:9365 and Nemotron for speech to text on 127.0.0.1:9865, both running.">
-          <figcaption>Two services running, each with its port, a copy button and a stop button.</figcaption>
+          <figcaption>Two services running, each with its port, a copy button, and a stop button.</figcaption>
         </figure>
         <figure class="wide">
           <img src="/img/service-toolbar-settings-0.9.0.png" width="790" height="1540" loading="lazy" alt="The Pipecat Service Toolbar settings and quit menu.">
-          <figcaption>Settings and quit.</figcaption>
+          <figcaption>Settings and the Stop All &amp; Quit command.</figcaption>
         </figure>
       </div>
     </div>
@@ -96,7 +96,7 @@ just app-open</pre></li>
   <section class="sec">
     <div class="wrap">
       <h2 class="t">Two servers, one pattern</h2>
-      <div class="prose lead"><p>Each server loads one model and listens on a Unix socket or loopback TCP. They share a design, so a client for one is easy to adapt for the other. You can also run them without the toolbar.</p></div>
+      <div class="prose lead"><p>Each server loads one model and listens on a Unix socket or loopback TCP. Both use related event-based WebSocket protocols, but STT and TTS clients remain separate. You can also run the servers without the toolbar.</p></div>
       <div class="split" style="margin-top:34px">
 
         <div class="lane" id="stt">
@@ -108,8 +108,8 @@ just app-open</pre></li>
             <li>Unix sockets with a same-user check, or loopback TCP with an optional token.</li>
           </ul>
           <figure class="lane-shot">
-            <img src="/img/service-toolbar-panel-0.9.0-stt.png" width="764" height="1104" loading="lazy" alt="The toolbar's Add Models view on the Speech to Text tab. Nemotron is running on port 9865, Apple Speech is installed and ready to start, and Whisper, Kyutai STT and Parakeet are available to get.">
-            <figcaption>Add Models, Speech to Text tab: running, installed and available models.</figcaption>
+            <img src="/img/service-toolbar-panel-0.9.0-stt.png" width="764" height="1104" loading="lazy" alt="The toolbar's Add Models view on the Speech to Text tab. Nemotron is running on port 9865, Apple Speech is installed and ready to start, and Whisper, Kyutai STT, and Parakeet are available to get.">
+            <figcaption>Add Models, Speech to Text tab: running, installed, and available models.</figcaption>
           </figure>
 <pre># in a checkout of the repository
 uv sync --extra mlx
@@ -127,7 +127,7 @@ uv run --no-sync python -m stt_server serve \
             <tr><th scope="row">Nemotron<code class="mid">mlx-community/nemotron-3.5-asr-streaming-0.6b</code></th><td>9865</td><td>Custom (<code>license:other</code>)</td></tr>
             </tbody>
           </table>
-          <p class="variants">Also in the toolbar: Whisper Large v3, Medium, Small, Base and Tiny on ports 9566 to 9570, and Kyutai STT 2.6B (English) on 9666.</p>
+          <p class="variants">Also in the toolbar: Whisper Large v3, Medium, Small, Base, and Tiny on ports 9566 to 9570, and Kyutai STT 2.6B (English) on 9666.</p>
         </div>
 
         <div class="lane" id="tts">
@@ -139,7 +139,7 @@ uv run --no-sync python -m stt_server serve \
             <li>Unix sockets or loopback TCP. It mirrors the STT server's design, with a protocol inspired by OpenAI Realtime.</li>
           </ul>
           <figure class="lane-shot">
-            <img src="/img/service-toolbar-panel-0.9.0-tts.png" width="750" height="1100" loading="lazy" alt="The toolbar's Add Models view on the Text to Speech tab, listing Tone, Kokoro, Phonon, Pocket TTS, Qwen3 TTS, Voxtral TTS, Dia and Fish S2 Pro with download sizes. Voxtral is marked CC-BY-NC and Fish S2 Pro is marked research only.">
+            <img src="/img/service-toolbar-panel-0.9.0-tts.png" width="750" height="1100" loading="lazy" alt="The toolbar's Add Models view on the Text to Speech tab, listing Tone, Kokoro, Phonon, Pocket TTS, Qwen3 TTS, Voxtral TTS, Dia, and Fish S2 Pro with download sizes. Voxtral is marked CC-BY-NC and Fish S2 Pro is marked research only.">
             <figcaption>Add Models, Text to Speech tab, with download sizes and licence badges.</figcaption>
           </figure>
 <pre>uv add "pipecat-local-tts-server[kokoro]"
@@ -172,13 +172,13 @@ uv run python -m tts_server serve --backend kokoro \
     <div class="wrap">
       <h2 class="t">Use them with onoats</h2>
       <div class="prose">
-        <p>onoats can send each channel to a local speech-to-text server over WebSocket. With no endpoint set, it falls back to <code>127.0.0.1:9565</code>, which is the Whisper port above. To use another model, set its port in <code>config.toml</code>:</p>
+        <p>onoats can send each channel to a local speech-to-text server over WebSocket. With no endpoint set, onoats uses a live legacy cache socket when available; otherwise, it connects to <code>127.0.0.1:9565</code>, the Whisper port above. To use another model, set its port in <code>config.toml</code>:</p>
       </div>
 <pre style="max-width:34em">[stt]
 service = "websocket"
 ws_host = "127.0.0.1"
 ws_port = 9865</pre>
-      <div class="prose"><p class="muted">onoats records and transcribes only, so it doesn't use the text-to-speech server. The <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md">configuration guide</a> covers sockets, auth and launchd self-healing.</p></div>
+      <div class="prose"><p class="muted">onoats records and transcribes only, so it doesn't use the text-to-speech server. The <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md">configuration guide</a> covers sockets, auth, and launchd self-healing.</p></div>
     </div>
   </section>
 </main>

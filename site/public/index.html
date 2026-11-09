@@ -122,7 +122,7 @@
     </div>
 
     <h1>Record both sides. Keep the files.</h1>
-    <p class="lede">onoats records your microphone and your computer's audio on separate streams, transcribes each one, and writes JSONL and Markdown you can read, search and move. No database. No account.</p>
+    <p class="lede">onoats records your microphone and your computer's audio on separate streams, transcribes each one, and writes JSONL and Markdown you can read, search, and move. No database. No account.</p>
     <div class="cta">
       <a class="btn" href="#install">Install onoats</a>
       <a class="textlink" href="https://github.com/vr000m/onoats-bot">Read the source</a>
@@ -157,7 +157,7 @@
       <div>
       <h2 class="t">Two sources, never mixed</h2>
       <div class="prose">
-        <p>Each source has its own socket, its own speech-to-text session and its own tag. Nothing sends one source to both. Who spoke is a fact of how the audio was captured, not a guess from the sound.</p>
+        <p>Each source has its own socket, its own speech-to-text session, and its own tag. Nothing sends one source to both. The source label follows each stream from capture to transcript.</p>
         <p class="muted">On macOS 14.4 or later, system audio comes from a native Core Audio tap, so you don't need a virtual loopback driver. On other platforms the CLI uses PortAudio, and system audio needs a loopback device.</p>
       </div>
       </div>
@@ -172,12 +172,12 @@
     <div class="wrap">
       <h2 class="t">What you get</h2>
       <dl>
-        <div><dt>A menu-bar app</dt><dd>Start, Stop and Flush from the menu bar, with live levels for both channels and the state of speech-to-text.</dd></div>
+        <div><dt>A menu-bar app</dt><dd>Start, Stop, and Flush from the menu bar, with live levels for both channels and the state of speech-to-text.</dd></div>
         <div><dt>Your choice of speech-to-text</dt><dd>Local Whisper-MLX on Apple Silicon, or a WebSocket server such as <a href="https://github.com/vr000m/pipecat-local-stt-server">pipecat-local-stt-server</a>. See <a href="/local-models/">the local models</a>.</dd></div>
-        <div><dt>Split remote speakers</dt><dd>Opt in to the Nemotron diarizer on Apple Silicon and the <code>them</code> channel gets S1, S2 and so on, live. If labelling fails, transcripts keep flowing without labels.</dd></div>
-        <div><dt>Failures you can see</dt><dd>Capture, speech-to-text and storage errors exit non-zero and say why. A partial session still lands in the queue.</dd></div>
-        <div><dt>Files in your own folders</dt><dd>Config, queue and transcripts live in directories you choose. Environment variables override the config file.</dd></div>
-        <div><dt>A CLI everywhere</dt><dd>Linux, Windows and Intel Macs run the CLI with PortAudio. The menu-bar app and native capture need Apple Silicon and macOS 14.4+.</dd></div>
+        <div><dt>Split remote speakers</dt><dd>Opt in to the Nemotron diarizer on Apple Silicon and the <code>them</code> channel gets S1, S2, and so on, live. If labelling fails, transcripts keep flowing without labels.</dd></div>
+        <div><dt>Failures you can see</dt><dd>The recorder exits non-zero on capture, speech-to-text, or storage errors and reports why. A partial session still lands in the queue.</dd></div>
+        <div><dt>Files in your own folders</dt><dd>Config, queue, and transcripts live in directories you choose. Environment variables override the config file.</dd></div>
+        <div><dt>A CLI everywhere</dt><dd>Linux, Windows, and Intel Macs run the CLI with PortAudio. The menu-bar app and native capture need Apple Silicon and macOS 14.4+.</dd></div>
       </dl>
     </div>
   </section>
@@ -197,8 +197,8 @@
         <p class="muted prose">The menu-bar app and the CLI read the same <code>config.toml</code>. A running session keeps the settings it started with.</p>
       </div>
       <figure>
-        <img src="/img/onoats-1.6.0-3-settings.png" width="834" height="1040" loading="lazy" alt="The onoats settings panel with audio, speech-to-text, storage and privacy options.">
-        <figcaption>Settings: microphone, speech-to-text service, data directory and privacy.</figcaption>
+        <img src="/img/onoats-1.6.0-3-settings.png" width="834" height="1040" loading="lazy" alt="The onoats settings panel with audio, speech-to-text, storage, and privacy options.">
+        <figcaption>Settings: microphone, speech-to-text service, data directory, and privacy.</figcaption>
       </figure>
     </div>
   </section>
@@ -207,13 +207,13 @@
     <div class="wrap">
       <h2 class="t">After the call</h2>
       <div class="prose">
-        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">the prompts I use for each step</a>.</p>
+        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">example prompts for each step</a>.</p>
       </div>
       <ol class="steps">
-        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>, and S1, S2 when speakers are labelled. A model can read who said what and assign each commitment to the person who made it.</span></li>
-        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku or ChatGPT's Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
+        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>; labelled speakers also get S1, S2, and so on. A model can read who said what and assign each commitment to the person who made it.</span></li>
+        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
         <li><h3 class="st">Consolidate into living documents</h3><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
-        <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly or per-topic summaries from those folders.</span></li>
+        <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly, or per-topic summaries from those folders.</span></li>
       </ol>
       <p class="aside">onoats stops at the files. These steps run in your own tools, on the queue and the Markdown it writes.</p>
     </div>
