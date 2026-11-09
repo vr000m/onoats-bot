@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-11-08
+
 ### Added
 
 - **Landing site.** `site/` holds the static source for onoats.dev: a home
