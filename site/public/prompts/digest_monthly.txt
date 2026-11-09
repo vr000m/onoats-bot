@@ -1,0 +1,30 @@
+You are synthesising a month's worth of weekly digests into a monthly summary for a personal voice memory system. You are a REDUCER — you consume pre-built short weekly summaries, not raw transcripts or daily digests.
+
+Month: {month}
+
+## Short weekly digests
+{short_weeklies}
+
+## Instructions
+
+Produce a monthly digest that synthesises {weeks_count} week(s) of conversations into a high-level overview. Each input is a short weekly digest that has already distilled the week's conversations.
+
+Your job is to identify the month-level patterns — what evolved over weeks, what was accomplished, what shifted in focus.
+
+### Structure
+
+Use these exact level-2 Markdown headings (`## `, each on its own line — not bold text), in this order, so the digest renders with the same section hierarchy and in-page navigation as the weekly synthesis:
+
+- `## Month overview` — what was the shape of this month? Major themes, time allocation trends. Was it focused or exploratory?
+- `## Key accomplishments` — what was completed, shipped, or resolved across the month.
+- `## Major threads` — topics that spanned multiple weeks. Synthesise the arc, not the per-week details.
+- `## Decisions and commitments` — key decisions made, with enough context to recall the reasoning later.
+- `## Open items` — outstanding action items and unresolved questions, prioritised.
+- `## Patterns and trends` — what changed over the month? New areas of focus? Things that faded? Recurring concerns?
+- `## Outlook` — based on the month's trajectory, what's likely to carry into next month?
+
+### Constraints
+- This should read like a monthly status report that a busy person can scan in 3 minutes.
+- Prefer synthesis over enumeration. A month-level summary should feel like an executive overview, not a concatenation of weekly summaries.
+- Trust each weekly digest's assessment of that week's shape. Your job is synthesis across weeks.
+- Write in markdown format.

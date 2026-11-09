@@ -156,6 +156,7 @@
       <a class="brand" href="/"><img src="/img/onoats-mark.svg" alt="" width="34" height="34">onoats</a>
       <nav aria-label="Primary">
         <a href="#install">Install</a>
+        <a href="/prompts/">Prompts</a>
         <a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a>
         <a href="https://github.com/vr000m/onoats-bot">GitHub</a>
       </nav>
@@ -241,11 +242,11 @@
     <div class="wrap">
       <h2 class="t">After the call</h2>
       <div class="prose">
-        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them.</p>
+        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">the prompts I use for each step</a>.</p>
       </div>
       <ol class="steps">
         <li><b>Pull out action points</b><span>Every line is tagged <code>me</code> or <code>them</code>, and S1, S2 when speakers are labelled. A model can read who said what and assign each commitment to the person who made it.</span></li>
-        <li><b>Split long calls by topic</b><span>Run a model such as Gemini, Claude Haiku or Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
+        <li><b>Split long calls by topic</b><span>Run a model such as Gemini, Claude Haiku or ChatGPT's Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
         <li><b>Consolidate into living documents</b><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
         <li><b>Build the digests</b><span>An agent such as Hermes or pi.dev can build weekly, monthly or per-topic summaries from those folders.</span></li>
       </ol>

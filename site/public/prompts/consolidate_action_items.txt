@@ -1,0 +1,52 @@
+You are consolidating a long list of action items extracted from a single transcript. The primary-pass classifier emitted too many items (often because the same workstream was mentioned in several utterances, or a single task was described in phases). Your job is to cluster items that belong to the same workstream into one merged item, and keep distinct workstreams separate.
+
+You will receive:
+- `category`: the transcript's classification category (one of: work, advisory, personal, ideas, seminars). Consolidation is skipped upstream for `gaming` and `uncategorized`, so this prompt never runs for those.
+- `summary`: a 1-2 sentence summary of the transcript.
+- `items`: a JSON list of `{{text, attribution}}` entries to consolidate.
+
+Your output MUST be a JSON object with a single key `consolidated_items`, whose value is a list of `{{text, attribution}}` entries. The list MUST contain at most 15 entries.
+
+## How to cluster
+
+Merge when items share a workstream. Keep separate when the objects or outcomes differ.
+
+- **Same-object remediation across utterances** → collapse to 1 item that names the object and the deliverable. Shape: `[VERB] all affected [OBJECT]s: [DISAMBIGUATING DETAIL]`.
+- **Sequential temporal phases of one plan** → collapse to 1 item that names the phases in order. Shape: `Execute phased [WORKSTREAM]: [PHASE A] → [PHASE B] → [PHASE C]`.
+- **Same workstream at different specificity** → keep the most specific item; drop vague wrappers ("focus on X", "look into Y", "start working on Z") when a concrete sibling already covers the same object.
+- **Single-task decomposition** → collapse sub-steps of one task ("set up X", "share X", "add people to X") into one item naming the task and its sub-steps.
+- **Distinct workstreams** → KEEP SEPARATE. If the objects differ (e.g. `[OBJECT A]`, `[OBJECT B]`, `[OBJECT C]`) and each has its own owner or deliverable, do not merge even if they appear close together in the transcript.
+
+## Attribution roll-up
+
+When you merge a cluster, the merged item takes the STRICTEST attribution among the inputs. Priority: `self_commit` > `delegated` > `ambiguous`. If any input in the cluster is `self_commit`, the merged item is `self_commit`. Otherwise if any is `delegated`, it is `delegated`. Otherwise `ambiguous`.
+
+## Anti-echo — critical
+
+Do NOT copy or paraphrase any text from these instructions into your outputs. The ALL-CAPS placeholders (`[VERB]`, `[OBJECT]`, `[WORKSTREAM]`, `[PHASE A]`, `[DISAMBIGUATING DETAIL]`, etc.) are shape hints, not content. Never emit those literal placeholder tokens. Every word in your `text` fields MUST come from the input items or the transcript summary. If an input item is a fragment or vague wrapper with no statable output and no concrete sibling to merge into, drop it — do not invent content to fill the gap.
+
+## Output schema
+
+Respond with ONLY this JSON object, no prose before or after:
+
+{{
+  "consolidated_items": [
+    {{"text": "<merged or preserved item, user-centric phrasing>", "attribution": "self_commit | delegated | ambiguous"}}
+  ]
+}}
+
+## Hard limits
+
+- `consolidated_items` MUST have length ≤ 15.
+- Prefer fewer, higher-quality items over many low-quality ones.
+- If fewer than 15 distinct workstreams exist, return fewer.
+- Preserve user-centric phrasing (task form: "Send the doc by Friday", not "I said I'll send the doc").
+
+## Inputs
+
+Category: {category}
+
+Summary: {summary}
+
+{existing_action_items_section}Items (JSON):
+{items_json}
