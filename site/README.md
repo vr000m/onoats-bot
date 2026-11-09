@@ -35,6 +35,9 @@ Every file under `public/img/` has a release version in its filename because
 Cloudflare serves that directory with a one-year immutable cache policy.
 `scripts/check_site.py` rejects unversioned filenames and references.
 
+Screenshots are quantized with `pngquant --quality=80-95 --strip` before they are
+committed (roughly 85% smaller, no visible change). Do the same to a new one.
+
 The mark, favicon and three published screenshots are byte-for-byte copies of
 their declared sources under `../assets/brand` and `../assets/screenshots`.
 `just check` verifies them. Copy a new release snapshot under a new versioned
@@ -46,8 +49,11 @@ project's version when they were copied, and `check_site.py` cannot compare them
 with a source in this repository.
 
 `scripts/render_social_card.swift` is the source owner for the 1200x630 social
-preview. It reads `../assets/brand/onoats-mark.svg` and writes the versioned PNG.
-Run these commands from `site/` after changing its copy or design:
+preview. It reads `../assets/brand/onoats-mark.svg`, renders exactly 1200x630
+pixels (independent of the display's scale) and quantizes the result with
+`pngquant` (`brew install pngquant`), about 40 KB instead of 700 KB, because link
+previews skip large images. Run these commands from `site/` after changing its
+copy or design:
 
     swift scripts/render_social_card.swift
     swift scripts/render_social_card.swift --check

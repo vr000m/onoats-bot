@@ -57,12 +57,28 @@ func drawPill(_ text: String, x: CGFloat, width: CGFloat) {
     )
 }
 
-let image = NSImage(size: NSSize(width: width, height: height))
-image.lockFocus()
-guard let context = NSGraphicsContext.current else {
+// Draw into a bitmap of exactly 1200x630 pixels. An NSImage with lockFocus renders at
+// the display's backing scale, which gives 2400x1260 on a Retina Mac.
+guard
+    let bitmap = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(width),
+        pixelsHigh: Int(height),
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: 0,
+        bitsPerPixel: 0
+    ),
+    let context = NSGraphicsContext(bitmapImageRep: bitmap)
+else {
     fputs("could not create drawing context\n", stderr)
     exit(1)
 }
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = context
 context.imageInterpolation = .high
 
 let background = NSGradient(
@@ -150,16 +166,45 @@ drawText(
     alignment: .right
 )
 
-image.unlockFocus()
+NSGraphicsContext.restoreGraphicsState()
 
 guard
-    let tiff = image.tiffRepresentation,
-    let bitmap = NSBitmapImageRep(data: tiff),
-    let png = bitmap.representation(using: .png, properties: [.compressionFactor: 0.9])
+    let fullColor = bitmap.representation(using: .png, properties: [.compressionFactor: 0.9])
 else {
     fputs("could not encode social card\n", stderr)
     exit(1)
 }
+
+/// The full-colour render is about 700 KB, too heavy for link previews (WhatsApp
+/// skips images over roughly 300 KB). Quantizing with pngquant brings it to
+/// about 40 KB with no visible change. `--check` compares this quantized output,
+/// so it needs the same pngquant major version as the committed file: `brew install pngquant`.
+func quantized(_ data: Data) -> Data {
+    let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("onoats-social-\(UUID().uuidString)")
+    let source = scratch.appendingPathComponent("in.png")
+    let result = scratch.appendingPathComponent("out.png")
+    defer { try? FileManager.default.removeItem(at: scratch) }
+    do {
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try data.write(to: source)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["pngquant", "--quality=80-95", "--strip", "--output", result.path, source.path]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, let out = try? Data(contentsOf: result) else {
+            fputs("pngquant failed (exit \(process.terminationStatus)); install it with: brew install pngquant\n", stderr)
+            exit(1)
+        }
+        return out
+    } catch {
+        fputs("could not run pngquant: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+let png = quantized(fullColor)
 
 if checking {
     guard let current = try? Data(contentsOf: outputURL), current == png else {
