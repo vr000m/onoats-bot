@@ -19,9 +19,6 @@ PAGE_PATHS = (
 ASSET_COPIES = {
     Path("site/public/favicon.svg"): Path("assets/brand/onoats-mark.svg"),
     Path("site/public/img/onoats-mark-1.6.0.svg"): Path("assets/brand/onoats-mark.svg"),
-    Path("site/public/img/onoats-1.6.0-1-ready.png"): Path(
-        "assets/screenshots/onoats-1.6.0-1-ready.png"
-    ),
     Path("site/public/img/onoats-1.6.0-2-recording.png"): Path(
         "assets/screenshots/onoats-1.6.0-2-recording.png"
     ),

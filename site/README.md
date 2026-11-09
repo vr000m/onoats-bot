@@ -38,7 +38,7 @@ Cloudflare serves that directory with a one-year immutable cache policy.
 Screenshots are quantized with `pngquant --quality=80-95 --strip` before they are
 committed (roughly 85% smaller, no visible change). Do the same to a new one.
 
-The mark, favicon and three published screenshots are byte-for-byte copies of
+The mark, favicon and two published screenshots are byte-for-byte copies of
 their declared sources under `../assets/brand` and `../assets/screenshots`.
 `just check` verifies them. Copy a new release snapshot under a new versioned
 name instead of replacing a cached file.

@@ -210,8 +210,8 @@
         <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">example prompts for each step</a>.</p>
       </div>
       <ol class="steps">
-        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>; labelled speakers also get S1, S2, and so on. A model can read who said what and assign each commitment to the person who made it.</span></li>
-        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes, and to find action points within each topic.</span></li>
+        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes.</span></li>
+        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>; labelled speakers also get S1, S2, and so on. A model can read who said what and assign each commitment to the person who made it, one topic at a time.</span></li>
         <li><h3 class="st">Consolidate into living documents</h3><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
         <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly, or per-topic summaries from those folders.</span></li>
       </ol>
