@@ -25,6 +25,13 @@ inlines each one between `<!-- prompt:NAME -->` markers. After editing a prompt:
     python3 scripts/build_prompts.py          # rewrite the page
     python3 scripts/build_prompts.py --check  # exit 1 if stale
 
+Both modes also fail when a prompt breaks the untrusted-data rules. A
+placeholder that carries transcript text, or text derived from it, goes alone
+on its own line between `--- BEGIN UNTRUSTED <LABEL> ---` and
+`--- END UNTRUSTED <LABEL> ---`, after the `## Instruction boundary`
+paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
+`UNTRUSTED_FIELDS` in the script, and the page must list it.
+
 `site.css` holds everything shared by the pages. `scripts/check_site.py` finds
 every `*.html` file under `public/` and ensures its navigation and footer match
 the home page's, apart from an `aria-current="page"` state.

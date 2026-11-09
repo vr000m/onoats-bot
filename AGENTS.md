@@ -24,8 +24,10 @@ non-obvious parts; the code and `docs/` cover the rest.
   Wrangler graph in a deny-by-default environment, and `just deploy` loads
   Cloudflare credentials only after installation. The prompt text in
   `site/public/prompts/*.txt` is canonical; `build_prompts.py --check` owns its
-  generated-page parity, and every prompt that embeds transcript text keeps its
-  `## Instruction boundary` paragraph and fences. `check_site.py` owns
+  generated-page parity (one marker pair per prompt) and the untrusted-data
+  rules: every placeholder is classified trusted or untrusted in the script, and
+  each untrusted one sits alone in its own `--- BEGIN/END UNTRUSTED` fence after
+  the `## Instruction boundary` paragraph. `check_site.py` owns
   copied-asset, shared-chrome, versioned-image and header contracts, and
   derives the social card from `og:image` (it must exist, be 1200x630 and be the
   file the renderer writes). `just check` and CI run both. Files in
