@@ -8,6 +8,14 @@
 <meta name="theme-color" content="#17233A">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/site.css">
+<style>
+  details{margin:6px 0 0;max-width:46em}
+  summary{cursor:pointer;font-weight:600;color:var(--midnight);width:max-content;max-width:100%}
+  summary:hover{color:var(--gold-ink)}
+  details pre{margin:10px 0 0;background:var(--midnight);color:var(--oat);padding:18px 20px;border-radius:8px;
+              font-size:12.5px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;max-height:30rem;overflow:auto}
+  .vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+</style>
 </head>
 <body>
 
@@ -38,36 +46,463 @@
           <h2 class="st">Split a long call by topic</h2>
           <p>Cuts a session into coherent segments with start and end times. It leans towards fewer, larger segments, and does not split on speaker changes or short silences.</p>
           <p class="meta"><a href="/prompts/segment.txt">segment.txt</a> takes <code>{buffer_jsonl}</code>, the session JSONL from the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md">queue</a>.</p>
+          <!-- prompt:segment.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">segment.txt</span></summary>
+            <pre tabindex="0">You are a conversation segmenter. Given a transcript buffer with timestamped utterances
+and silence gap markers, split it into logical conversation segments.
+
+The buffer may be legacy (no speaker tags), mixed (`Me:` / `Them:` utterances
+interleaved), me-only, or them-only. Speaker changes are NOT segment boundaries —
+a back-and-forth conversation on one topic is one segment. Use speaker tags only as
+context, not as a split signal. `Them` is a coarse bucket that may contain several
+real speakers (e.g. panelists); do not split on apparent Them-to-Them changes.
+
+Each segment should be ONE coherent topic or talk — typically 5–15 minutes of content.
+Your default bias is UNDER-segmentation: when in doubt, keep utterances together.
+
+## Core rules
+
+1. **Bias toward fewer, larger segments.** A typical coherent topic runs 5–15 minutes.
+   Segments under 3 minutes are almost always over-splits — before emitting one, check
+   whether the content is actually a continuation of the previous segment (same speaker,
+   same subject, same event). If it could plausibly be a continuation, merge it.
+
+2. **Hard minimum: 3 minutes.** Do not emit a segment shorter than 3 minutes unless the
+   content is genuinely isolated (e.g. a standalone announcement with no related
+   utterances before or after it). Short fragments next to a longer related segment
+   should be absorbed into that segment.
+
+3. **A single talk contains many sub-modes.** One talk/meeting/demo can contain pitch,
+   live demo, Q&amp;A, asides, setup noise, and follow-up comments. These are NOT segment
+   boundaries. Split only on genuine topic changes: new speaker on a new subject, or a
+   clearly unrelated new event. Shifts between "presenting → demoing → answering
+   questions" stay in one segment.
+
+4. **Silence gaps are weak hints, not hard boundaries.** Short silences, filler, brief
+   pauses, and asides are not segment boundaries. Only treat a silence gap as a boundary
+   if the topic ALSO changes across it. Small gaps (&lt;60s) between related content should
+   be merged through.
+
+5. **Topic coherence dominates.** Two utterances about the same subject separated by a
+   pause belong together. Two clearly different conversations with no gap should be
+   split — but be conservative: shared keywords, shared speaker, or continuation of an
+   argument all count as "same topic".
+
+6. **Mic-only context.** This transcript was captured from a microphone. You may see only
+   one side of a phone call, or bleed-through from other speakers. Short unintelligible
+   or "transcript too short to classify" fragments adjacent to a substantive segment
+   almost always belong to that segment — do not emit them as their own segments.
+
+## Counterexample patterns (do NOT split these)
+
+These are shape-only patterns. Do NOT copy any of these descriptions, keywords, or
+titles into your `reason` strings — they describe the abstract shape of a valid merge,
+not content you should emit. Every `reason` you write must come from the buffer above.
+
+- **Continuous activity session.** Multiple fragments within one extended activity
+  (game, task, exercise) with shared domain vocabulary → ONE segment, not many.
+
+- **Related business conversation with small gaps.** Several fragments on adjacent
+  business topics separated by &lt;30s gaps → ONE segment. Topic adjacency + small gap
+  = continuation.
+
+- **Product demo with multiple features.** Multiple fragments all demoing the same
+  product or tool, even when each shows a different feature → ONE segment. A demo
+  that covers several capabilities of ONE thing is one segment, not one per feature.
+
+- **Talk + its Q&amp;A + follow-up.** A substantive talk fragment followed by short
+  fragments that are clearly Q&amp;A, moderator comments, or audience reactions to that
+  talk → ONE segment including the Q&amp;A and follow-up.
+
+- **Long fragment flanked by short noise.** A long substantive fragment with short
+  adjacent fragments ("transcript too short to classify" or empty) → merge the shorts
+  into the long one. They are setup, transitions, or crosstalk from the same event.
+
+- **Same speaker continuing a theme.** Two fragments from the same speaker both on the
+  same technical theme with a small gap → ONE segment. Same speaker + overlapping
+  vocabulary = continuation.
+
+- **Event logistics.** Multiple short announcements (wrap-up, food, speaker timing,
+  housekeeping) → ONE logistics segment, not several tiny ones.
+
+## Input format
+
+The buffer is in JSONL format. Each line is one of:
+- {{"time": "...", "type": "utterance", "text": "..."}}
+- {{"time": "...", "type": "silence_gap", "duration_seconds": N}}
+
+## Output format
+
+Respond with a JSON object. Each segment specifies inclusive start and end times:
+
+{{
+  "segments": [
+    {{
+      "start_time": "2026-03-28T14:30:05-07:00",
+      "end_time": "2026-03-28T14:42:12-07:00",
+      "reason": "Product demo covering categorization, action items, and digests — one talk, multiple angles"
+    }},
+    {{
+      "start_time": "2026-03-28T14:45:15-07:00",
+      "end_time": "2026-03-28T14:58:30-07:00",
+      "reason": "Different speaker, unrelated topic (personal call)"
+    }}
+  ]
+}}
+
+If the entire buffer is one coherent conversation, return a single segment covering all
+utterances. That is often the correct answer.
+
+Buffer to segment:
+{buffer_jsonl}</pre>
+          </details>
+          <!-- /prompt:segment.txt -->
         </li>
         <li>
           <h2 class="st">Classify a transcript</h2>
           <p>Picks one category, with a confidence score, a short summary and tags. It handles transcripts with only <code>Them</code> lines (usually a talk you listened to) and refuses to invent a summary when there's too little text. The categories in the file are mine; replace them with your own <code>[categories]</code>.</p>
           <p class="meta"><a href="/prompts/classify_topics.txt">classify_topics.txt</a> takes <code>{transcript}</code>.</p>
+          <!-- prompt:classify_topics.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">classify_topics.txt</span></summary>
+            <pre tabindex="0">You are a conversation classifier. Given a transcript, classify it into ONE category and produce a short summary plus tags.
+
+CRITICAL RULE — apply FIRST, before any other reasoning:
+If the transcript has fewer than ~5 substantive sentences, or contains only timestamps/greetings/filler with no real conversational content, you MUST classify as "uncategorized" with confidence 0.1 and summary "Transcript too short to classify." Do NOT invent or infer topics that are not explicitly present in the text. Do NOT hallucinate content.
+
+Categories:
+- **work**: Professional calls, meetings, standups, code discussions, client calls, work planning — your day-job responsibilities
+- **personal**: Family conversations, personal calls, household discussions, non-work topics with people at home
+- **ideas**: Brain dumps, creative thinking, planning sessions with yourself, monologues about future projects
+- **advisory**: Startup advising, mentoring, industry discussions, technical deep-dives with founders/researchers, market analysis conversations — professional but not day-job
+- **seminars**: Attending talks, conferences, webinars, presentations, or lectures — you are in the audience, not a participant. The transcript captures what speakers presented, not a two-way conversation
+- **gaming**: Playing video games, discussing game strategy, in-game coordination with other players
+
+Important context: the transcript may be in ONE of four shapes. Detect which.
+
+1. **Legacy / mic-only** — no speaker tags at all. Lines look like `[HH:MM:SS] said something`. May be only the user's side of a call, or a mix of speakers captured through one mic.
+2. **Mixed (Me + Them)** — both tags appear, e.g. `[HH:MM:SS] Me: ...` and `[HH:MM:SS] Them: ...`. `Me` is the user; `Them` is a coarse bucket for everyone else (system-audio loopback captures remote participants, a video, a talk, etc. — several real speakers may all land in `Them`).
+3. **Me-only (speaker-labeled)** — only `Me:` lines appear. Typically a monologue, a note-to-self, or the other side of a call that wasn't captured.
+4. **Them-only (speaker-labeled)** — only `Them:` lines appear. Strong signal for **seminars**: the user is listening, not participating. Confirm from content (a talk, lecture, webinar, podcast, or conference panel). Short Them-only fragments can still be seminars (e.g. an unconference session).
+
+Treat `Me` as authoritative for the user's own commitments. Treat `Them` as "someone other than the user said this" — do NOT assume it is a single person.
+
+Infer what you can from the available text. Do not assume the transcript is a complete conversation.
+
+Also extract:
+- A 1-2 sentence summary
+- Key topics/tags (2-5 words)
+
+Respond in JSON with exactly these keys (schema only — fill every string from the
+transcript above, NOT from this template):
+{{
+  "category": "&lt;one of: work | personal | ideas | advisory | seminars | gaming | uncategorized&gt;",
+  "confidence": 0.0,
+  "summary": "&lt;1-2 sentences describing what was actually said&gt;",
+  "tags": ["&lt;specific topic word&gt;", "&lt;specific topic word&gt;"]
+}}
+
+Rules:
+- **Anti-echo:** Do NOT copy any names, phrases, or topics from this prompt into your
+  output. The schema above shows structure only — there is no example content to
+  reuse. Every word in `summary` and `tags` MUST come from the transcript. If the
+  transcript does not mention a name, a deadline, or a document, do not invent one.
+  Prompts that leak example content into real output are a known failure mode; it
+  has happened on this system before.
+- If you're uncertain between personal and work, classify as "personal" (privacy-first).
+- If the conversation is a technical/business discussion but NOT about day-job responsibilities (e.g., advising a startup, mentoring, industry analysis), classify as "advisory".
+- If the transcript is mostly one or more speakers presenting to an audience (talks, keynotes, panels, webinars) and the user is primarily listening, classify as "seminars". If the user is actively advising or having a two-way technical discussion, classify as "advisory" instead.
+- **Them-only hint for seminars:** when the transcript is speaker-labeled and contains only `Them:` lines (or `Me:` is limited to a handful of short questions/comments), that is a strong signal the user was listening — consider "seminars" or a passive consumption bucket rather than "work" or "advisory", unless the content is clearly a one-sided work call or voicemail.
+- If the conversation involves playing games, in-game actions, or game strategy, classify as "gaming" even if it sounds like work jargon (trading, navigation, etc.).
+- If the transcript is too short (&lt;5 substantive sentences), mostly filler/greetings, or unintelligible, classify as "uncategorized" with empty `tags`. NEVER fabricate a summary — only describe what is actually said.
+- Tags should be specific enough to be useful for search, not generic ("meeting" is too generic). Only use words that appear in or directly describe the transcript content.
+
+Transcript to classify:
+{transcript}</pre>
+          </details>
+          <!-- /prompt:classify_topics.txt -->
         </li>
         <li>
           <h2 class="st">Extract action points, with who said what</h2>
           <p>Pulls out specific future commitments and marks each as <code>self_commit</code> (you took it on), <code>delegated</code> (you asked someone else) or <code>ambiguous</code>. The <code>Me:</code> and <code>Them:</code> tags decide this, which is why onoats keeps the channels apart. It lists the kinds of line to skip, such as narrating what you're doing right now.</p>
           <p class="meta"><a href="/prompts/classify_ap.txt">classify_ap.txt</a> takes <code>{category}</code>, <code>{transcript}</code> and <code>{existing_action_items_section}</code>. Leave the last one empty on the first pass; later, fill it with the items already tracked so the model doesn't repeat them.</p>
+          <!-- prompt:classify_ap.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">classify_ap.txt</span></summary>
+            <pre tabindex="0">You are an action-item extractor. Given a transcript that has already been classified, extract specific future commitments from it.
+
+The transcript has already been classified as: **{category}**
+
+The transcript may be in ONE of four shapes. Detect which — it matters for attribution.
+
+1. **Legacy / mic-only** — no speaker tags. Lines look like `[HH:MM:SS] said something`. May be only the user's side or a mix of speakers through one mic.
+2. **Mixed (Me + Them)** — both tags appear, e.g. `[HH:MM:SS] Me: ...` and `[HH:MM:SS] Them: ...`. `Me` is the user; `Them` is a coarse bucket for everyone else.
+3. **Me-only** — only `Me:` lines. Typically a monologue or one side of a call.
+4. **Them-only** — only `Them:` lines. The user was listening, not participating. Action items rarely originate here — most candidates will be `ambiguous`.
+
+Treat `Me` as authoritative for the user's own commitments. Treat `Them` as "someone other than the user said this" — do NOT assume it is a single person.
+
+Respond in JSON with exactly this key (schema only — fill every string from the
+transcript, NOT from this template):
+{{
+  "action_items": [
+    {{"text": "&lt;specific commitment from the transcript&gt;", "attribution": "self_commit | delegated | ambiguous"}}
+  ]
+}}
+
+Rules:
+- **Anti-echo:** Do NOT copy any names, phrases, or topics from this prompt into your
+  output. The schema above shows structure only — there is no example content to
+  reuse. Every word in `action_items` MUST come from the transcript. If the
+  transcript does not mention a name, a deadline, or a document, do not invent one.
+  Prompts that leak example content into real output are a known failure mode; it
+  has happened on this system before.
+- Action items must be **specific future commitments with a concrete deliverable**.
+  - **NO shapes — exclude any item matching one of these shapes.** These are described as shapes, not phrases. Never copy or paraphrase these shape descriptions into your output.
+    - **Real-time narration (work context):** the speaker describes an action they are performing during the current call or immediately after it ends. If the action completes before the call ends or within minutes of it, it is not a trackable action item. Ask: will this task still need doing tomorrow? If not, skip it.
+    - **Vague intent with no statable output:** a follow-up verb (`continue working on [OBJECT]`, `follow up with [TEAM]`, `look into [TOPIC]`) with no named deliverable. If you cannot state the deliverable (a document, an email, a meeting, a number, a decision), it is not an action item. Vague wrappers that sit next to a concrete sibling in the same transcript are especially prone to leaking — drop the wrapper, keep the concrete sibling.
+    - **Incomplete or truncated fragments:** the utterance trails off before naming the object or deliverable. Drop these — do not guess the completion.
+    - **Domestic real-time narration (personal context):** the speaker names an immediate physical action they are about to take during the current conversation (domestic chores, moving between rooms, handling something in the next 30 minutes with no coordination required). Apply this rule to personal conversations as aggressively as to work calls.
+    - **Audience-addressed conditional (seminar shape):** a speaker addresses the audience with a conditional instruction (`if you [CONDITION], please [ACTION]`). Speaker-to-audience instruction is not a user commitment.
+    - **Rhetorical teaching question (seminar shape):** a speaker poses a question as a teaching device — addressed to no one in particular, used to demonstrate a point, not to assign a task.
+    - **Speaker live-demo action (seminar shape):** a speaker describes an action they are performing live during their presentation. They are demonstrating, not assigning work.
+    - **War-room hypothesizing (work-incident shape):** during a live incident or debugging session, a participant voices an investigative hypothesis (`see if [X] is the case`, `check if [Y] is happening`). If the check would resolve before the call ends, it is real-time narration, not an action item.
+  - **YES shapes — include items matching these shapes, phrased user-centrically (task form, not narration form).**
+    - A specific future commitment with a named deliverable and (ideally) a recipient or deadline.
+    - A request accepted by the user, rewritten as a task.
+    - A delegation from the user to another party, where the user is expected to follow up.
+  - **The NO shapes above describe what to EXCLUDE. Never copy or paraphrase those shape descriptions as outputs.**
+  - The test: would this item be **meaningful and actionable to someone reading it a week later**, without the surrounding conversation context? If not, drop it.
+  - If no clear commitment was stated, return `[]`. Fewer high-quality items is always better than many low-quality ones.
+- **Action-item attribution** — decide *who* is responsible for each item. Rewrite the text to be user-centric (from the user's point of view) and pick ONE:
+  - `self_commit` — the user committed to doing it themselves, OR someone asked/told the user to do it and the user accepted. Use `Me:` tags when present ("Me: I'll send the doc" → self_commit; "Them: can you send the doc?" with "Me: yeah" → self_commit). For legacy / mic-only transcripts, fall back to linguistic cues: first-person commitments ("I'll", "I'm going to", "I need to"), and second-person asks accepted ("you said you'd do X, yeah").
+  - `delegated` — the user asked/told someone else to do it; the user should follow up. "Me: can you look into X?", "Me: please send the deck to the team" → delegated. Them-only transcripts almost never produce `delegated`; treat them-only commitments as `ambiguous` unless the Them speaker is clearly addressing the user (rare for seminars, common for voicemails or 1:1 messages).
+  - `ambiguous` — you cannot tell whose responsibility it is. Default for legacy transcripts when the cue is unclear, and for Them-only lines like "someone should write this up."
+  - Rewrite the `text` from the user's perspective: drop "I'll " / "you should " prefixes, phrase as a task ("Send the doc by Friday" not "I said I'll send the doc"). Attribution explains *why* it's on the list; text describes *what* needs doing.
+
+{existing_action_items_section}Transcript to extract action items from:
+{transcript}</pre>
+          </details>
+          <!-- /prompt:classify_ap.txt -->
         </li>
         <li>
           <h2 class="st">Merge repeated action points</h2>
           <p>A second pass for long transcripts. It clusters items that belong to one workstream, keeps the strictest attribution, and caps the list at 15.</p>
           <p class="meta"><a href="/prompts/consolidate_action_items.txt">consolidate_action_items.txt</a> takes <code>{category}</code>, <code>{summary}</code>, <code>{items_json}</code> and <code>{existing_action_items_section}</code>.</p>
+          <!-- prompt:consolidate_action_items.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">consolidate_action_items.txt</span></summary>
+            <pre tabindex="0">You are consolidating a long list of action items extracted from a single transcript. The primary-pass classifier emitted too many items (often because the same workstream was mentioned in several utterances, or a single task was described in phases). Your job is to cluster items that belong to the same workstream into one merged item, and keep distinct workstreams separate.
+
+You will receive:
+- `category`: the transcript's classification category (one of: work, advisory, personal, ideas, seminars). Consolidation is skipped upstream for `gaming` and `uncategorized`, so this prompt never runs for those.
+- `summary`: a 1-2 sentence summary of the transcript.
+- `items`: a JSON list of `{{text, attribution}}` entries to consolidate.
+
+Your output MUST be a JSON object with a single key `consolidated_items`, whose value is a list of `{{text, attribution}}` entries. The list MUST contain at most 15 entries.
+
+## How to cluster
+
+Merge when items share a workstream. Keep separate when the objects or outcomes differ.
+
+- **Same-object remediation across utterances** → collapse to 1 item that names the object and the deliverable. Shape: `[VERB] all affected [OBJECT]s: [DISAMBIGUATING DETAIL]`.
+- **Sequential temporal phases of one plan** → collapse to 1 item that names the phases in order. Shape: `Execute phased [WORKSTREAM]: [PHASE A] → [PHASE B] → [PHASE C]`.
+- **Same workstream at different specificity** → keep the most specific item; drop vague wrappers ("focus on X", "look into Y", "start working on Z") when a concrete sibling already covers the same object.
+- **Single-task decomposition** → collapse sub-steps of one task ("set up X", "share X", "add people to X") into one item naming the task and its sub-steps.
+- **Distinct workstreams** → KEEP SEPARATE. If the objects differ (e.g. `[OBJECT A]`, `[OBJECT B]`, `[OBJECT C]`) and each has its own owner or deliverable, do not merge even if they appear close together in the transcript.
+
+## Attribution roll-up
+
+When you merge a cluster, the merged item takes the STRICTEST attribution among the inputs. Priority: `self_commit` &gt; `delegated` &gt; `ambiguous`. If any input in the cluster is `self_commit`, the merged item is `self_commit`. Otherwise if any is `delegated`, it is `delegated`. Otherwise `ambiguous`.
+
+## Anti-echo — critical
+
+Do NOT copy or paraphrase any text from these instructions into your outputs. The ALL-CAPS placeholders (`[VERB]`, `[OBJECT]`, `[WORKSTREAM]`, `[PHASE A]`, `[DISAMBIGUATING DETAIL]`, etc.) are shape hints, not content. Never emit those literal placeholder tokens. Every word in your `text` fields MUST come from the input items or the transcript summary. If an input item is a fragment or vague wrapper with no statable output and no concrete sibling to merge into, drop it — do not invent content to fill the gap.
+
+## Output schema
+
+Respond with ONLY this JSON object, no prose before or after:
+
+{{
+  "consolidated_items": [
+    {{"text": "&lt;merged or preserved item, user-centric phrasing&gt;", "attribution": "self_commit | delegated | ambiguous"}}
+  ]
+}}
+
+## Hard limits
+
+- `consolidated_items` MUST have length ≤ 15.
+- Prefer fewer, higher-quality items over many low-quality ones.
+- If fewer than 15 distinct workstreams exist, return fewer.
+- Preserve user-centric phrasing (task form: "Send the doc by Friday", not "I said I'll send the doc").
+
+## Inputs
+
+Category: {category}
+
+Summary: {summary}
+
+{existing_action_items_section}Items (JSON):
+{items_json}</pre>
+          </details>
+          <!-- /prompt:consolidate_action_items.txt -->
         </li>
         <li>
           <h2 class="st">Daily digest</h2>
           <p>Summarises one day of transcripts in under 800 words, with a metadata block that a weekly pass can use to decide which days deserve more detail.</p>
           <p class="meta"><a href="/prompts/digest_daily.txt">digest_daily.txt</a> takes <code>{target_date}</code> and <code>{transcripts}</code>.</p>
+          <!-- prompt:digest_daily.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">digest_daily.txt</span></summary>
+            <pre tabindex="0">You are summarizing a day's worth of conversation transcripts for a personal voice memory system.
+This short daily digest will be consumed by a higher-level weekly reducer — it must be self-contained AND include structured metadata for expansion decisions.
+
+Individual transcripts may be legacy (no speaker tags) or speaker-labeled with `Me:` and `Them:` prefixes. `Me` is the user; `Them` is a coarse bucket that may contain multiple real speakers. When attributing decisions, commitments, and action items, prefer what `Me` said or accepted. Do not assume a single `Them` speaker across turns.
+
+Today's date: {target_date}
+
+## Transcripts from this day
+{transcripts}
+
+## Instructions
+
+Produce a SHORT daily digest (target: under 800 words). This digest serves two audiences:
+1. The human reader who wants a quick "what happened today" briefing.
+2. A weekly reducer LLM that will decide whether to request more detail for this day.
+
+### Structure
+
+Structure the digest with these exact level-2 Markdown headings (`## `, each on its own line — not bold text), in this order. This mirrors the weekly synthesis so the digest renders with the same section hierarchy and in-page navigation:
+
+- `## Day at a glance` — under the heading, 2-3 sentences summarising the day's character. State whether the day was coherent (one deep topic dominated) or scattered (many disparate topics). Mention approximate total conversation time.
+- `## Key themes` — a bulleted list of the main topics, each in one line. For each theme, note which category it belongs to and roughly how much conversation time it consumed.
+- `## Decisions and commitments` — any decisions made or commitments given, one line each. Omit this section entirely if none.
+- `## Open action items` — bulleted, grouped by urgency (urgent / soon / later). Omit if none.
+- `## Connections` — cross-conversation links (e.g. "the SIP issue from the morning standup resurfaced in the afternoon incident review"). Omit if none.
+
+### Structured metadata block
+
+End the digest with a fenced metadata block exactly like this:
+
+```metadata
+categories_active: [list of categories that had transcripts today]
+transcript_ids: [list of transcript IDs]
+duration_by_category:
+  - category: work
+    minutes: 45
+  - category: personal
+    minutes: 12
+topic_density: coherent | scattered | mixed
+top_topics: [up to 5 most prominent topics with estimated minutes each]
+```
+
+### Constraints
+- Be concise but substantive. Every sentence must earn its place.
+- Do NOT echo transcript text verbatim — synthesise.
+- Do NOT pad with filler phrases. If the day was light, say so in 2-3 sentences total.
+- The metadata block is for machine consumption — keep it precise and consistently formatted.</pre>
+          </details>
+          <!-- /prompt:digest_daily.txt -->
         </li>
         <li>
           <h2 class="st">Weekly digest</h2>
           <p>Reduces the daily digests into a weekly report: major threads, decisions, open action items, change since last week, accomplishments and persistent blockers.</p>
           <p class="meta"><a href="/prompts/digest_weekly.txt">digest_weekly.txt</a> takes <code>{week_start}</code>, <code>{week_end}</code>, <code>{short_dailies}</code>, <code>{topic_signal}</code>, <code>{expansions}</code>, <code>{previous_week_context}</code> and <code>{expansion_budget_explanation}</code>.</p>
+          <!-- prompt:digest_weekly.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">digest_weekly.txt</span></summary>
+            <pre tabindex="0">You are synthesising a week's worth of daily digests into a weekly summary for a personal voice memory system. You are a REDUCER — you consume pre-built short daily summaries, not raw transcripts.
+
+Week: {week_start} to {week_end}
+
+## Short daily digests (always available)
+{short_dailies}
+
+## Topic recurrence signal (machine-generated)
+{topic_signal}
+
+## Expanded daily digests (detail for high-signal days)
+{expansions}
+
+## Previous Week Context (for delta analysis)
+{previous_week_context}
+
+## Expansion budget explanation
+{expansion_budget_explanation}
+
+## Instructions
+
+Produce a weekly digest that synthesises the week's conversations into actionable intelligence. You have two tiers of input per day:
+
+1. **Short daily digest** — always present for every day. Concise, ~800 words, with structured metadata.
+2. **Expanded daily digest** — present only for days the system judged high-signal (recurring topics, long discussions, key decisions). These give you full detail.
+
+Your job is to weave these into a coherent weekly narrative. For days where you have only the short summary and the content doesn't warrant depth at the weekly level, a one-line pointer is fine — e.g. "Saturday covered several disparate engineering topics (networking, multimedia, AI); see the daily digest for details."
+
+### Structure
+
+1. **Week overview** — What was the shape of this week? Time breakdown by category. Was it focused or scattered? How does it compare to the previous week?
+2. **Major threads** — Topics that spanned multiple days (use the topic recurrence signal above). For recurring themes, synthesise across all days — don't just list each day's contribution separately.
+3. **Decisions and commitments** — Key decisions made during the week, with context from expanded dailies where available
+4. **Open action items** — All pending items, prioritised
+5. **Themes and patterns** — Recurring topics, emerging concerns, things that need attention
+6. **Delta vs. last week** — Compare against the previous week's context provided above. Highlight shifts in focus, new themes, resolved issues.
+7. **Accomplishments** — What was finished or completed this week. Bullet list, one line each, with `[tid]` citation. Distinguish from in-progress; include only items with clear evidence of completion in the daily input.
+8. **Persistent Blockers** — Items unresolved this week that are likely to carry into next week. Bullet list, one line each, with `[tid]` citation and a short reason it persists.
+
+### Constraints
+- This should read like a weekly status report that a busy person can scan in 2 minutes.
+- Prefer synthesis over enumeration. "SIP debugging was a recurring theme Mon–Wed, culminating in a root cause fix on Wednesday" is better than listing each day's SIP notes.
+- For days you have only short summaries for, trust the short summary's assessment of coherence/scatter.
+- Write in markdown format.
+- Use these level-2 headings verbatim, in this order, for the final three sections: `## Delta vs. last week`, `## Accomplishments`, `## Persistent Blockers`. Downstream parsers depend on exact heading text — do not rephrase, pluralise, or change capitalisation. If a section has no content for the week, emit the heading followed by a single bullet `- _None this week._` so the structure is preserved.
+- Do not duplicate items between Accomplishments and Persistent Blockers. A single item belongs in exactly one.
+
+### Umbrella reducer note
+If the input above includes per-category weekly digests (umbrella reduction), each already contains its own `## Delta vs. last week`, `## Accomplishments`, and `## Persistent Blockers` sections. Merge them across categories into one of each — deduplicate identical items, keep category context where it clarifies, and do NOT strip these sections or emit them per-category.</pre>
+          </details>
+          <!-- /prompt:digest_weekly.txt -->
         </li>
         <li>
           <h2 class="st">Monthly digest</h2>
           <p>Reduces the weekly digests into a month-level overview.</p>
           <p class="meta"><a href="/prompts/digest_monthly.txt">digest_monthly.txt</a> takes <code>{month}</code>, <code>{weeks_count}</code> and <code>{short_weeklies}</code>.</p>
+          <!-- prompt:digest_monthly.txt -->
+          <details>
+            <summary>Read the prompt <span class="vh">digest_monthly.txt</span></summary>
+            <pre tabindex="0">You are synthesising a month's worth of weekly digests into a monthly summary for a personal voice memory system. You are a REDUCER — you consume pre-built short weekly summaries, not raw transcripts or daily digests.
+
+Month: {month}
+
+## Short weekly digests
+{short_weeklies}
+
+## Instructions
+
+Produce a monthly digest that synthesises {weeks_count} week(s) of conversations into a high-level overview. Each input is a short weekly digest that has already distilled the week's conversations.
+
+Your job is to identify the month-level patterns — what evolved over weeks, what was accomplished, what shifted in focus.
+
+### Structure
+
+Use these exact level-2 Markdown headings (`## `, each on its own line — not bold text), in this order, so the digest renders with the same section hierarchy and in-page navigation as the weekly synthesis:
+
+- `## Month overview` — what was the shape of this month? Major themes, time allocation trends. Was it focused or exploratory?
+- `## Key accomplishments` — what was completed, shipped, or resolved across the month.
+- `## Major threads` — topics that spanned multiple weeks. Synthesise the arc, not the per-week details.
+- `## Decisions and commitments` — key decisions made, with enough context to recall the reasoning later.
+- `## Open items` — outstanding action items and unresolved questions, prioritised.
+- `## Patterns and trends` — what changed over the month? New areas of focus? Things that faded? Recurring concerns?
+- `## Outlook` — based on the month's trajectory, what's likely to carry into next month?
+
+### Constraints
+- This should read like a monthly status report that a busy person can scan in 3 minutes.
+- Prefer synthesis over enumeration. A month-level summary should feel like an executive overview, not a concatenation of weekly summaries.
+- Trust each weekly digest's assessment of that week's shape. Your job is synthesis across weeks.
+- Write in markdown format.</pre>
+          </details>
+          <!-- /prompt:digest_monthly.txt -->
         </li>
       </ol>
       <p class="aside">The digest prompts reference things the files don't contain: a per-day expansion budget, a topic-recurrence signal and <code>[tid]</code> transcript citations. Fill those placeholders however your own pipeline works, or delete the sections that use them.</p>
