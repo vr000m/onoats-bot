@@ -20,7 +20,7 @@ non-obvious parts; the code and `docs/` cover the rest.
   re-run `/review-plan`, or recompute the hash for a purely administrative
   above-marker edit (`head -n <marker_line-1> plan.md | git hash-object --stdin`).
 - **The landing site lives in `site/`** and shares no code or tests with the
-  package. Deploy from that directory with `npx wrangler deploy`. The prompt
+  package. Commands are in `site/justfile`; deploy with `just deploy` from that directory. The prompt
   text in `site/public/prompts/*.txt` is the source of truth;
   `site/public/prompts/index.html` is generated from it, so run
   `python3 site/scripts/build_prompts.py` after editing a prompt

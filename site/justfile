@@ -1,0 +1,34 @@
+# onoats.dev site commands. Run from site/ (or any directory below it).
+
+[private]
+default:
+    @just --list
+
+# Preview with a plain static server. Fast, but ignores _headers and the 404 page.
+dev:
+    python3 -m http.server 8799 -d public
+
+# Preview the way Cloudflare serves it: _headers, 404 page, asset routing.
+preview:
+    npx --yes wrangler dev --port 8788
+
+# Rewrite prompts/index.html from the prompt .txt files.
+prompts:
+    python3 scripts/build_prompts.py
+
+# Fail if prompts/index.html is out of date with the .txt files.
+check:
+    python3 scripts/build_prompts.py --check
+
+# Validate the Worker config and bundle the assets without publishing anything.
+dry-run: check
+    npx --yes wrangler deploy --dry-run
+
+# Publish to onoats.dev (reads ~/.secrets/cf.env unless CLOUDFLARE_API_TOKEN is set).
+deploy: check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -f "$HOME/.secrets/cf.env" ]; then
+        set -a; . "$HOME/.secrets/cf.env"; set +a
+    fi
+    npx --yes wrangler deploy

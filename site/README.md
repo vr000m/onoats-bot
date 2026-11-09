@@ -4,10 +4,14 @@ Static landing page served by Cloudflare Workers static assets. No build step.
 
 - Content: `public/` (hand-written HTML/CSS, no JS). Images are copies of
   `assets/brand` and `assets/screenshots`; refresh them when those change.
-- Preview: `python3 -m http.server 8799 -d public`
-- Deploy: `npx wrangler deploy` from this directory, with `CLOUDFLARE_API_TOKEN`
-  and `CLOUDFLARE_ACCOUNT_ID` set (Workers Scripts edit + zone Workers Routes
-  edit for the `onoats.dev` custom domain).
+- Commands (run from `site/`, needs [`just`](https://github.com/casey/just)):
+  `just dev` (plain static preview), `just preview` (`wrangler dev`, serves
+  `_headers` and the 404 page like Cloudflare), `just prompts` / `just check`
+  (regenerate / verify the prompts page), `just dry-run` (validate the Worker
+  config without publishing), `just deploy` (publish; reads
+  `~/.secrets/cf.env` unless `CLOUDFLARE_API_TOKEN` is already set).
+- The token needs Workers Scripts edit, plus Workers Routes and DNS edit on the
+  `onoats.dev` zone for the custom domain.
 
 ## Prompts page
 
