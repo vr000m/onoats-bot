@@ -23,7 +23,7 @@ preview: deps
 prompts:
     python3 scripts/build_prompts.py
 
-# Fail if prompts/index.html is out of date with the .txt files.
+# Fail on a stale prompts page, a prompt-rule break, or a site-contract break.
 check:
     python3 scripts/build_prompts.py --check
     python3 scripts/check_site.py
