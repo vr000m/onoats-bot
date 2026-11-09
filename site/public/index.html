@@ -90,7 +90,7 @@
 
   /* ---------- small screens ---------- */
   @media (max-width:760px){
-    h1{margin-top:36px}
+    .hero h1{margin-top:36px}
     .lanehead{display:none}
     .lanes{display:flex;flex-direction:column;gap:12px}
     .lanes::before,.u time{display:none}
@@ -142,7 +142,7 @@
     <div class="disk">
       <h2>The same call, on disk</h2>
       <p class="cap">One JSON object per line. <code>source</code> is always <code>me</code> or <code>them</code>. Example, not a real recording.</p>
-<pre><span class="k">{"type":"session_meta","run_id":"3f9c1a7e"}</span>
+<pre><span class="k">{"type":"session_meta","run_id":"3f9c1a7e5b2d4086a1c9e7d3b4f2a650"}</span>
 {"type":"utterance","time":"2026-11-08T09:30:00+00:00","text":"Okay, recording. Can you hear me?","source":"<span class="s-me">me</span>"}
 {"type":"utterance","time":"2026-11-08T09:30:04+00:00","text":"Loud and clear. Roadmap first?","source":"<span class="s-them">them</span>"}
 {"type":"utterance","time":"2026-11-08T09:30:09+00:00","text":"Before that, did the migration finish?","source":"<span class="s-me">me</span>"}
@@ -236,7 +236,7 @@ make -C native setup</pre>
 <pre>uv tool install onoats
 onoats init
 onoats bot</pre>
-          <p class="note">See the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md">installation guide</a> for loopback setup and extras.</p>
+          <p class="note">On Linux, install the PortAudio headers first (<code>portaudio19-dev</code>). See the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md">installation guide</a> for loopback setup and extras.</p>
         </div>
       </div>
     </div>

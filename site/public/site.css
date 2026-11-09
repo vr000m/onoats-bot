@@ -12,7 +12,9 @@ body{margin:0;background:var(--oat);color:var(--midnight);font:17px/1.65 var(--s
 body{min-height:100vh;display:flex;flex-direction:column}
 main{flex:1 0 auto}
 a{color:inherit;text-underline-offset:3px}
-:focus-visible{outline:2px solid var(--gold);outline-offset:3px;border-radius:3px}
+:focus-visible{outline:2px solid var(--gold-ink);outline-offset:3px;border-radius:3px}
+/* gold is 1.8:1 on oat; keep it for the dark bands, where it clears 3:1 */
+.band :focus-visible{outline-color:var(--gold)}
 code,pre{font-family:var(--mono)}
 code{font-size:.88em;background:var(--straw);padding:.1em .35em;border-radius:4px;overflow-wrap:anywhere}
 pre code{overflow-wrap:normal}

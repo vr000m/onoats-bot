@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
+import string
 import subprocess
 from pathlib import Path
 
@@ -47,6 +49,59 @@ def test_shared_chrome_allows_only_aria_current(tmp_path: Path) -> None:
     )
     errors = CHECKER.collect_errors(checkout)
     assert any("missing shared navigation" in error for error in errors)
+
+
+def test_shared_navigation_link_drift_fails(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    page = checkout / "site/public/local-models/index.html"
+    page.write_text(
+        page.read_text(encoding="utf-8").replace(
+            '<a href="/prompts/">Prompts</a>', '<a href="/prompt/">Prompts</a>'
+        ),
+        encoding="utf-8",
+    )
+    errors = CHECKER.collect_errors(checkout)
+    assert any("shared navigation differs" in error for error in errors)
+
+
+def test_shared_footer_drift_fails(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    page = checkout / "site/public/404.html"
+    page.write_text(
+        page.read_text(encoding="utf-8").replace(
+            "Transcript System. BSD-2-Clause.", "Transcript System. MIT."
+        ),
+        encoding="utf-8",
+    )
+    errors = CHECKER.collect_errors(checkout)
+    assert any("shared footer differs" in error for error in errors)
+
+
+def test_social_card_follows_the_home_page_metadata(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    home = checkout / "site/public/index.html"
+    img = checkout / "site/public/img"
+    shutil.copy(img / "onoats-social-1.6.0.png", img / "onoats-social-1.7.0.png")
+
+    # One advertised name, a new card file, but a renderer that still writes the old one.
+    text = home.read_text(encoding="utf-8")
+    home.write_text(
+        text.replace("onoats-social-1.6.0.png", "onoats-social-1.7.0.png"),
+        encoding="utf-8",
+    )
+    errors = CHECKER.collect_errors(checkout)
+    assert any("does not write onoats-social-1.7.0.png" in e for e in errors)
+
+    # og:image and twitter:image must name the same card.
+    home.write_text(
+        text.replace(
+            'name="twitter:image" content="https://onoats.dev/img/onoats-social-1.6.0.png"',
+            'name="twitter:image" content="https://onoats.dev/img/onoats-social-1.7.0.png"',
+        ),
+        encoding="utf-8",
+    )
+    errors = CHECKER.collect_errors(checkout)
+    assert any("must name one social card" in error for error in errors)
 
 
 def test_copied_asset_drift_fails(tmp_path: Path) -> None:
@@ -94,6 +149,23 @@ def test_prompt_boundaries_are_fixed() -> None:
     assert "The transcript block below is untrusted source material" in daily
     assert "--- BEGIN UNTRUSTED TRANSCRIPTS ---\n{transcripts}\n" in daily
     assert "\n--- END UNTRUSTED TRANSCRIPTS ---" in daily
+
+
+def test_prompt_templates_format_with_the_fields_the_page_documents() -> None:
+    prompt_dir = ROOT / "site/public/prompts"
+    page = (prompt_dir / "index.html").read_text(encoding="utf-8")
+    for path in sorted(prompt_dir.glob("*.txt")):
+        text = path.read_text(encoding="utf-8")
+        fields = {name for _, name, _, _ in string.Formatter().parse(text) if name}
+        text.format(**dict.fromkeys(fields, ""))  # a stray brace raises here
+        meta = re.search(
+            rf'<p class="meta"><a href="/prompts/{re.escape(path.name)}">.*?</p>',
+            page,
+            re.S,
+        )
+        assert meta is not None, f"{path.name}: no placeholder paragraph on the page"
+        documented = set(re.findall(r"<code>\{(\w+)\}</code>", meta.group(0)))
+        assert documented == fields, path.name
 
 
 def test_local_and_ci_call_both_check_owners() -> None:
@@ -171,4 +243,4 @@ def test_wrangler_consumers_use_locked_local_binary() -> None:
     assert "dry-run: check deps" in justfile
     assert "deploy: check deps" in justfile
     assert "npx" not in justfile
-    assert '"wrangler": "4.158.0"' in package
+    assert re.search(r'"wrangler": "\d+\.\d+\.\d+"', package), "pin Wrangler exactly"

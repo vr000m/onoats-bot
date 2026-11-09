@@ -33,6 +33,13 @@ VERSIONED_IMAGE = re.compile(
     r"[a-z0-9][a-z0-9-]*-\d+\.\d+\.\d+(?:-[a-z0-9-]+)?\.(?:avif|gif|jpe?g|png|svg|webp)"
 )
 IMAGE_REFERENCE = re.compile(r"/img/(?P<name>[a-zA-Z0-9._-]+)")
+SOCIAL_SOURCE = Path("site/scripts/render_social_card.swift")
+META_IMAGE = re.compile(
+    r'<meta (?:property|name)="(?P<key>og:image|twitter:image)" content="(?P<url>[^"]*)"'
+)
+META_SIZE = re.compile(
+    r'<meta property="og:image:(?P<axis>width|height)" content="(?P<pixels>\d+)"'
+)
 NAV = re.compile(r'<nav aria-label="Primary">.*?</nav>', re.S)
 FOOTER = re.compile(r"<footer>.*?</footer>", re.S)
 
@@ -53,6 +60,42 @@ def _png_size(path: Path) -> tuple[int, int] | None:
     if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
         return None
     return struct.unpack(">II", data[16:24])
+
+
+def _social_card_errors(repo_root: Path, home: Path) -> list[str]:
+    """The card the home page advertises must be the one the renderer writes.
+
+    The advertised file is read from the page metadata, not named here, so
+    bumping it for a new release cannot leave this check pointing at the old PNG.
+    """
+
+    label = home.relative_to(repo_root)
+    try:
+        text = home.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [str(exc)]
+    urls = {m["key"]: m["url"] for m in META_IMAGE.finditer(text)}
+    if set(urls) != {"og:image", "twitter:image"} or len(set(urls.values())) != 1:
+        return [f"{label}: og:image and twitter:image must name one social card"]
+    reference = IMAGE_REFERENCE.search(urls["og:image"])
+    if reference is None:
+        return [f"{label}: the social card must live under /img/"]
+
+    name = reference["name"]
+    errors: list[str] = []
+    card = repo_root / "site/public/img" / name
+    if card.is_file():  # a missing card is already reported by the reference scan
+        declared = {m["axis"]: int(m["pixels"]) for m in META_SIZE.finditer(text)}
+        if _png_size(card) != (1200, 630):
+            errors.append(f"site/public/img/{name}: must be a 1200x630 PNG")
+        if declared != {"width": 1200, "height": 630}:
+            errors.append(f"{label}: og:image:width/height must be 1200 and 630")
+    source = repo_root / SOCIAL_SOURCE
+    if not source.is_file():
+        errors.append(f"{SOCIAL_SOURCE}: missing social-card source")
+    elif name not in source.read_text(encoding="utf-8"):
+        errors.append(f"{SOCIAL_SOURCE}: does not write {name}")
+    return errors
 
 
 def collect_errors(repo_root: Path) -> list[str]:
@@ -105,16 +148,7 @@ def collect_errors(repo_root: Path) -> list[str]:
             if not (image_dir / name).is_file():
                 errors.append(f"{source.relative_to(repo_root)}: missing /img/{name}")
 
-    social = image_dir / "onoats-social-1.6.0.png"
-    try:
-        if _png_size(social) != (1200, 630):
-            errors.append(f"{social.relative_to(repo_root)}: must be a 1200x630 PNG")
-    except OSError as exc:
-        errors.append(str(exc))
-    if not (repo_root / "site/scripts/render_social_card.swift").is_file():
-        errors.append(
-            "site/scripts/render_social_card.swift: missing social-card source"
-        )
+    errors.extend(_social_card_errors(repo_root, pages[0]))
 
     headers_path = repo_root / "site/public/_headers"
     try:

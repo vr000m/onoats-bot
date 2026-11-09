@@ -58,5 +58,7 @@ copy or design:
     swift scripts/render_social_card.swift
     swift scripts/render_social_card.swift --check
 
-When the public filename changes, update both `og:image` and `twitter:image` in
-`public/index.html` in the same commit.
+A published card is cached as immutable, so bump the version in its filename when
+the artwork changes. Change the name in the renderer's `outputURL` and in both `og:image`
+and `twitter:image` in `public/index.html` in the same commit;
+`scripts/check_site.py` fails when they disagree.
