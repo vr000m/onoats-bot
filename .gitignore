@@ -19,3 +19,4 @@ secrets.env
 .gauntlet/
 .DS_Store
 /site/.wrangler
+/site/node_modules/

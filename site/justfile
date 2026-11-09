@@ -1,7 +1,7 @@
 # onoats.dev site commands. Run from site/ (or any directory below it).
 
-# Pinned: `deploy` runs this with your Cloudflare token, so it must not float to "latest".
-wrangler := "wrangler@4.158.0"
+# The package lock owns Wrangler and its transitive graph.
+wrangler := "./node_modules/.bin/wrangler"
 
 [private]
 default:
@@ -11,9 +11,13 @@ default:
 dev:
     python3 -m http.server 8799 -d public
 
+# Install the locked graph before any recipe loads Cloudflare credentials.
+deps:
+    bash scripts/install_locked_deps.sh
+
 # Preview the way Cloudflare serves it: _headers, 404 page, asset routing.
-preview:
-    npx --yes {{wrangler}} dev --port 8788
+preview: deps
+    {{wrangler}} dev --port 8788
 
 # Rewrite prompts/index.html from the prompt .txt files.
 prompts:
@@ -22,20 +26,30 @@ prompts:
 # Fail if prompts/index.html is out of date with the .txt files.
 check:
     python3 scripts/build_prompts.py --check
+    python3 scripts/check_site.py
 
 # Validate the Worker config and bundle the assets without publishing anything.
-dry-run: check
-    npx --yes {{wrangler}} deploy --dry-run
+dry-run: check deps
+    {{wrangler}} deploy --dry-run
 
 # Publish to onoats.dev (reads ~/.secrets/cf.env unless CLOUDFLARE_API_TOKEN is set).
-deploy: check
+deploy: check deps
     #!/usr/bin/env bash
     set -euo pipefail
     f="$HOME/.secrets/cf.env"
-    # Export only the two values wrangler needs, never the whole file.
+    token="${CLOUDFLARE_API_TOKEN:-}"
+    account="${CLOUDFLARE_ACCOUNT_ID:-}"
+    # Read only the two values Wrangler needs, never the whole file.
     pick() { sed -n "s/^$1=//p" "$f" | head -n 1 | tr -d "\"'"; }
-    if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -f "$f" ]; then
-        export CLOUDFLARE_API_TOKEN="$(pick CLOUDFLARE_API_TOKEN)"
-        export CLOUDFLARE_ACCOUNT_ID="$(pick CLOUDFLARE_ACCOUNT_ID)"
+    if [ -f "$f" ]; then
+        [ -n "$token" ] || token="$(pick CLOUDFLARE_API_TOKEN)"
+        [ -n "$account" ] || account="$(pick CLOUDFLARE_ACCOUNT_ID)"
     fi
-    npx --yes {{wrangler}} deploy
+    if [ -z "$token" ] || [ -z "$account" ]; then
+        echo "CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are required" >&2
+        exit 1
+    fi
+    clean_tmp="${TMPDIR:-/tmp}"
+    env -i HOME="$HOME" PATH="$PATH" TMPDIR="$clean_tmp" \
+        CLOUDFLARE_API_TOKEN="$token" CLOUDFLARE_ACCOUNT_ID="$account" \
+        {{wrangler}} deploy

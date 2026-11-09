@@ -48,5 +48,6 @@ Category: {category}
 
 Summary: {summary}
 
-{existing_action_items_section}Items (JSON):
+{existing_action_items_section}
+Items (JSON):
 {items_json}

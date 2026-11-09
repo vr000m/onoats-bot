@@ -49,5 +49,6 @@ Rules:
   - `ambiguous` — you cannot tell whose responsibility it is. Default for legacy transcripts when the cue is unclear, and for Them-only lines like "someone should write this up."
   - Rewrite the `text` from the user's perspective: drop "I'll " / "you should " prefixes, phrase as a task ("Send the doc by Friday" not "I said I'll send the doc"). Attribution explains *why* it's on the list; text describes *what* needs doing.
 
-{existing_action_items_section}Transcript to extract action items from:
+{existing_action_items_section}
+Transcript to extract action items from:
 {transcript}

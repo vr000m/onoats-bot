@@ -20,6 +20,11 @@ jobs:
       - name: Dev-plan review-marker check
         run: python3 scripts/check_review_markers.py
 
+      - name: Landing-site contracts
+        run: |
+          python3 site/scripts/build_prompts.py --check
+          python3 site/scripts/check_site.py
+
       # pyaudio (via pipecat-ai[local]) builds a C extension against PortAudio,
       # whose dev headers ship with macOS/Homebrew but not ubuntu-latest. This
       # is the off-mac system dep the cross-platform baseline assumes.
