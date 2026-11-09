@@ -1,0 +1,3 @@
+# Wrangler uploads every file under public/ unless it is listed here (gitignore
+# syntax). Dotfiles such as .DS_Store are never part of the site.
+.*

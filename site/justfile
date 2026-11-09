@@ -1,0 +1,63 @@
+# onoats.dev site commands. Run from site/ (or any directory below it).
+
+# The package lock owns Wrangler and its transitive graph.
+wrangler := "./node_modules/.bin/wrangler"
+
+[private]
+default:
+    @just --list
+
+# Preview with a plain static server. Fast, but ignores _headers and the 404 page.
+dev:
+    python3 -m http.server 8799 -d public
+
+# Install the locked graph before any recipe loads Cloudflare credentials.
+deps:
+    bash scripts/install_locked_deps.sh
+
+# Preview the way Cloudflare serves it: _headers, 404 page, asset routing.
+preview: deps
+    {{wrangler}} dev --port 8788
+
+# Rewrite prompts/index.html from the prompt .txt files.
+prompts:
+    python3 scripts/build_prompts.py
+
+# Fail on a stale prompts page, a prompt-rule break, or a site-contract break.
+check:
+    python3 scripts/build_prompts.py --check
+    python3 scripts/check_site.py
+
+# Validate the Worker config and bundle the assets without publishing anything.
+dry-run: check deps
+    {{wrangler}} deploy --dry-run
+
+# Publish to onoats.dev (reads ~/.secrets/cf.env unless CLOUDFLARE_API_TOKEN is set).
+deploy: check deps
+    #!/usr/bin/env bash
+    set -euo pipefail
+    f="$HOME/.secrets/cf.env"
+    token="${CLOUDFLARE_API_TOKEN:-}"
+    account="${CLOUDFLARE_ACCOUNT_ID:-}"
+    # Read only the two values Wrangler needs, never the whole file.
+    pick() { sed -n "s/^$1=//p" "$f" | head -n 1 | tr -d "\"'"; }
+    if [ -f "$f" ]; then
+        [ -n "$token" ] || token="$(pick CLOUDFLARE_API_TOKEN)"
+        [ -n "$account" ] || account="$(pick CLOUDFLARE_ACCOUNT_ID)"
+    fi
+    if [ -z "$token" ] || [ -z "$account" ]; then
+        echo "CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are required" >&2
+        exit 1
+    fi
+    clean_tmp="${TMPDIR:-/tmp}"
+    # Deny by default without putting the token on any argv (env -i would show
+    # it in ps): drop every exported variable but HOME and PATH, export the
+    # three values with the export builtin, then exec Wrangler in place.
+    for name in $(compgen -e); do
+        case "$name" in
+            HOME | PATH) ;;
+            *) unset "$name" 2>/dev/null || { echo "cannot clear $name" >&2; exit 1; } ;;
+        esac
+    done
+    export TMPDIR="$clean_tmp" CLOUDFLARE_API_TOKEN="$token" CLOUDFLARE_ACCOUNT_ID="$account"
+    exec {{wrangler}} deploy

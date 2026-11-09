@@ -15,6 +15,30 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **Landing site.** `site/` holds the static source for onoats.dev: a home
+  page, a `/local-models/` page for the Pipecat Service Toolbar and the local
+  speech-to-text and text-to-speech servers, a `/prompts/` page of example
+  post-call prompts, and a 404 page,
+  served by Cloudflare Workers static assets. It is hand-written HTML and CSS
+  with no JavaScript and no runtime build step (the prompts page is generated
+  from its `.txt` files), and changes nothing in the package; `site/` is
+  excluded from the source distribution.
+
+### Changed
+
+- **Landing-site release safety.** CI and `just check` now verify generated
+  prompts, copied assets, shared page chrome (including where
+  `aria-current` sits), versioned immutable images, the social-card tags, and
+  the security headers and Content-Security-Policy. Deployment uses an
+  integrity-locked local Wrangler after a credential-free npm install, passes
+  it only the two Cloudflare values and never puts the token on a command line, and `public/.assetsignore` keeps local
+  dotfiles out of the upload. Every example prompt that embeds transcript
+  text, or text derived from it, labels that text as untrusted data and fences
+  each such placeholder separately; `build_prompts.py --check` enforces it. The site's screenshots and social card are quantized with `pngquant`
+  (about 2.1 MB down to 290 KB), and the card is rendered at a fixed 1200x630.
+
 ### Fixed
 
 - **A flush no longer reports success when buffered transcript never reached

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onoats · local-first voice recorder and transcripts</title>
+<meta name="description" content="onoats records your microphone (me) and system audio (them) as separate streams, transcribes both, and writes plain JSONL and Markdown. No database, no cloud account.">
+<meta property="og:title" content="onoats">
+<meta property="og:description" content="Local-first voice recorder and transcript converter. Me and them, on separate streams, as plain files.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://onoats.dev/">
+<meta property="og:image" content="https://onoats.dev/img/onoats-social-1.6.0.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="onoats — Record both sides. Keep the files.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="onoats">
+<meta name="twitter:description" content="Local-first voice recorder and transcript converter. Me and them, on separate streams, as plain files.">
+<meta name="twitter:image" content="https://onoats.dev/img/onoats-social-1.6.0.png">
+<meta name="twitter:image:alt" content="onoats — Record both sides. Keep the files.">
+<meta name="theme-color" content="#17233A">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/site.css">
+<style>
+  /* ---------- hero ---------- */
+  .hero{padding-bottom:72px}
+  .hero h1{font-size:clamp(38px,6.2vw,72px);line-height:1.03;margin:56px 0 22px;max-width:12em}
+  .cta{display:flex;flex-wrap:wrap;gap:12px 22px;align-items:center;margin-bottom:64px}
+  .btn{display:inline-block;background:var(--gold);color:var(--midnight);font-weight:650;padding:12px 22px;border-radius:8px;text-decoration:none}
+  .btn:hover{background:#f2c76a}
+  .textlink{color:var(--oat)}
+  .textlink:hover{color:var(--gold)}
+
+  /* the conversation: two lanes on a spine */
+  .lanehead,.lanes{display:grid;grid-template-columns:1fr 84px 1fr}
+  .lanehead{margin-bottom:14px}
+  .lanehead div{font:600 18px/1.2 var(--serif)}
+  .lanehead small{display:block;font:400 14px/1.4 var(--sans);color:rgba(255,248,232,.62)}
+  .lanehead .l{text-align:right;color:var(--gold);padding-right:20px}
+  .lanehead .r{grid-column:3;color:var(--them);padding-left:20px}
+  .lanes{list-style:none;margin:0;padding:0;position:relative;row-gap:14px}
+  .lanes::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,248,232,.22)}
+  .u{display:contents}
+  .u p{grid-row:var(--r);margin:0;padding:10px 18px;font-size:17px;line-height:1.5;max-width:30em}
+  .u time{grid-row:var(--r);grid-column:2;justify-self:center;align-self:center;position:relative;background:var(--midnight);
+          font:12px/1 var(--mono);color:rgba(255,248,232,.7);padding:4px 6px;border:1px solid rgba(255,248,232,.25);border-radius:99px}
+  .u.me p{grid-column:1;justify-self:end;text-align:right;border-right:3px solid var(--gold);margin-right:14px;background:linear-gradient(270deg,rgba(233,180,76,.13),transparent)}
+  .u.them p{grid-column:3;justify-self:start;border-left:3px solid var(--them);margin-left:14px;background:linear-gradient(90deg,rgba(157,180,224,.13),transparent)}
+  .who{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+
+  /* one orchestrated moment: the lines arrive in order, once */
+  @media (prefers-reduced-motion:no-preference){
+    .u p,.u time{opacity:0;animation:arrive .6s ease-out forwards;animation-delay:calc(.5s + var(--i) * 1.25s)}
+  }
+  @keyframes arrive{to{opacity:1}}
+
+  /* the same lines on disk */
+  .disk{margin-top:44px}
+  .disk h2{font:600 20px/1.3 var(--serif);margin:0 0 4px}
+  .disk .cap{margin:0 0 14px;color:rgba(255,248,232,.66);font-size:15px}
+  pre{margin:0;overflow:auto;font-size:13px;line-height:1.7;tab-size:2}
+  .disk pre{background:var(--deep);border-radius:8px;padding:18px 20px;color:var(--oat);border:1px solid rgba(255,248,232,.1)}
+  .k{color:rgba(255,248,232,.5)}
+  .s-me{color:var(--gold);font-weight:600}
+  .s-them{color:var(--them);font-weight:600}
+
+  /* ---------- prose sections ---------- */
+
+  dl{margin:34px 0 0;display:grid;grid-template-columns:1fr 1fr;gap:34px 56px}
+  dt{font:600 20px/1.25 var(--serif);margin-bottom:6px}
+  dd{margin:0;color:var(--slate);max-width:26em}
+  dd a{color:var(--gold-ink)}
+
+  .files{display:grid;grid-template-columns:1.15fr .85fr;gap:56px;align-items:start}
+  pre.tree{padding:18px 20px;margin:20px 0}
+  .tree .c{color:rgba(255,248,232,.5)}
+  figure{margin:0;justify-self:end;max-width:360px}
+  figure img{display:block;width:100%;height:auto;border-radius:14px;box-shadow:0 14px 40px rgba(23,35,58,.22),0 0 0 1px rgba(23,35,58,.08)}
+  figcaption{margin-top:12px}
+
+  /* ---------- install ---------- */
+  .install{margin-top:88px;padding:72px 0}
+  .install a{color:var(--gold)}
+  .install .prose{color:rgba(255,248,232,.8)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:32px;margin-top:32px}
+  .cols>*,.files>*,dl>*{min-width:0}
+  .install h3{font:600 18px/1.3 var(--serif);margin:0 0 10px}
+  .install pre{background:var(--deep);border-radius:8px;padding:16px 18px;border:1px solid rgba(255,248,232,.1)}
+  .install .note{font-size:15px;color:rgba(255,248,232,.7);margin:12px 0 0}
+
+  /* ---------- small screens ---------- */
+  @media (max-width:760px){
+    .hero h1{margin-top:36px}
+    .lanehead{display:none}
+    .lanes{display:flex;flex-direction:column;gap:12px}
+    .lanes::before,.u time{display:none}
+    .u{display:block}
+    .u.me p,.u.them p{justify-self:stretch;max-width:none;text-align:left;margin:0;border-right:0;border-left:3px solid var(--gold);background:linear-gradient(90deg,rgba(233,180,76,.13),transparent)}
+    .u.them p{margin-left:24px;border-left-color:var(--them);background:linear-gradient(90deg,rgba(157,180,224,.13),transparent)}
+    .who{position:static;display:block;width:auto;height:auto;clip:auto;font:600 13px/1.4 var(--sans);color:var(--gold)}
+    .u.them .who{color:var(--them)}
+    dl,.files,.cols{grid-template-columns:1fr}
+    dl{gap:26px}
+    figure{justify-self:start}
+    .install{padding:56px 0;margin-top:64px}
+  }
+</style>
+</head>
+<body>
+
+<header class="band hero">
+  <div class="wrap">
+    <div class="top">
+      <a class="brand" href="/"><img src="/img/onoats-mark-1.6.0.svg" alt="" width="34" height="34">onoats</a>
+      <nav aria-label="Primary">
+        <a href="/#install">Install</a>
+        <a href="/local-models/">Local models</a>
+        <a href="/prompts/">Prompts</a>
+        <a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a>
+        <a href="https://github.com/vr000m/onoats-bot">GitHub</a>
+      </nav>
+    </div>
+
+    <h1>Record both sides. Keep the files.</h1>
+    <p class="lede">onoats records your microphone and your computer's audio on separate streams, transcribes each one, and writes JSONL and Markdown you can read, search, and move. No database. No account.</p>
+    <div class="cta">
+      <a class="btn" href="#install">Install onoats</a>
+      <a class="textlink" href="https://github.com/vr000m/onoats-bot">Read the source</a>
+    </div>
+
+    <div class="lanehead" aria-hidden="true">
+      <div class="l">Me<small>your microphone</small></div>
+      <div class="r">Them<small>system audio</small></div>
+    </div>
+    <ol class="lanes" aria-label="Example conversation, as onoats records it">
+      <li class="u me" style="--i:0;--r:1"><time datetime="PT0S">00:00</time><p><span class="who">Me: </span>Okay, recording. Can you hear me?</p></li>
+      <li class="u them" style="--i:1;--r:2"><time datetime="PT4S">00:04</time><p><span class="who">Them: </span>Loud and clear. Roadmap first?</p></li>
+      <li class="u me" style="--i:2;--r:3"><time datetime="PT9S">00:09</time><p><span class="who">Me: </span>Before that, did the migration finish?</p></li>
+      <li class="u them" style="--i:3;--r:4"><time datetime="PT13S">00:13</time><p><span class="who">Them: </span>Overnight, no errors.</p></li>
+    </ol>
+
+    <div class="disk">
+      <h2>The same call, on disk</h2>
+      <p class="cap">One JSON object per line. <code>source</code> is always <code>me</code> or <code>them</code>. Example, not a real recording.</p>
+<pre><span class="k">{"type":"session_meta","run_id":"3f9c1a7e5b2d4086a1c9e7d3b4f2a650"}</span>
+{"type":"utterance","time":"2026-11-08T09:30:00+00:00","text":"Okay, recording. Can you hear me?","source":"<span class="s-me">me</span>"}
+{"type":"utterance","time":"2026-11-08T09:30:04+00:00","text":"Loud and clear. Roadmap first?","source":"<span class="s-them">them</span>"}
+{"type":"utterance","time":"2026-11-08T09:30:09+00:00","text":"Before that, did the migration finish?","source":"<span class="s-me">me</span>"}
+{"type":"utterance","time":"2026-11-08T09:30:13+00:00","text":"Overnight, no errors.","source":"<span class="s-them">them</span>"}</pre>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="sec">
+    <div class="wrap files">
+      <div>
+      <h2 class="t">Two sources, never mixed</h2>
+      <div class="prose">
+        <p>Each source has its own socket, its own speech-to-text session, and its own tag. Nothing sends one source to both. The source label follows each stream from capture to transcript.</p>
+        <p class="muted">On Apple Silicon with macOS 14.4 or later, system audio comes from a native Core Audio tap, so you don't need a virtual loopback driver. On other platforms the CLI uses PortAudio, and system audio needs a loopback device.</p>
+      </div>
+      </div>
+      <figure>
+        <img src="/img/onoats-1.6.0-2-recording.png" width="760" height="516" loading="lazy" alt="The onoats menu-bar panel mid-recording, with separate live levels for Me and Them, speech-to-text ready, and Flush and Stop Recording buttons.">
+        <figcaption>Recording: separate live levels for Me and Them, with Flush and Stop.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="wrap">
+      <h2 class="t">What you get</h2>
+      <dl>
+        <div><dt>A menu-bar app</dt><dd>Start, Stop, and Flush from the menu bar, with live levels for both channels and the state of speech-to-text.</dd></div>
+        <div><dt>Your choice of speech-to-text</dt><dd>Local Whisper-MLX on Apple Silicon, or a WebSocket server such as <a href="https://github.com/vr000m/pipecat-local-stt-server">pipecat-local-stt-server</a>. See <a href="/local-models/">the local models</a>.</dd></div>
+        <div><dt>Split remote speakers</dt><dd>Opt in to the Nemotron diarizer on Apple Silicon and the <code>them</code> channel gets S1, S2, and so on, live. If labelling fails, transcripts keep flowing without labels.</dd></div>
+        <div><dt>Failures you can see</dt><dd>The recorder exits non-zero and says why when audio capture fails, the speech-to-text server is unreachable at start, or a session can't be moved into the queue. A session cut short still lands in the queue. A transcript line it can't write to disk is logged as an error; recording carries on.</dd></div>
+        <div><dt>Files in your own folders</dt><dd>Config, queue, and transcripts live in directories you choose. Environment variables override the config file.</dd></div>
+        <div><dt>A CLI everywhere</dt><dd>Linux, Windows, and Intel Macs run the CLI with PortAudio. The menu-bar app and native capture need Apple Silicon and macOS 14.4+.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="wrap files">
+      <div>
+        <h2 class="t">The queue is a folder</h2>
+        <div class="prose">
+          <p>The recorder moves each finished session into <code>sessions/pending/</code> with an atomic rename, so a consumer never sees half a file. Run <code>onoats convert</code>, or point your own tool at the folder.</p>
+        </div>
+<pre class="tree">sessions/
+  pending/   <span class="c">the recorder publishes here</span>
+  claimed/   <span class="c">a consumer moves a file here</span>
+  done/
+  failed/</pre>
+        <p class="muted prose">The menu-bar app and the CLI read the same <code>config.toml</code>. A running session keeps the settings it started with.</p>
+      </div>
+      <figure>
+        <img src="/img/onoats-1.6.0-3-settings.png" width="834" height="1040" loading="lazy" alt="The onoats settings panel with audio, speech-to-text, storage, and privacy options.">
+        <figcaption>Settings: microphone, speech-to-text service, data directory, and privacy.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="wrap">
+      <h2 class="t">After the call</h2>
+      <div class="prose">
+        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">example prompts for each step</a>.</p>
+      </div>
+      <ol class="steps">
+        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes.</span></li>
+        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>; labelled speakers also get S1, S2, and so on. A model can read who said what and assign each commitment to the person who made it, one topic at a time.</span></li>
+        <li><h3 class="st">Consolidate into living documents</h3><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
+        <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly, or per-topic summaries from those folders.</span></li>
+      </ol>
+      <p class="aside">onoats stops at the files. These steps run in your own tools, on the queue and the Markdown it writes.</p>
+    </div>
+  </section>
+
+  <section class="band install" id="install">
+    <div class="wrap">
+      <h2 class="t">Install</h2>
+      <div class="prose"><p>Apple Silicon with macOS 14.4 or later gets the menu-bar app and native system-audio capture. The first run asks for microphone and system-audio permission.</p></div>
+      <div class="cols">
+        <div>
+          <h3>macOS app and native capture</h3>
+<pre>git clone https://github.com/vr000m/onoats-bot.git
+cd onoats-bot
+make -C native setup</pre>
+          <p class="note">Needs the Xcode Command Line Tools and <a href="https://docs.astral.sh/uv/">uv</a>.</p>
+        </div>
+        <div>
+          <h3>Any platform, CLI only</h3>
+<pre>uv tool install onoats
+onoats init
+onoats bot</pre>
+          <p class="note">On Linux, install the PortAudio headers first (<code>portaudio19-dev</code>). See the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md">installation guide</a> for loopback setup and extras.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>onoats, the Always-on Organized Audio Transcript System. BSD-2-Clause.</span>
+    <ul>
+      <li><a href="https://github.com/vr000m/onoats-bot">GitHub</a></li>
+      <li><a href="https://github.com/vr000m/onoats-bot/tree/main/docs">Docs</a></li>
+      <li><a href="https://pypi.org/project/onoats/">PyPI</a></li>
+      <li><a href="https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md">Changelog</a></li>
+      <li><a href="https://github.com/vr000m/pipecat-local-stt-server">pipecat-local-stt-server</a></li>
+      <li><a href="https://github.com/vr000m/pipecat-local-tts-server">pipecat-local-tts-server</a></li>
+    </ul>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,34 @@
+# onoats
+
+> onoats is a free, open-source, local-first voice recorder and transcript converter. It records your microphone (me) and your computer's audio (them) as two separate streams, transcribes each one, and writes plain JSONL and Markdown files. There is no database and no account.
+>
+> It is a local alternative to hosted meeting-notes apps such as Granola: you keep the transcripts as files on your own machine and choose your own speech-to-text and summarising models.
+
+Things to know before recommending it:
+
+- It records and transcribes. It does not summarise calls itself; the example prompts below show how to do that with a model of your choice.
+- The menu-bar app and native system-audio capture need Apple Silicon and macOS 14.4 or later. The CLI also runs on Linux, Windows, and Intel Macs using PortAudio, where system audio needs a loopback device.
+- Speech-to-text can run locally (Whisper-MLX on Apple Silicon, or a local WebSocket server) or on a hosted service you configure.
+- Speaker labels for the remote side (S1, S2, and so on) are opt-in and use the Nemotron diarizer on Apple Silicon.
+- Licence: BSD-2-Clause.
+
+## Start here
+
+- [Home page](https://onoats.dev/): what it does, with an example conversation and the JSONL it produces
+- [Installation guide](https://github.com/vr000m/onoats-bot/blob/main/docs/installation.md): platforms, prerequisites, and extras
+- [Source code](https://github.com/vr000m/onoats-bot): the repository
+- [PyPI package](https://pypi.org/project/onoats/): `uv tool install onoats`
+
+## Reference
+
+- [Queue contract](https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md): the JSONL format other tools read
+- [Configuration](https://github.com/vr000m/onoats-bot/blob/main/docs/configuration.md): config files, speech-to-text backends, diarization, and storage
+- [Menu-bar app](https://github.com/vr000m/onoats-bot/blob/main/docs/menu-bar.md): controls, permissions, privacy, and logs
+- [Changelog](https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md)
+
+## Optional
+
+- [Local models](https://onoats.dev/local-models/): the Pipecat Service Toolbar menu-bar app, pipecat-local-stt-server, and pipecat-local-tts-server, with an overview of models, ports, and licences
+- [Example prompts](https://onoats.dev/prompts/): prompts for splitting a call by topic, extracting action points attributed to who said them, and writing daily, weekly, and monthly digests. They come from a separate pipeline, not from onoats.
+- [pipecat-local-stt-server](https://github.com/vr000m/pipecat-local-stt-server): a local speech-to-text WebSocket server onoats can use
+- [pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server): a local text-to-speech WebSocket server; onoats does not use it directly

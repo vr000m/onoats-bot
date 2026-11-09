@@ -168,6 +168,7 @@ def test_experiments_are_excluded_from_the_distributions():
     """Scratch experiments stay in the repo but never ship (sdist) or install (wheel)."""
     build = _load_pyproject()["tool"]["hatch"]["build"]["targets"]
     assert "/experiments" in build["sdist"]["exclude"]
+    assert "/site" in build["sdist"]["exclude"]
     # The wheel is an exact allowlist of the application and its neutral
     # dependency-free contract package, so nothing else can ride along.
     assert build["wheel"]["packages"] == ["src/onoats", "src/onoats_contracts"]

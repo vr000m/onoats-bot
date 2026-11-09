@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "onoats-dev",
+  "compatibility_date": "2026-11-01",
+  // Static assets only: no Worker script, no build step.
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    { "pattern": "onoats.dev", "custom_domain": true }
+  ]
+}

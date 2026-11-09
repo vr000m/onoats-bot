@@ -190,6 +190,7 @@ categories, run IDs, diarization metadata, and consumer ownership.
 | [Recorder control socket](https://github.com/vr000m/onoats-bot/blob/main/docs/control-socket-contract.md) | generation-authenticated Flush and Stop protocol |
 | [Audio socket contract](https://github.com/vr000m/onoats-bot/blob/main/docs/audio-socket-contract.md) | native capturer framing, handshake, and backpressure |
 | [BlackHole fallback](https://github.com/vr000m/onoats-bot/blob/main/docs/blackhole-fallback.md) | loopback setup for the PortAudio path |
+| [Website source](https://github.com/vr000m/onoats-bot/blob/main/site/README.md) | the onoats.dev pages, example prompts, and how to deploy |
 
 ## License
 
