@@ -7,9 +7,8 @@
   --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--oat);color:var(--midnight);font:17px/1.65 var(--sans);-webkit-font-smoothing:antialiased}
 /* short pages (the 404) keep the footer at the bottom of the window; it scrolls with long ones */
-body{min-height:100vh;display:flex;flex-direction:column}
+body{margin:0;background:var(--oat);color:var(--midnight);font:17px/1.65 var(--sans);-webkit-font-smoothing:antialiased;min-height:100vh;display:flex;flex-direction:column}
 main{flex:1 0 auto}
 a{color:inherit;text-underline-offset:3px}
 :focus-visible{outline:2px solid var(--gold-ink);outline-offset:3px;border-radius:3px}
@@ -31,7 +30,6 @@ figcaption{font-size:14.5px;color:var(--slate)}
 /* header */
 .top{display:flex;align-items:center;justify-content:space-between;padding:22px 0}
 .brand{display:flex;align-items:center;gap:10px;text-decoration:none;font:600 22px/1 var(--serif);letter-spacing:-.01em;color:var(--oat)}
-.band .brand{color:var(--oat)}
 .brand img{width:34px;height:34px}
 .top nav{display:flex;gap:24px;font-size:15px}
 .band .top nav a{text-decoration:none;color:rgba(255,248,232,.78)}
@@ -54,7 +52,8 @@ h2.t{font:600 clamp(28px,4vw,40px)/1.12 var(--serif);letter-spacing:-.018em;marg
 .steps{list-style:none;margin:30px 0 0;padding:0;counter-reset:step;max-width:44em}
 .steps li{counter-increment:step;position:relative;padding:0 0 30px 54px}
 .steps li::before{content:counter(step);position:absolute;left:0;top:-3px;font:600 32px/1 var(--serif);color:var(--gold-ink)}
-.steps .st{display:block;font:600 20px/1.25 var(--serif);margin:0 0 4px}
+/* inherit, so a <span class="st"> title is not caught by the slate .steps span rule below */
+.steps .st{display:block;font:600 20px/1.25 var(--serif);margin:0 0 4px;color:inherit}
 .steps p,.steps span{margin:0 0 8px;color:var(--slate)}
 .steps .meta{font-size:15px}
 .steps .meta a{font-weight:600}
