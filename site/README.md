@@ -14,6 +14,9 @@ site has no runtime build step or JavaScript.
   (regenerate / verify the prompts page), `just dry-run` (validate the Worker
   config without publishing), `just deploy` (publish; reads
   `~/.secrets/cf.env` unless `CLOUDFLARE_API_TOKEN` is already set).
+- Wrangler uploads every file under `public/` except those listed in
+  `public/.assetsignore`, which holds exactly `.*` so local dotfiles such as
+  `.DS_Store` are never published; `check_site.py` keeps it that way.
 - The token needs Workers Scripts edit, plus Workers Routes and DNS edit on the
   `onoats.dev` zone for the custom domain.
 

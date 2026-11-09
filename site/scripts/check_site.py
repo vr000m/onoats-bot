@@ -36,6 +36,7 @@ META_SIZE = re.compile(
     r'<meta property="og:image:(?P<axis>width|height)" content="(?P<pixels>\d+)"'
 )
 HEADERS = "site/public/_headers"
+ASSETSIGNORE = "site/public/.assetsignore"
 HEADER_LINE = re.compile(r"(?P<name>[A-Za-z0-9-]+):[ \t]*(?P<value>\S.*)")
 IMAGE_PROBE = "/img/onoats-mark-1.6.0.svg"  # any URL served from public/img/
 NAV = re.compile(r'<nav aria-label="Primary">.*?</nav>', re.DOTALL)
@@ -202,6 +203,27 @@ def _headers_errors(text: str) -> list[str]:
     return errors
 
 
+def _assetsignore_errors(repo_root: Path) -> list[str]:
+    """Wrangler uploads every file under public/ that .assetsignore does not list.
+
+    The file must list exactly ``.*``: that keeps local dotfiles (.DS_Store)
+    off the site, and allowing no other pattern means it cannot drop a page.
+    """
+
+    try:
+        text = (repo_root / ASSETSIGNORE).read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"{ASSETSIGNORE}: missing ({exc.strerror})"]
+    patterns = [
+        line.rstrip()
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if patterns != [".*"]:
+        return [f"{ASSETSIGNORE}: must list exactly one pattern, .*, not {patterns}"]
+    return []
+
+
 def collect_errors(repo_root: Path) -> list[str]:
     """Return every site-contract violation below *repo_root*."""
 
@@ -258,6 +280,7 @@ def collect_errors(repo_root: Path) -> list[str]:
                 errors.append(f"{source.relative_to(repo_root)}: missing /img/{name}")
 
     errors.extend(_social_card_errors(repo_root, pages[0]))
+    errors.extend(_assetsignore_errors(repo_root))
 
     headers_path = repo_root / "site/public/_headers"
     try:

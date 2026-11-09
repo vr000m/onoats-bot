@@ -217,6 +217,37 @@ def test_every_published_page_carries_the_shared_chrome(tmp_path: Path) -> None:
     )
 
 
+ASSETSIGNORE_CASES = {
+    "committed": (None, None),
+    "comments and trailing space": ("# dotfiles\n.*  \n", None),
+    "missing": ("", "missing"),
+    "empty": ("\n", "must list exactly one pattern"),
+    "only .DS_Store": (".DS_Store\n", "must list exactly one pattern"),
+    "also drops pages": (".*\n*.html\n", "must list exactly one pattern"),
+    "negation": (".*\n!.well-known\n", "must list exactly one pattern"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ASSETSIGNORE_CASES))
+def test_assetsignore_keeps_dotfiles_off_the_site(tmp_path: Path, case: str) -> None:
+    content, expected = ASSETSIGNORE_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    ignore = checkout / "site/public/.assetsignore"
+    if content == "":
+        ignore.unlink()
+    elif content is not None:
+        ignore.write_text(content, encoding="utf-8")
+
+    errors = CHECKER.collect_errors(checkout)
+    if expected is None:
+        assert errors == []
+    else:
+        assert any(
+            error.startswith("site/public/.assetsignore: " + expected)
+            for error in errors
+        ), errors
+
+
 def test_copied_asset_drift_fails(tmp_path: Path) -> None:
     checkout = _copy_site_tree(tmp_path)
     mark = checkout / "site/public/img/onoats-mark-1.6.0.svg"

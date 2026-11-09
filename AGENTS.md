@@ -28,9 +28,11 @@ non-obvious parts; the code and `docs/` cover the rest.
   rules: every placeholder is classified trusted or untrusted in the script, and
   each untrusted one sits alone in its own `--- BEGIN/END UNTRUSTED` fence after
   the `## Instruction boundary` paragraph. `check_site.py` owns
-  copied-asset, shared-chrome, versioned-image and header contracts, and
-  derives the social card from `og:image` (it must exist, be 1200x630 and be the
-  file the renderer writes). `just check` and CI run both. Files in
+  copied-asset, shared-chrome (every `public/**/*.html`), versioned-image,
+  per-rule `_headers` and `public/.assetsignore` (exactly `.*`) contracts, and
+  derives the social card from `og:image` (it must be
+  `https://onoats.dev/img/<file>.png`, exist, be a complete 1200x630 PNG and be
+  the file the renderer writes). `just check` and CI run both. Files in
   `site/public/img/` are immutable and therefore versioned and quantized with
   `pngquant`; regenerate the social PNG with
   `swift scripts/render_social_card.swift` from `site/` (needs `pngquant`).
