@@ -23,8 +23,11 @@ Annotated tags exist from `v0.9.0` forward.
   home page's "After the call" steps link to. The digest row starts from a
   "Markdown files" box (`onoats convert`). Site only; the package is unchanged.
 - **Prompts page claims are checked.** `build_prompts.py --check` now also fails
-  when a prompt stops backing what the page says about its output (`FACTS`:
-  JSON keys, the 15-item cap, section and heading counts, metadata keys).
+  when a claim the page makes about a prompt's output drifts on either side: the
+  page text changes, or the prompt stops backing it (`FACTS`: JSON keys, the
+  15-item cap, metadata keys, section and heading counts and order).
+- **Fragment links are checked.** `check_site.py` now fails when a `#fragment`
+  link on a published page names an id its target page does not carry.
 
 ## [1.6.1] - 2026-11-08
 

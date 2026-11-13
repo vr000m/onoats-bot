@@ -16,6 +16,8 @@ image and rule), never "some match exists":
   immutable cache) matches ``VERSIONED_IMAGE``.
 - ``_reference_errors``: every ``/img/<name>`` in a published ``.css``,
   ``.html`` or ``.txt`` file is versioned and exists.
+- ``_fragment_errors``: every site-local ``href`` with a ``#fragment`` on a
+  published page reaches a published page that carries that ``id``.
 - ``_social_card_errors``: the home page has exactly one ``og:image``,
   ``twitter:image``, ``og:image:width`` and ``og:image:height`` (and none of
   the alias tags in ``SOCIAL_ALIASES``); both URLs are the same
@@ -30,11 +32,12 @@ from __future__ import annotations
 
 import argparse
 import re
-from html.parser import HTMLParser
 import struct
 import sys
 import zlib
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote, urljoin, urlsplit
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DIR = Path("site/public")
@@ -485,6 +488,58 @@ def _reference_errors(repo_root: Path) -> list[str]:
     return errors
 
 
+class _Anchors(HTMLParser):
+    """Every ``id`` and every ``href`` on one page, in page order."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: set[str] = set()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for key, value in attrs:
+            if key == "id" and value:
+                self.ids.add(value)
+            elif key in ("href", "xlink:href") and value is not None:
+                self.hrefs.append(value)
+
+
+def _anchors(page: Path) -> _Anchors:
+    parser = _Anchors()
+    parser.feed(page.read_text(encoding="utf-8"))
+    parser.close()
+    return parser
+
+
+def _fragment_errors(repo_root: Path, pages: list[Path]) -> list[str]:
+    """Every site-local ``href`` with a ``#fragment`` names an id on its target.
+
+    Same-page (``#x``), absolute (``/a/#x``) and relative (``../#x``) links are
+    resolved against the page's own path; the target must be a published page
+    and carry that ``id``. An empty fragment (the top of the page) and links
+    with a scheme or host are not checked.
+    """
+
+    served = {_own_path(repo_root, page): page for page in pages}
+    anchors = {page: _anchors(page) for page in pages}
+    errors: list[str] = []
+    for page in pages:
+        label = _rel(repo_root, page)
+        own = _own_path(repo_root, page)
+        for href in anchors[page].hrefs:
+            target = urlsplit(urljoin(own, href))
+            if not target.fragment or target.scheme or target.netloc:
+                continue
+            reached = served.get(target.path or own)
+            if reached is None:
+                errors.append(f"{label}: {href} reaches no published page")
+            elif unquote(target.fragment) not in anchors[reached].ids:
+                errors.append(
+                    f"{label}: {href} names no id on {_rel(repo_root, reached)}"
+                )
+    return errors
+
+
 def _headers_file_errors(repo_root: Path) -> list[str]:
     try:
         text = (repo_root / HEADERS).read_text(encoding="utf-8")
@@ -507,6 +562,7 @@ def collect_errors(repo_root: Path) -> list[str]:
         *_asset_copy_errors(repo_root),
         *_image_name_errors(repo_root),
         *_reference_errors(repo_root),
+        *_fragment_errors(repo_root, pages),
         *_social_card_errors(repo_root, pages[0]),
         *_assetsignore_errors(repo_root),
         *_headers_file_errors(repo_root),

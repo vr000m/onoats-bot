@@ -648,6 +648,75 @@ def test_headers_rules_are_scoped_to_their_path_block(
         assert any(expected in error for error in errors), errors
 
 
+HOME = "site/public/index.html"
+PROMPTS_PAGE = "site/public/prompts/index.html"
+
+
+def _extra_link(page: str, href: str) -> tuple[str, str, str]:
+    return (page, "</main>", f'<p><a href="{href}">x</a></p>\n</main>')
+
+
+# Every published href with a #fragment must name an id on the page it reaches.
+# (edits, expected error fragments). Each edit is (page, old, new) with old
+# occurring exactly once in that page.
+FRAGMENT_CASES = {
+    "committed": ([], []),
+    "same-page fragment resolves": ([_extra_link(PROMPTS_PAGE, "#classify")], []),
+    "fragment on an svg id resolves": ([_extra_link(PROMPTS_PAGE, "#flow-t")], []),
+    "relative cross-page fragment resolves": (
+        [_extra_link(PROMPTS_PAGE, "../#install")],
+        [],
+    ),
+    "empty fragment is the top of the page": ([_extra_link(HOME, "#")], []),
+    "external fragment is not checked": (
+        [_extra_link(HOME, "https://example.com/#nowhere")],
+        [],
+    ),
+    "same-page fragment missing": (
+        [_extra_link(PROMPTS_PAGE, "#nowhere")],
+        [f"{PROMPTS_PAGE}: #nowhere names no id on {PROMPTS_PAGE}"],
+    ),
+    "cross-page fragment missing": (
+        [(HOME, 'href="/prompts/#segment"', 'href="/prompts/#segments"')],
+        [f"{HOME}: /prompts/#segments names no id on {PROMPTS_PAGE}"],
+    ),
+    "missing page": (
+        [(HOME, 'href="/prompts/#segment"', 'href="/prompt/#segment"')],
+        [f"{HOME}: /prompt/#segment reaches no published page"],
+    ),
+    "id on a different page": (
+        [(HOME, 'href="/prompts/#segment"', 'href="/prompts/#install"')],
+        [f"{HOME}: /prompts/#install names no id on {PROMPTS_PAGE}"],
+    ),
+    "renamed target breaks the home link and both diagram copies": (
+        [(PROMPTS_PAGE, '<li id="weekly-digest">', '<li id="weekly">')],
+        [
+            f"{HOME}: /prompts/#weekly-digest names no id on {PROMPTS_PAGE}",
+            f"{PROMPTS_PAGE}: #weekly-digest names no id on {PROMPTS_PAGE}",
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(FRAGMENT_CASES))
+def test_every_fragment_link_names_an_id_on_its_target(
+    tmp_path: Path, case: str
+) -> None:
+    edits, expected = FRAGMENT_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    for page, old, new in edits:
+        _edit(checkout / page, old, new)
+
+    errors = CHECKER.collect_errors(checkout)
+    if not expected:
+        assert errors == []
+    for fragment in expected:
+        assert any(fragment in error for error in errors), errors
+    if case.startswith("renamed"):
+        # both SVG copies link to the item, so the page reports it twice
+        assert sum(f"{PROMPTS_PAGE}: #weekly-digest" in e for e in errors) == 2
+
+
 def test_committed_prompts_pass() -> None:
     assert BUILDER.collect_errors(ROOT) == []
 
@@ -792,42 +861,177 @@ def test_prompt_untrusted_data_rules(tmp_path: Path, case: str) -> None:
         assert not any("is stale" in error for error in errors)
 
 
-FACT_DRIFT = {
-    "segment output keys": ("segment.txt", '"segments": [', '"parts": ['),
-    "classify_topics output keys": (
-        "classify_topics.txt",
-        '"confidence": 0.0,',
-        '"certainty": 0.0,',
-    ),
-    "classify_ap output keys": ("classify_ap.txt", '"action_items": [', '"items": ['),
-    "consolidate cap": (CONSOLIDATE, "length ≤ 15", "length ≤ 12"),
-    "daily metadata keys": ("digest_daily.txt", "top_topics: [", "top_themes: ["),
-    "weekly last section": (
+MONTHLY = "digest_monthly.txt"
+WEEKLY_FIRST = "1. **Week overview**"
+WEEKLY_LAST = "8. **Persistent Blockers**"
+MONTHLY_FIRST = "- `## Month overview`"
+MONTHLY_LAST = "- `## Outlook`"
+
+# One prompt-side break per FACTS entry, keyed by (prompt, index in FACTS[prompt]).
+# test_every_fact_has_a_prompt_break keeps this table complete.
+FACT_PROMPT_BREAKS = {
+    ("segment.txt", 0): ('"segments": [', '"parts": ['),
+    ("classify_topics.txt", 0): ('"confidence": 0.0,', '"certainty": 0.0,'),
+    ("classify_ap.txt", 0): ('"action_items": [', '"items": ['),
+    (CONSOLIDATE, 0): ('"consolidated_items": [', '"items": ['),
+    (CONSOLIDATE, 1): ("length ≤ 15", "length ≤ 12"),
+    ("digest_daily.txt", 0): ("top_topics: [", "top_themes: ["),
+    ("digest_daily.txt", 1): ("under 800 words", "under 900 words"),
+    (WEEKLY, 0): (WEEKLY_FIRST, "1. **Week summary**"),
+    (WEEKLY, 1): ("`## Persistent Blockers`.", "`## Blockers`."),
+    (MONTHLY, 0): (MONTHLY_LAST, "- `## Looking ahead`"),
+}
+
+
+def _fact_cells() -> list[tuple[str, int, str]]:
+    return [
+        (name, index, side)
+        for name, facts in sorted(BUILDER.FACTS.items())
+        for index in range(len(facts))
+        for side in ("intact", "prompt broken", "page broken")
+    ]
+
+
+def test_every_fact_has_a_prompt_break() -> None:
+    entries = {
+        (name, index)
+        for name, facts in BUILDER.FACTS.items()
+        for index in range(len(facts))
+    }
+    assert entries == set(FACT_PROMPT_BREAKS)
+
+
+@pytest.mark.parametrize("cell", _fact_cells(), ids=lambda c: f"{c[0]}[{c[1]}]-{c[2]}")
+def test_every_fact_is_bound_to_both_the_prompt_and_the_page(
+    tmp_path: Path, cell: tuple[str, int, str]
+) -> None:
+    name, index, side = cell
+    excerpt = BUILDER.FACTS[name][index][0]
+    checkout = _copy_site_tree(tmp_path)
+    page_path = checkout / "site/public/prompts/index.html"
+    if side == "prompt broken":
+        _edit(checkout / "site/public/prompts" / name, *FACT_PROMPT_BREAKS[name, index])
+    if side == "page broken":
+        page = page_path.read_text(encoding="utf-8")
+        start, end = BUILDER.item_prose(page, name)
+        prose = page[start:end]
+        assert prose.count(excerpt) == 1, (name, excerpt)
+        page_path.write_text(
+            page[:start] + prose.replace(excerpt, "[edited]") + page[end:],
+            encoding="utf-8",
+        )
+    BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
+
+    errors = BUILDER.collect_errors(checkout)
+    assert not any("is stale" in error for error in errors)
+    if side == "intact":
+        assert errors == []
+    elif side == "prompt broken":
+        assert errors == [
+            f"site/public/prompts/{name}: the page says {excerpt!r}, which the"
+            " prompt no longer backs; update the prompts page and FACTS together"
+        ], errors
+    else:
+        assert errors == [
+            f"site/public/prompts/index.html: the {name} item no longer says"
+            f" {excerpt!r}; update the prompts page and FACTS together"
+        ], errors
+
+
+# Reordering and scoping breaks the presence-only predicates missed, each with
+# the FACTS index of the claim it must break.
+FACT_ORDER_BREAKS = {
+    "weekly first and last swapped": (
         WEEKLY,
-        "8. **Persistent Blockers**",
-        "8. **Open Blockers**",
+        0,
+        [
+            (WEEKLY_FIRST, "1. **SWAP_A**"),
+            (WEEKLY_LAST, "8. **Week overview**"),
+            ("1. **SWAP_A**", "1. **Persistent Blockers**"),
+        ],
     ),
-    "monthly last heading": (
-        "digest_monthly.txt",
-        "- `## Outlook`",
-        "- `## Looking ahead`",
+    "weekly fixed headings out of order": (
+        WEEKLY,
+        1,
+        [
+            (
+                "`## Delta vs. last week`, `## Accomplishments`, `## Persistent",
+                "`## Accomplishments`, `## Delta vs. last week`, `## Persistent",
+            )
+        ],
+    ),
+    "monthly first and last swapped": (
+        MONTHLY,
+        0,
+        [
+            (MONTHLY_FIRST, "- `## SWAP_A`"),
+            (MONTHLY_LAST, "- `## Month overview`"),
+            ("- `## SWAP_A`", "- `## Outlook`"),
+        ],
+    ),
+    "monthly heading moved out of the structure block": (
+        MONTHLY,
+        0,
+        [
+            ("- `## Open items`", "- Open items"),
+            ("### Constraints\n", "### Constraints\n- `## Open items` — moved\n"),
+        ],
     ),
 }
 
 
-@pytest.mark.parametrize("case", sorted(FACT_DRIFT))
-def test_page_claims_about_a_prompt_are_checked_against_it(
-    tmp_path: Path, case: str
-) -> None:
-    name, old, new = FACT_DRIFT[case]
+@pytest.mark.parametrize("case", sorted(FACT_ORDER_BREAKS))
+def test_section_facts_check_order_and_scope(tmp_path: Path, case: str) -> None:
+    name, index, edits = FACT_ORDER_BREAKS[case]
+    excerpt = BUILDER.FACTS[name][index][0]
     checkout = _copy_site_tree(tmp_path)
-    assert BUILDER.collect_errors(checkout) == []
-    _edit(checkout / "site/public/prompts" / name, old, new)
+    for old, new in edits:
+        _edit(checkout / "site/public/prompts" / name, old, new)
     BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
 
     errors = BUILDER.collect_errors(checkout)
-    assert any(f"{name}: the page says it" in error for error in errors), errors
-    assert not any("is stale" in error for error in errors)
+    assert any(f"{name}: the page says {excerpt!r}" in e for e in errors), errors
+
+
+def test_page_side_drift_fails(tmp_path: Path) -> None:
+    # The reported case: the page changes its cap, the prompt does not.
+    checkout = _copy_site_tree(tmp_path)
+    _edit(
+        checkout / "site/public/prompts/index.html",
+        "</code>, at most 15.",
+        "</code>, at most 12.",
+    )
+    errors = BUILDER.collect_errors(checkout)
+    assert any("consolidate_action_items.txt item no longer says" in e for e in errors)
+
+
+def test_weekly_returns_line_does_not_promise_numbered_output() -> None:
+    # The Structure list numbers the instructions; the output uses ## headings.
+    page = (ROOT / "site/public/prompts/index.html").read_text(encoding="utf-8")
+    start, end = BUILDER.item_prose(page, WEEKLY)
+    assert "numbered" not in page[start:end]
+
+
+def _figcaption() -> str:
+    page = (ROOT / "site/public/prompts/index.html").read_text(encoding="utf-8")
+    (caption,) = re.findall(r"<figcaption>(.*?)</figcaption>", page, re.DOTALL)
+    return caption
+
+
+def test_diagram_caption_names_every_category_consumer() -> None:
+    # classify_ap.txt and consolidate_action_items.txt both take {category}.
+    prompts = ROOT / "site/public/prompts"
+    takers = sorted(
+        name
+        for name in ("classify_ap.txt", CONSOLIDATE)
+        if "{category}" in (prompts / name).read_text(encoding="utf-8")
+    )
+    assert takers == ["classify_ap.txt", CONSOLIDATE]
+    assert "Prompts 3 and 4 take the category from 2" in _figcaption()
+
+
+def test_diagram_caption_makes_no_schedule_claim() -> None:
+    assert "schedule" not in _figcaption()
 
 
 def test_every_fact_names_a_real_prompt() -> None:

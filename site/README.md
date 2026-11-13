@@ -39,15 +39,17 @@ on its own line between `--- BEGIN UNTRUSTED <LABEL> ---` and
 paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 `UNTRUSTED_FIELDS` in the script, and the page must list it.
 
-Both modes also fail when a prompt no longer backs something the page says about
-its output: the "Returns" lines and the prose restate JSON keys, the 15-item cap,
-the weekly and monthly section counts and the daily metadata keys. Those claims
-live in the `FACTS` table in the script; change the page text and the table
-together.
+Both modes also fail when a claim the page makes about a prompt's output drifts
+on either side: JSON keys, the 15-item cap, the daily word limit and metadata
+keys, and the weekly and monthly sections (count, first and last, and the fixed
+`##` headings). Each `FACTS` entry in the script holds the exact text the
+prompt's item must contain and a check that the prompt still backs it; change
+the page text and the table together.
 
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
 copies: a wide one, and a single-column one that replaces it below 900px. A
-change to the pipeline means editing both. Neither is generated or checked.
+change to the pipeline means editing both. Neither is generated; their
+`#fragment` links are checked by `check_site.py`.
 
 `site.css` holds everything shared by the pages.
 
@@ -56,7 +58,8 @@ change to the pipeline means editing both. Neither is generated or checked.
 `scripts/check_site.py` owns every site contract the prompts script does not:
 shared navigation and footer on every `*.html` page (with `aria-current="page"`
 only on the link to the page itself), the copied assets, versioned image names
-and `/img/` references, the social card named by `og:image`, the
+and `/img/` references, `#fragment` links (same-page and cross-page) against the
+ids on their target page, the social card named by `og:image`, the
 `public/.assetsignore` rule, and the `_headers` rules (security headers and the
 Content-Security-Policy in `/*`, immutable caching only in `/img/*`). The exact
 values live in its module docstring and constants, not here.

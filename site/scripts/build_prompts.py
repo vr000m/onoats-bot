@@ -12,8 +12,9 @@ Prompt file names use only letters, digits, ``_``, ``.`` and ``-``.
 
 Run `python3 site/scripts/build_prompts.py` after editing a prompt, or with
 `--check` to fail (exit 1) when the page is out of date. Both modes also fail
-when a prompt breaks the untrusted-data rules in `prompt_errors` or stops
-backing something the page says about it (`FACTS`). Stdlib only.
+when a prompt breaks the untrusted-data rules in `prompt_errors`, or when a
+`FACTS` entry fails on either side: the prompt's item on the page no longer
+contains its text, or the prompt no longer backs it. Stdlib only.
 """
 
 from __future__ import annotations
@@ -263,14 +264,46 @@ def _metadata_keys(text: str) -> set[str]:
     return set(re.findall(r"^([a-z_]+):", block, re.MULTILINE))
 
 
-# What `/prompts/` says about each prompt's output, checked against the prompt
-# itself. The page's "Returns" lines and prose restate these, and nothing else
-# compares them, so a prompt edit would leave the page wrong without failing CI.
-# When one of these fails, change the page text and this table together.
+def _structure(text: str) -> str:
+    """The prompt's ``### Structure`` block, up to ``### Constraints``."""
+
+    return _between(text, "### Structure", "### Constraints")
+
+
+def _weekly_sections(text: str) -> list[str]:
+    """The weekly Structure list's section names, in order."""
+
+    return re.findall(r"^\d+\. \*\*(.+?)\*\*", _structure(text), re.MULTILINE)
+
+
+def _weekly_fixed_headings(text: str) -> list[str]:
+    """The ``##`` headings the weekly prompt asks for verbatim, in order."""
+
+    line = next(
+        (ln for ln in text.splitlines() if "level-2 headings verbatim" in ln), ""
+    )
+    return re.findall(r"`## ([^`]+)`", line)
+
+
+def _monthly_headings(text: str) -> list[str]:
+    """The monthly Structure block's ``##`` headings, in order."""
+
+    return re.findall(r"^- `## ([^`]+)`", _structure(text), re.MULTILINE)
+
+
+def _runs(names: list[str], count: int, first: str, last: str) -> bool:
+    return len(names) == count and names[0] == first and names[-1] == last
+
+
+# What `/prompts/` says about each prompt, checked on both sides: the first
+# element is text the prompt's item must contain (between its <li> and the
+# embedded prompt), the second checks that the prompt still backs it. Without
+# the page side, editing the page would leave this table checking a claim the
+# page no longer makes. When one fails, change the page and this table together.
 FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
     "segment.txt": (
         (
-            'returns {"segments": [{start_time, end_time, reason}]}',
+            '<code>{"segments": [{"start_time", "end_time", "reason"}]}</code>',
             lambda t: all(
                 f'"{k}"' in t for k in ("segments", "start_time", "end_time", "reason")
             ),
@@ -278,7 +311,8 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
     ),
     "classify_topics.txt": (
         (
-            "returns category, confidence, summary and tags",
+            "<code>category</code>, <code>confidence</code>, <code>summary</code>"
+            " and <code>tags</code>",
             lambda t: all(
                 f'"{k}":' in t for k in ("category", "confidence", "summary", "tags")
             ),
@@ -286,7 +320,7 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
     ),
     "classify_ap.txt": (
         (
-            'returns {"action_items": [{text, attribution}]}',
+            '<code>{"action_items": [{"text", "attribution"}]}</code>',
             lambda t: all(
                 k in t for k in ('"action_items"', '"text"', '"attribution"')
             ),
@@ -294,17 +328,18 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
     ),
     "consolidate_action_items.txt": (
         (
-            'returns {"consolidated_items": [{text, attribution}]}',
+            '<code>{"consolidated_items": [{"text", "attribution"}]}</code>',
             lambda t: all(
                 k in t for k in ('"consolidated_items"', '"text"', '"attribution"')
             ),
         ),
-        ("capped at 15 items", lambda t: "length ≤ 15" in t),
+        ("at most 15", lambda t: "length ≤ 15" in t),
     ),
     "digest_daily.txt": (
         (
-            "ends in a metadata block with categories_active, transcript_ids,"
-            " duration_by_category, topic_density and top_topics",
+            "<code>categories_active</code>, <code>transcript_ids</code>,"
+            " <code>duration_by_category</code>, <code>topic_density</code> and"
+            " <code>top_topics</code>",
             lambda t: (
                 _metadata_keys(t)
                 == {
@@ -320,42 +355,61 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
     ),
     "digest_weekly.txt": (
         (
-            "eight numbered sections, week overview first, persistent blockers last",
+            "eight sections, from the week overview to persistent blockers",
+            lambda t: _runs(
+                _weekly_sections(t), 8, "Week overview", "Persistent Blockers"
+            ),
+        ),
+        (
+            "the last three under fixed <code>##</code> headings",
             lambda t: (
-                len(
-                    re.findall(
-                        r"^\d+\. \*\*",
-                        _between(t, "### Structure", "### Constraints"),
-                        re.MULTILINE,
-                    )
-                )
-                == 8
-                and "**Week overview**" in t
-                and "**Persistent Blockers**" in t
+                len(_weekly_fixed_headings(t)) == 3
+                and _weekly_fixed_headings(t) == _weekly_sections(t)[-3:]
             ),
         ),
     ),
     "digest_monthly.txt": (
         (
-            "seven ## headings, Month overview first, Outlook last",
-            lambda t: (
-                len(re.findall(r"^- `## ", t, re.MULTILINE)) == 7
-                and "`## Month overview`" in t
-                and "`## Outlook`" in t
-            ),
+            "seven fixed <code>##</code> headings, from Month overview to Outlook",
+            lambda t: _runs(_monthly_headings(t), 7, "Month overview", "Outlook"),
         ),
     ),
 }
 
 
-def fact_errors(name: str, text: str) -> list[str]:
-    """Statements the page makes about *name* that the prompt no longer backs."""
+def item_prose(page: str, name: str) -> tuple[int, int] | None:
+    """The span of *name*'s item text, from its ``<li`` to the embedded prompt.
 
-    return [
-        f"{PROMPT_DIR / name}: the page says it {claim}; update {PAGE} and FACTS"
-        for claim, holds in FACTS.get(name, ())
-        if not holds(text)
-    ]
+    None when the item has no single meta paragraph inside an ``<li>`` followed
+    by its open marker; ``marker_errors`` reports that shape.
+    """
+
+    metas = meta_paragraphs(page, name)
+    if len(metas) != 1 or _item_end(page, metas[0]) is None:
+        return None
+    start = [m.start() for m in ITEM_OPEN.finditer(page, 0, metas[0].start())][-1]
+    marker = page.find(f"<!-- prompt:{name} -->", metas[0].end())
+    return None if marker == -1 else (start, marker)
+
+
+def fact_errors(name: str, text: str, page: str) -> list[str]:
+    """Statements about *name* the page no longer makes or the prompt no longer backs."""
+
+    span = item_prose(page, name)
+    prose = page[span[0] : span[1]] if span else ""
+    errors = []
+    for excerpt, holds in FACTS.get(name, ()):
+        if excerpt not in prose:
+            errors.append(
+                f"{PAGE}: the {name} item no longer says {excerpt!r};"
+                " update the prompts page and FACTS together"
+            )
+        if not holds(text):
+            errors.append(
+                f"{PROMPT_DIR / name}: the page says {excerpt!r}, which the prompt"
+                " no longer backs; update the prompts page and FACTS together"
+            )
+    return errors
 
 
 def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
@@ -376,7 +430,7 @@ def collect_errors(repo_root: Path) -> list[str]:
         errors.append(f"{PAGE} is stale; run build_prompts.py")
     for name, text in prompts.items():
         errors.extend(prompt_errors(name, text, page))
-        errors.extend(fact_errors(name, text))
+        errors.extend(fact_errors(name, text, page))
     return errors
 
 
