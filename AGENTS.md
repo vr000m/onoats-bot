@@ -28,8 +28,9 @@ non-obvious parts; the code and `docs/` cover the rest.
   would show it in `ps`). The prompt text in
   `site/public/prompts/*.txt` is canonical. Two scripts own the site contracts
   and their module docstrings hold the rule values; do not restate them here.
-  `build_prompts.py` owns the generated prompts page and the untrusted-data
-  fences. `check_site.py` owns shared chrome and `aria-current`, copied assets,
+  `build_prompts.py` owns the generated prompts page, the untrusted-data
+  fences and the `FACTS` table that checks what the page says about each
+  prompt's output. `check_site.py` owns shared chrome and `aria-current`, copied assets,
   versioned image names and references, the social card named by `og:image`,
   `public/.assetsignore` and the `_headers` rules (security headers and CSP,
   cache scope). Each check covers the whole set (every page, tag, link, image
