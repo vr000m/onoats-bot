@@ -15,6 +15,13 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Changed
+
+- **Prompts page diagram.** `/prompts/` now opens with a pipeline diagram of
+  how the seven example prompts fit together (a single-column version on narrow
+  screens), a "Returns" line under each prompt, and section anchors that the
+  home page's "After the call" steps link to. Site only; the package is unchanged.
+
 ## [1.6.1] - 2026-11-08
 
 ### Added
