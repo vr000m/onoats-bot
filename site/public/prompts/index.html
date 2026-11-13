@@ -14,6 +14,15 @@
   summary:hover{color:var(--gold-ink)}
   details pre{margin:10px 0 0;padding:18px 20px;
               font-size:12.5px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere;max-height:30rem;overflow:auto}
+  .steps .out{font-size:15px}
+  .flow{margin:0 0 8px;max-width:960px}
+  .flow .scroll{overflow-x:auto;padding:4px 0 8px}
+  .flow svg{display:block;width:100%;min-width:860px;height:auto;font-family:var(--sans)}
+  .flow a{cursor:pointer}
+  .flow a:hover .box{fill:#ead9a6}
+  .flow a:focus-visible{outline:2px solid var(--gold-ink);outline-offset:2px}
+  .flow figcaption{max-width:44em;margin-top:6px}
+  .flow-lead{max-width:44em;margin:0 0 14px;color:var(--slate)}
   .vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 </style>
 </head>
@@ -42,11 +51,19 @@
 <main>
   <section class="sec">
     <div class="wrap">
+      <p class="flow-lead">How the prompts fit together, from a recorded call to a monthly digest.</p>
+      <figure class="flow">
+      <div class="scroll" tabindex="0" role="region" aria-label="Pipeline diagram, scrolls sideways on narrow screens">
+<svg viewBox="0 0 960 400" role="group" aria-labelledby="flow-t"><title id="flow-t">How the seven example prompts fit together</title><defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#566078"/></marker></defs><g aria-hidden="true"><text x="0" y="24" fill="#566078" font-size="11" font-weight="700" letter-spacing="1.2">ONOATS</text><text x="0" y="166" fill="#566078" font-size="11" font-weight="700" letter-spacing="1.2">PER CALL</text><text x="0" y="302" fill="#566078" font-size="11" font-weight="700" letter-spacing="1.2">SCHEDULED</text></g><g><rect x="0" y="34" width="250" height="56" rx="9" fill="#17233A"/><text x="16" y="59" fill="#FFF8E8" font-size="15" font-weight="600">Capture</text><text x="16" y="78" fill="#9db4e0" font-size="12">Me: mic · Them: system audio</text></g><g><rect x="355" y="34" width="250" height="56" rx="9" fill="#17233A"/><text x="371" y="59" fill="#FFF8E8" font-size="15" font-weight="600">Speech-to-text</text><text x="371" y="78" fill="#9db4e0" font-size="12">each channel on its own</text></g><g><rect x="710" y="34" width="250" height="56" rx="9" fill="#17233A"/><text x="726" y="59" fill="#FFF8E8" font-size="15" font-weight="600">Session file</text><text x="726" y="78" fill="#9db4e0" font-size="12">sessions/pending/*.jsonl</text></g><g aria-hidden="true"><path d="M254 62H351" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><path d="M609 62H706" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><path d="M835 90V118H190V186" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><path d="M355 188C355 146 855 146 855 188" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><text x="605" y="145" text-anchor="middle" fill="#566078" font-size="11.5">category + summary</text><path d="M214 222H246" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><path d="M464 222H496" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><path d="M714 222H746" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><path d="M254 358H351" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><text x="302" y="350" text-anchor="middle" fill="#566078" font-size="11.5">daily digests</text><path d="M609 358H706" fill="none" stroke="#566078" stroke-width="1.8" marker-end="url(#ah)"/><text x="657" y="350" text-anchor="middle" fill="#566078" font-size="11.5">weekly digests</text></g><a href="#segment"><rect class="box" x="0" y="190" width="210" height="64" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5"/><circle cx="16" cy="190" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="16" y="195" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">1</text><text x="16" y="221" fill="#17233A" font-size="15" font-weight="600">Split by topic</text><text x="16" y="241" fill="#566078" font-size="12" font-family="var(--mono)">segment</text></a><a href="#classify"><rect class="box" x="250" y="190" width="210" height="64" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5"/><circle cx="266" cy="190" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="266" y="195" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">2</text><text x="266" y="221" fill="#17233A" font-size="15" font-weight="600">Classify</text><text x="266" y="241" fill="#566078" font-size="12" font-family="var(--mono)">classify_topics</text></a><a href="#action-points"><rect class="box" x="500" y="190" width="210" height="64" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5"/><circle cx="516" cy="190" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="516" y="195" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">3</text><text x="516" y="221" fill="#17233A" font-size="15" font-weight="600">Action points</text><text x="516" y="241" fill="#566078" font-size="12" font-family="var(--mono)">classify_ap</text></a><a href="#merge-action-points"><rect class="box" x="750" y="190" width="210" height="64" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5"/><circle cx="766" cy="190" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="766" y="195" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">4</text><text x="766" y="221" fill="#17233A" font-size="15" font-weight="600">Merge action points</text><text x="766" y="241" fill="#566078" font-size="12" font-family="var(--mono)">consolidate_action_items</text></a><a href="#daily-digest"><rect class="box" x="0" y="330" width="250" height="56" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5" stroke-dasharray="5 4"/><circle cx="16" cy="330" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="16" y="335" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">5</text><text x="16" y="357" fill="#17233A" font-size="15" font-weight="600">Daily digest</text><text x="16" y="377" fill="#566078" font-size="12" font-family="var(--mono)">digest_daily</text></a><a href="#weekly-digest"><rect class="box" x="355" y="330" width="250" height="56" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5" stroke-dasharray="5 4"/><circle cx="371" cy="330" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="371" y="335" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">6</text><text x="371" y="357" fill="#17233A" font-size="15" font-weight="600">Weekly digest</text><text x="371" y="377" fill="#566078" font-size="12" font-family="var(--mono)">digest_weekly</text></a><a href="#monthly-digest"><rect class="box" x="710" y="330" width="250" height="56" rx="9" fill="#F1E6C6" stroke="#7a5a12" stroke-width="1.5" stroke-dasharray="5 4"/><circle cx="726" cy="330" r="13" fill="#E9B44C" stroke="#17233A" stroke-width="1.5"/><text x="726" y="335" text-anchor="middle" fill="#17233A" font-size="14" font-weight="700">7</text><text x="726" y="357" fill="#17233A" font-size="15" font-weight="600">Monthly digest</text><text x="726" y="377" fill="#566078" font-size="12" font-family="var(--mono)">digest_monthly</text></a></svg>
+      </div>
+      <figcaption>Blue boxes are onoats. Tan boxes are model calls from this page, numbered as in the list below and linking to each prompt. A dashed outline means a scheduled job rather than one per call. Prompt 4 takes the category and summary from 2 and the items from 3. Prompt 5 reads a day's transcripts; 6 and 7 read the digests before them.</figcaption>
+    </figure>
       <ol class="steps">
-        <li>
+        <li id="segment">
           <h2 class="st">Split a long call by topic</h2>
           <p>Cuts a session into coherent segments with start and end times. It leans towards fewer, larger segments, and does not split on speaker changes or short silences.</p>
           <p class="meta"><a href="/prompts/segment.txt">segment.txt</a> takes <code>{buffer_jsonl}</code>: one JSON object per line, each an <code>utterance</code> or a <code>silence_gap</code>, with <code>Me:</code> or <code>Them:</code> at the start of each utterance's text. A session file from the <a href="https://github.com/vr000m/onoats-bot/blob/main/docs/queue-contract.md">queue</a> is not that shape as it stands: drop its first <code>session_meta</code> line and turn each utterance's <code>source</code> into that prefix.</p>
+          <p class="meta out">Returns JSON: <code>{"segments": [{"start_time", "end_time", "reason"}]}</code>, with inclusive ISO times. Run each segment through the next step.</p>
           <!-- prompt:segment.txt -->
           <details>
             <summary>Read the prompt <span class="vh">segment.txt</span></summary>
@@ -166,10 +183,11 @@ Buffer to segment:
           </details>
           <!-- /prompt:segment.txt -->
         </li>
-        <li>
+        <li id="classify">
           <h2 class="st">Classify a transcript</h2>
           <p>Picks one category, with a confidence score, a short summary and tags. It handles transcripts with only <code>Them</code> lines (usually a talk you listened to) and refuses to invent a summary when there's too little text. The categories in the file are mine; replace them with your own <code>[categories]</code>.</p>
           <p class="meta"><a href="/prompts/classify_topics.txt">classify_topics.txt</a> takes <code>{transcript}</code>.</p>
+          <p class="meta out">Returns JSON: <code>category</code>, <code>confidence</code>, <code>summary</code> and <code>tags</code>. The category feeds the next two prompts and the summary feeds the merge.</p>
           <!-- prompt:classify_topics.txt -->
           <details>
             <summary>Read the prompt <span class="vh">classify_topics.txt</span></summary>
@@ -236,10 +254,11 @@ Transcript to classify:
           </details>
           <!-- /prompt:classify_topics.txt -->
         </li>
-        <li>
+        <li id="action-points">
           <h2 class="st">Extract action points, with who said what</h2>
           <p>Pulls out specific future commitments and marks each as <code>self_commit</code> (you took it on), <code>delegated</code> (you asked someone else) or <code>ambiguous</code>. The <code>Me:</code> and <code>Them:</code> tags decide this, which is why onoats keeps the channels apart. It lists the kinds of line to skip, such as narrating what you're doing right now.</p>
           <p class="meta"><a href="/prompts/classify_ap.txt">classify_ap.txt</a> takes <code>{category}</code>, <code>{transcript}</code> and <code>{existing_action_items_section}</code>. Leave the last one empty on the first pass; later, fill it with the items already tracked so the model doesn't repeat them.</p>
+          <p class="meta out">Returns JSON: <code>{"action_items": [{"text", "attribution"}]}</code>.</p>
           <!-- prompt:classify_ap.txt -->
           <details>
             <summary>Read the prompt <span class="vh">classify_ap.txt</span></summary>
@@ -310,10 +329,11 @@ Transcript to extract action items from:
           </details>
           <!-- /prompt:classify_ap.txt -->
         </li>
-        <li>
+        <li id="merge-action-points">
           <h2 class="st">Merge repeated action points</h2>
           <p>A second pass for long transcripts. It clusters items that belong to one workstream, keeps the strictest attribution, and caps the list at 15.</p>
           <p class="meta"><a href="/prompts/consolidate_action_items.txt">consolidate_action_items.txt</a> takes <code>{category}</code>, <code>{summary}</code>, <code>{items_json}</code> and <code>{existing_action_items_section}</code>.</p>
+          <p class="meta out">Returns JSON: <code>{"consolidated_items": [{"text", "attribution"}]}</code>, at most 15. The summary comes from the classify step and the items from the action-point step.</p>
           <!-- prompt:consolidate_action_items.txt -->
           <details>
             <summary>Read the prompt <span class="vh">consolidate_action_items.txt</span></summary>
@@ -386,10 +406,11 @@ Items (JSON):
           </details>
           <!-- /prompt:consolidate_action_items.txt -->
         </li>
-        <li>
+        <li id="daily-digest">
           <h2 class="st">Daily digest</h2>
           <p>Summarises one day of transcripts in under 800 words, with a metadata block that a weekly pass can use to decide which days deserve more detail.</p>
           <p class="meta"><a href="/prompts/digest_daily.txt">digest_daily.txt</a> takes <code>{target_date}</code> and <code>{transcripts}</code>.</p>
+          <p class="meta out">Returns Markdown that ends in a fenced <code>metadata</code> block: <code>categories_active</code>, <code>transcript_ids</code>, <code>duration_by_category</code>, <code>topic_density</code> and <code>top_topics</code>.</p>
           <!-- prompt:digest_daily.txt -->
           <details>
             <summary>Read the prompt <span class="vh">digest_daily.txt</span></summary>
@@ -449,10 +470,11 @@ top_topics: [up to 5 most prominent topics with estimated minutes each]
           </details>
           <!-- /prompt:digest_daily.txt -->
         </li>
-        <li>
+        <li id="weekly-digest">
           <h2 class="st">Weekly digest</h2>
           <p>Reduces the daily digests into a weekly report: major threads, decisions, open action items, change since last week, accomplishments and persistent blockers.</p>
           <p class="meta"><a href="/prompts/digest_weekly.txt">digest_weekly.txt</a> takes <code>{week_start}</code>, <code>{week_end}</code>, <code>{short_dailies}</code>, <code>{topic_signal}</code>, <code>{expansions}</code>, <code>{previous_week_context}</code> and <code>{expansion_budget_explanation}</code>.</p>
+          <p class="meta out">Returns Markdown in eight numbered sections, from the week overview to persistent blockers. The input is the daily digests.</p>
           <!-- prompt:digest_weekly.txt -->
           <details>
             <summary>Read the prompt <span class="vh">digest_weekly.txt</span></summary>
@@ -522,10 +544,11 @@ If the input above includes per-category weekly digests (umbrella reduction), ea
           </details>
           <!-- /prompt:digest_weekly.txt -->
         </li>
-        <li>
+        <li id="monthly-digest">
           <h2 class="st">Monthly digest</h2>
           <p>Reduces the weekly digests into a month-level overview.</p>
           <p class="meta"><a href="/prompts/digest_monthly.txt">digest_monthly.txt</a> takes <code>{month}</code>, <code>{weeks_count}</code> and <code>{short_weeklies}</code>.</p>
+          <p class="meta out">Returns Markdown under seven fixed <code>##</code> headings, from Month overview to Outlook. The input is the weekly digests.</p>
           <!-- prompt:digest_monthly.txt -->
           <details>
             <summary>Read the prompt <span class="vh">digest_monthly.txt</span></summary>
