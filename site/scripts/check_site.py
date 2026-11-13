@@ -16,8 +16,9 @@ image and rule), never "some match exists":
   immutable cache) matches ``VERSIONED_IMAGE``.
 - ``_reference_errors``: every ``/img/<name>`` in a published ``.css``,
   ``.html`` or ``.txt`` file is versioned and exists.
-- ``_fragment_errors``: every site-local ``href`` with a ``#fragment`` on a
-  published page reaches a published page that carries that ``id``.
+- ``_fragment_errors``: every site-local ``href`` (relative, or on
+  ``SITE_ORIGIN``) with a ``#fragment`` on a published page reaches a
+  published page that carries that ``id``.
 - ``_social_card_errors``: the home page has exactly one ``og:image``,
   ``twitter:image``, ``og:image:width`` and ``og:image:height`` (and none of
   the alias tags in ``SOCIAL_ALIASES``); both URLs are the same
@@ -514,12 +515,15 @@ def _anchors(page: Path) -> _Anchors:
 def _fragment_errors(repo_root: Path, pages: list[Path]) -> list[str]:
     """Every site-local ``href`` with a ``#fragment`` names an id on its target.
 
-    Same-page (``#x``), absolute (``/a/#x``) and relative (``../#x``) links are
-    resolved against the page's own path; the target must be a published page
-    and carry that ``id``. An empty fragment (the top of the page) and links
-    with a scheme or host are not checked.
+    Same-page (``#x``), absolute (``/a/#x``), relative (``../#x``) and
+    ``SITE_ORIGIN`` links (``https://onoats.dev/a/#x`` or ``//onoats.dev/a/#x``,
+    host compared case-insensitively) are resolved against the page's own
+    path; the target must be a published page and carry that ``id``. An empty
+    fragment (the top of the page) and links to any other origin or scheme are
+    not checked.
     """
 
+    origin = urlsplit(SITE_ORIGIN)
     served = {_own_path(repo_root, page): page for page in pages}
     anchors = {page: _anchors(page) for page in pages}
     errors: list[str] = []
@@ -528,9 +532,19 @@ def _fragment_errors(repo_root: Path, pages: list[Path]) -> list[str]:
         own = _own_path(repo_root, page)
         for href in anchors[page].hrefs:
             target = urlsplit(urljoin(own, href))
-            if not target.fragment or target.scheme or target.netloc:
+            if not target.fragment:
                 continue
-            reached = served.get(target.path or own)
+            if target.netloc:
+                if target.scheme not in ("", origin.scheme) or (
+                    target.netloc.lower() != origin.netloc
+                ):
+                    continue
+                path = target.path or "/"
+            elif target.scheme:
+                continue
+            else:
+                path = target.path or own
+            reached = served.get(path)
             if reached is None:
                 errors.append(f"{label}: {href} reaches no published page")
             elif unquote(target.fragment) not in anchors[reached].ids:

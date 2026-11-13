@@ -12,9 +12,19 @@ Prompt file names use only letters, digits, ``_``, ``.`` and ``-``.
 
 Run `python3 site/scripts/build_prompts.py` after editing a prompt, or with
 `--check` to fail (exit 1) when the page is out of date. Both modes also fail
-when a prompt breaks the untrusted-data rules in `prompt_errors`, or when a
-`FACTS` entry fails on either side: the prompt's item on the page no longer
-contains its text, or the prompt no longer backs it. Stdlib only.
+when:
+
+- a prompt breaks the untrusted-data rules in `prompt_errors`;
+- a `FACTS` entry fails on either side: the prompt's item on the page no
+  longer contains its text, or the prompt no longer backs it (when the item's
+  shape is broken, `marker_errors` reports it and the page side is skipped);
+- a `CAPTION_FACTS` entry fails on either side for the one diagram
+  `<figcaption>`;
+- an item or the caption uses an `UNBACKED_WORDS` word;
+- a `FACTS` or `UNBACKED_WORDS` key names no prompt file.
+
+These tables are the only place the page's claims about the prompts are
+checked; tests drive them but add no claim of their own. Stdlib only.
 """
 
 from __future__ import annotations
@@ -333,7 +343,7 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
                 k in t for k in ('"consolidated_items"', '"text"', '"attribution"')
             ),
         ),
-        ("at most 15", lambda t: "length ≤ 15" in t),
+        ("at most 15.", lambda t: re.search(r"length ≤ 15\b", t) is not None),
     ),
     "digest_daily.txt": (
         (
@@ -377,6 +387,30 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
 }
 
 
+CATEGORY_TAKERS = ("classify_ap.txt", "consolidate_action_items.txt")
+
+# What the pipeline diagram's <figcaption> says about the prompts as a set, in
+# the same (page text, check) shape as FACTS; each check reads every prompt.
+CAPTION_FACTS: tuple[tuple[str, Callable[[dict[str, str]], bool]], ...] = (
+    (
+        "Prompts 3 and 4 take the category from 2",
+        lambda prompts: all(
+            "{category}" in prompts.get(name, "") for name in CATEGORY_TAKERS
+        ),
+    ),
+)
+CAPTION = "the diagram caption"
+FIGCAPTION = re.compile(r"<figcaption>(.*?)</figcaption>", re.DOTALL)
+
+# Words a prompt's item (or the caption, keyed by CAPTION) must not use, because
+# no prompt backs the claim: the weekly Structure list numbers instructions, not
+# output sections; no prompt runs on a schedule, the caller decides when.
+UNBACKED_WORDS: dict[str, tuple[str, ...]] = {
+    "digest_weekly.txt": ("numbered",),
+    CAPTION: ("schedule",),
+}
+
+
 def item_prose(page: str, name: str) -> tuple[int, int] | None:
     """The span of *name*'s item text, from its ``<li`` to the embedded prompt.
 
@@ -395,11 +429,11 @@ def item_prose(page: str, name: str) -> tuple[int, int] | None:
 def fact_errors(name: str, text: str, page: str) -> list[str]:
     """Statements about *name* the page no longer makes or the prompt no longer backs."""
 
-    span = item_prose(page, name)
-    prose = page[span[0] : span[1]] if span else ""
+    span = item_prose(page, name)  # None: marker_errors reports the item shape
+    prose = page[span[0] : span[1]] if span else None
     errors = []
     for excerpt, holds in FACTS.get(name, ()):
-        if excerpt not in prose:
+        if prose is not None and excerpt not in prose:
             errors.append(
                 f"{PAGE}: the {name} item no longer says {excerpt!r};"
                 " update the prompts page and FACTS together"
@@ -409,7 +443,52 @@ def fact_errors(name: str, text: str, page: str) -> list[str]:
                 f"{PROMPT_DIR / name}: the page says {excerpt!r}, which the prompt"
                 " no longer backs; update the prompts page and FACTS together"
             )
+    errors.extend(_unbacked_errors(f"{name} item", prose, UNBACKED_WORDS.get(name)))
     return errors
+
+
+def _unbacked_errors(
+    where: str, text: str | None, words: tuple[str, ...] | None
+) -> list[str]:
+    return [
+        f"{PAGE}: the {where} says {word!r}, a claim no prompt backs"
+        for word in words or ()
+        if text is not None and word in text
+    ]
+
+
+def caption_errors(page: str, prompts: dict[str, str]) -> list[str]:
+    """The diagram caption: exactly one, saying each backed CAPTION_FACTS text."""
+
+    captions = FIGCAPTION.findall(page)
+    if len(captions) != 1:
+        return [f"{PAGE}: needs exactly one <figcaption> (found {len(captions)})"]
+    errors = []
+    for excerpt, holds in CAPTION_FACTS:
+        if excerpt not in captions[0]:
+            errors.append(
+                f"{PAGE}: {CAPTION} no longer says {excerpt!r};"
+                " update the prompts page and CAPTION_FACTS together"
+            )
+        if not holds(prompts):
+            errors.append(
+                f"{PROMPT_DIR}: {CAPTION} says {excerpt!r}, which the prompts no"
+                " longer back; update the prompts page and CAPTION_FACTS together"
+            )
+    errors.extend(_unbacked_errors(CAPTION, captions[0], UNBACKED_WORDS[CAPTION]))
+    return errors
+
+
+def orphan_errors(prompts: dict[str, str]) -> list[str]:
+    """Table keys that name no prompt file, so their claims would go unchecked."""
+
+    tables = {"FACTS": set(FACTS), "UNBACKED_WORDS": set(UNBACKED_WORDS) - {CAPTION}}
+    return [
+        f"site/scripts/build_prompts.py: {table} names {name},"
+        " which is not a prompt file"
+        for table, names in tables.items()
+        for name in sorted(names - set(prompts))
+    ]
 
 
 def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
@@ -422,7 +501,9 @@ def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
 
 
 def collect_errors(repo_root: Path) -> list[str]:
-    """Marker, staleness and untrusted-data violations below *repo_root*."""
+    """Every violation below *repo_root*: markers, staleness, untrusted-data
+    rules, page claims (FACTS, CAPTION_FACTS, UNBACKED_WORDS) and table keys
+    that name no prompt file."""
 
     page, prompts = _load(repo_root)
     errors = marker_errors(page, set(prompts))
@@ -431,6 +512,8 @@ def collect_errors(repo_root: Path) -> list[str]:
     for name, text in prompts.items():
         errors.extend(prompt_errors(name, text, page))
         errors.extend(fact_errors(name, text, page))
+    errors.extend(caption_errors(page, prompts))
+    errors.extend(orphan_errors(prompts))
     return errors
 
 

@@ -39,17 +39,18 @@ on its own line between `--- BEGIN UNTRUSTED <LABEL> ---` and
 paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 `UNTRUSTED_FIELDS` in the script, and the page must list it.
 
-Both modes also fail when a claim the page makes about a prompt's output drifts
-on either side: JSON keys, the 15-item cap, the daily word limit and metadata
-keys, and the weekly and monthly sections (count, first and last, and the fixed
-`##` headings). Each `FACTS` entry in the script holds the exact text the
-prompt's item must contain and a check that the prompt still backs it; change
-the page text and the table together.
+Both modes also fail when a claim the page makes about the prompts drifts on
+either side: the page text changes, or the prompts stop backing it. The claims
+live in tables in the script (`FACTS` per prompt, `CAPTION_FACTS` for the
+diagram caption, `UNBACKED_WORDS` for words the page must not use); its module
+docstring lists the rules. Change the page text and the table together, and
+move a prompt's entries when you rename it.
 
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
-copies: a wide one, and a single-column one that replaces it below 900px. A
-change to the pipeline means editing both. Neither is generated; their
-`#fragment` links are checked by `check_site.py`.
+copies: a wide one, and a single-column one that replaces it on narrow screens.
+A change to the pipeline means editing both, by hand: no check compares the two
+copies. `check_site.py` checks their `#fragment` links, and `build_prompts.py`
+checks the caption.
 
 `site.css` holds everything shared by the pages.
 

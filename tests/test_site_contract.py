@@ -672,6 +672,30 @@ FRAGMENT_CASES = {
         [_extra_link(HOME, "https://example.com/#nowhere")],
         [],
     ),
+    "site-origin fragment resolves": (
+        [_extra_link(HOME, "https://onoats.dev/prompts/#classify")],
+        [],
+    ),
+    "site-origin root fragment resolves": (
+        [_extra_link(PROMPTS_PAGE, "https://onoats.dev#install")],
+        [],
+    ),
+    "site-origin fragment missing": (
+        [_extra_link(HOME, "https://onoats.dev/prompts/#nowhere")],
+        [f"{HOME}: https://onoats.dev/prompts/#nowhere names no id on {PROMPTS_PAGE}"],
+    ),
+    "site-origin host is case-insensitive": (
+        [_extra_link(HOME, "https://ONOATS.dev/#nowhere")],
+        [f"{HOME}: https://ONOATS.dev/#nowhere names no id on {HOME}"],
+    ),
+    "protocol-relative site fragment missing": (
+        [_extra_link(HOME, "//onoats.dev/prompts/#nowhere")],
+        [f"{HOME}: //onoats.dev/prompts/#nowhere names no id on {PROMPTS_PAGE}"],
+    ),
+    "site-origin link to an unpublished page": (
+        [_extra_link(HOME, "https://onoats.dev/nope/#x")],
+        [f"{HOME}: https://onoats.dev/nope/#x reaches no published page"],
+    ),
     "same-page fragment missing": (
         [_extra_link(PROMPTS_PAGE, "#nowhere")],
         [f"{PROMPTS_PAGE}: #nowhere names no id on {PROMPTS_PAGE}"],
@@ -969,12 +993,14 @@ FACT_ORDER_BREAKS = {
             ("- `## SWAP_A`", "- `## Outlook`"),
         ],
     ),
-    "monthly heading moved out of the structure block": (
+    # Six headings inside Structure plus one before it: a whole-text scan still
+    # sees seven from Month overview to Outlook, so only a scoped scan fails.
+    "monthly heading outside the structure block is not counted": (
         MONTHLY,
         0,
         [
             ("- `## Open items`", "- Open items"),
-            ("### Constraints\n", "### Constraints\n- `## Open items` — moved\n"),
+            ("### Structure\n", "- `## Month overview` — before\n\n### Structure\n"),
         ],
     ),
 }
@@ -993,50 +1019,119 @@ def test_section_facts_check_order_and_scope(tmp_path: Path, case: str) -> None:
     assert any(f"{name}: the page says {excerpt!r}" in e for e in errors), errors
 
 
-def test_page_side_drift_fails(tmp_path: Path) -> None:
-    # The reported case: the page changes its cap, the prompt does not.
+@pytest.mark.parametrize(
+    ("page_cap", "prompt_cap", "expected"),
+    [
+        ("15", "15", None),
+        ("12", "15", "consolidate_action_items.txt item no longer says"),
+        ("150", "15", "consolidate_action_items.txt item no longer says"),
+        ("15", "150", "the page says 'at most 15.', which the prompt no longer"),
+        ("15", "12", "the page says 'at most 15.', which the prompt no longer"),
+    ],
+)
+def test_cap_fact_binds_the_whole_number(
+    tmp_path: Path, page_cap: str, prompt_cap: str, expected: str | None
+) -> None:
+    # A prefix match let "at most 150." or "length ≤ 150" pass for a cap of 15.
     checkout = _copy_site_tree(tmp_path)
     _edit(
         checkout / "site/public/prompts/index.html",
         "</code>, at most 15.",
-        "</code>, at most 12.",
+        f"</code>, at most {page_cap}.",
     )
+    _edit(
+        checkout / "site/public/prompts" / CONSOLIDATE,
+        "length ≤ 15",
+        f"length ≤ {prompt_cap}",
+    )
+    BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
+
     errors = BUILDER.collect_errors(checkout)
-    assert any("consolidate_action_items.txt item no longer says" in e for e in errors)
+    assert not any("is stale" in error for error in errors)
+    if expected is None:
+        assert errors == []
+    else:
+        assert any(expected in error for error in errors), errors
 
 
-def test_weekly_returns_line_does_not_promise_numbered_output() -> None:
-    # The Structure list numbers the instructions; the output uses ## headings.
-    page = (ROOT / "site/public/prompts/index.html").read_text(encoding="utf-8")
-    start, end = BUILDER.item_prose(page, WEEKLY)
-    assert "numbered" not in page[start:end]
+# Claims outside FACTS that the script owns: the diagram caption and words no
+# prompt backs. (file edited, old, new, expected error fragment or None).
+CLAIM_BREAKS = {
+    "intact": (PROMPTS_PAGE, "</figcaption>", "</figcaption>", None),
+    "caption drops the category claim": (
+        PROMPTS_PAGE,
+        "Prompts 3 and 4 take the category from 2;",
+        "Prompt 3 takes the category from 2;",
+        "the diagram caption no longer says 'Prompts 3 and 4 take the category",
+    ),
+    "a category consumer stops taking it": (
+        f"site/public/prompts/{CONSOLIDATE}",
+        "Category: {category}",
+        "Category: unknown",
+        "the diagram caption says 'Prompts 3 and 4 take the category from 2'",
+    ),
+    "caption claims a schedule": (
+        PROMPTS_PAGE,
+        "not once per call.",
+        "not once per call, on a schedule.",
+        "the diagram caption says 'schedule'",
+    ),
+    "weekly Returns line claims numbered output": (
+        PROMPTS_PAGE,
+        "The input is the daily digests.",
+        "The sections are numbered. The input is the daily digests.",
+        f"the {WEEKLY} item says 'numbered'",
+    ),
+    "second caption": (
+        PROMPTS_PAGE,
+        "</figcaption>",
+        "</figcaption><figcaption>x</figcaption>",
+        "needs exactly one <figcaption> (found 2)",
+    ),
+}
 
 
-def _figcaption() -> str:
-    page = (ROOT / "site/public/prompts/index.html").read_text(encoding="utf-8")
-    (caption,) = re.findall(r"<figcaption>(.*?)</figcaption>", page, re.DOTALL)
-    return caption
+@pytest.mark.parametrize("case", sorted(CLAIM_BREAKS))
+def test_caption_and_unbacked_words_fail_the_check(tmp_path: Path, case: str) -> None:
+    path, old, new, expected = CLAIM_BREAKS[case]
+    checkout = _copy_site_tree(tmp_path)
+    _edit(checkout / path, old, new)
+    BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
+
+    errors = BUILDER.collect_errors(checkout)
+    assert not any("is stale" in error for error in errors)
+    if expected is None:
+        assert errors == []
+    else:
+        assert any(expected in error for error in errors), errors
 
 
-def test_diagram_caption_names_every_category_consumer() -> None:
-    # classify_ap.txt and consolidate_action_items.txt both take {category}.
-    prompts = ROOT / "site/public/prompts"
-    takers = sorted(
-        name
-        for name in ("classify_ap.txt", CONSOLIDATE)
-        if "{category}" in (prompts / name).read_text(encoding="utf-8")
+@pytest.mark.parametrize("table", ["FACTS", "UNBACKED_WORDS"])
+def test_a_table_key_without_a_prompt_file_fails_the_check(
+    monkeypatch: pytest.MonkeyPatch, table: str
+) -> None:
+    # A renamed or deleted prompt must not leave its claims silently unchecked.
+    monkeypatch.setitem(getattr(BUILDER, table), "gone.txt", ())
+    errors = BUILDER.collect_errors(ROOT)
+    assert errors == [
+        f"site/scripts/build_prompts.py: {table} names gone.txt,"
+        " which is not a prompt file"
+    ]
+
+
+def test_broken_item_shape_reports_once_not_per_fact(tmp_path: Path) -> None:
+    # marker_errors owns a missing or doubled item; fact_errors must not repeat it.
+    checkout = _copy_site_tree(tmp_path)
+    page_path = checkout / PROMPTS_PAGE
+    page = page_path.read_text(encoding="utf-8")
+    (meta,) = BUILDER.meta_paragraphs(page, CONSOLIDATE)
+    page_path.write_text(
+        page[: meta.end()] + meta.group(0) + page[meta.end() :], encoding="utf-8"
     )
-    assert takers == ["classify_ap.txt", CONSOLIDATE]
-    assert "Prompts 3 and 4 take the category from 2" in _figcaption()
 
-
-def test_diagram_caption_makes_no_schedule_claim() -> None:
-    assert "schedule" not in _figcaption()
-
-
-def test_every_fact_names_a_real_prompt() -> None:
-    prompts = {path.name for path in (ROOT / "site/public/prompts").glob("*.txt")}
-    assert set(BUILDER.FACTS) <= prompts
+    errors = BUILDER.collect_errors(checkout)
+    assert any(f"{CONSOLIDATE} needs exactly one" in e for e in errors), errors
+    assert not any("item no longer says" in e for e in errors), errors
 
 
 def test_page_must_document_exactly_the_template_fields(tmp_path: Path) -> None:
@@ -1180,8 +1275,16 @@ def test_prompt_markers_pair_once_per_file(tmp_path: Path, case: str) -> None:
     ],
 )
 def test_prompt_file_names_follow_one_grammar(
-    tmp_path: Path, new_name: str, expected: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    new_name: str,
+    expected: str | None,
 ) -> None:
+    # A rename moves the prompt's claims too, or orphan_errors reports them.
+    facts = BUILDER.FACTS["classify_ap.txt"]
+    monkeypatch.delitem(BUILDER.FACTS, "classify_ap.txt")
+    monkeypatch.setitem(BUILDER.FACTS, new_name, facts)
+    monkeypatch.setattr(BUILDER, "CATEGORY_TAKERS", (new_name, CONSOLIDATE))
     checkout = _copy_site_tree(tmp_path)
     prompts = checkout / "site/public/prompts"
     (prompts / "classify_ap.txt").rename(prompts / new_name)
