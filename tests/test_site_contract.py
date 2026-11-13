@@ -792,6 +792,49 @@ def test_prompt_untrusted_data_rules(tmp_path: Path, case: str) -> None:
         assert not any("is stale" in error for error in errors)
 
 
+FACT_DRIFT = {
+    "segment output keys": ("segment.txt", '"segments": [', '"parts": ['),
+    "classify_topics output keys": (
+        "classify_topics.txt",
+        '"confidence": 0.0,',
+        '"certainty": 0.0,',
+    ),
+    "classify_ap output keys": ("classify_ap.txt", '"action_items": [', '"items": ['),
+    "consolidate cap": (CONSOLIDATE, "length ≤ 15", "length ≤ 12"),
+    "daily metadata keys": ("digest_daily.txt", "top_topics: [", "top_themes: ["),
+    "weekly last section": (
+        WEEKLY,
+        "8. **Persistent Blockers**",
+        "8. **Open Blockers**",
+    ),
+    "monthly last heading": (
+        "digest_monthly.txt",
+        "- `## Outlook`",
+        "- `## Looking ahead`",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(FACT_DRIFT))
+def test_page_claims_about_a_prompt_are_checked_against_it(
+    tmp_path: Path, case: str
+) -> None:
+    name, old, new = FACT_DRIFT[case]
+    checkout = _copy_site_tree(tmp_path)
+    assert BUILDER.collect_errors(checkout) == []
+    _edit(checkout / "site/public/prompts" / name, old, new)
+    BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
+
+    errors = BUILDER.collect_errors(checkout)
+    assert any(f"{name}: the page says it" in error for error in errors), errors
+    assert not any("is stale" in error for error in errors)
+
+
+def test_every_fact_names_a_real_prompt() -> None:
+    prompts = {path.name for path in (ROOT / "site/public/prompts").glob("*.txt")}
+    assert set(BUILDER.FACTS) <= prompts
+
+
 def test_page_must_document_exactly_the_template_fields(tmp_path: Path) -> None:
     checkout = _copy_site_tree(tmp_path)
     _edit(

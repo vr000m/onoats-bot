@@ -12,7 +12,8 @@ Prompt file names use only letters, digits, ``_``, ``.`` and ``-``.
 
 Run `python3 site/scripts/build_prompts.py` after editing a prompt, or with
 `--check` to fail (exit 1) when the page is out of date. Both modes also fail
-when a prompt breaks the untrusted-data rules in `prompt_errors`. Stdlib only.
+when a prompt breaks the untrusted-data rules in `prompt_errors` or stops
+backing something the page says about it (`FACTS`). Stdlib only.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import re
 import string
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -251,6 +253,111 @@ def prompt_errors(name: str, text: str, page: str) -> list[str]:
     return errors
 
 
+def _between(text: str, start: str, end: str) -> str:
+    head, _, rest = text.partition(start)
+    return rest.partition(end)[0] if rest else ""
+
+
+def _metadata_keys(text: str) -> set[str]:
+    block = _between(text, "```metadata\n", "```")
+    return set(re.findall(r"^([a-z_]+):", block, re.MULTILINE))
+
+
+# What `/prompts/` says about each prompt's output, checked against the prompt
+# itself. The page's "Returns" lines and prose restate these, and nothing else
+# compares them, so a prompt edit would leave the page wrong without failing CI.
+# When one of these fails, change the page text and this table together.
+FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
+    "segment.txt": (
+        (
+            'returns {"segments": [{start_time, end_time, reason}]}',
+            lambda t: all(
+                f'"{k}"' in t for k in ("segments", "start_time", "end_time", "reason")
+            ),
+        ),
+    ),
+    "classify_topics.txt": (
+        (
+            "returns category, confidence, summary and tags",
+            lambda t: all(
+                f'"{k}":' in t for k in ("category", "confidence", "summary", "tags")
+            ),
+        ),
+    ),
+    "classify_ap.txt": (
+        (
+            'returns {"action_items": [{text, attribution}]}',
+            lambda t: all(
+                k in t for k in ('"action_items"', '"text"', '"attribution"')
+            ),
+        ),
+    ),
+    "consolidate_action_items.txt": (
+        (
+            'returns {"consolidated_items": [{text, attribution}]}',
+            lambda t: all(
+                k in t for k in ('"consolidated_items"', '"text"', '"attribution"')
+            ),
+        ),
+        ("capped at 15 items", lambda t: "length ≤ 15" in t),
+    ),
+    "digest_daily.txt": (
+        (
+            "ends in a metadata block with categories_active, transcript_ids,"
+            " duration_by_category, topic_density and top_topics",
+            lambda t: (
+                _metadata_keys(t)
+                == {
+                    "categories_active",
+                    "transcript_ids",
+                    "duration_by_category",
+                    "topic_density",
+                    "top_topics",
+                }
+            ),
+        ),
+        ("under 800 words", lambda t: "under 800 words" in t),
+    ),
+    "digest_weekly.txt": (
+        (
+            "eight numbered sections, week overview first, persistent blockers last",
+            lambda t: (
+                len(
+                    re.findall(
+                        r"^\d+\. \*\*",
+                        _between(t, "### Structure", "### Constraints"),
+                        re.MULTILINE,
+                    )
+                )
+                == 8
+                and "**Week overview**" in t
+                and "**Persistent Blockers**" in t
+            ),
+        ),
+    ),
+    "digest_monthly.txt": (
+        (
+            "seven ## headings, Month overview first, Outlook last",
+            lambda t: (
+                len(re.findall(r"^- `## ", t, re.MULTILINE)) == 7
+                and "`## Month overview`" in t
+                and "`## Outlook`" in t
+            ),
+        ),
+    ),
+}
+
+
+def fact_errors(name: str, text: str) -> list[str]:
+    """Statements the page makes about *name* that the prompt no longer backs."""
+
+    return [
+        f"{PROMPT_DIR / name}: the page says it {claim}; update {PAGE} and FACTS"
+        for claim, holds in FACTS.get(name, ())
+        if not holds(text)
+    ]
+
+
 def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
     page = (repo_root / PAGE).read_text(encoding="utf-8")
     prompts = {
@@ -269,6 +376,7 @@ def collect_errors(repo_root: Path) -> list[str]:
         errors.append(f"{PAGE} is stale; run build_prompts.py")
     for name, text in prompts.items():
         errors.extend(prompt_errors(name, text, page))
+        errors.extend(fact_errors(name, text))
     return errors
 
 
