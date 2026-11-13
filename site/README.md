@@ -39,6 +39,16 @@ on its own line between `--- BEGIN UNTRUSTED <LABEL> ---` and
 paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 `UNTRUSTED_FIELDS` in the script, and the page must list it.
 
+Both modes also fail when a prompt no longer backs something the page says about
+its output: the "Returns" lines and the prose restate JSON keys, the 15-item cap,
+the weekly and monthly section counts and the daily metadata keys. Those claims
+live in the `FACTS` table in the script; change the page text and the table
+together.
+
+The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
+copies: a wide one, and a single-column one that replaces it below 900px. A
+change to the pipeline means editing both. Neither is generated or checked.
+
 `site.css` holds everything shared by the pages.
 
 ## Site checks

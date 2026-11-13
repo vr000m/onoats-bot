@@ -20,7 +20,11 @@ Annotated tags exist from `v0.9.0` forward.
 - **Prompts page diagram.** `/prompts/` now opens with a pipeline diagram of
   how the seven example prompts fit together (a single-column version on narrow
   screens), a "Returns" line under each prompt, and section anchors that the
-  home page's "After the call" steps link to. Site only; the package is unchanged.
+  home page's "After the call" steps link to. The digest row starts from a
+  "Markdown files" box (`onoats convert`). Site only; the package is unchanged.
+- **Prompts page claims are checked.** `build_prompts.py --check` now also fails
+  when a prompt stops backing what the page says about its output (`FACTS`:
+  JSON keys, the 15-item cap, section and heading counts, metadata keys).
 
 ## [1.6.1] - 2026-11-08
 
