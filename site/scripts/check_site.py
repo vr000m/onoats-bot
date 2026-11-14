@@ -110,13 +110,16 @@ def _normalise_nav(block: str) -> str:
     return block.replace(CURRENT, "")
 
 
+def _served_path(path: str) -> str:
+    """The URL path that serves *path*: ``/a/index.html`` is ``/a/``."""
+
+    return path.removesuffix("index.html") if path.endswith("/index.html") else path
+
+
 def _own_path(repo_root: Path, page: Path) -> str:
     """The URL path a page is served at: ``a/index.html`` is ``/a/``."""
 
-    served = page.relative_to(repo_root / PUBLIC_DIR).as_posix()
-    if served == "index.html" or served.endswith("/index.html"):
-        served = served[: -len("index.html")]
-    return "/" + served
+    return _served_path("/" + page.relative_to(repo_root / PUBLIC_DIR).as_posix())
 
 
 def _aria_current_errors(label: Path, nav: str, own: str) -> list[str]:
@@ -518,7 +521,8 @@ def _fragment_errors(repo_root: Path, pages: list[Path]) -> list[str]:
     Same-page (``#x``), absolute (``/a/#x``), relative (``../#x``) and
     ``SITE_ORIGIN`` links (``https://onoats.dev/a/#x`` or ``//onoats.dev/a/#x``,
     host compared case-insensitively) are resolved against the page's own
-    path; the target must be a published page and carry that ``id``. An empty
+    path, and a path ending in ``/index.html`` names its directory (as served);
+    the target must be a published page and carry that ``id``. An empty
     fragment (the top of the page) and links to any other origin or scheme are
     not checked.
     """
@@ -544,7 +548,7 @@ def _fragment_errors(repo_root: Path, pages: list[Path]) -> list[str]:
                 continue
             else:
                 path = target.path or own
-            reached = served.get(path)
+            reached = served.get(_served_path(path))
             if reached is None:
                 errors.append(f"{label}: {href} reaches no published page")
             elif unquote(target.fragment) not in anchors[reached].ids:

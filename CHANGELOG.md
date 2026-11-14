@@ -26,12 +26,14 @@ Annotated tags exist from `v0.9.0` forward.
   when a claim the page makes about a prompt's output drifts on either side: the
   page text changes, or the prompt stops backing it (`FACTS`: JSON keys, the
   15-item cap, metadata keys, section and heading counts and order). The same
-  holds for the diagram caption (`CAPTION_FACTS`) and for words the page must
-  not use (`UNBACKED_WORDS`). A table entry for a prompt file that no longer
-  exists also fails.
+  holds for the diagram caption (`CAPTION_FACTS`, read in the page's step
+  order) and for words the page must not use in any letter case
+  (`UNBACKED_WORDS`, `CAPTION_UNBACKED`). A `PROMPT_TABLES` entry for a prompt
+  file that no longer exists also fails.
 - **Fragment links are checked.** `check_site.py` now fails when a `#fragment`
   link on a published page, relative or on `https://onoats.dev`, names an id
-  its target page does not carry.
+  its target page does not carry. A link to `…/index.html` reaches the page
+  served at its directory.
 
 ## [1.6.1] - 2026-11-08
 

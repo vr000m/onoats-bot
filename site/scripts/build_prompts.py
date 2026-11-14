@@ -19,9 +19,12 @@ when:
   longer contains its text, or the prompt no longer backs it (when the item's
   shape is broken, `marker_errors` reports it and the page side is skipped);
 - a `CAPTION_FACTS` entry fails on either side for the one diagram
-  `<figcaption>`;
-- an item or the caption uses an `UNBACKED_WORDS` word;
-- a `FACTS` or `UNBACKED_WORDS` key names no prompt file.
+  `<figcaption>`; the caption numbers prompts by their place in the one
+  `<ol class="steps">`, so its checks read the prompts in that order;
+- an item uses its `UNBACKED_WORDS` word, or the caption a `CAPTION_UNBACKED`
+  word, in any letter case;
+- a key of a `PROMPT_TABLES` table (the only tables keyed by prompt file name)
+  names no prompt file.
 
 These tables are the only place the page's claims about the prompts are
 checked; tests drive them but add no claim of their own. Stdlib only.
@@ -387,27 +390,57 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
 }
 
 
-CATEGORY_TAKERS = ("classify_ap.txt", "consolidate_action_items.txt")
+STEPS = re.compile(r'<ol class="steps">(.*?)</ol>', re.DOTALL)
+
+
+def step_names(page: str) -> list[str | None] | None:
+    """The prompt each ``<li>`` of the one steps list embeds, in page order.
+
+    Prompt N on the page is item N of ``<ol class="steps">``; an item with no
+    marker is None. None when the page has no single steps list.
+    """
+
+    lists = STEPS.findall(page)
+    if len(lists) != 1:
+        return None
+    items = ITEM_OPEN.split(lists[0])[1:]
+    return [m["name"] if (m := OPEN_MARKER.search(item)) else None for item in items]
+
+
+def _category_flow(steps: list[str | None], prompts: dict[str, str]) -> bool:
+    """Step 2 is the one prompt returning a category; steps 3 and 4 take it.
+
+    This also backs the classify item's "feeds the next two prompts".
+    """
+
+    producers = [name for name, text in prompts.items() if '"category":' in text]
+    return (
+        len(steps) >= 4
+        and producers == [steps[1]]
+        and all("{category}" in prompts.get(name or "", "") for name in steps[2:4])
+    )
+
 
 # What the pipeline diagram's <figcaption> says about the prompts as a set, in
-# the same (page text, check) shape as FACTS; each check reads every prompt.
-CAPTION_FACTS: tuple[tuple[str, Callable[[dict[str, str]], bool]], ...] = (
-    (
-        "Prompts 3 and 4 take the category from 2",
-        lambda prompts: all(
-            "{category}" in prompts.get(name, "") for name in CATEGORY_TAKERS
-        ),
-    ),
-)
+# the same (page text, check) shape as FACTS; each check reads the prompts in
+# step order (from step_names) and every prompt's text.
+CAPTION_FACTS: tuple[
+    tuple[str, Callable[[list[str | None], dict[str, str]], bool]], ...
+] = (("Prompts 3 and 4 take the category from 2", _category_flow),)
 CAPTION = "the diagram caption"
 FIGCAPTION = re.compile(r"<figcaption>(.*?)</figcaption>", re.DOTALL)
 
-# Words a prompt's item (or the caption, keyed by CAPTION) must not use, because
-# no prompt backs the claim: the weekly Structure list numbers instructions, not
-# output sections; no prompt runs on a schedule, the caller decides when.
-UNBACKED_WORDS: dict[str, tuple[str, ...]] = {
-    "digest_weekly.txt": ("numbered",),
-    CAPTION: ("schedule",),
+# Words a prompt's item must not use, in any letter case, because no prompt
+# backs the claim: the weekly Structure list numbers instructions, not output
+# sections. CAPTION_UNBACKED holds the caption's: no prompt runs on a schedule,
+# the caller decides when.
+UNBACKED_WORDS: dict[str, tuple[str, ...]] = {"digest_weekly.txt": ("numbered",)}
+CAPTION_UNBACKED: tuple[str, ...] = ("schedule",)
+
+# Every table keyed by prompt file name; orphan_errors checks each key.
+PROMPT_TABLES: dict[str, dict[str, tuple[object, ...]]] = {
+    "FACTS": FACTS,
+    "UNBACKED_WORDS": UNBACKED_WORDS,
 }
 
 
@@ -450,10 +483,11 @@ def fact_errors(name: str, text: str, page: str) -> list[str]:
 def _unbacked_errors(
     where: str, text: str | None, words: tuple[str, ...] | None
 ) -> list[str]:
+    folded = text.casefold() if text is not None else None
     return [
         f"{PAGE}: the {where} says {word!r}, a claim no prompt backs"
         for word in words or ()
-        if text is not None and word in text
+        if folded is not None and word.casefold() in folded
     ]
 
 
@@ -463,6 +497,9 @@ def caption_errors(page: str, prompts: dict[str, str]) -> list[str]:
     captions = FIGCAPTION.findall(page)
     if len(captions) != 1:
         return [f"{PAGE}: needs exactly one <figcaption> (found {len(captions)})"]
+    steps = step_names(page)
+    if steps is None:
+        return [f'{PAGE}: needs exactly one <ol class="steps">']
     errors = []
     for excerpt, holds in CAPTION_FACTS:
         if excerpt not in captions[0]:
@@ -470,24 +507,23 @@ def caption_errors(page: str, prompts: dict[str, str]) -> list[str]:
                 f"{PAGE}: {CAPTION} no longer says {excerpt!r};"
                 " update the prompts page and CAPTION_FACTS together"
             )
-        if not holds(prompts):
+        if not holds(steps, prompts):
             errors.append(
                 f"{PROMPT_DIR}: {CAPTION} says {excerpt!r}, which the prompts no"
                 " longer back; update the prompts page and CAPTION_FACTS together"
             )
-    errors.extend(_unbacked_errors(CAPTION, captions[0], UNBACKED_WORDS[CAPTION]))
+    errors.extend(_unbacked_errors(CAPTION, captions[0], CAPTION_UNBACKED))
     return errors
 
 
 def orphan_errors(prompts: dict[str, str]) -> list[str]:
     """Table keys that name no prompt file, so their claims would go unchecked."""
 
-    tables = {"FACTS": set(FACTS), "UNBACKED_WORDS": set(UNBACKED_WORDS) - {CAPTION}}
     return [
         f"site/scripts/build_prompts.py: {table} names {name},"
         " which is not a prompt file"
-        for table, names in tables.items()
-        for name in sorted(names - set(prompts))
+        for table, keys in PROMPT_TABLES.items()
+        for name in sorted(set(keys) - set(prompts))
     ]
 
 
@@ -502,8 +538,8 @@ def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
 
 def collect_errors(repo_root: Path) -> list[str]:
     """Every violation below *repo_root*: markers, staleness, untrusted-data
-    rules, page claims (FACTS, CAPTION_FACTS, UNBACKED_WORDS) and table keys
-    that name no prompt file."""
+    rules, page claims (FACTS, CAPTION_FACTS, UNBACKED_WORDS, CAPTION_UNBACKED)
+    and PROMPT_TABLES keys that name no prompt file."""
 
     page, prompts = _load(repo_root)
     errors = marker_errors(page, set(prompts))

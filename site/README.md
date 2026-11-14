@@ -42,9 +42,11 @@ paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 Both modes also fail when a claim the page makes about the prompts drifts on
 either side: the page text changes, or the prompts stop backing it. The claims
 live in tables in the script (`FACTS` per prompt, `CAPTION_FACTS` for the
-diagram caption, `UNBACKED_WORDS` for words the page must not use); its module
-docstring lists the rules. Change the page text and the table together, and
-move a prompt's entries when you rename it.
+diagram caption, `UNBACKED_WORDS` and `CAPTION_UNBACKED` for words the page
+must not use); its module docstring lists the rules. Change the page text and
+the table together. The caption numbers prompts by their place in the steps
+list, so its checks follow the page order, not file names. When you rename a
+prompt, move its entries in every `PROMPT_TABLES` table.
 
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
 copies: a wide one, and a single-column one that replaces it on narrow screens.

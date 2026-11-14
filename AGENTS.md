@@ -29,7 +29,8 @@ non-obvious parts; the code and `docs/` cover the rest.
   `site/public/prompts/*.txt` is canonical. Two scripts own the site contracts
   and their module docstrings hold the rule values; do not restate them here.
   `build_prompts.py` owns the generated prompts page, the untrusted-data
-  fences and the claim tables (`FACTS`, `CAPTION_FACTS`, `UNBACKED_WORDS`)
+  fences and the claim tables (`FACTS`, `CAPTION_FACTS`, `UNBACKED_WORDS`,
+  `CAPTION_UNBACKED`)
   that bind what the page says about the prompts to both the page text and
   the prompts. `check_site.py` owns shared chrome and `aria-current`, copied
   assets, versioned image names and references, `#fragment` links, the social

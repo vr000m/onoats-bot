@@ -741,6 +741,45 @@ def test_every_fragment_link_names_an_id_on_its_target(
         assert sum(f"{PROMPTS_PAGE}: #weekly-digest" in e for e in errors) == 2
 
 
+# Every way a link can spell the prompts page, crossed with an id that exists
+# and one that does not. A served path ending in /index.html is its directory.
+PROMPTS_LINK_FORMS = {
+    "directory": "/prompts/",
+    "index.html": "/prompts/index.html",
+    "query": "/prompts/?a=1",
+    "query on index.html": "/prompts/index.html?a=1",
+    "relative index.html": "prompts/index.html",
+    "site origin": "https://onoats.dev/prompts/",
+    "site origin index.html": "https://onoats.dev/prompts/index.html",
+}
+
+
+@pytest.mark.parametrize("form", sorted(PROMPTS_LINK_FORMS))
+@pytest.mark.parametrize("fragment", ["classify", "nowhere"])
+def test_fragment_check_covers_every_spelling_of_a_page(
+    tmp_path: Path, form: str, fragment: str
+) -> None:
+    href = f"{PROMPTS_LINK_FORMS[form]}#{fragment}"
+    checkout = _copy_site_tree(tmp_path)
+    _edit(checkout / HOME, *_extra_link(HOME, href)[1:])
+
+    errors = CHECKER.collect_errors(checkout)
+    if fragment == "classify":
+        assert errors == []
+    else:
+        assert errors == [f"{HOME}: {href} names no id on {PROMPTS_PAGE}"]
+
+
+def test_home_index_html_link_reaches_the_home_page(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    _edit(
+        checkout / PROMPTS_PAGE, *_extra_link(PROMPTS_PAGE, "/index.html#nowhere")[1:]
+    )
+    assert CHECKER.collect_errors(checkout) == [
+        f"{PROMPTS_PAGE}: /index.html#nowhere names no id on {HOME}"
+    ]
+
+
 def test_committed_prompts_pass() -> None:
     assert BUILDER.collect_errors(ROOT) == []
 
@@ -1082,6 +1121,18 @@ CLAIM_BREAKS = {
         "The sections are numbered. The input is the daily digests.",
         f"the {WEEKLY} item says 'numbered'",
     ),
+    "caption claims a schedule at a sentence start": (
+        PROMPTS_PAGE,
+        "not once per call.",
+        "not once per call. Scheduled runs only.",
+        "the diagram caption says 'schedule'",
+    ),
+    "weekly item says Numbered at a sentence start": (
+        PROMPTS_PAGE,
+        "The input is the daily digests.",
+        "Numbered sections. The input is the daily digests.",
+        f"the {WEEKLY} item says 'numbered'",
+    ),
     "second caption": (
         PROMPTS_PAGE,
         "</figcaption>",
@@ -1106,7 +1157,36 @@ def test_caption_and_unbacked_words_fail_the_check(tmp_path: Path, case: str) ->
         assert any(expected in error for error in errors), errors
 
 
-@pytest.mark.parametrize("table", ["FACTS", "UNBACKED_WORDS"])
+PROMPT_FILES = frozenset(p.name for p in (ROOT / "site/public/prompts").glob("*.txt"))
+
+
+def _names_in(value: object) -> set[str]:
+    """Prompt file names a module-level table mentions as a key or element."""
+
+    if isinstance(value, dict):
+        return {k for k in value if isinstance(k, str) and k in PROMPT_FILES}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return {v for v in value if isinstance(v, str) and v in PROMPT_FILES}
+    return set()
+
+
+def test_every_table_naming_a_prompt_is_orphan_checked() -> None:
+    # A table keyed by prompt name that orphan_errors skips goes stale on a
+    # rename, and the check then blames the wrong thing.
+    checked = getattr(BUILDER, "PROMPT_TABLES", {})
+    naming = {
+        name
+        for name, value in vars(BUILDER).items()
+        if name.isupper() and _names_in(value)
+    }
+    assert naming <= set(checked), naming - set(checked)
+    for table, value in checked.items():
+        assert getattr(BUILDER, table) is value
+        # every key is a prompt file: no sentinel keys for non-prompt claims
+        assert set(value) <= PROMPT_FILES, (table, set(value) - PROMPT_FILES)
+
+
+@pytest.mark.parametrize("table", sorted(getattr(BUILDER, "PROMPT_TABLES", {})))
 def test_a_table_key_without_a_prompt_file_fails_the_check(
     monkeypatch: pytest.MonkeyPatch, table: str
 ) -> None:
@@ -1117,6 +1197,56 @@ def test_a_table_key_without_a_prompt_file_fails_the_check(
         f"site/scripts/build_prompts.py: {table} names gone.txt,"
         " which is not a prompt file"
     ]
+
+
+def _swap_items(text: str, first: str, second: str) -> str:
+    """Swap the two ``<li id=...>`` items of the steps list."""
+
+    def item(item_id: str) -> str:
+        start = text.index(f'<li id="{item_id}">')
+        return text[start : text.index("</li>", start) + len("</li>")]
+
+    a, b = item(first), item(second)
+    return text.replace(a, "@@a@@").replace(b, a).replace("@@a@@", b)
+
+
+CAPTION_CATEGORY_UNBACKED = (
+    "the diagram caption says 'Prompts 3 and 4 take the category from 2',"
+    " which the prompts no longer back"
+)
+
+# The caption numbers prompts by their place in <ol class="steps">, so the
+# claim must follow the items, not fixed file names. (swap, expected or None).
+STEP_ORDER_CASES = {
+    "committed order": (None, None),
+    "classify moves to step 3": (("classify", "action-points"), "caption"),
+    "merge moves to step 5": (("merge-action-points", "daily-digest"), "caption"),
+    "classify moves to step 5": (("classify", "daily-digest"), "caption"),
+    "no steps list": ("no-steps", 'needs exactly one <ol class="steps">'),
+}
+
+
+@pytest.mark.parametrize("case", sorted(STEP_ORDER_CASES))
+def test_caption_category_claim_follows_the_step_order(
+    tmp_path: Path, case: str
+) -> None:
+    edit, expected = STEP_ORDER_CASES[case]
+    checkout = _copy_site_tree(tmp_path)
+    page = checkout / PROMPTS_PAGE
+    text = page.read_text(encoding="utf-8")
+    if edit == "no-steps":
+        text = text.replace('<ol class="steps">', "<ol>")
+    elif edit is not None:
+        text = _swap_items(text, *edit)
+    page.write_text(text, encoding="utf-8")
+
+    errors = BUILDER.collect_errors(checkout)
+    if expected is None:
+        assert errors == []
+    elif expected == "caption":
+        assert any(CAPTION_CATEGORY_UNBACKED in e for e in errors), errors
+    else:
+        assert any(expected in e for e in errors), errors
 
 
 def test_broken_item_shape_reports_once_not_per_fact(tmp_path: Path) -> None:
@@ -1284,7 +1414,6 @@ def test_prompt_file_names_follow_one_grammar(
     facts = BUILDER.FACTS["classify_ap.txt"]
     monkeypatch.delitem(BUILDER.FACTS, "classify_ap.txt")
     monkeypatch.setitem(BUILDER.FACTS, new_name, facts)
-    monkeypatch.setattr(BUILDER, "CATEGORY_TAKERS", (new_name, CONSOLIDATE))
     checkout = _copy_site_tree(tmp_path)
     prompts = checkout / "site/public/prompts"
     (prompts / "classify_ap.txt").rename(prompts / new_name)
