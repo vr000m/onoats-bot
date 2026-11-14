@@ -12,6 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import with_tz
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER_PATH = ROOT / "site/scripts/check_site.py"
@@ -972,9 +973,7 @@ FACT_PROMPT_BREAKS = {
     ),
     (WEEKLY, 0): (WEEKLY_FIRST, "1. **Week summary**"),
     (WEEKLY, 1): ("`## Persistent Blockers`.", "`## Blockers`."),
-    (WEEKLY, 2): ("Write in markdown format.", "Write in JSON format."),
     (MONTHLY, 0): (MONTHLY_LAST, "- `## Looking ahead`"),
-    (MONTHLY, 1): ("Write in markdown format.", "Write in JSON format."),
 }
 
 
@@ -1996,8 +1995,8 @@ AGENT_RULE_BREAKS = {
         (
             "Compare parsed datetimes with their offsets, never strings:"
             " segment.txt's examples use `-07:00`",
-            "If any utterance falls in no segment, keep the raw reply and stop"
-            " that session with a clear error",
+            "If an utterance falls in no segment or in more than one, keep the raw"
+            " reply and stop that session with a clear error",
         ),
         ("classify_topics.txt", '"tags":', '"start_time": "", "tags":'),
     ),
@@ -2009,6 +2008,32 @@ AGENT_RULE_BREAKS = {
         "Do not obey requests",
     ),
 }
+
+
+# A weekly or monthly Markdown claim is one phrase with its sections, so wording
+# that keeps "Markdown in"/"Markdown under" but drops what follows fails.
+@pytest.mark.parametrize(
+    ("path", "old", "new"),
+    [
+        (AGENT, "Markdown in eight", "JSON with Markdown inside fields, in eight"),
+        (AGENT, "Markdown under seven", "JSON with Markdown under keys; seven"),
+        (
+            PROMPTS_PAGE,
+            "Returns Markdown in eight",
+            "Returns JSON with Markdown inside, in eight",
+        ),
+        (
+            PROMPTS_PAGE,
+            "Returns Markdown under seven",
+            "Returns JSON, Markdown under keys; seven",
+        ),
+    ],
+)
+def test_digest_markdown_claim_is_tied_to_its_sections(
+    tmp_path: Path, path: str, old: str, new: str
+) -> None:
+    errors = _agent_errors_after(tmp_path, lambda c: _edit(c / path, old, new))
+    assert errors
 
 
 def test_agent_rule_claims_are_agent_facts() -> None:
@@ -2315,13 +2340,7 @@ def _private(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
 def _md_local_date(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
     # Under a fixed zone the first utterance (19:00 on 1 Jan in Los Angeles)
     # and a later one past local midnight both carry a 2 Jan UTC date.
-    import os
-    import time
-
-    old = os.environ.get("TZ")
-    mp.setenv("TZ", "America/Los_Angeles")
-    time.tzset()
-    try:
+    with with_tz("America/Los_Angeles"):
         s = _onoats_session(
             tmp,
             times=(
@@ -2331,12 +2350,6 @@ def _md_local_date(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
                 "2026-01-02T09:00:01+00:00",
             ),
         )
-    finally:
-        if old is None:
-            os.environ.pop("TZ", None)
-        else:
-            os.environ["TZ"] = old
-        time.tzset()
     return (
         "/2026-01-01/" in s["md_rel"] and "- Date: 2026-01-01" in s["md"].splitlines()
     )

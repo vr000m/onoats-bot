@@ -11,6 +11,11 @@ next test's acquire. Release it after every test so each starts from a clean slo
 
 from __future__ import annotations
 
+import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import pytest
 
 
@@ -20,3 +25,26 @@ def _release_instance_lock_after_each():
     from onoats.runtime import _release_instance_lock
 
     _release_instance_lock()
+
+
+@contextmanager
+def with_tz(tz: str) -> Iterator[None]:
+    """Run the block under process time zone *tz*, then restore the old one.
+
+    Skips the calling test where ``time.tzset`` is missing (it is POSIX-only).
+    Test modules import it with ``from conftest import with_tz``.
+    """
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset is POSIX-only")
+    orig = os.environ.get("TZ")
+    os.environ["TZ"] = tz
+    time.tzset()
+    try:
+        yield
+    finally:
+        if orig is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = orig
+        time.tzset()

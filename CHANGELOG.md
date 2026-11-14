@@ -28,12 +28,13 @@ Annotated tags exist from `v0.9.0` forward.
   files from the onoats data folder, fetches the seven prompts, builds a
   command for each stage of the diagram and asks which model to call.
   It accepts prompt 2's category only from that prompt's list, skips prompt 4
-  for the categories that prompt says upstream code skips, feeds the daily
-  digest Markdown it writes per segment with its own id, prompt 2's category,
-  local times and local date (onoats's own Markdown carries the recording's
-  lock category and no times), stops a session when an utterance falls in no
-  segment, asks before it reads real sessions, writes its outputs owner-only
-  and asks the user how to fill the placeholders onoats keeps no data for.
+  for the categories `consolidate_action_items.txt` says upstream code skips,
+  feeds the daily digest Markdown it writes per segment with its own id,
+  prompt 2's category, local times and local date (onoats's own Markdown
+  carries the recording's lock category and no times), stops a session when
+  an utterance falls in no segment or in more than one, asks before it reads
+  real sessions, writes its outputs owner-only and asks the user how to fill
+  the placeholders onoats keeps no data for.
   The home page's "After the call" section links to it. `build_prompts.py
   --check` binds it to the page's step order, the placeholders each prompt takes
   and the claims the page makes about how they connect and what they return

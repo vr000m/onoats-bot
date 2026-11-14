@@ -395,9 +395,12 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
     ),
     "digest_weekly.txt": (
         (
-            "eight sections, from the week overview to persistent blockers",
-            lambda t: _runs(
-                _weekly_sections(t), 8, "Week overview", "Persistent Blockers"
+            "Markdown in eight sections, from the week overview to persistent blockers",
+            lambda t: (
+                _markdown(t)
+                and _runs(
+                    _weekly_sections(t), 8, "Week overview", "Persistent Blockers"
+                )
             ),
         ),
         (
@@ -407,14 +410,16 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
                 and _weekly_fixed_headings(t) == _weekly_sections(t)[-3:]
             ),
         ),
-        ("Markdown in", _markdown),
     ),
     "digest_monthly.txt": (
         (
-            "seven fixed <code>##</code> headings, from Month overview to Outlook",
-            lambda t: _runs(_monthly_headings(t), 7, "Month overview", "Outlook"),
+            "Markdown under seven fixed <code>##</code> headings, from Month"
+            " overview to Outlook",
+            lambda t: (
+                _markdown(t)
+                and _runs(_monthly_headings(t), 7, "Month overview", "Outlook")
+            ),
         ),
-        ("Markdown under", _markdown),
     ),
 }
 
@@ -633,8 +638,9 @@ def _daily_categories(steps: Steps, prompts: dict[str, str]) -> bool:
 def _segment_bounds(steps: Steps, prompts: dict[str, str]) -> bool:
     """Step 1 is the one prompt returning segment start and end times, and its
     examples give them with a UTC offset (``-07:00``), so the caller compares
-    parsed datetimes. That an utterance outside every segment stops the session
-    is the caller's rule."""
+    parsed datetimes. That an utterance in no segment, or in more than one
+    (segment.txt does not forbid overlapping ranges), stops the session is the
+    caller's rule."""
 
     text = _step(steps, prompts, 1) or ""
     return (
@@ -723,8 +729,8 @@ AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
         _segment_bounds,
     ),
     (
-        "If any utterance falls in no segment, keep the raw reply and stop that"
-        " session with a clear error",
+        "If an utterance falls in no segment or in more than one, keep the raw"
+        " reply and stop that session with a clear error",
         _segment_bounds,
     ),
     ("Prompt 6 reads the daily digests and prompt 7 the weekly ones", _digest_inputs),
@@ -769,12 +775,10 @@ AGENT_RETURNS: dict[str, tuple[str, ...]] = {
         " topic_density and top_topics",
     ),
     "digest_weekly.txt": (
-        "Markdown in",
-        "eight sections, from the week overview to persistent blockers",
+        "Markdown in eight sections, from the week overview to persistent blockers",
     ),
     "digest_monthly.txt": (
-        "Markdown under",
-        "seven fixed ## headings, from Month overview to Outlook",
+        "Markdown under seven fixed ## headings, from Month overview to Outlook",
     ),
 }
 
