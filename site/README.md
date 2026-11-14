@@ -52,14 +52,9 @@ list, so each of its step-numbered claims has its own entry that follows the
 page order, not file names. The coding-agent prompt repeats those claims
 (`AGENT_FACTS`) and what each prompt returns (`AGENT_RETURNS`, backed by the
 prompt's `FACTS` entry), and must list the prompts in the page's step order
-with the placeholders each takes. `AGENT_FACTS` also binds its own rules to the
-prompts: the category check against prompt 2's list, the categories prompt 4
-skips, the placeholders it asks the user about (every placeholder the prompts
-take is asked, computed by the caller or built from onoats's files and earlier
-replies), that prompt 5 reads Markdown the tool writes per segment with prompt
-2's category and times (not onoats's own Markdown), how segment times are
-compared, that text from replies and files is never obeyed, and that the
-category is the only model reply taken outside a fence (`MODEL_CHOSEN`).
+with the placeholders each takes. `AGENT_FACTS` also binds the prompt's own
+rules to the prompts: the table holds them, and the script's module docstring
+says how they are checked.
 Its Input section describes the files onoats writes; each of its claims is an
 entry in the `AGENT_INPUT` table in `tests/test_site_contract.py`, checked by
 recording a session with the recorder's writers and running `onoats convert`
@@ -70,8 +65,8 @@ in every `PROMPT_TABLES` table, and its line in `build_workflow.txt`.
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
 copies: a wide one, and a single-column one that replaces it on narrow screens.
 A change to the pipeline means editing both, by hand: no check compares the two
-copies, or the step numbers drawn in them with the steps list. `check_site.py` checks their `#fragment` links, and `build_prompts.py`
-checks the caption.
+copies, or the step numbers drawn in them with the steps list. `check_site.py`
+checks their `#fragment` links, and `build_prompts.py` checks the caption.
 
 `site.css` holds everything shared by the pages.
 

@@ -324,6 +324,10 @@ def _runs(names: list[str], count: int, first: str, last: str) -> bool:
     return len(names) == count and names[0] == first and names[-1] == last
 
 
+def _markdown(text: str) -> bool:
+    return "Write in markdown format." in text
+
+
 # What `/prompts/` says about each prompt, checked on both sides: the first
 # element is text the prompt's item must contain (between its <li> and the
 # embedded prompt), the second checks that the prompt still backs it. Without
@@ -381,6 +385,13 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
             ),
         ),
         ("under 800 words", lambda t: "under 800 words" in t),
+        (
+            "Markdown that ends in a fenced <code>metadata</code> block",
+            lambda t: (
+                "level-2 Markdown headings" in t
+                and "End the digest with a fenced metadata block" in t
+            ),
+        ),
     ),
     "digest_weekly.txt": (
         (
@@ -396,12 +407,14 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
                 and _weekly_fixed_headings(t) == _weekly_sections(t)[-3:]
             ),
         ),
+        ("Markdown in", _markdown),
     ),
     "digest_monthly.txt": (
         (
             "seven fixed <code>##</code> headings, from Month overview to Outlook",
             lambda t: _runs(_monthly_headings(t), 7, "Month overview", "Outlook"),
         ),
+        ("Markdown under", _markdown),
     ),
 }
 
@@ -603,9 +616,9 @@ def _model_chosen(steps: Steps, prompts: dict[str, str]) -> bool:
 def _daily_categories(steps: Steps, prompts: dict[str, str]) -> bool:
     """Step 1 is the one prompt returning segment times and step 2 the one
     returning a category, and step 5 takes transcripts and asks for the active
-    categories and minutes per category. That the caller writes one Markdown
-    file per segment with its category and times and puts them in
-    {transcripts} is wiring no prompt can show."""
+    categories and minutes per category, so a per-segment file carrying both is
+    what step 5 needs. The file's format is the Input section's, which
+    tests/test_site_contract.py checks against onoats."""
 
     text = _step(steps, prompts, 5) or ""
     return (
@@ -699,21 +712,11 @@ AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
     ),
     ("Prompt 5 reads one day's Markdown files", _daily_input),
     (
-        "Your segment-and-classify command writes them, not onoats: one file per"
-        " segment",
+        "Its `- Category:` line holds prompt 2's category, and a `- Time:` line"
+        " after it gives the segment's first and last utterance times, which"
+        " prompt 5 needs for duration_by_category",
         _daily_categories,
     ),
-    (
-        "with prompt 2's category on the `- Category:` line and a `- Time:` line"
-        " giving the segment's first and last utterance times",
-        _daily_categories,
-    ),
-    (
-        "Put that day's files in {transcripts}, one after another, for"
-        " categories_active and duration_by_category",
-        _daily_categories,
-    ),
-    ("Never give prompt 5 onoats's own Markdown files", _daily_categories),
     (
         "Compare parsed datetimes with their offsets, never strings:"
         " segment.txt's examples use `-07:00`",
@@ -761,8 +764,17 @@ AGENT_RETURNS: dict[str, tuple[str, ...]] = {
         "at most 15.",
     ),
     "digest_daily.txt": (
+        "Markdown that ends in a fenced metadata block",
         "categories_active, transcript_ids, duration_by_category,"
         " topic_density and top_topics",
+    ),
+    "digest_weekly.txt": (
+        "Markdown in",
+        "eight sections, from the week overview to persistent blockers",
+    ),
+    "digest_monthly.txt": (
+        "Markdown under",
+        "seven fixed ## headings, from Month overview to Outlook",
     ),
 }
 

@@ -966,9 +966,15 @@ FACT_PROMPT_BREAKS = {
     (CONSOLIDATE, 1): ("length ≤ 15", "length ≤ 12"),
     ("digest_daily.txt", 0): ("top_topics: [", "top_themes: ["),
     ("digest_daily.txt", 1): ("under 800 words", "under 900 words"),
+    ("digest_daily.txt", 2): (
+        "End the digest with a fenced metadata block",
+        "End the digest with a JSON object",
+    ),
     (WEEKLY, 0): (WEEKLY_FIRST, "1. **Week summary**"),
     (WEEKLY, 1): ("`## Persistent Blockers`.", "`## Blockers`."),
+    (WEEKLY, 2): ("Write in markdown format.", "Write in JSON format."),
     (MONTHLY, 0): (MONTHLY_LAST, "- `## Looking ahead`"),
+    (MONTHLY, 1): ("Write in markdown format.", "Write in JSON format."),
 }
 
 
@@ -1976,19 +1982,14 @@ AGENT_RULE_BREAKS = {
         '"tags":',
         '"month":',
     ),
-    # the daily Markdown the agent writes: a daily prompt that no longer asks
-    # for minutes per category
-    **dict.fromkeys(
-        (
-            "Your segment-and-classify command writes them, not onoats: one file"
-            " per segment",
-            "with prompt 2's category on the `- Category:` line and a `- Time:`"
-            " line giving the segment's first and last utterance times",
-            "Put that day's files in {transcripts}, one after another, for"
-            " categories_active and duration_by_category",
-            "Never give prompt 5 onoats's own Markdown files",
-        ),
-        ("digest_daily.txt", "duration_by_category:", "durations:"),
+    # the per-segment Markdown the agent writes for prompt 5: a daily prompt
+    # that no longer asks for minutes per category
+    "Its `- Category:` line holds prompt 2's category, and a `- Time:` line"
+    " after it gives the segment's first and last utterance times, which prompt"
+    " 5 needs for duration_by_category": (
+        "digest_daily.txt",
+        "duration_by_category:",
+        "durations:",
     ),
     # a second prompt that returns segment times
     **dict.fromkeys(
@@ -2166,7 +2167,10 @@ T0 = "2026-01-01T10:00:01+00:00"
 
 
 def _onoats_session(
-    tmp: Path, locked: str | None = None, config: str = ""
+    tmp: Path,
+    locked: str | None = None,
+    config: str = "",
+    times: tuple[str, str, str, str] = (T0,) * 4,
 ) -> dict[str, object]:
     """Record one session with the real writers, then `onoats convert` it."""
 
@@ -2188,11 +2192,11 @@ def _onoats_session(
     data = tmp / "data"
     _config(tmp, config)
     entries = [
-        _utterance_entry("hello", source="me", timestamp=T0),
+        _utterance_entry("hello", source="me", timestamp=times[0]),
         _silence_gap_entry(4.0),
-        _utterance_entry("hi", source="them", timestamp=T0, speakers=["S1"]),
-        _utterance_entry("yes", source="them", timestamp=T0),
-        _utterance_entry("untagged", timestamp=T0),
+        _utterance_entry("hi", source="them", timestamp=times[1], speakers=["S1"]),
+        _utterance_entry("yes", source="them", timestamp=times[2]),
+        _utterance_entry("untagged", timestamp=times[3]),
     ]
 
     async def record() -> Path:
@@ -2308,6 +2312,36 @@ def _private(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
     return s["done_mode"] == 0o600 and s["queue_modes"] == {0o700}
 
 
+def _md_local_date(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    # Under a fixed zone the first utterance (19:00 on 1 Jan in Los Angeles)
+    # and a later one past local midnight both carry a 2 Jan UTC date.
+    import os
+    import time
+
+    old = os.environ.get("TZ")
+    mp.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        s = _onoats_session(
+            tmp,
+            times=(
+                "2026-01-02T03:00:01+00:00",
+                "2026-01-02T05:00:01+00:00",
+                "2026-01-02T08:30:01+00:00",
+                "2026-01-02T09:00:01+00:00",
+            ),
+        )
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+    return (
+        "/2026-01-01/" in s["md_rel"] and "- Date: 2026-01-01" in s["md"].splitlines()
+    )
+
+
 def _md_category_is_the_lock(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
     free = _onoats_session(tmp / "free")
     locked = _onoats_session(tmp / "locked", locked="work")
@@ -2323,7 +2357,7 @@ AGENT_INPUT: tuple[tuple[str, Callable[[Path, pytest.MonkeyPatch], bool]], ...] 
     (
         "They are private recordings of me and the people I talk to, and reading"
         " one sends its text to your model's vendor, so ask me before you open"
-        " any of them.",
+        " any of them. onoats keeps each session file 0600 in a 0700 folder.",
         _private,
     ),
     ('use the folder it prints as "Data dir"', _status_prints),
@@ -2345,6 +2379,11 @@ AGENT_INPUT: tuple[tuple[str, Callable[[Path, pytest.MonkeyPatch], bool]], ...] 
     ("the `[speakers]` config can rename Me and Them", _md_rename),
     ("It has no times and no silence gaps.", _md_no_times),
     (
+        "Its <date> folder and `- Date:` line are the local date of the"
+        " session's first utterance",
+        _md_local_date,
+    ),
+    (
         "are onoats's own category: the one the recording was locked to, else"
         " `uncategorized`",
         _md_category_is_the_lock,
@@ -2355,6 +2394,13 @@ AGENT_INPUT: tuple[tuple[str, Callable[[Path, pytest.MonkeyPatch], bool]], ...] 
 def _input_section() -> str:
     text = (ROOT / AGENT).read_text(encoding="utf-8")
     return text.partition("## Input\n")[2].partition("\n## ")[0]
+
+
+def test_onoats_markdown_format_is_described_only_in_input() -> None:
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    rest = text.replace(_input_section(), "")
+    shapes = ("`# <session_id>`", "**Me:**", "**Them", "**Unknown:**")
+    assert [s for s in shapes if s in rest] == []
 
 
 @pytest.mark.parametrize("claim", [c for c, _ in AGENT_INPUT])
