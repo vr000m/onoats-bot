@@ -1822,7 +1822,8 @@ def test_agent_claims_are_the_ones_the_tests_know() -> None:
     claims = [excerpt for excerpt, _ in BUILDER.AGENT_FACTS]
     assert set(AGENT_CAPTION_PAIRS) <= set(claims)
     assert set(claims) - set(AGENT_CAPTION_PAIRS) == {
-        "wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED"
+        "wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED",
+        *AGENT_RULE_BREAKS,
     }
 
 
@@ -1946,3 +1947,141 @@ def test_agent_prompt_must_exist_and_link_only_the_prompts(tmp_path: Path) -> No
     assert any(
         "build_workflow.txt is missing" in e for e in BUILDER.collect_errors(checkout)
     )
+
+
+# Round 5: the agent's category, skip and ask-list claims, its Input section
+# against what onoats writes, and the builder's own agent-prompt plumbing.
+
+AGENT_CATEGORY = (
+    "Accept the category only if it is one of the values in prompt 2's category list"
+)
+AGENT_SKIP = "Skip prompt 4 when the category is `gaming` or `uncategorized`"
+AGENT_ASK = (
+    "{existing_action_items_section}, {topic_signal}, {expansions},"
+    " {previous_week_context}, {expansion_budget_explanation}"
+)
+# (prompt edited, old, new) that leaves the prompts no longer backing the claim.
+AGENT_RULE_BREAKS = {
+    AGENT_CATEGORY: ("classify_topics.txt", '"<one of: ', '"<pick: '),
+    AGENT_SKIP: (
+        CONSOLIDATE,
+        "skipped upstream for `gaming` and `uncategorized`",
+        "skipped upstream for `gaming`",
+    ),
+    AGENT_ASK: (WEEKLY, "{topic_signal}", "{topic_signals}"),
+}
+
+
+def test_agent_rule_claims_are_agent_facts() -> None:
+    claims = {excerpt for excerpt, _ in BUILDER.AGENT_FACTS}
+    assert set(AGENT_RULE_BREAKS) <= claims
+
+
+@pytest.mark.parametrize("claim", sorted(AGENT_RULE_BREAKS))
+def test_each_agent_rule_must_stay_in_the_agent_prompt(
+    tmp_path: Path, claim: str
+) -> None:
+    errors = _agent_errors_after(tmp_path, lambda c: _edit(c / AGENT, claim, "x"))
+    assert any(f"no longer says {claim!r}" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("claim", sorted(AGENT_RULE_BREAKS))
+def test_each_agent_rule_is_backed_by_the_prompts(tmp_path: Path, claim: str) -> None:
+    name, old, new = AGENT_RULE_BREAKS[claim]
+    errors = _agent_errors_after(
+        tmp_path, lambda c: _edit(c / "site/public/prompts" / name, old, new)
+    )
+    assert any(f"the coding-agent prompt says {claim!r}" in e for e in errors), errors
+
+
+def test_agent_skip_rule_fails_when_prompt_2_drops_a_skipped_category(
+    tmp_path: Path,
+) -> None:
+    errors = _agent_errors_after(
+        tmp_path,
+        lambda c: _edit(
+            c / "site/public/prompts/classify_topics.txt",
+            "seminars | gaming | uncategorized>",
+            "seminars | uncategorized>",
+        ),
+    )
+    assert any(f"the coding-agent prompt says {AGENT_SKIP!r}" in e for e in errors), (
+        errors
+    )
+
+
+def test_agent_unbacked_word_is_reported_against_the_agent_file(
+    tmp_path: Path,
+) -> None:
+    errors = _agent_errors_after(
+        tmp_path,
+        lambda c: _edit(
+            c / AGENT,
+            "Run the tool on two",
+            "Put it on a schedule. Run the tool on two",
+        ),
+    )
+    hits = [e for e in errors if "'schedule'" in e]
+    assert hits == [f"{AGENT} says 'schedule', a claim no prompt backs"], errors
+
+
+def test_agent_returns_use_the_one_agent_line_grammar(tmp_path: Path) -> None:
+    errors = _agent_errors_after(
+        tmp_path,
+        lambda c: _edit(
+            c / AGENT,
+            '{existing_action_items_section}. It returns JSON: {"consolidated',
+            '{existing_action_items_section}; it returns JSON: {"consolidated',
+        ),
+    )
+    plain = '{"consolidated_items": [{"text", "attribution"}]}'
+    assert any(
+        f"the {CONSOLIDATE} line no longer says {plain!r}" in e for e in errors
+    ), errors
+
+
+def test_agent_returns_reject_a_repeated_prompt_line() -> None:
+    _, prompts = BUILDER._load(ROOT)
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if f"/{CONSOLIDATE} takes" in ln)
+    errors = BUILDER._returns_errors(Path(AGENT), f"{text}\n{line}\n", prompts)
+    assert f"{AGENT}: lists {CONSOLIDATE} on 2 lines" in errors, errors
+
+
+def test_agent_input_matches_what_onoats_writes() -> None:
+    """The Input section names the files onoats writes and their real shape."""
+
+    from onoats._vendor.session_queue import QUEUE_SUBDIRS, SESSIONS_DIR
+    from onoats.jsonl import Session, SilenceGap, Utterance
+    from onoats.render import render_session
+
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    md = render_session(
+        Session(
+            "s1",
+            "work",
+            entries=[
+                Utterance("2026-01-01T10:00:01-07:00", "hello", "me"),
+                SilenceGap("2026-01-01T10:00:05-07:00", 4.0),
+                Utterance("2026-01-01T10:00:09-07:00", "hi", "them", ["S1"]),
+                Utterance("2026-01-01T10:00:11-07:00", "yes", "them"),
+            ],
+        )
+    )
+    lines = md.splitlines()
+    assert lines[0] == "# s1" and "`# <session_id>` heading" in text
+    for shape in ("- Date:", "- Category:", "**Me:**", "**Them:**", "**Them (S1):**"):
+        assert any(ln.startswith(shape) for ln in lines), shape
+        assert f"`{shape}`" in text, shape
+    assert "10:00" not in md and "4.0" not in md  # no times, no silence gaps
+    assert "no times and no silence gaps" in text
+    for sub in ("pending", "done"):
+        assert sub in QUEUE_SUBDIRS
+        assert f"{SESSIONS_DIR}/{sub}/" in text, sub
+    assert "Lines start with `Me:`" not in text
+    store = (ROOT / "src/onoats/_vendor/store.py").read_text(encoding="utf-8")
+    cli = (ROOT / "src/onoats/cli.py").read_text(encoding="utf-8")
+    assert '"ONOATS_DATA_DIR"' in store and "`$ONOATS_DATA_DIR`" in text
+    assert 'print(f"Data dir: ' in cli and '"Data dir"' in text
+    # prompt 1 gets the JSONL, never the Markdown, which has no times
+    assert "Build prompt 1's {buffer_jsonl} from the session's JSONL" in text

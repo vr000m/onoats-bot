@@ -52,7 +52,11 @@ list, so each of its step-numbered claims has its own entry that follows the
 page order, not file names. The coding-agent prompt repeats those claims
 (`AGENT_FACTS`) and what each prompt returns (`AGENT_RETURNS`, backed by the
 prompt's `FACTS` entry), and must list the prompts in the page's step order
-with the placeholders each takes. When you rename a prompt, move its entries in
+with the placeholders each takes. `AGENT_FACTS` also binds its own rules to the
+prompts: the category check against prompt 2's list, the categories prompt 4
+skips, and the placeholders it asks the user about. Its Input section, which
+describes the files onoats writes, is checked against `src/onoats` by
+`tests/test_site_contract.py`, not by the script. When you rename a prompt, move its entries in
 every `PROMPT_TABLES` table, and its line in `build_workflow.txt`.
 
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two

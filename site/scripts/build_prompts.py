@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Inline each prompts/*.txt into site/public/prompts/index.html.
 
-The .txt files are the source of truth. Each prompt's <li> carries exactly one
-meta paragraph, ``<p class="meta"><a href="/prompts/NAME">``, followed in the
+The .txt files are the source of truth. Each embedded file's <li> (the seven
+prompts' items and the coding-agent task's) carries exactly one meta paragraph, ``<p class="meta"><a href="/prompts/NAME">``, followed in the
 same <li> by exactly one pair of markers; this script rewrites everything
 between them:
 
@@ -22,15 +22,17 @@ when:
   `<figcaption>`; the caption numbers prompts by their place in the one
   `<ol class="steps">`, so each step-numbered claim has its own entry, read in
   that order, and a short or broken list fails every entry;
-- an item uses its `UNBACKED_WORDS` word, or the caption a `CAPTION_UNBACKED`
-  word, in any letter case;
+- an item uses its `UNBACKED_WORDS` word, or the caption or the coding-agent
+  prompt a `CAPTION_UNBACKED` word, in any letter case;
 - a key of a `PROMPT_TABLES` table (the only tables keyed by prompt file name)
   names no prompt file;
 - the coding-agent prompt (`AGENT_PROMPT`, a task for an agent, not a
   `str.format` template, so the template rules above skip it) lists the
-  prompts out of the page's step order, with other placeholders than the
-  prompts take, or with a claim an `AGENT_FACTS` entry finds the prompts no
-  longer back.
+  prompts out of the page's step order or more than once, with other
+  placeholders than the prompts take, with a claim an `AGENT_FACTS` entry
+  finds the prompts no longer back, or with an `AGENT_RETURNS` text that is
+  missing from that prompt's line or that no one `FACTS` entry for the same
+  prompt backs.
 
 These tables are the only place the page's claims about the prompts are
 checked; tests drive them but add no claim of their own. Stdlib only.
@@ -536,8 +538,10 @@ CAPTION_UNBACKED: tuple[str, ...] = ("schedule",)
 # connect are bound to the same checks as the diagram caption's.
 AGENT_PROMPT = "build_workflow.txt"
 PROMPT_URL = "https://onoats.dev/prompts/"
+# One grammar for a prompt's line: agent_errors reads its number, name and
+# placeholders from the groups, _returns_errors the whole line (group 0).
 AGENT_LINE = re.compile(
-    rf"^(\d+)\. {re.escape(PROMPT_URL)}({NAME}) takes (.*?)\. It returns",
+    rf"^(\d+)\. {re.escape(PROMPT_URL)}({NAME}) takes (.*?)\. It returns\b.*$",
     re.MULTILINE,
 )
 AGENT_URL = re.compile(rf"{re.escape(PROMPT_URL)}({NAME})")
@@ -551,6 +555,61 @@ def _all_fenced(steps: Steps, prompts: dict[str, str]) -> bool:
     )
 
 
+def _categories(text: str | None) -> list[str]:
+    """The values in a prompt's ``"category": "<one of: a | b>"`` line."""
+
+    m = re.search(r'"category": "<one of: ([^>]*)>"', text or "")
+    return [c.strip() for c in m[1].split("|")] if m else []
+
+
+def _category_values(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 2 lists the category values the agent checks a reply against, and
+    the category steps 3 and 4 take is the one trusted (unfenced) placeholder a
+    model chooses, so that check is what keeps model text out of their fixed
+    instructions."""
+
+    return (
+        bool(_categories(_step(steps, prompts, 2)))
+        and "category" in TRUSTED_FIELDS
+        and all(_takes(steps, prompts, n, "category") for n in (3, 4))
+    )
+
+
+# The categories step 4 says upstream code skips, as the agent prompt names them.
+AGENT_SKIPPED = ("gaming", "uncategorized")
+
+
+def _consolidate_skips(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 4 names exactly AGENT_SKIPPED as skipped upstream, and step 2 can
+    return each of them."""
+
+    text = _step(steps, prompts, 4) or ""
+    said = re.search(r"skipped upstream for (.*?), so", text)
+    named = re.findall(r"`(\w+)`", said[1]) if said else []
+    return sorted(named) == sorted(AGENT_SKIPPED) and set(named) <= set(
+        _categories(_step(steps, prompts, 2))
+    )
+
+
+# Placeholders onoats keeps no data for; the agent prompt asks the user about
+# each. Each must still be a placeholder some prompt takes.
+AGENT_ASK = (
+    "existing_action_items_section",
+    "topic_signal",
+    "expansions",
+    "previous_week_context",
+    "expansion_budget_explanation",
+)
+
+
+def _ask_fields(steps: Steps, prompts: dict[str, str]) -> bool:
+    try:
+        taken = {f for text in prompts.values() for f in _fields(text)}
+    except ValueError:  # prompt_errors reports a broken template
+        return False
+    return bool(prompts) and set(AGENT_ASK) <= taken
+
+
 AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
     ("Prompts 1 to 4 run in order on each session file", _session_chain),
     ("Prompts 3 and 4 take the category from 2", _category_flow),
@@ -562,6 +621,17 @@ AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
     ("Prompt 6 reads the daily digests and prompt 7 the weekly ones", _digest_inputs),
     ("Prompts 5 to 7 run once per day, week or month", _digest_cadence),
     ("wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED", _all_fenced),
+    (
+        "Accept the category only if it is one of the values in prompt 2's"
+        " category list",
+        _category_values,
+    ),
+    (
+        "Skip prompt 4 when the category is "
+        + " or ".join(f"`{c}`" for c in AGENT_SKIPPED),
+        _consolidate_skips,
+    ),
+    (", ".join(f"{{{f}}}" for f in AGENT_ASK), _ask_fields),
 )
 
 # What the coding-agent prompt says each prompt returns, keyed by prompt file:
@@ -591,15 +661,15 @@ PROMPT_TABLES: dict[str, dict[str, tuple[object, ...]]] = {
 
 
 def _returns_errors(label: Path, text: str, prompts: dict[str, str]) -> list[str]:
-    lines = {
-        m["name"]: m.group(0)
-        for m in re.finditer(
-            rf"^\d+\. {re.escape(PROMPT_URL)}(?P<name>{NAME}) takes .*$",
-            text,
-            re.MULTILINE,
-        )
-    }
-    errors = []
+    found: dict[str, list[str]] = {}
+    for m in AGENT_LINE.finditer(text):
+        found.setdefault(m[2], []).append(m[0])
+    errors = [
+        f"{label}: lists {name} on {len(said)} lines"
+        for name, said in found.items()
+        if len(said) > 1
+    ]
+    lines = {name: said[0] for name, said in found.items() if len(said) == 1}
     for name, plains in AGENT_RETURNS.items():
         for plain in plains:
             cells = [
@@ -665,7 +735,7 @@ def agent_errors(page: str, prompts: dict[str, str], text: str) -> list[str]:
                 f"{PROMPT_DIR}: {AGENT} says {excerpt!r}, which the prompts no"
                 " longer back; update the prompt and AGENT_FACTS together"
             )
-    errors.extend(_unbacked_errors(AGENT, text, CAPTION_UNBACKED))
+    errors.extend(_unbacked_errors(str(label), text, CAPTION_UNBACKED))
     return errors
 
 
@@ -701,16 +771,20 @@ def fact_errors(name: str, text: str, page: str) -> list[str]:
                 f"{PROMPT_DIR / name}: the page says {excerpt!r}, which the prompt"
                 " no longer backs; update the prompts page and FACTS together"
             )
-    errors.extend(_unbacked_errors(f"{name} item", prose, UNBACKED_WORDS.get(name)))
+    errors.extend(
+        _unbacked_errors(f"{PAGE}: the {name} item", prose, UNBACKED_WORDS.get(name))
+    )
     return errors
 
 
 def _unbacked_errors(
     where: str, text: str | None, words: tuple[str, ...] | None
 ) -> list[str]:
+    """*words* that *text* uses; *where* names the file and the part of it."""
+
     folded = text.casefold() if text is not None else None
     return [
-        f"{PAGE}: the {where} says {word!r}, a claim no prompt backs"
+        f"{where} says {word!r}, a claim no prompt backs"
         for word in words or ()
         if folded is not None and word.casefold() in folded
     ]
@@ -737,7 +811,7 @@ def caption_errors(page: str, prompts: dict[str, str]) -> list[str]:
                 f"{PROMPT_DIR}: {CAPTION} says {excerpt!r}, which the prompts no"
                 " longer back; update the prompts page and CAPTION_FACTS together"
             )
-    errors.extend(_unbacked_errors(CAPTION, captions[0], CAPTION_UNBACKED))
+    errors.extend(_unbacked_errors(f"{PAGE}: {CAPTION}", captions[0], CAPTION_UNBACKED))
     return errors
 
 

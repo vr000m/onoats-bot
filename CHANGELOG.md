@@ -31,8 +31,12 @@ Annotated tags exist from `v0.9.0` forward.
   (`UNBACKED_WORDS`, `CAPTION_UNBACKED`). A `PROMPT_TABLES` entry for a prompt
   file that no longer exists also fails.
 - **Coding-agent prompt.** `/prompts/` ends with a task to paste into a coding
-  agent (`build_workflow.txt`, section `#build`): it fetches the seven prompts,
+  agent (`build_workflow.txt`, section `#build`): it reads the session JSONL
+  and Markdown files from the onoats data folder, fetches the seven prompts,
   builds a command for each stage of the diagram and asks which model to call.
+  It accepts prompt 2's category only from that prompt's list, skips prompt 4
+  for the categories that prompt says upstream code skips, and asks the user
+  how to fill the placeholders onoats keeps no data for.
   The home page's "After the call" section links to it. `build_prompts.py
   --check` binds it to the page's step order, the placeholders each prompt takes
   and the claims the page makes about how they connect and what they return
