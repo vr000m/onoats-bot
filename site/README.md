@@ -45,13 +45,14 @@ live in tables in the script (`FACTS` per prompt, `CAPTION_FACTS` for the
 diagram caption, `UNBACKED_WORDS` and `CAPTION_UNBACKED` for words the page
 must not use); its module docstring lists the rules. Change the page text and
 the table together. The caption numbers prompts by their place in the steps
-list, so its checks follow the page order, not file names. When you rename a
+list, so each of its step-numbered claims has its own entry that follows the
+page order, not file names. When you rename a
 prompt, move its entries in every `PROMPT_TABLES` table.
 
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
 copies: a wide one, and a single-column one that replaces it on narrow screens.
 A change to the pipeline means editing both, by hand: no check compares the two
-copies. `check_site.py` checks their `#fragment` links, and `build_prompts.py`
+copies, or the step numbers drawn in them with the steps list. `check_site.py` checks their `#fragment` links, and `build_prompts.py`
 checks the caption.
 
 `site.css` holds everything shared by the pages.

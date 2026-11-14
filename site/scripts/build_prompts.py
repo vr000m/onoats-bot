@@ -20,7 +20,8 @@ when:
   shape is broken, `marker_errors` reports it and the page side is skipped);
 - a `CAPTION_FACTS` entry fails on either side for the one diagram
   `<figcaption>`; the caption numbers prompts by their place in the one
-  `<ol class="steps">`, so its checks read the prompts in that order;
+  `<ol class="steps">`, so each step-numbered claim has its own entry, read in
+  that order, and a short or broken list fails every entry;
 - an item uses its `UNBACKED_WORDS` word, or the caption a `CAPTION_UNBACKED`
   word, in any letter case;
 - a key of a `PROMPT_TABLES` table (the only tables keyed by prompt file name)
@@ -407,26 +408,113 @@ def step_names(page: str) -> list[str | None] | None:
     return [m["name"] if (m := OPEN_MARKER.search(item)) else None for item in items]
 
 
-def _category_flow(steps: list[str | None], prompts: dict[str, str]) -> bool:
+Steps = list[str | None]
+
+
+def _step(steps: Steps, prompts: dict[str, str], number: int) -> str | None:
+    """The text of prompt *number* (1-based) on the page; None when the list is
+    too short, the item has no marker or the marker names no prompt file."""
+
+    name = steps[number - 1] if 0 < number <= len(steps) else None
+    return prompts.get(name) if name is not None else None
+
+
+def _takes(steps: Steps, prompts: dict[str, str], number: int, *fields: str) -> bool:
+    text = _step(steps, prompts, number)
+    return text is not None and all(f"{{{field}}}" in text for field in fields)
+
+
+def _sole_producer(
+    steps: Steps, prompts: dict[str, str], number: int, key: str
+) -> bool:
+    """Prompt *number* is the one prompt whose text contains *key*."""
+
+    producers = [name for name, text in prompts.items() if key in text]
+    return _step(steps, prompts, number) is not None and producers == [
+        steps[number - 1]
+    ]
+
+
+# Each check below backs one step-numbered claim of the caption. Data flow is
+# checkable from the prompts (who returns a key, who takes a placeholder);
+# what the caller passes between steps, and when it calls them, is not.
+
+
+def _session_chain(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 1 takes the session buffer; steps 2 and 3 take a transcript.
+
+    That step 1's segments become the {transcript} of steps 2 and 3 is caller
+    wiring; the order 2 -> 3 -> 4 is backed by the category and summary/items
+    checks. This also backs the segment item's "through the next step".
+    """
+
+    return _takes(steps, prompts, 1, "buffer_jsonl") and all(
+        _takes(steps, prompts, n, "transcript") for n in (2, 3)
+    )
+
+
+def _category_flow(steps: Steps, prompts: dict[str, str]) -> bool:
     """Step 2 is the one prompt returning a category; steps 3 and 4 take it.
 
     This also backs the classify item's "feeds the next two prompts".
     """
 
-    producers = [name for name, text in prompts.items() if '"category":' in text]
+    return _sole_producer(steps, prompts, 2, '"category":') and all(
+        _takes(steps, prompts, n, "category") for n in (3, 4)
+    )
+
+
+def _summary_and_items_flow(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 4 takes the summary only step 2 returns and the items only step 3
+    returns."""
+
     return (
-        len(steps) >= 4
-        and producers == [steps[1]]
-        and all("{category}" in prompts.get(name or "", "") for name in steps[2:4])
+        _sole_producer(steps, prompts, 2, '"summary":')
+        and _sole_producer(steps, prompts, 3, '"action_items"')
+        and _takes(steps, prompts, 4, "summary", "items_json")
+    )
+
+
+def _daily_input(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 5 reads one day's transcripts. That they are the rendered Markdown
+    files is the caller's choice; no prompt names a file format for them."""
+
+    text = _step(steps, prompts, 5)
+    return _takes(steps, prompts, 5, "transcripts") and "a day's worth" in (text or "")
+
+
+def _digest_inputs(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 6 takes the daily digests and step 7 the weekly ones."""
+
+    return _takes(steps, prompts, 6, "short_dailies") and _takes(
+        steps, prompts, 7, "short_weeklies"
+    )
+
+
+def _digest_cadence(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Steps 5, 6 and 7 each take one day, week and month. Which boxes are
+    dashed is the hand-drawn SVG, and "not once per call" is when the caller
+    runs them; neither is checked."""
+
+    return (
+        _takes(steps, prompts, 5, "target_date")
+        and _takes(steps, prompts, 6, "week_start", "week_end")
+        and _takes(steps, prompts, 7, "month")
     )
 
 
 # What the pipeline diagram's <figcaption> says about the prompts as a set, in
-# the same (page text, check) shape as FACTS; each check reads the prompts in
-# step order (from step_names) and every prompt's text.
-CAPTION_FACTS: tuple[
-    tuple[str, Callable[[list[str | None], dict[str, str]], bool]], ...
-] = (("Prompts 3 and 4 take the category from 2", _category_flow),)
+# the same (page text, check) shape as FACTS: one entry per step-numbered claim,
+# each reading the prompts in step order (from step_names) and every prompt's
+# text. A short or broken steps list fails every check.
+CAPTION_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
+    ("Prompts 1 to 4 run in order on each session file", _session_chain),
+    ("Prompts 3 and 4 take the category from 2", _category_flow),
+    ("4 also takes the summary from 2 and the items from 3", _summary_and_items_flow),
+    ("Prompt 5 reads a day's Markdown files", _daily_input),
+    ("6 reads the daily digests and 7 the weekly ones", _digest_inputs),
+    ("Dashed boxes run once per day, week or month", _digest_cadence),
+)
 CAPTION = "the diagram caption"
 FIGCAPTION = re.compile(r"<figcaption>(.*?)</figcaption>", re.DOTALL)
 

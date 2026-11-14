@@ -935,7 +935,8 @@ MONTHLY_LAST = "- `## Outlook`"
 FACT_PROMPT_BREAKS = {
     ("segment.txt", 0): ('"segments": [', '"parts": ['),
     ("classify_topics.txt", 0): ('"confidence": 0.0,', '"certainty": 0.0,'),
-    ("classify_ap.txt", 0): ('"action_items": [', '"items": ['),
+    # the "action_items" key also backs a caption claim, so break another key
+    ("classify_ap.txt", 0): ('"attribution": "self', '"owner": "self'),
     (CONSOLIDATE, 0): ('"consolidated_items": [', '"items": ['),
     (CONSOLIDATE, 1): ("length ≤ 15", "length ≤ 12"),
     ("digest_daily.txt", 0): ("top_topics: [", "top_themes: ["),
@@ -1210,43 +1211,129 @@ def _swap_items(text: str, first: str, second: str) -> str:
     return text.replace(a, "@@a@@").replace(b, a).replace("@@a@@", b)
 
 
-CAPTION_CATEGORY_UNBACKED = (
-    "the diagram caption says 'Prompts 3 and 4 take the category from 2',"
-    " which the prompts no longer back"
-)
+# Every step-numbered claim in the diagram caption, written out here rather
+# than read from CAPTION_FACTS so a dropped entry fails these tests.
+SESSION = "Prompts 1 to 4 run in order on each session file"
+CATEGORY = "Prompts 3 and 4 take the category from 2"
+SUMMARY_ITEMS = "4 also takes the summary from 2 and the items from 3"
+DAILY = "Prompt 5 reads a day's Markdown files"
+WEEKLY_MONTHLY = "6 reads the daily digests and 7 the weekly ones"
+CADENCE = "Dashed boxes run once per day, week or month"
+CAPTION_CLAIMS = (SESSION, CATEGORY, SUMMARY_ITEMS, DAILY, WEEKLY_MONTHLY, CADENCE)
 
-# The caption numbers prompts by their place in <ol class="steps">, so the
-# claim must follow the items, not fixed file names. (swap, expected or None).
+
+def _caption_unbacked(errors: list[str]) -> set[str]:
+    """The caption claims *errors* report as no longer backed by the prompts."""
+
+    return {
+        claim
+        for claim in CAPTION_CLAIMS
+        if any(
+            f"the diagram caption says {claim!r}, which the prompts no longer back" in e
+            for e in errors
+        )
+    }
+
+
+def test_every_caption_claim_has_a_caption_fact() -> None:
+    assert [excerpt for excerpt, _ in BUILDER.CAPTION_FACTS] == list(CAPTION_CLAIMS)
+
+
+# The caption numbers prompts by their place in <ol class="steps">, so each
+# claim must follow the items, not fixed file names: (swap, claims it breaks).
 STEP_ORDER_CASES = {
-    "committed order": (None, None),
-    "classify moves to step 3": (("classify", "action-points"), "caption"),
-    "merge moves to step 5": (("merge-action-points", "daily-digest"), "caption"),
-    "classify moves to step 5": (("classify", "daily-digest"), "caption"),
-    "no steps list": ("no-steps", 'needs exactly one <ol class="steps">'),
+    "committed order": (None, set()),
+    "segment moves to step 2": (
+        ("segment", "classify"),
+        {SESSION, CATEGORY, SUMMARY_ITEMS},
+    ),
+    "classify moves to step 3": (
+        ("classify", "action-points"),
+        {CATEGORY, SUMMARY_ITEMS},
+    ),
+    "merge moves to step 5": (
+        ("merge-action-points", "daily-digest"),
+        {CATEGORY, SUMMARY_ITEMS, DAILY, CADENCE},
+    ),
+    "classify moves to step 5": (
+        ("classify", "daily-digest"),
+        {SESSION, CATEGORY, SUMMARY_ITEMS, DAILY, CADENCE},
+    ),
+    "daily moves to step 6": (
+        ("daily-digest", "weekly-digest"),
+        {DAILY, WEEKLY_MONTHLY, CADENCE},
+    ),
+    "weekly moves to step 7": (
+        ("weekly-digest", "monthly-digest"),
+        {WEEKLY_MONTHLY, CADENCE},
+    ),
 }
 
 
 @pytest.mark.parametrize("case", sorted(STEP_ORDER_CASES))
-def test_caption_category_claim_follows_the_step_order(
-    tmp_path: Path, case: str
-) -> None:
-    edit, expected = STEP_ORDER_CASES[case]
+def test_caption_claims_follow_the_step_order(tmp_path: Path, case: str) -> None:
+    edit, broken = STEP_ORDER_CASES[case]
     checkout = _copy_site_tree(tmp_path)
     page = checkout / PROMPTS_PAGE
     text = page.read_text(encoding="utf-8")
-    if edit == "no-steps":
-        text = text.replace('<ol class="steps">', "<ol>")
-    elif edit is not None:
+    if edit is not None:
         text = _swap_items(text, *edit)
     page.write_text(text, encoding="utf-8")
 
     errors = BUILDER.collect_errors(checkout)
-    if expected is None:
+    if not broken:
         assert errors == []
-    elif expected == "caption":
-        assert any(CAPTION_CATEGORY_UNBACKED in e for e in errors), errors
-    else:
-        assert any(expected in e for e in errors), errors
+    assert _caption_unbacked(errors) == broken, errors
+
+
+def test_caption_needs_one_steps_list(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    _edit(checkout / PROMPTS_PAGE, '<ol class="steps">', "<ol>")
+    errors = BUILDER.collect_errors(checkout)
+    assert any('needs exactly one <ol class="steps">' in e for e in errors), errors
+
+
+# One prompt edit per caption claim; each must break that claim and no other.
+CAPTION_PROMPT_EDITS = {
+    SESSION: ("segment.txt", "{buffer_jsonl}", "{buffer}"),
+    CATEGORY: ("classify_ap.txt", "{category}", "{kind}"),
+    SUMMARY_ITEMS: ("consolidate_action_items.txt", "{items_json}", "{items}"),
+    DAILY: ("digest_daily.txt", "{transcripts}", "{texts}"),
+    WEEKLY_MONTHLY: ("digest_monthly.txt", "{short_weeklies}", "{weeklies}"),
+    CADENCE: ("digest_monthly.txt", "{month}", "{period}"),
+}
+
+
+@pytest.mark.parametrize("claim", CAPTION_CLAIMS)
+def test_each_caption_claim_fails_alone_when_its_prompt_stops_backing_it(
+    tmp_path: Path, claim: str
+) -> None:
+    name, old, new = CAPTION_PROMPT_EDITS[claim]
+    checkout = _copy_site_tree(tmp_path)
+    path = checkout / "site/public/prompts" / name
+    path.write_text(path.read_text(encoding="utf-8").replace(old, new), "utf-8")
+    assert _caption_unbacked(BUILDER.collect_errors(checkout)) == {claim}
+
+
+@pytest.mark.parametrize("claim", CAPTION_CLAIMS)
+def test_each_caption_claim_must_stay_on_the_page(tmp_path: Path, claim: str) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    _edit(checkout / PROMPTS_PAGE, claim, "x")
+    errors = BUILDER.collect_errors(checkout)
+    assert any(f"the diagram caption no longer says {claim!r}" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [[], [None] * 7, ["segment.txt"], ["gone.txt"] * 7],
+    ids=["empty", "no markers", "short", "unknown prompts"],
+)
+def test_caption_checks_fail_on_a_broken_steps_list(steps: list) -> None:
+    # A short or broken list must fail every check, never pass vacuously.
+    _, prompts = BUILDER._load(ROOT)
+    assert [holds(steps, prompts) for _, holds in BUILDER.CAPTION_FACTS] == [
+        False
+    ] * len(BUILDER.CAPTION_FACTS)
 
 
 def test_broken_item_shape_reports_once_not_per_fact(tmp_path: Path) -> None:
