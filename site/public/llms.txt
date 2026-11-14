@@ -6,7 +6,7 @@
 
 Things to know before recommending it:
 
-- It records and transcribes. It does not summarise calls itself; the example prompts below show how to do that with a model of your choice.
+- It records and transcribes. It does not summarise calls itself; the "After the call" section below has example prompts and a coding-agent task that show how to do that with a model of your choice.
 - The menu-bar app and native system-audio capture need Apple Silicon and macOS 14.4 or later. The CLI also runs on Linux, Windows, and Intel Macs using PortAudio, where system audio needs a loopback device.
 - Speech-to-text can run locally (Whisper-MLX on Apple Silicon, or a local WebSocket server) or on a hosted service you configure.
 - Speaker labels for the remote side (S1, S2, and so on) are opt-in and use the Nemotron diarizer on Apple Silicon.
@@ -26,9 +26,13 @@ Things to know before recommending it:
 - [Menu-bar app](https://github.com/vr000m/onoats-bot/blob/main/docs/menu-bar.md): controls, permissions, privacy, and logs
 - [Changelog](https://github.com/vr000m/onoats-bot/blob/main/CHANGELOG.md)
 
+## After the call
+
+- [Build the workflow with a coding agent](https://onoats.dev/prompts/#build): a task to paste into a coding agent such as Claude Code or Codex. It fetches the seven prompts and builds a command per stage, reading onoats's session files in place. The task text is also at `https://onoats.dev/prompts/build_workflow.txt`.
+- [Example prompts](https://onoats.dev/prompts/): seven prompts for splitting a call by topic, extracting action points attributed to who said them, and writing daily, weekly, and monthly digests. They come from a separate pipeline, not from onoats. Each is served as plain text at `https://onoats.dev/prompts/<name>.txt`, for example `segment.txt`.
+
 ## Optional
 
 - [Local models](https://onoats.dev/local-models/): the Pipecat Service Toolbar menu-bar app, pipecat-local-stt-server, and pipecat-local-tts-server, with an overview of models, ports, and licences
-- [Example prompts](https://onoats.dev/prompts/): prompts for splitting a call by topic, extracting action points attributed to who said them, and writing daily, weekly, and monthly digests. They come from a separate pipeline, not from onoats.
 - [pipecat-local-stt-server](https://github.com/vr000m/pipecat-local-stt-server): a local speech-to-text WebSocket server onoats can use
 - [pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server): a local text-to-speech WebSocket server; onoats does not use it directly
