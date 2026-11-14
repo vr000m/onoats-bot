@@ -207,7 +207,7 @@
     <div class="wrap">
       <h2 class="t">After the call</h2>
       <div class="prose">
-        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">example prompts for each step</a>.</p>
+        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them. To have a coding agent build it, give it <a href="/prompts/#build">this task</a>: it fetches the <a href="/prompts/">example prompts for each step</a> and wires them together.</p>
       </div>
       <ol class="steps">
         <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes. <a href="/prompts/#segment">Example prompt</a>.</span></li>

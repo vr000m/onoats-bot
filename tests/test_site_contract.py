@@ -790,6 +790,30 @@ def _edit(path: Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new), encoding="utf-8")
 
 
+def _edit_caption(path: Path, old: str, new: str) -> None:
+    """Edit *old* inside the diagram caption only: the embedded coding-agent
+    prompt repeats some of its claims."""
+
+    text = path.read_text(encoding="utf-8")
+    start, end = text.index("<figcaption>"), text.index("</figcaption>")
+    caption = text[start:end]
+    assert caption.count(old) == 1, (path.name, old)
+    path.write_text(
+        text[:start] + caption.replace(old, new) + text[end:], encoding="utf-8"
+    )
+
+
+def _template_errors(errors: list[str]) -> list[str]:
+    """*errors* without those the coding-agent prompt adds: it repeats claims
+    that the page's items and caption make, so a break reports both."""
+
+    return [
+        e
+        for e in errors
+        if "build_workflow.txt" not in e and "the coding-agent prompt" not in e
+    ]
+
+
 CONSOLIDATE = "consolidate_action_items.txt"
 WEEKLY = "digest_weekly.txt"
 SUMMARY_FENCE = (
@@ -991,7 +1015,7 @@ def test_every_fact_is_bound_to_both_the_prompt_and_the_page(
     if side == "intact":
         assert errors == []
     elif side == "prompt broken":
-        assert errors == [
+        assert _template_errors(errors) == [
             f"site/public/prompts/{name}: the page says {excerpt!r}, which the"
             " prompt no longer backs; update the prompts page and FACTS together"
         ], errors
@@ -1112,8 +1136,8 @@ CLAIM_BREAKS = {
     ),
     "caption claims a schedule": (
         PROMPTS_PAGE,
-        "not once per call.",
-        "not once per call, on a schedule.",
+        "Dashed boxes run once per day, week or month, not once per call.",
+        "Dashed boxes run once per day, week or month, not once per call, on a schedule.",
         "the diagram caption says 'schedule'",
     ),
     "weekly Returns line claims numbered output": (
@@ -1124,8 +1148,8 @@ CLAIM_BREAKS = {
     ),
     "caption claims a schedule at a sentence start": (
         PROMPTS_PAGE,
-        "not once per call.",
-        "not once per call. Scheduled runs only.",
+        "Dashed boxes run once per day, week or month, not once per call.",
+        "Dashed boxes run once per day, week or month, not once per call. Scheduled runs only.",
         "the diagram caption says 'schedule'",
     ),
     "weekly item says Numbered at a sentence start": (
@@ -1318,7 +1342,7 @@ def test_each_caption_claim_fails_alone_when_its_prompt_stops_backing_it(
 @pytest.mark.parametrize("claim", CAPTION_CLAIMS)
 def test_each_caption_claim_must_stay_on_the_page(tmp_path: Path, claim: str) -> None:
     checkout = _copy_site_tree(tmp_path)
-    _edit(checkout / PROMPTS_PAGE, claim, "x")
+    _edit_caption(checkout / PROMPTS_PAGE, claim, "x")
     errors = BUILDER.collect_errors(checkout)
     assert any(f"the diagram caption no longer says {claim!r}" in e for e in errors)
 
@@ -1498,18 +1522,25 @@ def test_prompt_file_names_follow_one_grammar(
     expected: str | None,
 ) -> None:
     # A rename moves the prompt's claims too, or orphan_errors reports them.
-    facts = BUILDER.FACTS["classify_ap.txt"]
-    monkeypatch.delitem(BUILDER.FACTS, "classify_ap.txt")
-    monkeypatch.setitem(BUILDER.FACTS, new_name, facts)
+    for table in BUILDER.PROMPT_TABLES.values():
+        if "classify_ap.txt" not in table:
+            continue
+        claims = table["classify_ap.txt"]
+        monkeypatch.delitem(table, "classify_ap.txt")
+        monkeypatch.setitem(table, new_name, claims)
     checkout = _copy_site_tree(tmp_path)
     prompts = checkout / "site/public/prompts"
     (prompts / "classify_ap.txt").rename(prompts / new_name)
     page = prompts / "index.html"
     text = page.read_text(encoding="utf-8")
-    assert (
-        text.count("classify_ap.txt") == 5
-    )  # href, link text, two markers, summary label
+    assert text.count("classify_ap.txt") == 6  # item: href, link text, two
+    # markers, summary label; the embedded coding-agent prompt: one link
     page.write_text(text.replace("classify_ap.txt", new_name), encoding="utf-8")
+    agent = prompts / BUILDER.AGENT_PROMPT
+    agent.write_text(
+        agent.read_text(encoding="utf-8").replace("classify_ap.txt", new_name),
+        encoding="utf-8",
+    )
 
     errors = BUILDER.collect_errors(checkout)
     if expected is None:
@@ -1763,3 +1794,155 @@ def test_social_card_renderer_removes_its_scratch_dir_when_pngquant_fails(
     assert result.returncode == 1, result.stderr
     assert "pngquant failed (exit 3)" in result.stderr
     assert set(temp_dir.glob("onoats-social-*")) == before
+
+
+# --- the coding-agent prompt (build_workflow.txt) ---------------------------
+
+AGENT = "site/public/prompts/build_workflow.txt"
+AGENT_CAPTION_PAIRS = {
+    "Prompts 1 to 4 run in order on each session file": SESSION,
+    "Prompts 3 and 4 take the category from 2": CATEGORY,
+    "Prompt 4 also takes the summary from 2 and the items from 3": SUMMARY_ITEMS,
+    "Prompt 5 reads one day's Markdown files": DAILY,
+    "Prompt 6 reads the daily digests and prompt 7 the weekly ones": WEEKLY_MONTHLY,
+    "Prompts 5 to 7 run once per day, week or month": CADENCE,
+}
+
+
+def _agent_errors_after(tmp_path: Path, edit) -> list[str]:  # noqa: ANN001
+    checkout = _copy_site_tree(tmp_path)
+    edit(checkout)
+    BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
+    errors = BUILDER.collect_errors(checkout)
+    assert not any("is stale" in error for error in errors)
+    return errors
+
+
+def test_agent_claims_are_the_ones_the_tests_know() -> None:
+    claims = [excerpt for excerpt, _ in BUILDER.AGENT_FACTS]
+    assert set(AGENT_CAPTION_PAIRS) <= set(claims)
+    assert set(claims) - set(AGENT_CAPTION_PAIRS) == {
+        "wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED"
+    }
+
+
+def test_agent_prompt_lists_the_steps_in_page_order(tmp_path: Path) -> None:
+    def swap(checkout: Path) -> None:
+        path = checkout / AGENT
+        lines = path.read_text(encoding="utf-8").split("\n")
+        i = next(
+            n for n, line in enumerate(lines) if "/classify_topics.txt takes" in line
+        )
+        lines[i], lines[i + 1] = lines[i + 1], lines[i]
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+    errors = _agent_errors_after(tmp_path, swap)
+    assert any(
+        "lists its prompts as" in e and "build_workflow.txt" in e for e in errors
+    )
+
+
+def test_agent_prompt_lists_the_placeholders_a_prompt_takes(tmp_path: Path) -> None:
+    errors = _agent_errors_after(
+        tmp_path,
+        lambda c: _edit(
+            c / AGENT, "takes {category}, {transcript} and", "takes {transcript} and"
+        ),
+    )
+    assert any("classify_ap.txt takes ['category'" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "claim",
+    sorted(AGENT_CAPTION_PAIRS)
+    + ["wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED"],
+)
+def test_each_agent_claim_must_stay_in_the_agent_prompt(
+    tmp_path: Path, claim: str
+) -> None:
+    errors = _agent_errors_after(tmp_path, lambda c: _edit(c / AGENT, claim, "x"))
+    assert any(f"no longer says {claim!r}" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("claim", sorted(AGENT_CAPTION_PAIRS))
+def test_each_agent_claim_is_backed_by_the_prompts(tmp_path: Path, claim: str) -> None:
+    name, old, new = CAPTION_PROMPT_EDITS[AGENT_CAPTION_PAIRS[claim]]
+    errors = _agent_errors_after(
+        tmp_path, lambda c: _edit(c / "site/public/prompts" / name, old, new)
+    )
+    assert any(f"the coding-agent prompt says {claim!r}" in e for e in errors), errors
+
+
+def test_agent_fence_claim_needs_every_prompt_fenced(tmp_path: Path) -> None:
+    def unfence(checkout: Path) -> None:
+        path = checkout / "site/public/prompts/segment.txt"
+        text = path.read_text(encoding="utf-8")
+        text = text.replace("--- BEGIN UNTRUSTED", "--- BEGIN DATA")
+        path.write_text(text.replace("--- END UNTRUSTED", "--- END DATA"), "utf-8")
+
+    errors = _agent_errors_after(tmp_path, unfence)
+    assert any("the coding-agent prompt says 'wrap each such" in e for e in errors), (
+        errors
+    )
+
+
+AGENT_RETURN_CELLS = [
+    (name, plain) for name, plains in BUILDER.AGENT_RETURNS.items() for plain in plains
+]
+
+
+@pytest.mark.parametrize(("name", "plain"), AGENT_RETURN_CELLS)
+def test_each_agent_return_claim_is_backed_by_a_fact(
+    tmp_path: Path, name: str, plain: str
+) -> None:
+    index = next(
+        i
+        for i, (excerpt, _) in enumerate(BUILDER.FACTS[name])
+        if re.sub(r"</?code>", "", excerpt) == plain
+    )
+    old, new = FACT_PROMPT_BREAKS[name, index]
+    errors = _agent_errors_after(
+        tmp_path, lambda c: _edit(c / "site/public/prompts" / name, old, new)
+    )
+    assert any(
+        f"the coding-agent prompt says {plain!r} for {name}" in e for e in errors
+    ), errors
+
+
+@pytest.mark.parametrize(("name", "plain"), AGENT_RETURN_CELLS)
+def test_each_agent_return_claim_must_stay_on_its_line(
+    tmp_path: Path, name: str, plain: str
+) -> None:
+    errors = _agent_errors_after(tmp_path, lambda c: _edit(c / AGENT, plain, "x"))
+    assert any(f"the {name} line no longer says {plain!r}" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [[], [None] * 7, ["segment.txt"], ["gone.txt"] * 7],
+    ids=["empty", "no markers", "short", "unknown prompts"],
+)
+def test_agent_checks_fail_on_a_broken_steps_list(steps: list) -> None:
+    _, prompts = BUILDER._load(ROOT)
+    flow = [
+        holds
+        for excerpt, holds in BUILDER.AGENT_FACTS
+        if excerpt in AGENT_CAPTION_PAIRS
+    ]
+    assert [holds(steps, prompts) for holds in flow] == [False] * len(flow)
+
+
+def test_agent_prompt_must_exist_and_link_only_the_prompts(tmp_path: Path) -> None:
+    checkout = _copy_site_tree(tmp_path)
+    _edit(
+        checkout / AGENT,
+        "https://onoats.dev/prompts/segment.txt takes",
+        "https://onoats.dev/prompts/segment.txt takes {buffer_jsonl} and https://onoats.dev/prompts/gone.txt, then",
+    )
+    errors = BUILDER.collect_errors(checkout)
+    assert any("links [" in e and "gone.txt" in e for e in errors), errors
+
+    (checkout / AGENT).unlink()
+    assert any(
+        "build_workflow.txt is missing" in e for e in BUILDER.collect_errors(checkout)
+    )

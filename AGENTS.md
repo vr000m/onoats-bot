@@ -30,9 +30,10 @@ non-obvious parts; the code and `docs/` cover the rest.
   and their module docstrings hold the rule values; do not restate them here.
   `build_prompts.py` owns the generated prompts page, the untrusted-data
   fences and the claim tables (`FACTS`, `CAPTION_FACTS`, `UNBACKED_WORDS`,
-  `CAPTION_UNBACKED`)
+  `CAPTION_UNBACKED`, `AGENT_FACTS`, `AGENT_RETURNS`)
   that bind what the page says about the prompts to both the page text and
-  the prompts. `check_site.py` owns shared chrome and `aria-current`, copied
+  the prompts; `build_workflow.txt`, the coding-agent task, is checked against
+  the same tables but is not a `str.format` template. `check_site.py` owns shared chrome and `aria-current`, copied
   assets, versioned image names and references, `#fragment` links, the social
   card named by `og:image`, `public/.assetsignore` and the `_headers` rules
   (security headers and CSP, cache scope). Each check covers the whole set

@@ -27,7 +27,10 @@ site has no runtime build step or JavaScript.
 `public/prompts/*.txt` are the source of truth. `public/prompts/index.html`
 inlines each one between `<!-- prompt:NAME -->` markers, which must follow that
 prompt's `<p class="meta">` paragraph in the same `<li>` (the binding rule is
-in the script's docstring). After editing a prompt:
+in the script's docstring). `build_workflow.txt` is the exception: a task for a
+coding agent, not a `str.format` template, so the template and untrusted-data
+rules skip it; it sits in its own section (`#build`) and links to the seven
+prompts. After editing a prompt:
 
     python3 scripts/build_prompts.py          # rewrite the page
     python3 scripts/build_prompts.py --check  # exit 1 if stale
@@ -46,8 +49,11 @@ diagram caption, `UNBACKED_WORDS` and `CAPTION_UNBACKED` for words the page
 must not use); its module docstring lists the rules. Change the page text and
 the table together. The caption numbers prompts by their place in the steps
 list, so each of its step-numbered claims has its own entry that follows the
-page order, not file names. When you rename a
-prompt, move its entries in every `PROMPT_TABLES` table.
+page order, not file names. The coding-agent prompt repeats those claims
+(`AGENT_FACTS`) and what each prompt returns (`AGENT_RETURNS`, backed by the
+prompt's `FACTS` entry), and must list the prompts in the page's step order
+with the placeholders each takes. When you rename a prompt, move its entries in
+every `PROMPT_TABLES` table, and its line in `build_workflow.txt`.
 
 The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
 copies: a wide one, and a single-column one that replaces it on narrow screens.

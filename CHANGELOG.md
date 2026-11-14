@@ -30,6 +30,13 @@ Annotated tags exist from `v0.9.0` forward.
   claim, read in the page's step order) and for words the page must not use in any letter case
   (`UNBACKED_WORDS`, `CAPTION_UNBACKED`). A `PROMPT_TABLES` entry for a prompt
   file that no longer exists also fails.
+- **Coding-agent prompt.** `/prompts/` ends with a task to paste into a coding
+  agent (`build_workflow.txt`, section `#build`): it fetches the seven prompts,
+  builds a command for each stage of the diagram and asks which model to call.
+  The home page's "After the call" section links to it. `build_prompts.py
+  --check` binds it to the page's step order, the placeholders each prompt takes
+  and the claims the page makes about how they connect and what they return
+  (`AGENT_FACTS`, `AGENT_RETURNS`).
 - **Fragment links are checked.** `check_site.py` now fails when a `#fragment`
   link on a published page, relative or on `https://onoats.dev`, names an id
   its target page does not carry. A link to `…/index.html` reaches the page

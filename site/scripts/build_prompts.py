@@ -25,7 +25,12 @@ when:
 - an item uses its `UNBACKED_WORDS` word, or the caption a `CAPTION_UNBACKED`
   word, in any letter case;
 - a key of a `PROMPT_TABLES` table (the only tables keyed by prompt file name)
-  names no prompt file.
+  names no prompt file;
+- the coding-agent prompt (`AGENT_PROMPT`, a task for an agent, not a
+  `str.format` template, so the template rules above skip it) lists the
+  prompts out of the page's step order, with other placeholders than the
+  prompts take, or with a claim an `AGENT_FACTS` entry finds the prompts no
+  longer back.
 
 These tables are the only place the page's claims about the prompts are
 checked; tests drive them but add no claim of their own. Stdlib only.
@@ -525,11 +530,143 @@ FIGCAPTION = re.compile(r"<figcaption>(.*?)</figcaption>", re.DOTALL)
 UNBACKED_WORDS: dict[str, tuple[str, ...]] = {"digest_weekly.txt": ("numbered",)}
 CAPTION_UNBACKED: tuple[str, ...] = ("schedule",)
 
+# The coding-agent prompt is not a template: it is a task for an agent, which
+# fetches the seven prompts by URL. It lists them as "N. URL takes {fields}. It
+# returns ...", numbered by the page's steps list, and its claims about how they
+# connect are bound to the same checks as the diagram caption's.
+AGENT_PROMPT = "build_workflow.txt"
+PROMPT_URL = "https://onoats.dev/prompts/"
+AGENT_LINE = re.compile(
+    rf"^(\d+)\. {re.escape(PROMPT_URL)}({NAME}) takes (.*?)\. It returns",
+    re.MULTILINE,
+)
+AGENT_URL = re.compile(rf"{re.escape(PROMPT_URL)}({NAME})")
+AGENT = "the coding-agent prompt"
+
+
+def _all_fenced(steps: Steps, prompts: dict[str, str]) -> bool:
+    return bool(prompts) and all(
+        any(FENCE.fullmatch(line) for line in text.splitlines())
+        for text in prompts.values()
+    )
+
+
+AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
+    ("Prompts 1 to 4 run in order on each session file", _session_chain),
+    ("Prompts 3 and 4 take the category from 2", _category_flow),
+    (
+        "Prompt 4 also takes the summary from 2 and the items from 3",
+        _summary_and_items_flow,
+    ),
+    ("Prompt 5 reads one day's Markdown files", _daily_input),
+    ("Prompt 6 reads the daily digests and prompt 7 the weekly ones", _digest_inputs),
+    ("Prompts 5 to 7 run once per day, week or month", _digest_cadence),
+    ("wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED", _all_fenced),
+)
+
+# What the coding-agent prompt says each prompt returns, keyed by prompt file:
+# each text must sit in that prompt's line and be the excerpt of a FACTS entry
+# for the same prompt (without its <code> tags), so FACTS backs it.
+AGENT_RETURNS: dict[str, tuple[str, ...]] = {
+    "segment.txt": ('{"segments": [{"start_time", "end_time", "reason"}]}',),
+    "classify_topics.txt": ("category, confidence, summary and tags",),
+    "classify_ap.txt": ('{"action_items": [{"text", "attribution"}]}',),
+    "consolidate_action_items.txt": (
+        '{"consolidated_items": [{"text", "attribution"}]}',
+        "at most 15.",
+    ),
+    "digest_daily.txt": (
+        "categories_active, transcript_ids, duration_by_category,"
+        " topic_density and top_topics",
+    ),
+}
+
+
 # Every table keyed by prompt file name; orphan_errors checks each key.
 PROMPT_TABLES: dict[str, dict[str, tuple[object, ...]]] = {
     "FACTS": FACTS,
     "UNBACKED_WORDS": UNBACKED_WORDS,
+    "AGENT_RETURNS": AGENT_RETURNS,
 }
+
+
+def _returns_errors(label: Path, text: str, prompts: dict[str, str]) -> list[str]:
+    lines = {
+        m["name"]: m.group(0)
+        for m in re.finditer(
+            rf"^\d+\. {re.escape(PROMPT_URL)}(?P<name>{NAME}) takes .*$",
+            text,
+            re.MULTILINE,
+        )
+    }
+    errors = []
+    for name, plains in AGENT_RETURNS.items():
+        for plain in plains:
+            cells = [
+                holds
+                for excerpt, holds in FACTS.get(name, ())
+                if re.sub(r"</?code>", "", excerpt) == plain
+            ]
+            if plain not in lines.get(name, ""):
+                errors.append(
+                    f"{label}: the {name} line no longer says {plain!r};"
+                    " update the prompt and AGENT_RETURNS together"
+                )
+            if len(cells) != 1:
+                errors.append(
+                    f"site/scripts/build_prompts.py: AGENT_RETURNS says {plain!r}"
+                    f" for {name}, which no one FACTS entry backs"
+                )
+            elif name in prompts and not cells[0](prompts[name]):
+                errors.append(
+                    f"{PROMPT_DIR}: {AGENT} says {plain!r} for {name}, which the"
+                    " prompt no longer backs; update the prompt and AGENT_RETURNS"
+                    " together"
+                )
+    return errors
+
+
+def agent_errors(page: str, prompts: dict[str, str], text: str) -> list[str]:
+    """The coding-agent prompt against the page's steps and the prompts."""
+
+    label = PROMPT_DIR / AGENT_PROMPT
+    steps = step_names(page)
+    if steps is None:  # caption_errors reports the missing or repeated list
+        return []
+    errors = []
+    listed = AGENT_LINE.findall(text)
+    if [(int(n), name) for n, name, _ in listed] != list(enumerate(steps, 1)):
+        errors.append(
+            f"{label}: lists its prompts as {[(int(n), name) for n, name, _ in listed]},"
+            f" but the page's steps embed {list(enumerate(steps, 1))}"
+        )
+    for _, name, taken in listed:
+        said = set(re.findall(r"\{(\w+)\}", taken))
+        try:  # a prompt that is not a template is prompt_errors' to report
+            takes = set(_fields(prompts[name])) if name in prompts else said
+        except ValueError:
+            continue
+        if said != takes:
+            errors.append(f"{label}: {name} takes {sorted(takes)}, not {sorted(said)}")
+    urls = set(AGENT_URL.findall(text))
+    if urls != set(prompts):
+        errors.append(
+            f"{label}: links {sorted(urls)}, but the prompts are {sorted(prompts)}"
+        )
+    errors.extend(_returns_errors(label, text, prompts))
+    for excerpt, holds in AGENT_FACTS:
+        if excerpt not in text:
+            errors.append(
+                f"{label}: no longer says {excerpt!r};"
+                " update the prompt and AGENT_FACTS together"
+            )
+        if not holds(steps, prompts):
+            errors.append(
+                f"{PROMPT_DIR}: {AGENT} says {excerpt!r}, which the prompts no"
+                " longer back; update the prompt and AGENT_FACTS together"
+            )
+    errors.extend(_unbacked_errors(AGENT, text, CAPTION_UNBACKED))
+    return errors
 
 
 def item_prose(page: str, name: str) -> tuple[int, int] | None:
@@ -620,8 +757,18 @@ def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
     prompts = {
         path.name: path.read_text(encoding="utf-8")
         for path in sorted((repo_root / PROMPT_DIR).glob("*.txt"))
+        if path.name != AGENT_PROMPT
     }
     return page, prompts
+
+
+def _load_agent(repo_root: Path) -> str | None:
+    path = repo_root / PROMPT_DIR / AGENT_PROMPT
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def _prompt_files(prompts: dict[str, str], agent: str | None) -> set[str]:
+    return set(prompts) | ({AGENT_PROMPT} if agent is not None else set())
 
 
 def collect_errors(repo_root: Path) -> list[str]:
@@ -630,13 +777,18 @@ def collect_errors(repo_root: Path) -> list[str]:
     and PROMPT_TABLES keys that name no prompt file."""
 
     page, prompts = _load(repo_root)
-    errors = marker_errors(page, set(prompts))
+    agent = _load_agent(repo_root)
+    errors = marker_errors(page, _prompt_files(prompts, agent))
+    if agent is None:
+        errors.append(f"{PROMPT_DIR / AGENT_PROMPT} is missing")
     if not errors and render(page, repo_root / PROMPT_DIR) != page:
         errors.append(f"{PAGE} is stale; run build_prompts.py")
     for name, text in prompts.items():
         errors.extend(prompt_errors(name, text, page))
         errors.extend(fact_errors(name, text, page))
     errors.extend(caption_errors(page, prompts))
+    if agent is not None:
+        errors.extend(agent_errors(page, prompts, agent))
     errors.extend(orphan_errors(prompts))
     return errors
 
@@ -652,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.check:
         page, prompts = _load(repo_root)
-        errors = marker_errors(page, set(prompts))
+        errors = marker_errors(page, _prompt_files(prompts, _load_agent(repo_root)))
         if not errors:
             out = render(page, repo_root / PROMPT_DIR)
             if out != page:
