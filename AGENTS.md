@@ -25,19 +25,27 @@ non-obvious parts; the code and `docs/` cover the rest.
   Cloudflare credentials only after installation, then clears every exported
   variable but `HOME`/`PATH` and `export`s `TMPDIR` plus the token and account
   id before `exec`ing Wrangler, so the token never sits on an argv (`env -i`
-  would show it in `ps`). The prompt text in
-  `site/public/prompts/*.txt` is canonical. Two scripts own the site contracts
-  and their module docstrings hold the rule values; do not restate them here.
-  `build_prompts.py` owns the generated prompts page and the untrusted-data
-  fences. `check_site.py` owns shared chrome and `aria-current`, copied assets,
-  versioned image names and references, the social card named by `og:image`,
-  `public/.assetsignore` and the `_headers` rules (security headers and CSP,
-  cache scope). Each check covers the whole set (every page, tag, link, image
-  and rule), not "some match exists". `just check` and CI run both. Files in
-  `site/public/img/` are immutable and therefore versioned and quantized with
-  `pngquant`; regenerate the social PNG with
-  `swift scripts/render_social_card.swift` from `site/` (needs `pngquant`).
-  `site/` is excluded from the sdist, and its tests skip when it is absent.
+  would show it in `ps`). The prompt text in `site/public/prompts/*.txt` is
+  canonical. Two scripts own the site contracts and their module docstrings
+  hold the rule values; do not restate them here. `build_prompts.py` owns the
+  generated prompts page, the untrusted-data fences and the claim tables
+  (`FACTS`, `CAPTION_FACTS`, `UNBACKED_WORDS`, `CAPTION_UNBACKED`,
+  `AGENT_FACTS`, `AGENT_RETURNS`) that bind what the page says about the
+  prompts to both the page text and the prompts; `build_workflow.txt`, the
+  coding-agent task, is checked against the same tables but is not a
+  `str.format` template. Its Input section describes onoats's own files, and
+  its claims are the `AGENT_INPUT` table in `tests/test_site_contract.py`,
+  each checked by recording and converting a session with onoats's code.
+  `check_site.py` owns shared chrome and `aria-current`, copied assets,
+  versioned image names and references, `#fragment` links, the social card
+  named by `og:image`, `public/.assetsignore` and the `_headers` rules
+  (security headers and CSP, cache scope). Each check covers the whole set
+  (every page, tag, link, image and rule), not "some match exists".
+  `just check` and CI run both. Files in `site/public/img/` are immutable and
+  therefore versioned and quantized with `pngquant`; regenerate the social PNG
+  with `swift scripts/render_social_card.swift` from `site/` (needs
+  `pngquant`). `site/` is excluded from the sdist, and its tests skip when it
+  is absent.
 
 ## Audio capture: PortAudio vs socket (`AUDIO_SOURCE`)
 
@@ -904,3 +912,4 @@ should NOT re-flag go here, one per line:
 - **[Performance] won't-fix**: `just deps` reinstalls `site/node_modules` from the lockfile on every `preview`, `dry-run` and `deploy`. The clean `npm ci` is deliberate: `deploy` runs Wrangler from `node_modules` with Cloudflare credentials, so it must run exactly the locked graph, and a stamp that skips the install would trust whatever is already on disk. The cost is a few seconds per run. (2026-11-08)
 - **[Testing] won't-fix**: `swift scripts/render_social_card.swift --check` byte-compares system-font AppKit output after `pngquant`, so it depends on the macOS and `pngquant` versions and does not run in CI. It is a maintainer command for regenerating the card; CI's `check_site.py` gates what can be checked portably (the card named by `og:image` exists, is 1200x630 and is the file the renderer writes). (2026-11-08)
 - **[Security] won't-fix**: the example prompts' `--- BEGIN/END UNTRUSTED ... ---` fences are fixed lines, so transcript text that reproduces one can close a fence early. A static published template cannot carry a per-call random fence; `/prompts/` already says the fences are fixed and tells readers to use a random fence for each call in their own pipeline. (2026-11-08)
+- **[Architecture] won't-fix**: the two `/prompts/` pipeline SVGs keep hard-coded hex colours and stay hand-maintained, by owner decision. A generator and `site.css` token classes were weighed and declined. The checks cover their `#fragment` link targets and the caption text, not the drawings: no check compares the two copies, so keeping them in step is by hand. (2026-11-13)

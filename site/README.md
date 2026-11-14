@@ -27,7 +27,10 @@ site has no runtime build step or JavaScript.
 `public/prompts/*.txt` are the source of truth. `public/prompts/index.html`
 inlines each one between `<!-- prompt:NAME -->` markers, which must follow that
 prompt's `<p class="meta">` paragraph in the same `<li>` (the binding rule is
-in the script's docstring). After editing a prompt:
+in the script's docstring). `build_workflow.txt` is the exception: a task for a
+coding agent, not a `str.format` template, so the template and untrusted-data
+rules skip it; it sits in its own section (`#build`) and links to the seven
+prompts. After editing a prompt:
 
     python3 scripts/build_prompts.py          # rewrite the page
     python3 scripts/build_prompts.py --check  # exit 1 if stale
@@ -39,6 +42,32 @@ on its own line between `--- BEGIN UNTRUSTED <LABEL> ---` and
 paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 `UNTRUSTED_FIELDS` in the script, and the page must list it.
 
+Both modes also fail when a claim the page makes about the prompts drifts on
+either side: the page text changes, or the prompts stop backing it. The claims
+live in tables in the script (`FACTS` per prompt, `CAPTION_FACTS` for the
+diagram caption, `UNBACKED_WORDS` and `CAPTION_UNBACKED` for words the page
+must not use); its module docstring lists the rules. Change the page text and
+the table together. The caption numbers prompts by their place in the steps
+list, so each of its step-numbered claims has its own entry that follows the
+page order, not file names. The coding-agent prompt repeats those claims
+(`AGENT_FACTS`) and what each prompt returns (`AGENT_RETURNS`, backed by the
+prompt's `FACTS` entry), and must list the prompts in the page's step order
+with the placeholders each takes. `AGENT_FACTS` also binds the prompt's own
+rules to the prompts: the table holds them, and the script's module docstring
+says how they are checked.
+Its Input section describes the files onoats writes; each of its claims is an
+entry in the `AGENT_INPUT` table in `tests/test_site_contract.py`, checked by
+recording a session with the recorder's writers and running `onoats convert`
+on it, or by resolving the data folder through onoats's own code. Edit the
+section and that table together. When you rename a prompt, move its entries
+in every `PROMPT_TABLES` table, and its line in `build_workflow.txt`.
+
+The pipeline diagram at the top of the page is hand-drawn inline SVG, in two
+copies: a wide one, and a single-column one that replaces it on narrow screens.
+A change to the pipeline means editing both, by hand: no check compares the two
+copies, or the step numbers drawn in them with the steps list. `check_site.py`
+checks their `#fragment` links, and `build_prompts.py` checks the caption.
+
 `site.css` holds everything shared by the pages.
 
 ## Site checks
@@ -46,7 +75,8 @@ paragraph. A new placeholder must be added to `TRUSTED_FIELDS` or
 `scripts/check_site.py` owns every site contract the prompts script does not:
 shared navigation and footer on every `*.html` page (with `aria-current="page"`
 only on the link to the page itself), the copied assets, versioned image names
-and `/img/` references, the social card named by `og:image`, the
+and `/img/` references, `#fragment` links (same-page and cross-page) against the
+ids on their target page, the social card named by `og:image`, the
 `public/.assetsignore` rule, and the `_headers` rules (security headers and the
 Content-Security-Policy in `/*`, immutable caching only in `/img/*`). The exact
 values live in its module docstring and constants, not here.

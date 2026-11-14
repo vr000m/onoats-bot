@@ -16,6 +16,9 @@ image and rule), never "some match exists":
   immutable cache) matches ``VERSIONED_IMAGE``.
 - ``_reference_errors``: every ``/img/<name>`` in a published ``.css``,
   ``.html`` or ``.txt`` file is versioned and exists.
+- ``_fragment_errors``: every site-local ``href`` (relative, or on
+  ``SITE_ORIGIN``) with a ``#fragment`` on a published page reaches a
+  published page that carries that ``id``.
 - ``_social_card_errors``: the home page has exactly one ``og:image``,
   ``twitter:image``, ``og:image:width`` and ``og:image:height`` (and none of
   the alias tags in ``SOCIAL_ALIASES``); both URLs are the same
@@ -30,11 +33,12 @@ from __future__ import annotations
 
 import argparse
 import re
-from html.parser import HTMLParser
 import struct
 import sys
 import zlib
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote, urljoin, urlsplit
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DIR = Path("site/public")
@@ -106,13 +110,16 @@ def _normalise_nav(block: str) -> str:
     return block.replace(CURRENT, "")
 
 
+def _served_path(path: str) -> str:
+    """The URL path that serves *path*: ``/a/index.html`` is ``/a/``."""
+
+    return path.removesuffix("index.html") if path.endswith("/index.html") else path
+
+
 def _own_path(repo_root: Path, page: Path) -> str:
     """The URL path a page is served at: ``a/index.html`` is ``/a/``."""
 
-    served = page.relative_to(repo_root / PUBLIC_DIR).as_posix()
-    if served == "index.html" or served.endswith("/index.html"):
-        served = served[: -len("index.html")]
-    return "/" + served
+    return _served_path("/" + page.relative_to(repo_root / PUBLIC_DIR).as_posix())
 
 
 def _aria_current_errors(label: Path, nav: str, own: str) -> list[str]:
@@ -485,6 +492,72 @@ def _reference_errors(repo_root: Path) -> list[str]:
     return errors
 
 
+class _Anchors(HTMLParser):
+    """Every ``id`` and every ``href`` on one page, in page order."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: set[str] = set()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for key, value in attrs:
+            if key == "id" and value:
+                self.ids.add(value)
+            elif key in ("href", "xlink:href") and value is not None:
+                self.hrefs.append(value)
+
+
+def _anchors(page: Path) -> _Anchors:
+    parser = _Anchors()
+    parser.feed(page.read_text(encoding="utf-8"))
+    parser.close()
+    return parser
+
+
+def _fragment_errors(repo_root: Path, pages: list[Path]) -> list[str]:
+    """Every site-local ``href`` with a ``#fragment`` names an id on its target.
+
+    Same-page (``#x``), absolute (``/a/#x``), relative (``../#x``) and
+    ``SITE_ORIGIN`` links (``https://onoats.dev/a/#x`` or ``//onoats.dev/a/#x``,
+    host compared case-insensitively) are resolved against the page's own
+    path, and a path ending in ``/index.html`` names its directory (as served);
+    the target must be a published page and carry that ``id``. An empty
+    fragment (the top of the page) and links to any other origin or scheme are
+    not checked.
+    """
+
+    origin = urlsplit(SITE_ORIGIN)
+    served = {_own_path(repo_root, page): page for page in pages}
+    anchors = {page: _anchors(page) for page in pages}
+    errors: list[str] = []
+    for page in pages:
+        label = _rel(repo_root, page)
+        own = _own_path(repo_root, page)
+        for href in anchors[page].hrefs:
+            target = urlsplit(urljoin(own, href))
+            if not target.fragment:
+                continue
+            if target.netloc:
+                if target.scheme not in ("", origin.scheme) or (
+                    target.netloc.lower() != origin.netloc
+                ):
+                    continue
+                path = target.path or "/"
+            elif target.scheme:
+                continue
+            else:
+                path = target.path or own
+            reached = served.get(_served_path(path))
+            if reached is None:
+                errors.append(f"{label}: {href} reaches no published page")
+            elif unquote(target.fragment) not in anchors[reached].ids:
+                errors.append(
+                    f"{label}: {href} names no id on {_rel(repo_root, reached)}"
+                )
+    return errors
+
+
 def _headers_file_errors(repo_root: Path) -> list[str]:
     try:
         text = (repo_root / HEADERS).read_text(encoding="utf-8")
@@ -507,6 +580,7 @@ def collect_errors(repo_root: Path) -> list[str]:
         *_asset_copy_errors(repo_root),
         *_image_name_errors(repo_root),
         *_reference_errors(repo_root),
+        *_fragment_errors(repo_root, pages),
         *_social_card_errors(repo_root, pages[0]),
         *_assetsignore_errors(repo_root),
         *_headers_file_errors(repo_root),

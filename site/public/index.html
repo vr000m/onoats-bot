@@ -207,15 +207,15 @@
     <div class="wrap">
       <h2 class="t">After the call</h2>
       <div class="prose">
-        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them, with <a href="/prompts/">example prompts for each step</a>.</p>
+        <p><code>onoats convert</code> renders each session to <code>transcripts/&lt;category&gt;/&lt;date&gt;/&lt;session_id&gt;.md</code>. From there the files are yours. Here is a workflow that builds on them. To have a coding agent build it, give it <a href="/prompts/#build">this task</a>: it fetches the <a href="/prompts/">example prompts for each step</a> and wires them together.</p>
       </div>
       <ol class="steps">
-        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes.</span></li>
-        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>; labelled speakers also get S1, S2, and so on. A model can read who said what and assign each commitment to the person who made it, one topic at a time.</span></li>
+        <li><h3 class="st">Split long calls by topic</h3><span>Run a model such as Gemini, Claude Haiku, or ChatGPT's Luna over a long transcript to cut it where the topic changes. <a href="/prompts/#segment">Example prompt</a>.</span></li>
+        <li><h3 class="st">Pull out action points</h3><span>Every line is tagged <code>me</code> or <code>them</code>; labelled speakers also get S1, S2, and so on. A model can read who said what and assign each commitment to the person who made it, one topic at a time. <a href="/prompts/#action-points">Example prompt</a>.</span></li>
         <li><h3 class="st">Consolidate into living documents</h3><span>Group transcripts into topic folders, or into one document per topic that grows as related calls arrive.</span></li>
-        <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly, or per-topic summaries from those folders.</span></li>
+        <li><h3 class="st">Build the digests</h3><span>An agent such as Hermes or pi.dev can build weekly, monthly, or per-topic summaries from those folders. Example prompts: <a href="/prompts/#daily-digest">daily</a>, <a href="/prompts/#weekly-digest">weekly</a> and <a href="/prompts/#monthly-digest">monthly</a>.</span></li>
       </ol>
-      <p class="aside">onoats stops at the files. These steps run in your own tools, on the queue and the Markdown it writes.</p>
+      <p class="aside">onoats stops at the session file and the Markdown it renders. Everything after that is an example pipeline: these steps run in your own tools, on those files.</p>
     </div>
   </section>
 

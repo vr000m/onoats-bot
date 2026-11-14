@@ -15,6 +15,47 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Added
+
+- **Prompts page diagram.** `/prompts/` now opens with a pipeline diagram of
+  how the seven example prompts fit together (a single-column version on narrow
+  screens), a "Returns" line under each prompt, and section anchors that the
+  home page's "After the call" steps link to. The digest row starts from a
+  "Markdown files" box, written per segment from prompts 1 and 2. Site only;
+  the package is unchanged.
+- **Coding-agent prompt.** `/prompts/` ends with a task to paste into a coding
+  agent (`build_workflow.txt`, section `#build`): it reads the session JSONL
+  files from the onoats data folder, fetches the seven prompts, builds a
+  command for each stage of the diagram and asks which model to call.
+  It accepts prompt 2's category only from that prompt's list, skips prompt 4
+  for the categories `consolidate_action_items.txt` says upstream code skips,
+  feeds the daily digest Markdown it writes per segment with its own id,
+  prompt 2's category, local times and local date (onoats's own Markdown
+  carries the recording's lock category and no times), stops a session when
+  an utterance falls in no segment or in more than one, asks before it reads
+  real sessions, writes its outputs owner-only and asks the user how to fill
+  the placeholders onoats keeps no data for.
+  The home page's "After the call" section links to it. `build_prompts.py
+  --check` binds it to the page's step order, the placeholders each prompt takes
+  and the claims the page makes about how they connect and what they return
+  (`AGENT_FACTS`, `AGENT_RETURNS`). Its Input section's claims about onoats's
+  files are checked against `src/onoats` by `tests/test_site_contract.py`.
+
+### Changed
+
+- **Prompts page claims are checked.** `build_prompts.py --check` now also fails
+  when a claim the page makes about a prompt's output drifts on either side: the
+  page text changes, or the prompt stops backing it (`FACTS`: JSON keys, the
+  15-item cap, metadata keys, Markdown output, section and heading counts and
+  order). The same holds for the diagram caption (`CAPTION_FACTS`, one entry
+  per step-numbered claim, read in the page's step order) and for words the
+  page must not use in any letter case (`UNBACKED_WORDS`, `CAPTION_UNBACKED`).
+  A `PROMPT_TABLES` entry for a prompt file that no longer exists also fails.
+- **Fragment links are checked.** `check_site.py` now fails when a `#fragment`
+  link on a published page, relative or on `https://onoats.dev`, names an id
+  its target page does not carry. A link to `…/index.html` reaches the page
+  served at its directory.
+
 ## [1.6.1] - 2026-11-08
 
 ### Added
