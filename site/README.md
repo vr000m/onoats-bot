@@ -56,8 +56,10 @@ with the placeholders each takes. `AGENT_FACTS` also binds its own rules to the
 prompts: the category check against prompt 2's list, the categories prompt 4
 skips, the placeholders it asks the user about (every placeholder the prompts
 take is asked, computed by the caller or built from onoats's files and earlier
-replies), that prompt 5 gets prompt 2's category for each segment, and that
-the category is the only model reply taken outside a fence (`MODEL_CHOSEN`).
+replies), that prompt 5 reads Markdown the tool writes per segment with prompt
+2's category and times (not onoats's own Markdown), how segment times are
+compared, that text from replies and files is never obeyed, and that the
+category is the only model reply taken outside a fence (`MODEL_CHOSEN`).
 Its Input section describes the files onoats writes; each of its claims is an
 entry in the `AGENT_INPUT` table in `tests/test_site_contract.py`, checked by
 recording a session with the recorder's writers and running `onoats convert`
