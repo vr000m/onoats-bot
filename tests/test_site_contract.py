@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from conftest import with_tz
+from _tz import with_tz
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER_PATH = ROOT / "site/scripts/check_site.py"
@@ -993,6 +993,35 @@ def test_every_fact_has_a_prompt_break() -> None:
         for index in range(len(facts))
     }
     assert entries == set(FACT_PROMPT_BREAKS)
+
+
+# FACTS entries whose check needs the Markdown instruction as well as the
+# section shape. FACT_PROMPT_BREAKS breaks the section half; this breaks the
+# Markdown half, so dropping either from the predicate fails a test.
+MARKDOWN_FACTS = [(WEEKLY, 0), (MONTHLY, 0)]
+
+
+@pytest.mark.parametrize("entry", MARKDOWN_FACTS, ids=lambda e: e[0])
+def test_digest_markdown_fact_needs_the_markdown_instruction(
+    tmp_path: Path, entry: tuple[str, int]
+) -> None:
+    name, index = entry
+    assert entry in FACT_PROMPT_BREAKS  # the section half has its own break
+    excerpt = BUILDER.FACTS[name][index][0]
+    checkout = _copy_site_tree(tmp_path)
+    _edit(
+        checkout / "site/public/prompts" / name,
+        "Write in markdown format.",
+        "Write in JSON format.",
+    )
+    BUILDER.main(["--repo-root", str(checkout)])  # regenerate the page
+
+    errors = BUILDER.collect_errors(checkout)
+    assert not any("is stale" in error for error in errors)
+    assert _template_errors(errors) == [
+        f"site/public/prompts/{name}: the page says {excerpt!r}, which the"
+        " prompt no longer backs; update the prompts page and FACTS together"
+    ], errors
 
 
 @pytest.mark.parametrize("cell", _fact_cells(), ids=lambda c: f"{c[0]}[{c[1]}]-{c[2]}")

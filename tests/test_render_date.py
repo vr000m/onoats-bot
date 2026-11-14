@@ -8,7 +8,7 @@ it actually happened (2026-06-07). The fix lives only in the renderer
 
 from __future__ import annotations
 
-from conftest import with_tz
+from _tz import with_tz
 from onoats.jsonl import Session, Utterance
 from onoats.render import session_date
 
