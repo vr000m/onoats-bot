@@ -40,6 +40,9 @@ Annotated tags exist from `v0.9.0` forward.
   and the claims the page makes about how they connect and what they return
   (`AGENT_FACTS`, `AGENT_RETURNS`). Its Input section's claims about onoats's
   files are checked against `src/onoats` by `tests/test_site_contract.py`.
+- **`llms.txt`.** The example-prompts entry now says the seven prompts are
+  served as plain text, and a new entry points to the coding-agent task
+  (`/prompts/#build`, `/prompts/build_workflow.txt`).
 
 ### Changed
 
