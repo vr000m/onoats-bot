@@ -35,12 +35,16 @@ Annotated tags exist from `v0.9.0` forward.
   and Markdown files from the onoats data folder, fetches the seven prompts,
   builds a command for each stage of the diagram and asks which model to call.
   It accepts prompt 2's category only from that prompt's list, skips prompt 4
-  for the categories that prompt says upstream code skips, and asks the user
-  how to fill the placeholders onoats keeps no data for.
+  for the categories that prompt says upstream code skips, gives the daily
+  digest each segment's category from prompt 2 and its times (the Markdown's
+  category is onoats's lock), stops a session when an utterance falls in no
+  segment, asks before it reads real sessions, and asks the user how to fill
+  the placeholders onoats keeps no data for.
   The home page's "After the call" section links to it. `build_prompts.py
   --check` binds it to the page's step order, the placeholders each prompt takes
   and the claims the page makes about how they connect and what they return
-  (`AGENT_FACTS`, `AGENT_RETURNS`).
+  (`AGENT_FACTS`, `AGENT_RETURNS`). Its Input section's claims about onoats's
+  files are checked against `src/onoats` by `tests/test_site_contract.py`.
 - **Fragment links are checked.** `check_site.py` now fails when a `#fragment`
   link on a published page, relative or on `https://onoats.dev`, names an id
   its target page does not carry. A link to `…/index.html` reaches the page

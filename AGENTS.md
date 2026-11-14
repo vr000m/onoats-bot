@@ -25,24 +25,27 @@ non-obvious parts; the code and `docs/` cover the rest.
   Cloudflare credentials only after installation, then clears every exported
   variable but `HOME`/`PATH` and `export`s `TMPDIR` plus the token and account
   id before `exec`ing Wrangler, so the token never sits on an argv (`env -i`
-  would show it in `ps`). The prompt text in
-  `site/public/prompts/*.txt` is canonical. Two scripts own the site contracts
-  and their module docstrings hold the rule values; do not restate them here.
-  `build_prompts.py` owns the generated prompts page, the untrusted-data
-  fences and the claim tables (`FACTS`, `CAPTION_FACTS`, `UNBACKED_WORDS`,
-  `CAPTION_UNBACKED`, `AGENT_FACTS`, `AGENT_RETURNS`)
-  that bind what the page says about the prompts to both the page text and
-  the prompts; `build_workflow.txt`, the coding-agent task, is checked against
-  the same tables but is not a `str.format` template. `check_site.py` owns shared chrome and `aria-current`, copied
-  assets, versioned image names and references, `#fragment` links, the social
-  card named by `og:image`, `public/.assetsignore` and the `_headers` rules
+  would show it in `ps`). The prompt text in `site/public/prompts/*.txt` is
+  canonical. Two scripts own the site contracts and their module docstrings
+  hold the rule values; do not restate them here. `build_prompts.py` owns the
+  generated prompts page, the untrusted-data fences and the claim tables
+  (`FACTS`, `CAPTION_FACTS`, `UNBACKED_WORDS`, `CAPTION_UNBACKED`,
+  `AGENT_FACTS`, `AGENT_RETURNS`) that bind what the page says about the
+  prompts to both the page text and the prompts; `build_workflow.txt`, the
+  coding-agent task, is checked against the same tables but is not a
+  `str.format` template. Its Input section describes onoats's own files, and
+  its claims are the `AGENT_INPUT` table in `tests/test_site_contract.py`,
+  each checked by recording and converting a session with onoats's code.
+  `check_site.py` owns shared chrome and `aria-current`, copied assets,
+  versioned image names and references, `#fragment` links, the social card
+  named by `og:image`, `public/.assetsignore` and the `_headers` rules
   (security headers and CSP, cache scope). Each check covers the whole set
   (every page, tag, link, image and rule), not "some match exists".
-  `just check` and CI run both. Files in
-  `site/public/img/` are immutable and therefore versioned and quantized with
-  `pngquant`; regenerate the social PNG with
-  `swift scripts/render_social_card.swift` from `site/` (needs `pngquant`).
-  `site/` is excluded from the sdist, and its tests skip when it is absent.
+  `just check` and CI run both. Files in `site/public/img/` are immutable and
+  therefore versioned and quantized with `pngquant`; regenerate the social PNG
+  with `swift scripts/render_social_card.swift` from `site/` (needs
+  `pngquant`). `site/` is excluded from the sdist, and its tests skip when it
+  is absent.
 
 ## Audio capture: PortAudio vs socket (`AUDIO_SOURCE`)
 

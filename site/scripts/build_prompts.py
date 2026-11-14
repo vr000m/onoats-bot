@@ -2,9 +2,10 @@
 """Inline each prompts/*.txt into site/public/prompts/index.html.
 
 The .txt files are the source of truth. Each embedded file's <li> (the seven
-prompts' items and the coding-agent task's) carries exactly one meta paragraph, ``<p class="meta"><a href="/prompts/NAME">``, followed in the
-same <li> by exactly one pair of markers; this script rewrites everything
-between them:
+prompts' items and the coding-agent task's) carries exactly one meta
+paragraph, ``<p class="meta"><a href="/prompts/NAME">``, followed in the same
+<li> by exactly one pair of markers; this script rewrites everything between
+them:
 
     <!-- prompt:segment.txt -->...<!-- /prompt:segment.txt -->
 
@@ -32,7 +33,8 @@ when:
   placeholders than the prompts take, with a claim an `AGENT_FACTS` entry
   finds the prompts no longer back, or with an `AGENT_RETURNS` text that is
   missing from that prompt's line or that no one `FACTS` entry for the same
-  prompt backs.
+  prompt backs. Its Input section describes onoats's own files, not the
+  prompts; `tests/test_site_contract.py` checks it against `src/onoats`.
 
 These tables are the only place the page's claims about the prompts are
 checked; tests drive them but add no claim of their own. Stdlib only.
@@ -66,11 +68,15 @@ ITEM_CLOSE = "</li>"
 # Every placeholder in every prompt is classified once, by name. Untrusted ones
 # carry transcript text or text derived from it (summaries, extracted items,
 # digests, topic signals) and must each sit alone inside a BEGIN/END UNTRUSTED
-# fence; trusted ones are scalars the caller computes (a category, a date, a
-# count). A new placeholder fails the check until it is added to one set.
+# fence; trusted ones are short scalars that sit outside a fence. A new
+# placeholder fails the check until it is added to one set. MODEL_CHOSEN is
+# the trusted placeholders a model reply supplies (step 2's category, which the
+# agent prompt checks against step 2's list); the caller computes every other
+# trusted one (a date, a count), and no prompt returns it as a JSON key.
 TRUSTED_FIELDS = frozenset(
     {"category", "month", "target_date", "week_end", "week_start", "weeks_count"}
 )
+MODEL_CHOSEN = frozenset({"category"})
 UNTRUSTED_FIELDS = frozenset(
     {
         "buffer_jsonl",
@@ -575,6 +581,40 @@ def _category_values(steps: Steps, prompts: dict[str, str]) -> bool:
     )
 
 
+def _model_chosen(steps: Steps, prompts: dict[str, str]) -> bool:
+    """MODEL_CHOSEN is exactly the category, which is trusted and which only
+    step 2 returns, and no prompt returns any other trusted placeholder as a
+    JSON key, so the category is the one model reply taken outside a fence."""
+
+    returned = {
+        field
+        for field in TRUSTED_FIELDS
+        if any(f'"{field}":' in text for text in prompts.values())
+    }
+    return (
+        MODEL_CHOSEN == {"category"}
+        and MODEL_CHOSEN <= TRUSTED_FIELDS
+        and returned == MODEL_CHOSEN
+        and _sole_producer(steps, prompts, 2, '"category":')
+    )
+
+
+def _daily_categories(steps: Steps, prompts: dict[str, str]) -> bool:
+    """Step 1 is the one prompt returning segment times and step 2 the one
+    returning a category, and step 5 takes transcripts and asks for the active
+    categories and minutes per category. That the caller puts each segment's
+    category and times in {transcripts} is wiring no prompt can show."""
+
+    text = _step(steps, prompts, 5) or ""
+    return (
+        _sole_producer(steps, prompts, 1, '"start_time"')
+        and _sole_producer(steps, prompts, 2, '"category":')
+        and _takes(steps, prompts, 5, "transcripts")
+        and {"categories_active", "duration_by_category"} <= _metadata_keys(text)
+        and "minutes:" in _between(text, "```metadata\n", "```")
+    )
+
+
 # The categories step 4 says upstream code skips, as the agent prompt names them.
 AGENT_SKIPPED = ("gaming", "uncategorized")
 
@@ -591,8 +631,21 @@ def _consolidate_skips(steps: Steps, prompts: dict[str, str]) -> bool:
     )
 
 
-# Placeholders onoats keeps no data for; the agent prompt asks the user about
-# each. Each must still be a placeholder some prompt takes.
+# Every placeholder the prompts take is in exactly one group: AGENT_ASK, which
+# onoats keeps no data for and the agent prompt asks the user about; the
+# caller-computed scalars (TRUSTED_FIELDS - MODEL_CHOSEN); or AGENT_BUILT, which
+# the caller builds from onoats's files and earlier replies. A new placeholder
+# fails _ask_fields until it joins one group, so the ask list stays complete.
+AGENT_BUILT = (
+    "buffer_jsonl",
+    "transcript",
+    "category",
+    "summary",
+    "items_json",
+    "transcripts",
+    "short_dailies",
+    "short_weeklies",
+)
 AGENT_ASK = (
     "existing_action_items_section",
     "topic_signal",
@@ -607,7 +660,9 @@ def _ask_fields(steps: Steps, prompts: dict[str, str]) -> bool:
         taken = {f for text in prompts.values() for f in _fields(text)}
     except ValueError:  # prompt_errors reports a broken template
         return False
-    return bool(prompts) and set(AGENT_ASK) <= taken
+    groups = (set(AGENT_ASK), TRUSTED_FIELDS - MODEL_CHOSEN, set(AGENT_BUILT))
+    every = set().union(*groups)
+    return bool(prompts) and sum(map(len, groups)) == len(every) and every == taken
 
 
 AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
@@ -618,6 +673,11 @@ AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
         _summary_and_items_flow,
     ),
     ("Prompt 5 reads one day's Markdown files", _daily_input),
+    (
+        "Prompt 5 also gets each segment's category from prompt 2 and its start"
+        " and end times",
+        _daily_categories,
+    ),
     ("Prompt 6 reads the daily digests and prompt 7 the weekly ones", _digest_inputs),
     ("Prompts 5 to 7 run once per day, week or month", _digest_cadence),
     ("wrap each such placeholder in a fixed `--- BEGIN UNTRUSTED", _all_fenced),
@@ -625,6 +685,10 @@ AGENT_FACTS: tuple[tuple[str, Callable[[Steps, dict[str, str]], bool]], ...] = (
         "Accept the category only if it is one of the values in prompt 2's"
         " category list",
         _category_values,
+    ),
+    (
+        "The category is the only model reply the prompts take outside a fence",
+        _model_chosen,
     ),
     (
         "Skip prompt 4 when the category is "

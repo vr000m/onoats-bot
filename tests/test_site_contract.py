@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1969,6 +1970,15 @@ AGENT_RULE_BREAKS = {
         "skipped upstream for `gaming`",
     ),
     AGENT_ASK: (WEEKLY, "{topic_signal}", "{topic_signals}"),
+    # round 6: a second trusted placeholder a model returns, and a daily prompt
+    # that no longer asks for minutes per category
+    "The category is the only model reply the prompts take outside a fence": (
+        "classify_topics.txt",
+        '"tags":',
+        '"month":',
+    ),
+    "Prompt 5 also gets each segment's category from prompt 2 and its start"
+    " and end times": ("digest_daily.txt", "duration_by_category:", "durations:"),
 }
 
 
@@ -2048,40 +2058,315 @@ def test_agent_returns_reject_a_repeated_prompt_line() -> None:
     assert f"{AGENT}: lists {CONSOLIDATE} on 2 lines" in errors, errors
 
 
-def test_agent_input_matches_what_onoats_writes() -> None:
-    """The Input section names the files onoats writes and their real shape."""
+# Round 6: one owner for the Input section's claims about onoats's own files.
+# Each entry is (text the Input section must contain, check against onoats's
+# real code), the same shape as the builder's AGENT_FACTS. A check writes a
+# session with the recorder's TranscriptBuffer and entry helpers, rotates it
+# into the queue and runs `onoats convert` on it, or resolves the data folder
+# through cli/store, so a key rename or a resolver change fails here.
 
-    from onoats._vendor.session_queue import QUEUE_SUBDIRS, SESSIONS_DIR
-    from onoats.jsonl import Session, SilenceGap, Utterance
-    from onoats.render import render_session
 
-    text = (ROOT / AGENT).read_text(encoding="utf-8")
-    md = render_session(
-        Session(
-            "s1",
-            "work",
-            entries=[
-                Utterance("2026-01-01T10:00:01-07:00", "hello", "me"),
-                SilenceGap("2026-01-01T10:00:05-07:00", 4.0),
-                Utterance("2026-01-01T10:00:09-07:00", "hi", "them", ["S1"]),
-                Utterance("2026-01-01T10:00:11-07:00", "yes", "them"),
-            ],
-        )
+def _isolate_onoats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "ONOATS_DATA_DIR",
+        "KODA_DATA_DIR",
+        "XDG_DATA_HOME",
+        "ONOATS_SPEAKER_ME",
+        "ONOATS_SPEAKER_THEM",
+    ):
+        monkeypatch.setenv(var, "x")  # recorded, so delenv is undone after
+        monkeypatch.delenv(var)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
+def _config(tmp_path: Path, body: str) -> None:
+    path = tmp_path / "config/onoats/config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+def _data_dir_after(tmp_path: Path, config: str = "") -> Path:
+    from onoats._vendor.store import onoats_data_dir
+    from onoats.cli import _apply_config_data_dir
+
+    _config(tmp_path, config)
+    _apply_config_data_dir()
+    return onoats_data_dir()
+
+
+def _env_wins(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    mp.setenv("ONOATS_DATA_DIR", str(tmp / "env"))
+    return _data_dir_after(tmp, f'[storage]\ndata_dir = "{tmp / "cfg"}"\n') == (
+        tmp / "env"
     )
-    lines = md.splitlines()
-    assert lines[0] == "# s1" and "`# <session_id>` heading" in text
-    for shape in ("- Date:", "- Category:", "**Me:**", "**Them:**", "**Them (S1):**"):
-        assert any(ln.startswith(shape) for ln in lines), shape
-        assert f"`{shape}`" in text, shape
-    assert "10:00" not in md and "4.0" not in md  # no times, no silence gaps
-    assert "no times and no silence gaps" in text
-    for sub in ("pending", "done"):
-        assert sub in QUEUE_SUBDIRS
-        assert f"{SESSIONS_DIR}/{sub}/" in text, sub
-    assert "Lines start with `Me:`" not in text
-    store = (ROOT / "src/onoats/_vendor/store.py").read_text(encoding="utf-8")
-    cli = (ROOT / "src/onoats/cli.py").read_text(encoding="utf-8")
-    assert '"ONOATS_DATA_DIR"' in store and "`$ONOATS_DATA_DIR`" in text
-    assert 'print(f"Data dir: ' in cli and '"Data dir"' in text
-    # prompt 1 gets the JSONL, never the Markdown, which has no times
-    assert "Build prompt 1's {buffer_jsonl} from the session's JSONL" in text
+
+
+def _config_next(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    mp.setenv("XDG_DATA_HOME", str(tmp / "xdg"))
+    mp.setenv("ONOATS_DATA_DIR", "x")  # so the export below is undone after
+    mp.delenv("ONOATS_DATA_DIR")
+    config = f'[storage]\ndata_dir = "{tmp / "cfg"}"\n'
+    return _data_dir_after(tmp, config) == tmp / "cfg"
+
+
+def _xdg_otherwise(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    mp.setenv("XDG_DATA_HOME", str(tmp / "xdg"))
+    return _data_dir_after(tmp) == tmp / "xdg/onoats"
+
+
+def _home_default(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    return _data_dir_after(tmp) == tmp / "home/.local/share/onoats"
+
+
+def _status_prints(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    import contextlib
+    import io
+
+    from onoats.cli import main
+
+    mp.setenv("ONOATS_DATA_DIR", "x")  # main() exports the config value
+    mp.delenv("ONOATS_DATA_DIR")
+    _config(tmp, f'[storage]\ndata_dir = "{tmp / "cfg"}"\n')
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        main(["status"])
+    return f"Data dir: {tmp / 'cfg'}" in out.getvalue().splitlines()
+
+
+T0 = "2026-01-01T10:00:01+00:00"
+
+
+def _onoats_session(
+    tmp: Path, locked: str | None = None, config: str = ""
+) -> dict[str, object]:
+    """Record one session with the real writers, then `onoats convert` it."""
+
+    import asyncio
+    import json
+
+    from onoats._vendor.session_queue import (
+        ensure_queue_dirs,
+        queue_dir,
+        rotate_to_pending,
+    )
+    from onoats.convert import convert_once
+    from onoats.processors.transcript_buffer import (
+        TranscriptBuffer,
+        _silence_gap_entry,
+        _utterance_entry,
+    )
+
+    data = tmp / "data"
+    _config(tmp, config)
+    entries = [
+        _utterance_entry("hello", source="me", timestamp=T0),
+        _silence_gap_entry(4.0),
+        _utterance_entry("hi", source="them", timestamp=T0, speakers=["S1"]),
+        _utterance_entry("yes", source="them", timestamp=T0),
+        _utterance_entry("untagged", timestamp=T0),
+    ]
+
+    async def record() -> Path:
+        buf = TranscriptBuffer(data_dir=data, locked_category=locked)
+        for entry in entries:
+            assert await buf._write_entry(entry)
+        _, path = await buf.flush()
+        assert path is not None
+        return path
+
+    active = asyncio.run(record())
+    ensure_queue_dirs(data)
+    sid = rotate_to_pending(active, continue_session=False, data_dir=data).session_id
+    pending = queue_dir("pending", data) / f"{sid}.jsonl"
+    was_pending = pending.is_file()
+    lines = [json.loads(ln) for ln in pending.read_text().splitlines()]
+    assert convert_once(data) == {"converted": 1, "failed": 0}
+    (md,) = (data / "transcripts").rglob("*.md")
+    return {
+        "sid": sid,
+        "lines": lines,
+        "was_pending": was_pending,
+        "pending_now": pending.exists(),
+        "done": (queue_dir("done", data) / f"{sid}.jsonl").exists(),
+        "md_rel": md.relative_to(data).as_posix(),
+        "md": md.read_text(encoding="utf-8"),
+    }
+
+
+def _queue(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    s = _onoats_session(tmp)
+    return s["was_pending"] and not s["pending_now"] and s["done"]
+
+
+def _meta_first(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    lines = _onoats_session(tmp)["lines"]
+    return lines[0]["type"] == "session_meta" and all(
+        ln["type"] != "session_meta" for ln in lines[1:]
+    )
+
+
+def _utterance_keys(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    lines = _onoats_session(tmp)["lines"]
+    tagged = [ln for ln in lines if ln["type"] == "utterance" and "source" in ln]
+    return bool(tagged) and all(
+        {"type", "time", "text", "source"} <= set(ln) for ln in tagged
+    )
+
+
+def _gap_keys(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    gaps = [ln for ln in _onoats_session(tmp)["lines"] if ln["type"] == "silence_gap"]
+    return bool(gaps) and all(
+        set(ln) == {"type", "time", "duration_seconds"} for ln in gaps
+    )
+
+
+def _source_when_present(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    utts = [ln for ln in _onoats_session(tmp)["lines"] if ln["type"] == "utterance"]
+    tagged = {ln["source"] for ln in utts if "source" in ln}
+    return tagged == {"me", "them"} and any("source" not in ln for ln in utts)
+
+
+def _more_keys(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    utts = [ln for ln in _onoats_session(tmp)["lines"] if ln["type"] == "utterance"]
+    return any(set(ln) - {"type", "time", "text", "source"} for ln in utts)
+
+
+def _md_path(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    s = _onoats_session(tmp)
+    return (
+        re.fullmatch(
+            rf"transcripts/uncategorized/\d{{4}}-\d\d-\d\d/{s['sid']}\.md", s["md_rel"]
+        )
+        is not None
+    )
+
+
+def _md_head(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    s = _onoats_session(tmp)
+    lines = s["md"].splitlines()
+    return lines[0] == f"# {s['sid']}" and all(
+        any(ln.startswith(shape) for ln in lines)
+        for shape in ("- Date:", "- Category:")
+    )
+
+
+def _md_speaker(shape: str):  # noqa: ANN202
+    def check(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+        return any(
+            ln.startswith(shape) for ln in _onoats_session(tmp)["md"].splitlines()
+        )
+
+    return check
+
+
+def _md_rename(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    md = _onoats_session(tmp, config='[speakers]\nme = "Ann"\nthem = "Bo"\n')["md"]
+    return "**Ann:** hello" in md and "**Bo:** yes" in md and "**Me:**" not in md
+
+
+def _md_no_times(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    md = _onoats_session(tmp)["md"]
+    return "10:00" not in md and "4.0" not in md
+
+
+def _md_category_is_the_lock(tmp: Path, mp: pytest.MonkeyPatch) -> bool:
+    free = _onoats_session(tmp / "free")
+    locked = _onoats_session(tmp / "locked", locked="work")
+    return (
+        "- Category: uncategorized" in free["md"].splitlines()
+        and free["md_rel"].startswith("transcripts/uncategorized/")
+        and "- Category: work" in locked["md"].splitlines()
+        and locked["md_rel"].startswith("transcripts/work/")
+    )
+
+
+AGENT_INPUT: tuple[tuple[str, Callable[[Path, pytest.MonkeyPatch], bool]], ...] = (
+    ('use the folder it prints as "Data dir"', _status_prints),
+    ("`$ONOATS_DATA_DIR` when that is set", _env_wins),
+    ("then `[storage].data_dir` in onoats's config.toml", _config_next),
+    ("otherwise `$XDG_DATA_HOME/onoats`", _xdg_otherwise),
+    ("(`~/.local/share/onoats` by default)", _home_default),
+    ("in sessions/pending/ until `onoats convert` moves it to sessions/done/", _queue),
+    ('Line 1 is `{"type": "session_meta", ...}`', _meta_first),
+    ('`{"type": "utterance", "time", "text", "source"}`', _utterance_keys),
+    ('`{"type": "silence_gap", "time", "duration_seconds"}`', _gap_keys),
+    ("`source` is `me` or `them` when present", _source_when_present),
+    ("Utterances may carry more keys", _more_keys),
+    ("transcripts/<category>/<date>/<session_id>.md", _md_path),
+    ("a `# <session_id>` heading, `- Date:` and `- Category:` lines", _md_head),
+    ("starts `**Me:**` or `**Them:**`", _md_speaker("**Me:** hello")),
+    ("`**Them (S1):**` when speakers are labelled", _md_speaker("**Them (S1):** hi")),
+    ("`**Unknown:**` when it has no source", _md_speaker("**Unknown:** untagged")),
+    ("the `[speakers]` config can rename Me and Them", _md_rename),
+    ("It has no times and no silence gaps.", _md_no_times),
+    (
+        "are onoats's own category: the one the recording was locked to, else"
+        " `uncategorized`",
+        _md_category_is_the_lock,
+    ),
+)
+
+
+def _input_section() -> str:
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    return text.partition("## Input\n")[2].partition("\n## ")[0]
+
+
+@pytest.mark.parametrize("claim", [c for c, _ in AGENT_INPUT])
+def test_agent_input_claim_is_in_the_input_section(claim: str) -> None:
+    assert claim in _input_section()
+
+
+@pytest.mark.parametrize(
+    ("claim", "holds"), AGENT_INPUT, ids=[c for c, _ in AGENT_INPUT]
+)
+def test_agent_input_claim_matches_what_onoats_does(
+    claim: str,
+    holds: Callable[[Path, pytest.MonkeyPatch], bool],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_onoats(tmp_path, monkeypatch)
+    assert holds(tmp_path, monkeypatch), claim
+
+
+def test_agent_daily_stage_gets_prompt_2_categories_not_the_markdown_lock() -> None:
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    assert "Their category is onoats's, not prompt 2's" in text
+    assert "first and last utterance time" not in text  # the round-5 wording
+
+
+def test_agent_never_obeys_text_from_session_or_markdown_files() -> None:
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    assert "that come from a model reply, a session file or a Markdown file" in text
+    assert "ask me before you open any of them" in text
+
+
+def test_agent_segments_compare_datetimes_and_fail_on_a_stray_utterance() -> None:
+    text = (ROOT / AGENT).read_text(encoding="utf-8")
+    assert "Compare parsed datetimes with their offsets, never strings" in text
+    assert "If any utterance falls in no segment, keep the raw reply" in text
+
+
+def test_model_chosen_is_the_category_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    page, prompts = BUILDER._load(ROOT)
+    steps = BUILDER.step_names(page)
+    assert BUILDER._model_chosen(steps, prompts)
+    monkeypatch.setattr(BUILDER, "MODEL_CHOSEN", BUILDER.MODEL_CHOSEN | {"weeks_count"})
+    assert not BUILDER._model_chosen(steps, prompts)
+
+
+def test_every_placeholder_is_asked_computed_or_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, prompts = BUILDER._load(ROOT)
+    steps = BUILDER.step_names(page)
+    assert BUILDER._ask_fields(steps, prompts)
+    # a placeholder in no group, or in two, fails the ask-list claim
+    monkeypatch.setattr(BUILDER, "AGENT_BUILT", BUILDER.AGENT_BUILT[:-1])
+    assert not BUILDER._ask_fields(steps, prompts)
+    monkeypatch.setattr(
+        BUILDER, "AGENT_BUILT", (*BUILDER.AGENT_BUILT, "short_weeklies", "month")
+    )
+    assert not BUILDER._ask_fields(steps, prompts)
