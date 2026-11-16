@@ -46,6 +46,10 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Changed
 
+- Update `pipecat-local-stt-server` to the 0.6 series, which adds the Moonshine
+  CPU backend. The local-models page lists Moonshine in the toolbar model
+  table with its default model, port and licence.
+
 - **Prompts page claims are checked.** `build_prompts.py --check` now also fails
   when a claim the page makes about a prompt's output drifts on either side: the
   page text changes, or the prompt stops backing it (`FACTS`: JSON keys, the
