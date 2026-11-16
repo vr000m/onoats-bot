@@ -2280,7 +2280,7 @@ requires-dist = [
     { name = "mlx-whisper", marker = "extra == 'macos'", specifier = ">=0.4.0" },
     { name = "numpy", specifier = ">=1.26.4,<3" },
     { name = "pipecat-ai", extras = ["deepgram", "google", "local", "runner", "silero", "soundfile", "webrtc", "whisper"], specifier = ">=1.3.0,<2.0.0" },
-    { name = "pipecat-local-stt-server", specifier = ">=0.5.0,<0.6" },
+    { name = "pipecat-local-stt-server", specifier = ">=0.6.0,<0.7" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "websockets", specifier = ">=13.0" },
 ]
@@ -2498,14 +2498,14 @@ wheels = [
 
 [[package]]
 name = "pipecat-local-stt-server"
-version = "0.5.0"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/96/2e/29dbdeabfdd6da1450f29c5d7f2afcb1cdcd08f6bd8d9eb1fb4af536cd73/pipecat_local_stt_server-0.5.0.tar.gz", hash = "sha256:910e451e0c3fa147162cb3059adce2083bfd8835a002c957b2eadf5116e34c14", size = 573796, upload-time = "2026-10-27T17:51:48.681Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2a/7d/502bedf6674e94133bb64efbd90e631885927368233f6ea88dd15a266609/pipecat_local_stt_server-0.6.0.tar.gz", hash = "sha256:b5490c1985227bcf42880c9c6042343ba6e340b5f74960cef68ccdb78f288242", size = 798972, upload-time = "2026-11-16T17:22:45.634Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/c5/957278676a2584b760d8e64f22218c5aa8e4384fefcc213e10d826bb86c1/pipecat_local_stt_server-0.5.0-py3-none-any.whl", hash = "sha256:572fd9a501fd39fa81377a0629294b1ec1cc167c3cfcb913d2ee275dc8897211", size = 113397, upload-time = "2026-10-27T17:51:47.308Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/70/5c2882a7fb9f1e471b5194265056dd80a3880aa1780c36f1febae081fd6b/pipecat_local_stt_server-0.6.0-py3-none-any.whl", hash = "sha256:9f1f43f20c4300d36c77078181aa8e533c3fbf395b6604d37895039e9789062f", size = 118425, upload-time = "2026-11-16T17:22:43.953Z" },
 ]
 
 [[package]]
