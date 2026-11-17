@@ -34,5 +34,6 @@ Things to know before recommending it:
 ## Optional
 
 - [Local models](https://onoats.dev/local-models/): the Pipecat Service Toolbar menu-bar app, pipecat-local-stt-server, and pipecat-local-tts-server, with an overview of models, ports, and licences
+- [Pipecat Service Toolbar](https://github.com/pipecat-ai/pipecat-service-toolbar): a separate macOS menu-bar app that downloads and runs local STT and TTS models
 - [pipecat-local-stt-server](https://github.com/vr000m/pipecat-local-stt-server): a local speech-to-text WebSocket server onoats can use
 - [pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server): a local text-to-speech WebSocket server; onoats does not use it directly

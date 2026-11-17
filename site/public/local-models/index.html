@@ -82,16 +82,18 @@
         <h2 class="t">Pipecat Service Toolbar</h2>
         <div class="prose lead">
           <p>A native macOS menu-bar app that downloads speech models and serves each one on its own port on <code>127.0.0.1</code>. Point a Pipecat app at the port and it uses the model. The app has no Dock icon. It stops servers it started when it quits and leaves other servers running.</p>
-          <p class="muted">The toolbar is a separate project from onoats. It lives in the <a href="https://github.com/vr000m/pipecat-local-tts-server/tree/main/macos">pipecat-local-tts-server</a> repository.</p>
+          <p class="muted">The toolbar is a separate project from onoats, with its own <a href="https://github.com/pipecat-ai/pipecat-service-toolbar">pipecat-service-toolbar</a> repository.</p>
         </div>
         <ol class="steps quick">
-          <li><span class="st">Build and open it</span><span>Needs Apple Silicon, macOS 15 or later, Xcode 16+, and <a href="https://docs.astral.sh/uv/">uv</a>. Apple Speech needs macOS 26 or later.</span>
-<pre>git clone https://github.com/vr000m/pipecat-local-tts-server.git
-cd pipecat-local-tts-server
+          <li><span class="st">Build and open it</span><span>Running the app needs Apple Silicon and macOS 15 or later. Building it needs Xcode 26+ (with the macOS 26 SDK), <a href="https://docs.astral.sh/uv/">uv</a>, and <a href="https://github.com/casey/just">just</a>. Apple Speech needs macOS 26 or later.</span>
+<pre>git clone https://github.com/pipecat-ai/pipecat-service-toolbar.git
+cd pipecat-service-toolbar
+uv sync --locked
 just app-open</pre></li>
           <li><span class="st">Add a model</span><span>Click the cat in the menu bar, choose <b>Add Models</b>, then click <b>Get</b> on a model and <b>Start</b>.</span></li>
           <li><span class="st">Point your app at it</span><span>Each running service shows its address, such as <code>127.0.0.1:9365</code>, with a button to copy it.</span></li>
         </ol>
+        <p class="muted">Already installed? Run <code>just app-install</code> from the new checkout with the same signing identity to keep your settings, environments, and model caches. See the <a href="https://github.com/pipecat-ai/pipecat-service-toolbar/blob/main/docs/migration.md">migration guide</a>.</p>
       </div>
       <div class="shots">
         <figure>
