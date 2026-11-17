@@ -97,8 +97,11 @@ name instead of replacing a cached file.
 
 The `service-toolbar-*-0.9.0.png` screenshots on `/local-models/` are copies from
 `docs/images/` in `vr000m/pipecat-local-tts-server`; the number is that
-project's version when they were copied, and `check_site.py` cannot compare them
-with a source in this repository.
+project's version when they were copied. The toolbar and its current screenshots
+now live in [pipecat-ai/pipecat-service-toolbar](https://github.com/pipecat-ai/pipecat-service-toolbar)
+under `docs/images/`. Keep the existing image names and bytes as historical
+snapshots; use a new versioned filename for any replacement. `check_site.py`
+cannot compare these screenshots with a source in this repository.
 
 `scripts/render_social_card.swift` is the source owner for the 1200x630 social
 preview. It reads `../assets/brand/onoats-mark.svg`, renders exactly 1200x630

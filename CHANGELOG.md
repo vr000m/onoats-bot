@@ -46,6 +46,10 @@ Annotated tags exist from `v0.9.0` forward.
 
 ### Changed
 
+- The local-models page now points to the standalone
+  `pipecat-ai/pipecat-service-toolbar` repository, with its current build
+  prerequisites and migration guide. `llms.txt` also links to the toolbar.
+
 - Update `pipecat-local-stt-server` to the 0.6 series, which adds the Moonshine
   CPU backend. The local-models page lists Moonshine in the toolbar model
   table with its default model, port and licence.
