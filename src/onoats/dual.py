@@ -475,7 +475,6 @@ async def run_onoats_dual(
     _acquire_instance_lock(data_dir / ".active")
 
     from onoats.config import load_config
-
     from onoats.runtime import RecorderSessionConfig
 
     if session_config is None:
@@ -516,7 +515,14 @@ async def run_onoats_dual(
         # Lazy: pulls numpy, which only diarized runs need here.
         from onoats.stt.diarization_timeline import SLOT_IDLE_REMINT_SEC
 
-        effective_remint_sec = cfg.diarization_idle_remint_sec or SLOT_IDLE_REMINT_SEC
+        # Same predicate as ``DiarizationTimeline.__init__`` (``is None``, not
+        # truthiness), so the header can never name a window the timeline
+        # was not built with.
+        effective_remint_sec = (
+            SLOT_IDLE_REMINT_SEC
+            if cfg.diarization_idle_remint_sec is None
+            else cfg.diarization_idle_remint_sec
+        )
 
     transcript_buffer = TranscriptBuffer(
         data_dir=data_dir,

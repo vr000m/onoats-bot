@@ -119,12 +119,18 @@ def normalize_launchd_label(value: str | None) -> str | None:
     return validate_launchd_label(stripped) if stripped else None
 
 
+#: Upper bound (about 31 years) so ``int(sec * sample_rate)`` in the timeline can
+#: never overflow; far beyond any real idle window.
+_MAX_IDLE_REMINT_SEC = 1e9
+
+
 def parse_idle_remint_sec(value: Any) -> float | None:
     """Map a raw ``diarization_idle_remint_sec`` value to seconds; ``None`` if absent.
 
     Absent is ``None`` or a blank string. A positive, finite number (or numeric
-    string) is returned as a float; anything else (including a TOML bool, zero,
-    a negative, ``inf``/``nan`` or text) raises ``ValueError``. Shared by the
+    string) up to ``_MAX_IDLE_REMINT_SEC`` is returned as a float; anything else
+    (including a TOML bool, zero, a negative, ``inf``/``nan``, a value too large
+    for the timeline's sample count, or text) raises ``ValueError``. Shared by the
     runtime reader and ``onoats init``'s carry-over so they cannot disagree.
     """
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -135,7 +141,7 @@ def parse_idle_remint_sec(value: Any) -> float | None:
         sec = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"invalid diarization_idle_remint_sec {value!r}") from None
-    if not 0 < sec < float("inf"):
+    if not 0 < sec <= _MAX_IDLE_REMINT_SEC:
         raise ValueError(f"invalid diarization_idle_remint_sec {value!r}")
     return sec
 

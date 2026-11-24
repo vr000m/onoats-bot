@@ -48,7 +48,9 @@ that and never rewrites `speakers` with display names. S-labels stay canonical.
 
 1. `session_meta` is line 1 of every session file written by `TranscriptBuffer`
    (including rotated/continuation files and `bot-single`), with
-   `{"type":"session_meta", "category"?, "run_id", "diarization"?}`.
+   `{"type":"session_meta", "category"?, "run_id", "diarization"?,
+   "diarization_idle_remint_sec"?}` (the last is the effective re-mint window,
+   added later and written only when diarization is on).
 2. `category` is omitted when no lock exists; `session_meta_line(None)` must not
    default it.
 3. One run id per `TranscriptBuffer` instance, so it is stable across
@@ -63,7 +65,7 @@ that and never rewrites `speakers` with display names. S-labels stay canonical.
 
 ## Files to Modify
 
-- `src/onoats/categories.py` - `session_meta_line(category, *, run_id, diarization)`
+- `src/onoats/categories.py` - `session_meta_line(category, *, run_id, diarization, diarization_idle_remint_sec)`
 - `src/onoats/processors/transcript_buffer.py` - run id, always-on header
 - `src/onoats/dual.py`, `src/onoats/stt/diarization_model.py` - header provenance
 - `src/onoats/stt/diarization_timeline.py` - slot generations, re-mint

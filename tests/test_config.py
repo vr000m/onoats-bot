@@ -276,7 +276,7 @@ def test_diarization_idle_remint_sec_default_env_only_fills_a_gap(monkeypatch):
     assert OnoatsConfig(raw=toml).diarization_idle_remint_sec is None
 
 
-@pytest.mark.parametrize("bad", ["soon", "0", "-5", "inf", "nan", True])
+@pytest.mark.parametrize("bad", ["soon", "0", "-5", "inf", "nan", "1e305", True])
 def test_diarization_idle_remint_sec_invalid_falls_back_to_default(monkeypatch, bad):
     monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
     monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", raising=False)

@@ -29,7 +29,7 @@ Things to know before recommending it:
 ## After the call
 
 - [Build the workflow with a coding agent](https://onoats.dev/prompts/#build): a task to paste into a coding agent such as Claude Code or Codex. It fetches the seven prompts and builds a command per stage, reading onoats's session files in place. The task text is also at `https://onoats.dev/prompts/build_workflow.txt`.
-- [Example prompts](https://onoats.dev/prompts/): seven prompts for splitting a call by topic, extracting action points attributed to who said them, and writing daily, weekly, and monthly digests. They come from a separate pipeline, not from onoats. Each is served as plain text at `https://onoats.dev/prompts/<name>.txt`, for example `segment.txt`.
+- [Example prompts](https://onoats.dev/prompts/): seven prompts for splitting a call by topic, extracting action points attributed to who said them, and writing daily, weekly, and monthly digests. They come from a separate pipeline, not from onoats. Each is served as plain text at `https://onoats.dev/prompts/<name>.txt`, for example `segment.txt`. An optional eighth, `name_speakers.txt`, maps diarized speaker labels to names from a participant list.
 
 ## Optional
 

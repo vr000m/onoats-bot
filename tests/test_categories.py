@@ -108,6 +108,22 @@ def test_session_meta_line_carries_idle_remint_sec_only_when_given():
     )
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0])
+def test_session_meta_line_drops_an_unusable_idle_remint_window(bad):
+    prov = {"model": "m/x", "version": "r"}
+    line = session_meta_line(
+        run_id="abc", diarization=prov, diarization_idle_remint_sec=bad
+    )
+    # strict parse: ``NaN`` / ``Infinity`` are not JSON
+    assert "diarization_idle_remint_sec" not in json.loads(
+        line, parse_constant=lambda c: pytest.fail(f"non-JSON constant {c}")
+    )
+    # the window rides only beside diarization provenance
+    assert "diarization_idle_remint_sec" not in json.loads(
+        session_meta_line(run_id="abc", diarization_idle_remint_sec=1200.0)
+    )
+
+
 def test_session_meta_line_omits_diarization_when_off():
     assert "diarization" not in json.loads(session_meta_line("work", run_id="abc"))
 

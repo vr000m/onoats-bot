@@ -72,11 +72,13 @@ window in seconds (a positive number, e.g. `1200.0`):
 ~~~
 
 A speaker slot that stays silent for longer than this gets a fresh label on its
-next utterance (`S2` can come back as `S6`). A return within the window keeps
-its label; only a longer silence can split one speaker across two labels, so a
-consumer matching speakers across labels should treat this value as the
-shortest silence at which a same-speaker relabel can happen. It is the value
-the run's diarizer was built with (`ONOATS_DIARIZATION_IDLE_REMINT_SEC`, then
+next utterance (`S2` can come back as `S6`). A slot that returns within the
+window keeps its label, so this value is the shortest silence at which the
+diarizer itself re-labels a slot. It does not bound identity: the model can
+still put one person in several slots, or two people in one slot, with no long
+silence at all, so neither a shared label nor a gap shorter than this proves
+who spoke. It is the value the run's diarizer was built with
+(`ONOATS_DIARIZATION_IDLE_REMINT_SEC`, then
 `[stt].diarization_idle_remint_sec`, then
 `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT`, then the built-in default),
 written to every file of the run. Absent when diarization is off or in files
