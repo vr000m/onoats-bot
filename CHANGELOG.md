@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-11-23
+
 ### Fixed
 
 - **Diarization refused to start on pipecat 1.17.** The startup order probe
