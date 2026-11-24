@@ -32,6 +32,12 @@ Annotated tags exist from `v0.9.0` forward.
   `continue` past a segment, or that references `_push_segment_frames` more
   than once. Neither occurs in any pipecat release checked (1.3.0-1.17.0); both
   would strand a speaker span.
+- The order probe now checks the reader's whole loop body and the helper's
+  whole contract rather than matching statements anywhere: it refuses a check
+  between `try` and the hand-off, a misplaced tuple unpack, a helper that
+  calls itself or rebinds its audio, and a second `run_stt` site in a
+  1.9-1.12-shaped class, and no longer refuses a reader or helper because of
+  a local function's `return` or an inner loop's `continue`.
 
 ## [1.7.0] - 2026-11-23
 

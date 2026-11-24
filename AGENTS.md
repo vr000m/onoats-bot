@@ -590,8 +590,11 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   `asyncio.Queue()` built in `__init__`, one handler task created by `start`,
   that handler as the queue's only reader, one unconditional segment `put`
   per VAD stop (only the `not self.is_usable` drop, which the STT mirrors,
-  may exit early; any other `put` is the `None` sentinel), and the reader one
-  sentinel-ended loop awaiting its single `run_stt` once per segment); the
+  may exit early; any other `put` is the `None` sentinel), the reader one
+  sentinel-ended loop of one exact shape whose `try` starts with the hand-off
+  and whose other statements are inert in its own frame, and one `run_stt`
+  reference in the whole class, in the reader or in the helper only the reader
+  references); the
   feeder and the STT
   each count samples with `SampleCounter`, and the feeder's `start_sample` is
   the worker's position authority. Pinned by
@@ -931,3 +934,7 @@ should NOT re-flag go here, one per line:
 - **[Testing] won't-fix**: `swift scripts/render_social_card.swift --check` byte-compares system-font AppKit output after `pngquant`, so it depends on the macOS and `pngquant` versions and does not run in CI. It is a maintainer command for regenerating the card; CI's `check_site.py` gates what can be checked portably (the card named by `og:image` exists, is 1200x630 and is the file the renderer writes). (2026-11-08)
 - **[Security] won't-fix**: the example prompts' `--- BEGIN/END UNTRUSTED ... ---` fences are fixed lines, so transcript text that reproduces one can close a fence early. A static published template cannot carry a per-call random fence; `/prompts/` already says the fences are fixed and tells readers to use a random fence for each call in their own pipeline. (2026-11-08)
 - **[Architecture] won't-fix**: the two `/prompts/` pipeline SVGs keep hard-coded hex colours and stay hand-maintained, by owner decision. A generator and `site.css` token classes were weighed and declined. The checks cover their `#fragment` link targets and the caption text, not the drawings: no check compares the two copies, so keeping them in step is by hand. (2026-11-13)
+- **[Logic] won't-fix**: shapes of pipecat's `SegmentedSTTService` that only a deliberately hostile or obfuscated class could contain, and that `segmented_stt_orders_spans()` therefore does not try to refuse: a receiver alias (`service = self; service._push_segment_frames(...)`), `self` rebound in the helper prefix, a `yield` added after the helper loop, a property setter that schedules the helper, a decorator (retry, wrapper) on the reader or helper, a second reader started through `getattr(self, "_segment_task_handler")`, and an alias of `_segment_queue`. pipecat is a trusted dependency and the failure the probe guards is an ordinary upstream refactor (the 1.9 and 1.17 reader changes), so soundness against adversarial source is not the goal. Every review round of the 1.17 fix (rounds 1-2, 2026-11-24) turned up another shape of this kind, so chasing them is not converging; `.github/workflows/pipecat-drift.yml` is the guard against real drift. Add a shape to the probe when a real pipecat release produces it. (2026-11-24)
+- **[Logic] won't-fix**: a comprehension target named like the helper's audio parameter (`[audio for audio in ...]`) after the helper loop makes the probe refuse an otherwise sound class. The binding walk is deliberately conservative: a false refusal blocks diarization loudly at startup, a false acceptance mislabels speakers silently. (2026-11-24)
+- **[Architecture] won't-fix**: the order probe stays in `diarization_timeline.py` (about 40% of that module now) and keeps its detail in the probe docstrings and the Them-channel invariants above. Moving it to its own leaf module, or recording a design that keys spans by segment identity (pipecat 1.17 carries `_transcribing_segment`) in the plan, is a separate change; neither affects behaviour. (2026-11-24)
+- **[Architecture] won't-fix**: `.github/workflows/pipecat-drift.yml` pins `actions/checkout` and `astral-sh/setup-uv` by tag, as `ci.yml` and `release.yml` do. The job has a read-only token, `persist-credentials: false` and no secrets, so SHA-pinning one workflow would only make it inconsistent with the others. (2026-11-24)
