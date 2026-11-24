@@ -50,7 +50,7 @@
     </div>
     <div class="intro">
       <h1>Example prompts for after the call</h1>
-      <p class="lede">onoats writes the transcripts. These are the prompts I use to turn them into topics, action points and digests. They come from my own pipeline, not from onoats, and are illustrative: the rest of that pipeline is not published, so expect to adapt the wording and fields to yours. To have a coding agent build the workflow from them, <a href="#build">start from this task</a>.</p>
+      <p class="lede">onoats writes the transcripts. These are the prompts I use to turn them into topics, action points and digests. They come from my own pipeline, not from onoats, and are illustrative: the rest of that pipeline is not published, so expect to adapt the wording and fields to yours. To have a coding agent build the workflow from them, <a href="#build">start from this task</a>. To put names on diarized speakers, <a href="#name-speakers">see how koda does it</a>.</p>
       <p class="lede" style="margin-top:14px">Each file is a Python <code>str.format</code> template: <code>{name}</code> is a placeholder you fill in, and <code>{{</code> and <code>}}</code> are literal braces in the JSON examples. They expect transcripts with <code>Me:</code> and <code>Them:</code> lines, which is how onoats tags its two channels.</p>
     </div>
   </div>
@@ -606,6 +606,12 @@ Use these exact level-2 Markdown headings (`## `, each on its own line — not b
   <section class="sec">
     <div class="wrap">
       <ul class="build">
+        <li id="name-speakers">
+          <h2 class="st">Put names on the speakers</h2>
+          <p>With diarization on, the <code>them</code> channel comes out as S1, S2 and so on. Those are model slots, not people. koda, the pipeline these prompts come from, is adding a step that maps them to names. It reads the call's invite with <a href="https://github.com/vr000m/macos-calendar-events">macos-calendar-events</a> to get the participant list, then asks a model to match each label to a name from how people introduce themselves or each other in the call, such as &ldquo;Hi, it's Sam&rdquo; or &ldquo;over to you, Priya&rdquo;.</p>
+          <p>Two <code>session_meta</code> fields feed that step. <code>run_id</code> ties the files of one recording together, so a label means the same slot in all of them. <code>diarization_idle_remint_sec</code> is how long a silent slot can stay quiet before it comes back under a new label, so S2 can return as S6. A label that fails to match a name stays a label.</p>
+          <p class="meta">This is not an onoats feature. onoats writes the labels and those two fields; the invite lookup and the matching live in koda.</p>
+        </li>
         <li id="build">
           <h2 class="st">Build the workflow with a coding agent</h2>
           <p>Paste this task into a coding agent such as Claude Code or Codex, in the folder where you want the tool to live. It asks before it reads your sessions from the onoats data folder, fetches the seven prompts above, builds a command for each stage of the diagram, and asks you which model to call and how to fill the placeholders your files do not hold.</p>
