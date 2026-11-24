@@ -475,7 +475,6 @@ async def run_onoats_dual(
     _acquire_instance_lock(data_dir / ".active")
 
     from onoats.config import load_config
-
     from onoats.runtime import RecorderSessionConfig
 
     if session_config is None:
@@ -511,6 +510,17 @@ async def run_onoats_dual(
                 )
             telemetry_state.set_transcript(text, source, speaker_label)
 
+    effective_remint_sec: float | None = None
+    if cfg.diarization:
+        # Lazy: pulls numpy, which only diarized runs need here.
+        from onoats.stt.diarization_timeline import effective_idle_remint_sec
+
+        # The timeline's own rule, so the header can never name a window the
+        # timeline was not built with.
+        effective_remint_sec = effective_idle_remint_sec(
+            cfg.diarization_idle_remint_sec
+        )
+
     transcript_buffer = TranscriptBuffer(
         data_dir=data_dir,
         track_vad_gaps=True,
@@ -520,6 +530,9 @@ async def run_onoats_dual(
         # with. A runtime degrade does not change it; per-utterance `speakers`
         # is the truth about whether a line was labelled.
         diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
+        # Effective window (config/env, else the timeline default) so a
+        # consumer never has to re-derive it from private config.
+        diarization_idle_remint_sec=effective_remint_sec,
         on_transcript=_publish_transcript if audio_source == "socket" else None,
     )
 

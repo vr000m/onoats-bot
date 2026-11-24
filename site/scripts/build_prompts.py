@@ -219,7 +219,8 @@ def prompt_errors(name: str, text: str, page: str) -> list[str]:
             f"{label}: the page documents {sorted(documented or [])},"
             f" the template takes {sorted(fields)}"
         )
-    for field in sorted(fields - TRUSTED_FIELDS - UNTRUSTED_FIELDS):
+    untrusted = UNTRUSTED_FIELDS | EXTRA_UNTRUSTED_FIELDS
+    for field in sorted(fields - TRUSTED_FIELDS - EXTRA_TRUSTED_FIELDS - untrusted):
         errors.append(f"{label}: {{{field}}} is not classified as trusted or untrusted")
 
     lines = text.splitlines()
@@ -262,7 +263,7 @@ def prompt_errors(name: str, text: str, page: str) -> list[str]:
         if begin["label"] != fence["label"]:
             errors.append(f"{label}:{number + 1}: END label does not match BEGIN")
         body = lines[open_at + 1 : number]
-        if len(body) != 1 or body[0] not in {f"{{{f}}}" for f in UNTRUSTED_FIELDS}:
+        if len(body) != 1 or body[0] not in {f"{{{f}}}" for f in untrusted}:
             errors.append(
                 f"{label}:{open_at + 1}: a fence must hold exactly one untrusted"
                 " placeholder line"
@@ -273,9 +274,7 @@ def prompt_errors(name: str, text: str, page: str) -> list[str]:
 
     for number, line in enumerate(lines):
         for field in _fields(line):
-            if field in UNTRUSTED_FIELDS and (
-                number not in fenced or line != f"{{{field}}}"
-            ):
+            if field in untrusted and (number not in fenced or line != f"{{{field}}}"):
                 errors.append(
                     f"{label}:{number + 1}: {{{field}}} must be alone on a line"
                     " inside an UNTRUSTED fence"
@@ -348,6 +347,19 @@ FACTS: dict[str, tuple[tuple[str, Callable[[str], bool]], ...]] = {
             " and <code>tags</code>",
             lambda t: all(
                 f'"{k}":' in t for k in ("category", "confidence", "summary", "tags")
+            ),
+        ),
+    ),
+    "name_speakers.txt": (
+        (
+            "either <code>null</code> or <code>participant</code>,"
+            " <code>confidence</code>, <code>role</code> and <code>quote</code>",
+            lambda t: (
+                all(
+                    f'"{k}":' in t
+                    for k in ("participant", "confidence", "role", "quote")
+                )
+                and ": null" in t
             ),
         ),
     ),
@@ -563,6 +575,19 @@ CAPTION_UNBACKED: tuple[str, ...] = ("schedule",)
 # returns ...", numbered by the page's steps list, and its claims about how they
 # connect are bound to the same checks as the diagram caption's.
 AGENT_PROMPT = "build_workflow.txt"
+# Prompts that sit outside the seven-step pipeline (an optional step after it).
+# They get the marker, untrusted-data and FACTS checks, but the diagram caption
+# and the coding-agent task describe the seven only, so they are left out of
+# those checks.
+EXTRA_PROMPTS: dict[str, tuple[object, ...]] = {"name_speakers.txt": ()}
+# Their placeholders are classified here, apart from the pipeline's sets above,
+# which the coding-agent task's ask list is checked against. ``labels`` is the
+# one exception to "the caller computes it from a date or a count": it is a list
+# of diarizer labels taken from the session's ``speakers`` values, and the prompt
+# asks for one JSON key per label. It sits outside a fence, so the caller must
+# build it from labels that match ``S`` plus digits, never from raw file text.
+EXTRA_TRUSTED_FIELDS = frozenset({"labels"})
+EXTRA_UNTRUSTED_FIELDS = frozenset({"participants"})
 PROMPT_URL = "https://onoats.dev/prompts/"
 # One grammar for a prompt's line: agent_errors reads its number, name and
 # placeholders from the groups, _returns_errors the whole line (group 0).
@@ -788,6 +813,7 @@ PROMPT_TABLES: dict[str, dict[str, tuple[object, ...]]] = {
     "FACTS": FACTS,
     "UNBACKED_WORDS": UNBACKED_WORDS,
     "AGENT_RETURNS": AGENT_RETURNS,
+    "EXTRA_PROMPTS": EXTRA_PROMPTS,
 }
 
 
@@ -962,9 +988,17 @@ def _load(repo_root: Path) -> tuple[str, dict[str, str]]:
     prompts = {
         path.name: path.read_text(encoding="utf-8")
         for path in sorted((repo_root / PROMPT_DIR).glob("*.txt"))
-        if path.name != AGENT_PROMPT
+        if path.name != AGENT_PROMPT and path.name not in EXTRA_PROMPTS
     }
     return page, prompts
+
+
+def _load_extra(repo_root: Path) -> dict[str, str]:
+    return {
+        name: (repo_root / PROMPT_DIR / name).read_text(encoding="utf-8")
+        for name in sorted(EXTRA_PROMPTS)
+        if (repo_root / PROMPT_DIR / name).is_file()
+    }
 
 
 def _load_agent(repo_root: Path) -> str | None:
@@ -972,8 +1006,11 @@ def _load_agent(repo_root: Path) -> str | None:
     return path.read_text(encoding="utf-8") if path.is_file() else None
 
 
-def _prompt_files(prompts: dict[str, str], agent: str | None) -> set[str]:
-    return set(prompts) | ({AGENT_PROMPT} if agent is not None else set())
+def _prompt_files(
+    prompts: dict[str, str], agent: str | None, extra: dict[str, str]
+) -> set[str]:
+    agent_file = {AGENT_PROMPT} if agent is not None else set()
+    return set(prompts) | set(extra) | agent_file
 
 
 def collect_errors(repo_root: Path) -> list[str]:
@@ -982,19 +1019,20 @@ def collect_errors(repo_root: Path) -> list[str]:
     and PROMPT_TABLES keys that name no prompt file."""
 
     page, prompts = _load(repo_root)
+    extra = _load_extra(repo_root)
     agent = _load_agent(repo_root)
-    errors = marker_errors(page, _prompt_files(prompts, agent))
+    errors = marker_errors(page, _prompt_files(prompts, agent, extra))
     if agent is None:
         errors.append(f"{PROMPT_DIR / AGENT_PROMPT} is missing")
     if not errors and render(page, repo_root / PROMPT_DIR) != page:
         errors.append(f"{PAGE} is stale; run build_prompts.py")
-    for name, text in prompts.items():
+    for name, text in {**prompts, **extra}.items():
         errors.extend(prompt_errors(name, text, page))
         errors.extend(fact_errors(name, text, page))
     errors.extend(caption_errors(page, prompts))
     if agent is not None:
         errors.extend(agent_errors(page, prompts, agent))
-    errors.extend(orphan_errors(prompts))
+    errors.extend(orphan_errors({**prompts, **extra}))
     return errors
 
 
@@ -1009,7 +1047,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.check:
         page, prompts = _load(repo_root)
-        errors = marker_errors(page, _prompt_files(prompts, _load_agent(repo_root)))
+        errors = marker_errors(
+            page,
+            _prompt_files(prompts, _load_agent(repo_root), _load_extra(repo_root)),
+        )
         if not errors:
             out = render(page, repo_root / PROMPT_DIR)
             if out != page:

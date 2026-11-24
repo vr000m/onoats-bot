@@ -543,7 +543,7 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   on the worker thread via `load_mlx_diarizer`), no feeder/labeler is wired, no
   attribute reaches a frame, and utterance JSONL/render are unchanged (the
   always-written `session_meta` header then carries `run_id` only, no
-  `diarization` key).
+  `diarization` or `diarization_idle_remint_sec` key).
 - **The worker thread owns the model and the coverage writes.** One daemon
   thread (`diar-worker`; bounded join in the feeder's `cleanup()`, never on
   the frame path) does the load, `set_streaming_config("low")`, every
@@ -618,12 +618,21 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   both speakers are active. Pinned by `tests/test_diarization_timeline.py`.
 - **`session_meta` is line 1 of every file, `category` only on a lock.**
   `TranscriptBuffer` writes `{"type":"session_meta","run_id", "category"?,
-  "diarization"?}` through `categories.session_meta_line`; never default
+  "diarization"?, "diarization_idle_remint_sec"?}` through
+  `categories.session_meta_line`; never default
   `category` (the consumer reads any non-blank value as a hard classification
   lock). `run_id` is minted once per buffer (so stable across continuation
   files), `diarization` is `diarization_model.provenance()` and is configuration
-  provenance only (a runtime degrade leaves it stale by design). Never put a
-  speaker list in it. Pinned by `tests/test_categories.py`.
+  provenance only (a runtime degrade leaves it stale by design).
+  `diarization_idle_remint_sec` is the effective re-mint window (config/env,
+  else `SLOT_IDLE_REMINT_SEC`), written only when diarization is on; env
+  precedence is `ONOATS_DIARIZATION_IDLE_REMINT_SEC` > `[stt]` key >
+  `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT` > built-in.
+  `diarization_timeline.effective_idle_remint_sec` is the one owner of that
+  default (the timeline and the header both call it), header values go through
+  `config.parse_idle_remint_sec`, and a window above 1e9 s is rejected. Never
+  put a speaker list in it. Pinned by `tests/test_categories.py` (header shape) and
+  `tests/test_dual_socket_source.py` (the value `dual` hands the buffer).
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
   composed at render/live-terminal/UI-adapter time by

@@ -190,7 +190,10 @@ fails before audio capture and prints the remediation.
 - Labels remain unique within one recorder run and can exceed `S8`.
 - A slot idle for more than 20 minutes receives a new number when it returns.
   Tune this with `[stt].diarization_idle_remint_sec` or
-  `ONOATS_DIARIZATION_IDLE_REMINT_SEC`.
+  `ONOATS_DIARIZATION_IDLE_REMINT_SEC`. A wrapper can set
+  `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT` to supply a fallback that applies
+  only when neither of those is set. The effective value is written to each
+  file's `session_meta` as `diarization_idle_remint_sec`.
 - A speaker may split across slots, and quiet or overlapped speech may remain
   unlabelled.
 - Runtime failure is fail-open: onoats logs once and continues transcription

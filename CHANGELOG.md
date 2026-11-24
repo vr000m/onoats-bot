@@ -15,8 +15,20 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-23
+
 ### Added
 
+- **Re-mint window in the queue contract.** `session_meta` now carries
+  `diarization_idle_remint_sec` (the effective idle window, diarization on
+  only), and `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT` supplies a fallback
+  used only when neither the explicit env var nor `config.toml` sets one.
+  Both are optional and backward compatible. A value too large for the
+  diarizer's sample count (above 1e9 seconds) is now rejected with the usual
+  warning instead of crashing the recorder at startup.
+- **Speaker-naming prompt.** The prompts page has an optional `name_speakers.txt`
+  that maps diarized labels (S1, S2) to participants from a calendar invite,
+  using self-introductions and hand-overs in the call.
 - **Prompts page diagram.** `/prompts/` now opens with a pipeline diagram of
   how the seven example prompts fit together (a single-column version on narrow
   screens), a "Returns" line under each prompt, and section anchors that the

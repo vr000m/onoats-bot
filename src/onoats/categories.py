@@ -9,8 +9,8 @@ The validated ``--category`` is NOT written into the filename — the
 ``{session_id}`` stem stays load-bearing for a consumer's back-fill keying.
 Instead it rides in the queue contract as the ``category`` key of the typed
 ``session_meta`` FIRST line (written on every session file; ``category`` only
-when a lock exists, alongside ``run_id`` and optional ``diarization``
-provenance)::
+when a lock exists, alongside ``run_id`` and optional ``diarization`` and
+``diarization_idle_remint_sec`` provenance)::
 
     {"type": "session_meta", "run_id": "<hex>", "category": "<cat>"}
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 
-from onoats.config import OnoatsConfig, load_config
+from onoats.config import OnoatsConfig, load_config, parse_idle_remint_sec
 
 DEFAULT_CATEGORY = "uncategorized"
 INVALID_CATEGORY_ERROR_TAG = "ONOATS-ERROR invalid-category"
@@ -70,6 +70,7 @@ def session_meta_line(
     *,
     run_id: str | None = None,
     diarization: dict[str, str] | None = None,
+    diarization_idle_remint_sec: float | None = None,
 ) -> str:
     """Return the JSONL ``session_meta`` first line for a session.
 
@@ -78,8 +79,10 @@ def session_meta_line(
     default such as ``uncategorized`` would pin every transcript. ``run_id`` is
     an opaque per-recorder-run token; ``diarization`` is provenance
     (``{"model", "version"}``) recording that diarization was configured on,
-    not that a line was labelled. The returned string has NO trailing newline
-    — the writer appends it.
+    not that a line was labelled. ``diarization_idle_remint_sec`` is the
+    effective idle window (seconds) after which a silent speaker slot is given
+    a fresh label; omitted when diarization is off. The returned string has NO
+    trailing newline — the writer appends it.
     """
     meta: dict[str, object] = {"type": "session_meta"}
     if category:
@@ -88,4 +91,15 @@ def session_meta_line(
         meta["run_id"] = run_id
     if diarization:
         meta["diarization"] = dict(diarization)
+    # The window only means something beside diarization provenance. It must
+    # pass the same predicate the config reader applies (so the header never
+    # names a window the reader would reject, and ``json.dumps`` can never emit
+    # the non-JSON ``NaN``/``Infinity`` or a bool as ``true``).
+    if diarization and diarization_idle_remint_sec is not None:
+        try:
+            window = parse_idle_remint_sec(diarization_idle_remint_sec)
+        except ValueError:
+            window = None
+        if window is not None:
+            meta["diarization_idle_remint_sec"] = window
     return json.dumps(meta, ensure_ascii=False)

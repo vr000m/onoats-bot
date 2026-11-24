@@ -141,12 +141,12 @@
 
     <div class="disk">
       <h2>The same call, on disk</h2>
-      <p class="cap">One JSON object per line. <code>source</code> is always <code>me</code> or <code>them</code>. Example, not a real recording.</p>
-<pre><span class="k">{"type":"session_meta","run_id":"3f9c1a7e5b2d4086a1c9e7d3b4f2a650"}</span>
+      <p class="cap">One JSON object per line. <code>source</code> is always <code>me</code> or <code>them</code>. With diarization on, the header also records the re-mint window and <code>them</code> lines carry <code>speakers</code>. Example, not a real recording.</p>
+<pre><span class="k">{"type":"session_meta","run_id":"3f9c1a7e5b2d4086a1c9e7d3b4f2a650","diarization":{"model":"mlx-community/Nemotron-3-Diarization","version":"8c1e0f4a2b6d93e57f10a4c8d2e6b9137a5f0c4e"},"diarization_idle_remint_sec":1200.0}</span>
 {"type":"utterance","time":"2026-11-08T09:30:00+00:00","text":"Okay, recording. Can you hear me?","source":"<span class="s-me">me</span>"}
-{"type":"utterance","time":"2026-11-08T09:30:04+00:00","text":"Loud and clear. Roadmap first?","source":"<span class="s-them">them</span>"}
+{"type":"utterance","time":"2026-11-08T09:30:04+00:00","text":"Loud and clear. Roadmap first?","source":"<span class="s-them">them</span>","speakers":["S1"],"overlap":false}
 {"type":"utterance","time":"2026-11-08T09:30:09+00:00","text":"Before that, did the migration finish?","source":"<span class="s-me">me</span>"}
-{"type":"utterance","time":"2026-11-08T09:30:13+00:00","text":"Overnight, no errors.","source":"<span class="s-them">them</span>"}</pre>
+{"type":"utterance","time":"2026-11-08T09:30:13+00:00","text":"Overnight, no errors.","source":"<span class="s-them">them</span>","speakers":["S1"],"overlap":false}</pre>
     </div>
   </div>
 </header>

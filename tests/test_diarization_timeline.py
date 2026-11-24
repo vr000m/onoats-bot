@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 from loguru import logger
-
 from onoats.stt import diarization_timeline as dt
 from onoats.stt.diarization_timeline import DiarizationTimeline
 
@@ -303,6 +302,13 @@ def test_idle_remint_threshold_is_per_timeline_and_defaults_to_the_constant():
         t.record(0, probs(frames(2), s0=ON))
         t.record(seconds(gap), probs(frames(2), s0=ON))
         assert t.label_for(seconds(gap), seconds(gap + 2)).speakers == [expected]
+
+
+def test_effective_idle_remint_sec_is_the_one_default_rule():
+    # ``dual`` writes this into the header; the timeline builds from it.
+    assert dt.effective_idle_remint_sec(None) == dt.SLOT_IDLE_REMINT_SEC
+    assert dt.effective_idle_remint_sec(300) == 300.0
+    assert dt.effective_idle_remint_sec(0.5) == 0.5
 
 
 def test_first_activity_and_remint_are_logged_with_the_slot_and_label():
