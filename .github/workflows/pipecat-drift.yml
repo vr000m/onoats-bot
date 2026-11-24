@@ -1,0 +1,59 @@
+name: Pipecat drift
+
+# CI and uv.lock pin one pipecat-ai (see pyproject), but users float to the
+# newest release inside the declared range. pipecat ships about weekly, and the
+# diarization preflight (`segmented_stt_orders_spans`) fails closed on any
+# SegmentedSTTService shape it cannot read, so a refactor upstream shows up as a
+# startup failure on a user's machine (pipecat 1.17, fixed in 1.7.1). This job
+# runs the suite against the newest allowed pipecat so that failure is seen here
+# first. A red run means: read the failing step, extend the probe or the
+# adapter, and keep it fail-closed.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1,4"  # Monday and Thursday, 06:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/pipecat-drift.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  newest-pipecat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system deps (PortAudio for pyaudio)
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      # Upgrades only pipecat-ai, within the bounds in pyproject.toml. The lock
+      # edit stays in this ephemeral checkout.
+      - name: Sync with the newest allowed pipecat-ai
+        run: uv sync --dev --upgrade-package pipecat-ai
+
+      - name: Show resolved pipecat
+        run: uv pip list | grep -i "^pipecat"
+
+      # Named step so a red run says what drifted before the broad suite runs.
+      - name: Diarization order probe accepts this pipecat
+        run: |
+          uv run python - <<'PY'
+          import importlib.metadata as md
+          from onoats.stt import diarization_timeline as dt
+
+          version = md.version("pipecat-ai")
+          ok = dt.segmented_stt_orders_spans()
+          print(f"pipecat-ai {version}: segmented_stt_orders_spans() -> {ok}")
+          raise SystemExit(0 if ok else 1)
+          PY
+
+      - name: Tests
+        run: uv run pytest -q
