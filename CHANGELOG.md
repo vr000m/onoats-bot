@@ -39,6 +39,11 @@ Annotated tags exist from `v0.9.0` forward.
   1.9-1.12-shaped class, and no longer refuses a reader or helper because of
   a local function's `return` or an inner loop's `continue`.
 
+- A `pipecat-drift` workflow upgrades only `pipecat-ai` within the declared
+  range, asserts the probe accepts it, and runs the full suite. It runs Monday
+  and Thursday, on manual dispatch, and on PRs touching the probe,
+  `pyproject.toml`, the STT service or their tests.
+
 ## [1.7.0] - 2026-11-23
 
 ### Added

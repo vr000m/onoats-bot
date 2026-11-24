@@ -657,8 +657,9 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
 **Pipecat drift is watched by `.github/workflows/pipecat-drift.yml`.** CI and
 `uv.lock` pin one pipecat, but users float to the newest release in range, and
 `segmented_stt_orders_spans` fails closed on any shape it cannot read. The
-workflow runs Monday and Thursday: `uv sync --upgrade-package pipecat-ai`, a
-named probe step, then the full suite. A red run means pipecat refactored
+workflow runs Monday and Thursday, on manual dispatch, and on PRs touching the
+probe, `pyproject.toml`, the STT service or their tests: `uv sync
+--upgrade-package pipecat-ai`, a named probe step, then the full suite. A red run means pipecat refactored
 something we depend on; extend the probe or adapter and keep it fail-closed.
 It reports by failing the run only (no issue is opened), so check the Actions tab.
 
