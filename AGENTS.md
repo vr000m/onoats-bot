@@ -543,7 +543,7 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   on the worker thread via `load_mlx_diarizer`), no feeder/labeler is wired, no
   attribute reaches a frame, and utterance JSONL/render are unchanged (the
   always-written `session_meta` header then carries `run_id` only, no
-  `diarization` key).
+  `diarization` or `diarization_idle_remint_sec` key).
 - **The worker thread owns the model and the coverage writes.** One daemon
   thread (`diar-worker`; bounded join in the feeder's `cleanup()`, never on
   the frame path) does the load, `set_streaming_config("low")`, every

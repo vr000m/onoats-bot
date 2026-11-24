@@ -9,8 +9,8 @@ The validated ``--category`` is NOT written into the filename — the
 ``{session_id}`` stem stays load-bearing for a consumer's back-fill keying.
 Instead it rides in the queue contract as the ``category`` key of the typed
 ``session_meta`` FIRST line (written on every session file; ``category`` only
-when a lock exists, alongside ``run_id`` and optional ``diarization``
-provenance)::
+when a lock exists, alongside ``run_id`` and optional ``diarization`` and
+``diarization_idle_remint_sec`` provenance)::
 
     {"type": "session_meta", "run_id": "<hex>", "category": "<cat>"}
 

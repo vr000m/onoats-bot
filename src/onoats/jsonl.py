@@ -3,12 +3,14 @@
 A session file is a type-discriminated JSONL stream:
 
     {"type": "session_meta", "run_id": "<hex>", "category"?: "<cat>",
-     "diarization"?: {"model": "...", "version": "..."}}   # FIRST line
+     "diarization"?: {"model": "...", "version": "..."},
+     "diarization_idle_remint_sec"?: <float>}              # FIRST line
     {"type": "utterance", "time": "...", "text": "...", "source": "me"|"them",
      "speakers"?: ["S1", ...], "overlap"?: bool}
     {"type": "silence_gap", "time": "...", "duration_seconds": N}
 
-``category`` is present only when ``--category`` locks one; ``speakers`` /
+``category`` is present only when ``--category`` locks one;
+``diarization_idle_remint_sec`` only when diarization is on; ``speakers`` /
 ``overlap`` only on a diarization-labelled ``them`` utterance.
 
 This is onoats' own minimal reader — no upstream classifier/segmenter/renderer
