@@ -1190,3 +1190,16 @@ recording now passes one caller-owned `RecorderSessionConfig` snapshot to both S
 so the diarization flag, span stamping, telemetry state, and backend selection
 cannot split during startup. Direct helper calls without a snapshot still load
 the current config, and `bot-single` passes its own one-session `RecorderSessionConfig`.
+
+### 2026-11-24 correction: order probe accepts pipecat 1.17
+
+The "1.9-1.12 reader" shape recorded in the review rounds above is no longer the
+only one `segmented_stt_orders_spans` accepts. pipecat 1.17 queues
+`(audio, number)` tuples and its one reader task awaits `_push_segment_frames`,
+the class's only `run_stt` site, so the 1.9-1.12 probe refused it and diarization
+would not start (fixed in 1.7.1, PR #46). The probe now accepts either reader
+shape and still fails closed unless the helper runs `run_stt` once, unconditionally,
+with the reader as its only caller; a reader that can `continue` past a segment, or
+references the helper twice, is refused. `.github/workflows/pipecat-drift.yml` runs
+the probe and the suite against the newest allowed pipecat twice a week. Checked
+pipecat range: 1.3.0-1.17.0.
