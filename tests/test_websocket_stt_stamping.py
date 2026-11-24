@@ -276,9 +276,10 @@ def test_spans_stay_aligned_when_run_stt_is_deferred(monkeypatch):
     deferred: list[bytes] = []
 
     async def _queued(frame):
-        svc._user_speaking = False
-        deferred.append(bytes(svc._audio_buffer))
-        svc._audio_buffer.clear()
+        # Placeholder audio: the scripted client ignores it, and pipecat's own
+        # buffer attribute differs across versions (``_audio_buffer`` before
+        # 1.17, ``_speech_buffer`` after), so this must not read it.
+        deferred.append(b"\x01\x00" * CHUNK)
         if len(deferred) == 3:
             for audio in deferred:
                 await svc.process_generator(svc.run_stt(audio))
