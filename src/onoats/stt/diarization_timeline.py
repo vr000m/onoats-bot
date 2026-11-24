@@ -120,8 +120,10 @@ def segmented_stt_orders_spans() -> bool:
     VAD-stops were seen. Two shapes guarantee that: pipecat 1.3.0-1.8.x await
     ``run_stt`` inline in the stop handler, once and unconditionally
     (:func:`_inline_handler_runs_stt_once`); from 1.9.0 the handler puts the
-    segment on ``_segment_queue`` (1.17 puts an ``(audio, number)`` tuple) and ONE ``_segment_task_handler`` task takes
-    them off one at a time. The queue shape is only in order if the whole
+    segment on ``_segment_queue`` (1.17 puts an ``(audio, number)`` tuple and
+    its reader hands the audio to ``_push_segment_frames``) and ONE
+    ``_segment_task_handler`` task takes them off one at a time. The queue
+    shape is only in order if the whole
     class agrees (:func:`_segment_queue_is_one_fifo_consumer`): the queue is
     built once as a plain ``asyncio.Queue()`` (not LIFO / priority),
     ``start`` creates exactly one handler task, the queue's only reader, each
@@ -387,7 +389,7 @@ def _stop_handler_puts_one_segment(tree: object) -> bool:
     """True iff the VAD-stop handler puts its segment on EVERY stop it does not drop.
 
     The STT appends one span per VAD-stop and skips only when ``is_usable`` is
-    false (mirroring pipecat 1.9-1.12, which drops that segment). So the put
+    false (mirroring pipecat 1.9-1.17, which drops that segment). So the put
     must be one top-level ``await self._segment_queue.put(<segment>)``
     statement (not under a branch or loop), and every ``return`` / ``raise``
     in the handler must sit in an ``if not self.is_usable:`` block - any
@@ -437,7 +439,8 @@ def _reader_drains_one_for_one(
 
     i.e. one top-level ``while <flag>:`` loop (no ``else``) ended ONLY by the
     ``None`` sentinel (``<flag>`` is otherwise only ever ``True``), with no
-    ``return`` / ``break`` / ``raise`` inside it, whose body gets one item and
+    ``return`` / ``break`` / ``continue`` / ``raise`` inside it (``continue``
+    would skip a segment without calling ``run_stt``), whose body gets one item and
     awaits the handler's ONE ``run_stt`` call on it - reached through nothing
     but ``if <item>:`` and a ``try`` body. A one-shot reader, a ``run_stt``
     outside the loop, a second or skippable ``run_stt`` would strand a span
@@ -464,7 +467,10 @@ def _reader_drains_one_for_one(
     if loop.orelse or not isinstance(loop.test, ast.Name):
         return False
     flag = loop.test.id
-    if any(isinstance(n, (ast.Return, ast.Break, ast.Raise)) for n in ast.walk(loop)):
+    if any(
+        isinstance(n, (ast.Return, ast.Break, ast.Continue, ast.Raise))
+        for n in ast.walk(loop)
+    ):
         return False
 
     # ``<item> = await self._segment_queue.get()``, directly in the loop body.
@@ -594,6 +600,10 @@ def _reader_drains_one_for_one(
     elif not run_calls and len(helper_calls) == 1:
         helper_call = helper_calls[0]
         if not _is_item_arg(helper_call):
+            return False
+        # The awaited call is the reader's ONLY reference to the helper: a bare
+        # reference (a callback handed to the loop) is a second way to run it.
+        if sum(_is_self_attr(n, _SEGMENT_PUSH_HELPER) for n in ast.walk(fn)) != 1:
             return False
         helper = (methods or {}).get(_SEGMENT_PUSH_HELPER)
         if helper is None or not _helper_runs_stt_once(helper):

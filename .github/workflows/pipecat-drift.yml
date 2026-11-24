@@ -13,9 +13,13 @@ on:
   schedule:
     - cron: "17 6 * * 1,4"  # Monday and Thursday, 06:17 UTC
   workflow_dispatch:
+  # Also when the probe or its tests change: ci.yml only sees the locked pipecat,
+  # so this is the one place a probe edit meets the newest release.
   pull_request:
     paths:
       - ".github/workflows/pipecat-drift.yml"
+      - "src/onoats/stt/diarization_timeline.py"
+      - "tests/test_diarization_timeline.py"
 
 permissions:
   contents: read
@@ -23,6 +27,7 @@ permissions:
 jobs:
   newest-pipecat:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 

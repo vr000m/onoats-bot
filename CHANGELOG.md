@@ -26,6 +26,13 @@ Annotated tags exist from `v0.9.0` forward.
   accepts that shape, still failing closed when the helper or its single caller
   can skip, repeat or reorder a segment.
 
+### Changed
+
+- The diarization order probe now also refuses a segment reader that can
+  `continue` past a segment, or that references `_push_segment_frames` more
+  than once. Neither occurs in any pipecat release checked (1.3.0-1.17.0); both
+  would strand a speaker span.
+
 ## [1.7.0] - 2026-11-23
 
 ### Added

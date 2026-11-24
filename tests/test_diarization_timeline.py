@@ -839,6 +839,29 @@ async def _reader_returns_inside_loop(self):  # pragma: no cover - never run
             return
 
 
+async def _reader_continues_before_helper(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            if self._muted:
+                continue
+            await self._push_segment_frames(audio)
+
+
+async def _reader_references_helper_twice(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            self._loop.call_soon(self._push_segment_frames, b"x")
+            await self._push_segment_frames(audio)
+
+
 @pytest.mark.parametrize(
     "reader",
     [
@@ -847,6 +870,8 @@ async def _reader_returns_inside_loop(self):  # pragma: no cover - never run
         _reader_hands_over_other_audio,
         _reader_calls_helper_and_run_stt,
         _reader_returns_inside_loop,
+        _reader_continues_before_helper,
+        _reader_references_helper_twice,
     ],
     ids=[
         "extra-condition",
@@ -854,6 +879,8 @@ async def _reader_returns_inside_loop(self):  # pragma: no cover - never run
         "not-the-segment",
         "helper-and-run_stt",
         "return-in-loop",
+        "continue-before-hand-off",
+        "helper-referenced-twice",
     ],
 )
 def test_segmented_stt_orders_spans_false_unless_the_reader_hands_each_segment_on(
@@ -874,6 +901,20 @@ def test_segmented_stt_orders_spans_false_when_another_method_calls_the_helper(
     """A second caller of ``_push_segment_frames`` (here the VAD-stop handler)
     would transcribe a segment outside the one in-order task."""
     _patch_helper_shape(monkeypatch, stop_handler=_stop_calls_helper)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _stop_also_calls_run_stt(self, frame):  # pragma: no cover - never run
+    await self._segment_queue.put((b"a", 1))
+    await self.process_generator(self.run_stt(b"a"))
+
+
+def test_segmented_stt_orders_spans_false_when_another_method_calls_run_stt(
+    monkeypatch,
+):
+    """The helper must be the class's ONLY ``run_stt`` site: a second one (here
+    the VAD-stop handler) transcribes a segment outside the one in-order task."""
+    _patch_helper_shape(monkeypatch, stop_handler=_stop_also_calls_run_stt)
     assert dt.segmented_stt_orders_spans() is False
 
 
@@ -1037,6 +1078,28 @@ async def _handler_other_condition(self):  # pragma: no cover - never run
             await self.process_generator(self.run_stt(audio))
 
 
+async def _handler_continues_before_run_stt(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if self._muted:
+            continue
+        if audio:
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_continues_inside_if(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio:
+            if self._muted:
+                continue
+            await self.process_generator(self.run_stt(audio))
+
+
 async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
     running = True
     while running:
@@ -1057,6 +1120,8 @@ async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
         _handler_stops_on_a_non_sentinel,
         _handler_other_condition,
         _handler_run_stt_not_awaited,
+        _handler_continues_before_run_stt,
+        _handler_continues_inside_if,
     ],
     ids=[
         "one-shot",
@@ -1067,6 +1132,8 @@ async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
         "loop-ends-without-sentinel",
         "extra-run_stt-condition",
         "run_stt-not-awaited",
+        "continue-before-run_stt",
+        "continue-inside-if",
     ],
 )
 def test_segmented_stt_orders_spans_false_unless_the_reader_drains_one_for_one(

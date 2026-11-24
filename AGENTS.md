@@ -879,8 +879,8 @@ should NOT re-flag go here, one per line:
 - **[Logic] won't-fix**: `segmented_stt_orders_spans()` inspects the stop handler
   and the queue methods but not `SegmentedSTTService.process_frame`, so a future
   pipecat that gates the stop-handler dispatch (e.g. on `_user_speaking`) would
-  pass the probe and strand a span. Speculative: 1.3.0 and 1.12.0 dispatch
-  unconditionally, and the probe fails closed on the shapes it can see.
+  pass the probe and strand a span. Speculative: 1.3.0, 1.12.0 and 1.17.0
+  dispatch unconditionally, and the probe fails closed on the shapes it can see.
   (2026-10-11)
 - **[Architecture] won't-fix**: the `pipecat-ai>=1.3.0` floor applies to every
   user, although only diarization needs it. Deliberate and stated in the
