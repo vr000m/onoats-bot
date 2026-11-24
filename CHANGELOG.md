@@ -15,6 +15,10 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Changed
+
+- `uv.lock` now pins pipecat-ai 1.17.0 (was 1.12.0), so CI and the release workflow run against the shape the diarization order probe was fixed for. The newest-pipecat drift job still covers releases after it.
+
 ## [1.7.1] - 2026-11-23
 
 ### Fixed
