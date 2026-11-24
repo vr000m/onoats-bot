@@ -961,6 +961,7 @@ MONTHLY_LAST = "- `## Outlook`"
 FACT_PROMPT_BREAKS = {
     ("segment.txt", 0): ('"segments": [', '"parts": ['),
     ("classify_topics.txt", 0): ('"confidence": 0.0,', '"certainty": 0.0,'),
+    ("name_speakers.txt", 0): ('"role": "self_intro', '"kind": "self_intro'),
     # the "action_items" key also backs a caption claim, so break another key
     ("classify_ap.txt", 0): ('"attribution": "self', '"owner": "self'),
     (CONSOLIDATE, 0): ('"consolidated_items": [', '"items": ['),
@@ -2489,3 +2490,28 @@ def test_every_placeholder_is_asked_computed_or_built(
         BUILDER, "AGENT_BUILT", (*BUILDER.AGENT_BUILT, "short_weeklies", "month")
     )
     assert not BUILDER._ask_fields(steps, prompts)
+
+
+def test_the_speaker_naming_prompt_is_checked_but_outside_the_pipeline(
+    tmp_path: Path,
+) -> None:
+    # An extra prompt gets the untrusted-data rules without joining the seven the
+    # diagram caption and the coding-agent task describe.
+    assert "name_speakers.txt" in BUILDER.EXTRA_PROMPTS
+    _, pipeline = BUILDER._load(ROOT)
+    assert "name_speakers.txt" not in pipeline
+    assert BUILDER.collect_errors(ROOT) == []
+
+    checkout = _copy_site_tree(tmp_path)
+    prompt = checkout / "site/public/prompts/name_speakers.txt"
+    # an unfenced placeholder is an injection path, so the check must fail
+    prompt.write_text(
+        prompt.read_text(encoding="utf-8").replace(
+            "--- BEGIN UNTRUSTED PARTICIPANTS ---\n{participants}\n"
+            "--- END UNTRUSTED PARTICIPANTS ---",
+            "{participants}",
+        ),
+        encoding="utf-8",
+    )
+    errors = BUILDER.collect_errors(checkout)
+    assert any("{participants} must be alone on a line" in e for e in errors), errors
