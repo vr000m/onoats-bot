@@ -627,8 +627,11 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   `diarization_idle_remint_sec` is the effective re-mint window (config/env,
   else `SLOT_IDLE_REMINT_SEC`), written only when diarization is on; env
   precedence is `ONOATS_DIARIZATION_IDLE_REMINT_SEC` > `[stt]` key >
-  `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT` > built-in. Never put a
-  speaker list in it. Pinned by `tests/test_categories.py` (header shape) and
+  `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT` > built-in.
+  `diarization_timeline.effective_idle_remint_sec` is the one owner of that
+  default (the timeline and the header both call it), header values go through
+  `config.parse_idle_remint_sec`, and a window above 1e9 s is rejected. Never
+  put a speaker list in it. Pinned by `tests/test_categories.py` (header shape) and
   `tests/test_dual_socket_source.py` (the value `dual` hands the buffer).
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
