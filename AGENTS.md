@@ -582,7 +582,8 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   `_span_queue` is an ordered queue with one entry per VAD-stop, appended
   **before** delegating VAD-stop to `super()` and popped at the head of
   `run_stt` (pipecat 1.3.0-1.8.x run `run_stt` inline; 1.9+ queue segments and
-  ONE task awaits `run_stt` for each in order - either way segments reach
+  ONE task awaits `run_stt` for each in order (1.17 queues `(audio, number)`
+  and that task awaits `_push_segment_frames`, the sole `run_stt` site) - either way segments reach
   `run_stt` in VAD-stop order; `runtime._preflight_diarization` refuses any
   pipecat for which `diarization_timeline.segmented_stt_orders_spans` cannot
   see one of those two shapes - for the queue shape that means one plain

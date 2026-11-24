@@ -120,7 +120,7 @@ def segmented_stt_orders_spans() -> bool:
     VAD-stops were seen. Two shapes guarantee that: pipecat 1.3.0-1.8.x await
     ``run_stt`` inline in the stop handler, once and unconditionally
     (:func:`_inline_handler_runs_stt_once`); from 1.9.0 the handler puts the
-    segment on ``_segment_queue`` and ONE ``_segment_task_handler`` task takes
+    segment on ``_segment_queue`` (1.17 puts an ``(audio, number)`` tuple) and ONE ``_segment_task_handler`` task takes
     them off one at a time. The queue shape is only in order if the whole
     class agrees (:func:`_segment_queue_is_one_fifo_consumer`): the queue is
     built once as a plain ``asyncio.Queue()`` (not LIFO / priority),
@@ -174,7 +174,7 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
     """True iff ``cls`` builds ``_segment_queue`` as ONE FIFO with ONE reader task.
 
     Parses every method defined on ``cls`` (the class that owns the queue) and
-    requires, exactly as pipecat 1.9-1.12 write it:
+    requires, exactly as pipecat 1.9-1.17 write it:
 
     - the queue is assigned once, in ``__init__``, as ``asyncio.Queue()`` with
       no arguments (a ``LifoQueue`` / ``PriorityQueue`` / factory call / a
@@ -274,7 +274,7 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
         return False
     if not _stop_handler_puts_one_segment(methods["_handle_user_stopped_speaking"]):
         return False
-    if not _reader_drains_one_for_one(methods["_segment_task_handler"]):
+    if not _reader_drains_one_for_one(methods["_segment_task_handler"], methods):
         return False
 
     def _is_the_one_task(stmt: ast.stmt) -> bool:
@@ -418,10 +418,13 @@ def _stop_handler_puts_one_segment(tree: object) -> bool:
     return True
 
 
-def _reader_drains_one_for_one(tree: object) -> bool:
+def _reader_drains_one_for_one(
+    tree: object, methods: dict[str, object] | None = None
+) -> bool:
     """True iff ``_segment_task_handler`` awaits ``run_stt`` once per queued segment.
 
-    Requires pipecat 1.9-1.12's exact reader shape::
+    Requires pipecat 1.9-1.12's exact reader shape (1.17's variant, which hands
+    the audio to ``_push_segment_frames`` instead, is described below)::
 
         running = True
         while running:
@@ -439,6 +442,11 @@ def _reader_drains_one_for_one(tree: object) -> bool:
     but ``if <item>:`` and a ``try`` body. A one-shot reader, a ``run_stt``
     outside the loop, a second or skippable ``run_stt`` would strand a span
     or pair it with another segment.
+
+    From pipecat 1.17 the segment is an ``(audio, number)`` tuple unpacked by
+    ``audio, self._transcribing_segment = <item>``, and the loop body awaits
+    ``self._push_segment_frames(audio)``: the class's one ``run_stt`` site
+    (:func:`_helper_runs_stt_once`) and that method's only caller.
 
     ``if <item>:`` skips an empty segment without calling ``run_stt``. That
     is unreachable for ``WebSocketSTTService``: it keeps pipecat's default
@@ -519,34 +527,104 @@ def _reader_drains_one_for_one(tree: object) -> bool:
     if sentinel_writes != 1:
         return False
 
-    # The handler's one ``run_stt`` call: ``await self.process_generator(
-    # self.run_stt(<item>))``, inside the loop under only ``if <item>:``/``try``.
-    calls = [
+    # The reader's one hand-off to ``run_stt``, in one of two shapes: pipecat
+    # 1.9-1.12 awaits ``self.process_generator(self.run_stt(<item>))`` itself;
+    # 1.17 awaits ``self._push_segment_frames(<item>)``, whose body holds the
+    # class's one ``run_stt`` call (:func:`_helper_runs_stt_once`).
+    run_calls = [
         n
         for n in ast.walk(fn)
         if isinstance(n, ast.Call) and _is_self_attr(n.func, "run_stt")
     ]
-    if len(calls) != 1:
-        return False
-    run_stt = calls[0]
-    if not (
-        len(run_stt.args) == 1
-        and not run_stt.keywords
-        and isinstance(run_stt.args[0], ast.Name)
-        and run_stt.args[0].id == item
-    ):
+    helper_calls = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and _is_self_attr(n.func, _SEGMENT_PUSH_HELPER)
+    ]
+
+    # pipecat 1.17 queues ``(audio, segment_number)`` and unpacks it with one
+    # ``audio, self._transcribing_segment = <item>`` statement, so the segment
+    # handed on is either ``<item>`` or that unpacked first element.
+    unpacked = [
+        n.targets[0].elts[0].id
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Tuple)
+        and len(n.targets[0].elts) == 2
+        and isinstance(n.targets[0].elts[0], ast.Name)
+        and isinstance(n.value, ast.Name)
+        and n.value.id == item
+    ]
+    arg_names = {item, *unpacked}
+    stores = [
+        n.id
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Name)
+        and isinstance(n.ctx, ast.Store)
+        and n.id in arg_names
+    ]
+    # ``<item>`` is bound once (the ``get``), the unpacked name once (the unpack).
+    if len(unpacked) > 1 or len(stores) != len(arg_names):
         return False
 
-    def _reaches(stmts: list[ast.stmt]) -> bool:
-        for stmt in stmts:
-            if (
+    def _is_item_arg(call: ast.Call) -> bool:
+        return (
+            len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id in arg_names
+        )
+
+    if len(run_calls) == 1 and not helper_calls:
+        run_stt = run_calls[0]
+        if not _is_item_arg(run_stt):
+            return False
+
+        def _is_handoff(stmt: ast.stmt) -> bool:
+            return (
                 isinstance(stmt, ast.Expr)
                 and isinstance(stmt.value, ast.Await)
                 and isinstance(stmt.value.value, ast.Call)
                 and _is_self_attr(stmt.value.value.func, "process_generator")
                 and stmt.value.value.args == [run_stt]
                 and not stmt.value.value.keywords
-            ):
+            )
+
+    elif not run_calls and len(helper_calls) == 1:
+        helper_call = helper_calls[0]
+        if not _is_item_arg(helper_call):
+            return False
+        helper = (methods or {}).get(_SEGMENT_PUSH_HELPER)
+        if helper is None or not _helper_runs_stt_once(helper):
+            return False
+        # The helper is the class's only ``run_stt`` site and the reader its
+        # only caller: any other path could transcribe a segment out of order.
+        # (The reader itself is excluded: it has no ``run_stt`` call here.)
+        for name, other in (methods or {}).items():
+            if name == _SEGMENT_PUSH_HELPER:
+                continue
+            for node in ast.walk(other):
+                if name != "_segment_task_handler" and _is_self_attr(
+                    node, _SEGMENT_PUSH_HELPER
+                ):
+                    return False
+                if isinstance(node, ast.Call) and _is_self_attr(node.func, "run_stt"):
+                    return False
+
+        def _is_handoff(stmt: ast.stmt) -> bool:
+            return (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Await)
+                and stmt.value.value is helper_call
+            )
+
+    else:
+        return False
+
+    def _reaches(stmts: list[ast.stmt]) -> bool:
+        for stmt in stmts:
+            if _is_handoff(stmt):
                 return True
             if (
                 isinstance(stmt, ast.If)
@@ -561,6 +639,65 @@ def _reader_drains_one_for_one(tree: object) -> bool:
         return False
 
     return _reaches(loop.body)
+
+
+# pipecat 1.17 moved the reader's ``run_stt`` call into this method.
+_SEGMENT_PUSH_HELPER = "_push_segment_frames"
+
+
+def _helper_runs_stt_once(tree: object) -> bool:
+    """True iff ``_push_segment_frames(audio)`` calls ``run_stt(audio)`` once, unconditionally.
+
+    The pipecat 1.17 shape::
+
+        async def _push_segment_frames(self, audio):
+            held = None
+            async for frame in self.run_stt(audio):
+                ...
+
+    One top-level ``async for <x> in self.run_stt(<first parameter>)`` statement
+    (not under a branch, loop or ``try``), no other ``run_stt`` call, and no
+    ``return`` / ``raise`` in a statement before it: a helper that can leave
+    without iterating ``run_stt`` would strand the STT's span for that segment.
+    """
+    import ast
+
+    fn = _function_def(tree)
+    if fn is None or not isinstance(fn, ast.AsyncFunctionDef):
+        return False
+    params = [a.arg for a in fn.args.args]
+    if len(params) != 2 or params[0] != "self":
+        return False
+    audio = params[1]
+
+    def _is_run_loop(stmt: ast.stmt) -> bool:
+        it = stmt.iter if isinstance(stmt, ast.AsyncFor) else None
+        return (
+            isinstance(it, ast.Call)
+            and _is_self_attr(it.func, "run_stt")
+            and len(it.args) == 1
+            and not it.keywords
+            and isinstance(it.args[0], ast.Name)
+            and it.args[0].id == audio
+            and not getattr(stmt, "orelse", None)
+        )
+
+    loops = [i for i, stmt in enumerate(fn.body) if _is_run_loop(stmt)]
+    if len(loops) != 1:
+        return False
+    if (
+        sum(
+            isinstance(n, ast.Call) and _is_self_attr(n.func, "run_stt")
+            for n in ast.walk(fn)
+        )
+        != 1
+    ):
+        return False
+    return not any(
+        isinstance(n, (ast.Return, ast.Raise))
+        for stmt in fn.body[: loops[0]]
+        for n in ast.walk(stmt)
+    )
 
 
 class SampleCounter:

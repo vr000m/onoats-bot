@@ -15,6 +15,15 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Diarization refused to start on pipecat 1.17.** The startup order probe
+  (`segmented_stt_orders_spans`) expected `run_stt` inside the segment reader
+  loop; 1.17 moved it into `_push_segment_frames` and queues `(audio, number)`
+  tuples. Segment order is unchanged (one FIFO, one task), so the probe now
+  accepts that shape, still failing closed when the helper or its single caller
+  can skip, repeat or reorder a segment.
+
 ## [1.7.0] - 2026-11-23
 
 ### Added

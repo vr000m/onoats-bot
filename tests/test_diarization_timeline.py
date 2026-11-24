@@ -668,6 +668,226 @@ def test_segmented_stt_orders_spans_true_for_pipecat_1_9_queue_shape(monkeypatch
     assert dt.segmented_stt_orders_spans() is True
 
 
+# The pipecat 1.17 shape: segments are ``(audio, number)`` tuples and the reader
+# hands the audio to ``_push_segment_frames``, the one ``run_stt`` site.
+async def _reader_via_helper(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _helper_sound(self, audio):  # pragma: no cover - never run
+    """Transcribe one segment."""
+    held = None
+    async for frame in self.run_stt(audio):
+        if not frame:
+            continue
+        held = frame
+    if held is not None:
+        await self.push_frame(held)
+
+
+async def _stop_puts_numbered_segment(self, frame):  # pragma: no cover - never run
+    segment = self._speech_buffer.stop()
+    if not self.is_usable:
+        return
+    audio = bytes(segment)
+    await self._segment_queue.put((audio, self._segment_count))
+
+
+def _patch_helper_shape(
+    monkeypatch, reader=_reader_via_helper, helper=_helper_sound, **kwargs
+):
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    kwargs.setdefault("stop_handler", _stop_puts_numbered_segment)
+    _patch_queued_shape(monkeypatch, reader, **kwargs)
+    monkeypatch.setattr(
+        SegmentedSTTService, "_push_segment_frames", helper, raising=False
+    )
+
+
+def test_segmented_stt_orders_spans_true_for_pipecat_1_17_helper_shape(monkeypatch):
+    """Regression: pipecat 1.17 moved ``run_stt`` out of the reader loop into
+    ``_push_segment_frames`` and queues ``(audio, number)`` tuples, and the probe
+    (which wanted ``run_stt`` inside the reader) refused it, so diarization
+    would not start. The order guarantee is unchanged: one task, one FIFO."""
+    _patch_helper_shape(monkeypatch)
+    assert dt.segmented_stt_orders_spans() is True
+
+
+async def _helper_conditional(self, audio):  # pragma: no cover - never run
+    if self._muted:
+        return
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _helper_returns_before_run_stt(self, audio):  # pragma: no cover - never run
+    if not audio:
+        return
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _helper_run_stt_under_if(self, audio):  # pragma: no cover - never run
+    if audio:
+        async for frame in self.run_stt(audio):
+            await self.push_frame(frame)
+
+
+async def _helper_two_run_stt_sites(self, audio):  # pragma: no cover - never run
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _helper_other_audio(self, audio):  # pragma: no cover - never run
+    async for frame in self.run_stt(b"x"):
+        await self.push_frame(frame)
+
+
+async def _helper_run_stt_not_iterated(self, audio):  # pragma: no cover - never run
+    self.run_stt(audio)
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        _helper_conditional,
+        _helper_returns_before_run_stt,
+        _helper_run_stt_under_if,
+        _helper_two_run_stt_sites,
+        _helper_other_audio,
+        _helper_run_stt_not_iterated,
+    ],
+    ids=[
+        "guarded-by-early-return",
+        "return-before-run_stt",
+        "run_stt-under-if",
+        "two-run_stt-sites",
+        "not-the-segment",
+        "run_stt-not-iterated",
+    ],
+)
+def test_segmented_stt_orders_spans_false_unless_the_helper_runs_stt_once(
+    monkeypatch, helper
+):
+    """The helper must iterate ``run_stt(<its segment>)`` once, unconditionally:
+    a helper that can skip or repeat it strands or mis-pairs the STT's span."""
+    _patch_helper_shape(monkeypatch, helper=helper)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _reader_skips_helper(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment and self._muted is False:
+            audio, self._transcribing_segment = segment
+            await self._push_segment_frames(audio)
+
+
+async def _reader_unpacks_twice(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            audio, self._other = (b"x", 0)
+            await self._push_segment_frames(audio)
+
+
+async def _reader_hands_over_other_audio(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            await self._push_segment_frames(b"x")
+
+
+async def _reader_calls_helper_and_run_stt(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            await self._push_segment_frames(audio)
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _reader_returns_inside_loop(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            await self._push_segment_frames(audio)
+            return
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        _reader_skips_helper,
+        _reader_unpacks_twice,
+        _reader_hands_over_other_audio,
+        _reader_calls_helper_and_run_stt,
+        _reader_returns_inside_loop,
+    ],
+    ids=[
+        "extra-condition",
+        "unpacked-twice",
+        "not-the-segment",
+        "helper-and-run_stt",
+        "return-in-loop",
+    ],
+)
+def test_segmented_stt_orders_spans_false_unless_the_reader_hands_each_segment_on(
+    monkeypatch, reader
+):
+    _patch_helper_shape(monkeypatch, reader=reader)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _stop_calls_helper(self, frame):  # pragma: no cover - never run
+    await self._segment_queue.put((b"a", 1))
+    await self._push_segment_frames(b"a")
+
+
+def test_segmented_stt_orders_spans_false_when_another_method_calls_the_helper(
+    monkeypatch,
+):
+    """A second caller of ``_push_segment_frames`` (here the VAD-stop handler)
+    would transcribe a segment outside the one in-order task."""
+    _patch_helper_shape(monkeypatch, stop_handler=_stop_calls_helper)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+def test_segmented_stt_orders_spans_false_when_the_helper_is_missing(monkeypatch):
+    """A reader that names a helper the class does not define is not provable."""
+    _patch_helper_shape(monkeypatch)
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    monkeypatch.setattr(
+        SegmentedSTTService, "_push_segment_frames", None, raising=False
+    )
+    assert dt.segmented_stt_orders_spans() is False
+
+
 def _init_lifo(self, **kwargs):  # pragma: no cover - never run
     self._segment_queue = asyncio.LifoQueue()
 
