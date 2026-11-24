@@ -94,6 +94,20 @@ def test_session_meta_line_carries_run_id_and_diarization_provenance():
     assert "\n" not in line
 
 
+def test_session_meta_line_carries_idle_remint_sec_only_when_given():
+    on = json.loads(
+        session_meta_line(
+            run_id="abc",
+            diarization={"model": "m/x", "version": "r"},
+            diarization_idle_remint_sec=3600.0,
+        )
+    )
+    assert on["diarization_idle_remint_sec"] == 3600.0
+    assert "diarization_idle_remint_sec" not in json.loads(
+        session_meta_line(run_id="abc")
+    )
+
+
 def test_session_meta_line_omits_diarization_when_off():
     assert "diarization" not in json.loads(session_meta_line("work", run_id="abc"))
 
@@ -194,6 +208,33 @@ def test_session_meta_carries_diarization_provenance_only_when_given(tmp_path):
     (off_head,) = _first_lines(tmp_path / "off")
     assert on_head["diarization"] == {"model": "m/x", "version": "r"}
     assert "diarization" not in off_head
+    assert "diarization_idle_remint_sec" not in off_head
+
+
+def test_session_meta_idle_remint_sec_requires_diarization_meta(tmp_path):
+    import asyncio
+
+    from onoats.processors.transcript_buffer import TranscriptBuffer
+
+    entry = {"time": "2026-01-01T00:00:00+00:00", "type": "utterance", "text": "hi"}
+
+    async def _run() -> None:
+        on = TranscriptBuffer(
+            data_dir=tmp_path / "on",
+            diarization_meta={"model": "m/x", "version": "r"},
+            diarization_idle_remint_sec=3600.0,
+        )
+        off = TranscriptBuffer(
+            data_dir=tmp_path / "off", diarization_idle_remint_sec=3600.0
+        )
+        await on._write_entry(entry)
+        await off._write_entry(entry)
+
+    asyncio.run(_run())
+    (on_head,) = _first_lines(tmp_path / "on")
+    (off_head,) = _first_lines(tmp_path / "off")
+    assert on_head["diarization_idle_remint_sec"] == 3600.0
+    assert "diarization_idle_remint_sec" not in off_head
 
 
 def test_failed_header_write_never_repeats_the_header_mid_file(tmp_path, monkeypatch):

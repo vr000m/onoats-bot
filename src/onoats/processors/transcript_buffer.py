@@ -149,6 +149,7 @@ class TranscriptBuffer(FrameProcessor):
         locked_category: Optional[str] = None,
         run_id: Optional[str] = None,
         diarization_meta: Optional[dict[str, str]] = None,
+        diarization_idle_remint_sec: Optional[float] = None,
         on_transcript: Callable[[str, str | None, tuple[str, ...], bool], None]
         | None = None,
         **kwargs,
@@ -176,6 +177,11 @@ class TranscriptBuffer(FrameProcessor):
         # Provenance of the diarizer the run was *configured* with (known at
         # file creation); None when diarization is off.
         self._diarization_meta = dict(diarization_meta) if diarization_meta else None
+        # Effective idle re-mint window the run's diarizer was built with;
+        # only meaningful (and only written) when diarization is configured.
+        self._idle_remint_sec = (
+            diarization_idle_remint_sec if self._diarization_meta else None
+        )
         self._on_transcript = on_transcript
         # Session file whose header has been settled (written, or found to need
         # no header). Keeps ``_write_entry`` from re-reading the file's first
@@ -509,6 +515,7 @@ class TranscriptBuffer(FrameProcessor):
                     self._locked_category,
                     run_id=self._run_id,
                     diarization=self._diarization_meta,
+                    diarization_idle_remint_sec=self._idle_remint_sec,
                 ),
             )
             self._meta_settled_path = path

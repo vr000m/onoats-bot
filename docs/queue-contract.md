@@ -16,7 +16,7 @@ completed file from `.active/` into `sessions/pending/` with an atomic
 
 | Type | Required shape |
 |---|---|
-| `session_meta` | `{"type":"session_meta","run_id":"<hex>"}` plus optional `category` and `diarization`; always line 1 |
+| `session_meta` | `{"type":"session_meta","run_id":"<hex>"}` plus optional `category`, `diarization` and `diarization_idle_remint_sec`; always line 1 |
 | `utterance` | `{"type":"utterance","time":...,"text":...,"source":"me"|"them"}` plus optional `speakers` and `overlap` |
 | `silence_gap` | `{"type":"silence_gap","time":...,"duration_seconds":N}` |
 
@@ -61,6 +61,28 @@ was labelled, and runtime degradation does not rewrite the header.
 
 The header never lists speakers because they are unknown when the file is
 created.
+
+### `diarization_idle_remint_sec`
+
+When diarization is configured, the header also carries the effective idle
+window in seconds (a positive number, e.g. `1200.0`):
+
+~~~json
+{"diarization_idle_remint_sec":1200.0}
+~~~
+
+A speaker slot that stays silent for longer than this gets a fresh label on its
+next utterance (`S2` can come back as `S6`), so a consumer matching speakers
+across labels should use this value as the longest gap that can still be the
+same slot. It is the value the run's diarizer was built with (env, then
+`config.toml`, then the built-in default), written to every file of the run.
+Absent when diarization is off or in files from older versions; treat absence
+as unknown. Which label was re-minted from which is not recorded.
+
+A wrapper can supply a default without reading `config.toml` by setting
+`ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT`; it applies only when neither
+`ONOATS_DIARIZATION_IDLE_REMINT_SEC` nor `[stt].diarization_idle_remint_sec`
+is set.
 
 ## Diarized utterances
 

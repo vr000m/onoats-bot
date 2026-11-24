@@ -70,6 +70,7 @@ def session_meta_line(
     *,
     run_id: str | None = None,
     diarization: dict[str, str] | None = None,
+    diarization_idle_remint_sec: float | None = None,
 ) -> str:
     """Return the JSONL ``session_meta`` first line for a session.
 
@@ -78,7 +79,9 @@ def session_meta_line(
     default such as ``uncategorized`` would pin every transcript. ``run_id`` is
     an opaque per-recorder-run token; ``diarization`` is provenance
     (``{"model", "version"}``) recording that diarization was configured on,
-    not that a line was labelled. The returned string has NO trailing newline
+    not that a line was labelled. ``diarization_idle_remint_sec`` is the
+    effective idle window (seconds) after which a silent speaker slot is given
+    a fresh label; omitted when diarization is off. The returned string has NO trailing newline
     — the writer appends it.
     """
     meta: dict[str, object] = {"type": "session_meta"}
@@ -88,4 +91,6 @@ def session_meta_line(
         meta["run_id"] = run_id
     if diarization:
         meta["diarization"] = dict(diarization)
+    if diarization_idle_remint_sec is not None:
+        meta["diarization_idle_remint_sec"] = diarization_idle_remint_sec
     return json.dumps(meta, ensure_ascii=False)

@@ -462,8 +462,10 @@ class OnoatsConfig:
         """Seconds a diarizer slot may sit idle before it is given a new label.
 
         env ``ONOATS_DIARIZATION_IDLE_REMINT_SEC`` > config.toml
-        ``[stt].diarization_idle_remint_sec`` > ``None`` (the timeline's own
-        default). A non-positive, non-finite or non-numeric value logs one
+        ``[stt].diarization_idle_remint_sec`` > env
+        ``ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT`` (a wrapper's
+        "only if unset" default, so it need not parse config.toml) > ``None``
+        (the timeline's own default). A non-positive, non-finite or non-numeric value logs one
         WARNING and falls back to the default, so a typo can never disable
         re-minting or make every utterance a new speaker.
         """
@@ -471,6 +473,8 @@ class OnoatsConfig:
             "ONOATS_DIARIZATION_IDLE_REMINT_SEC",
             self.raw.get("stt", {}).get("diarization_idle_remint_sec"),
         )
+        if val in (None, ""):
+            val = _env_or("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", None)
         try:
             return parse_idle_remint_sec(val)
         except ValueError:

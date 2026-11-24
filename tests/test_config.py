@@ -253,6 +253,19 @@ def test_diarization_idle_remint_sec_resolution(monkeypatch):
     assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 900.0
 
 
+def test_diarization_idle_remint_sec_default_env_only_fills_a_gap(monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", "3600")
+    assert OnoatsConfig(raw={}).diarization_idle_remint_sec == 3600.0
+    toml = {"stt": {"diarization_idle_remint_sec": 900}}
+    assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 900.0
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", "1800")
+    assert OnoatsConfig(raw={}).diarization_idle_remint_sec == 1800.0
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC")
+    monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", "soon")
+    assert OnoatsConfig(raw={}).diarization_idle_remint_sec is None
+
+
 @pytest.mark.parametrize("bad", ["soon", "0", "-5", "inf", "nan", True])
 def test_diarization_idle_remint_sec_invalid_falls_back_to_default(monkeypatch, bad):
     monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)

@@ -511,6 +511,13 @@ async def run_onoats_dual(
                 )
             telemetry_state.set_transcript(text, source, speaker_label)
 
+    effective_remint_sec: float | None = None
+    if cfg.diarization:
+        # Lazy: pulls numpy, which only diarized runs need here.
+        from onoats.stt.diarization_timeline import SLOT_IDLE_REMINT_SEC
+
+        effective_remint_sec = cfg.diarization_idle_remint_sec or SLOT_IDLE_REMINT_SEC
+
     transcript_buffer = TranscriptBuffer(
         data_dir=data_dir,
         track_vad_gaps=True,
@@ -520,6 +527,9 @@ async def run_onoats_dual(
         # with. A runtime degrade does not change it; per-utterance `speakers`
         # is the truth about whether a line was labelled.
         diarization_meta=(diarization_model.provenance() if cfg.diarization else None),
+        # Effective window (config/env, else the timeline default) so a
+        # consumer never has to re-derive it from private config.
+        diarization_idle_remint_sec=effective_remint_sec,
         on_transcript=_publish_transcript if audio_source == "socket" else None,
     )
 

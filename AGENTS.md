@@ -618,11 +618,15 @@ utterances `S1..` live. Pipeline: `DiarizationFeeder` immediately before
   both speakers are active. Pinned by `tests/test_diarization_timeline.py`.
 - **`session_meta` is line 1 of every file, `category` only on a lock.**
   `TranscriptBuffer` writes `{"type":"session_meta","run_id", "category"?,
-  "diarization"?}` through `categories.session_meta_line`; never default
+  "diarization"?, "diarization_idle_remint_sec"?}` through `categories.session_meta_line`; never default
   `category` (the consumer reads any non-blank value as a hard classification
   lock). `run_id` is minted once per buffer (so stable across continuation
   files), `diarization` is `diarization_model.provenance()` and is configuration
-  provenance only (a runtime degrade leaves it stale by design). Never put a
+  provenance only (a runtime degrade leaves it stale by design).
+  `diarization_idle_remint_sec` is the effective re-mint window (config/env,
+  else `SLOT_IDLE_REMINT_SEC`), written only when diarization is on; env
+  precedence is `ONOATS_DIARIZATION_IDLE_REMINT_SEC` > `[stt]` key >
+  `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT` > built-in. Never put a
   speaker list in it. Pinned by `tests/test_categories.py`.
 - **Persistence is canonical; display is render-time.** `speakers`/`overlap`
   are stored on the utterance (omitted when empty); the `Them (S1)` string is
