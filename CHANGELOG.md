@@ -15,6 +15,35 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-11-23
+
+### Fixed
+
+- **Diarization refused to start on pipecat 1.17.** The startup order probe
+  (`segmented_stt_orders_spans`) expected `run_stt` inside the segment reader
+  loop; 1.17 moved it into `_push_segment_frames` and queues `(audio, number)`
+  tuples. Segment order is unchanged (one FIFO, one task), so the probe now
+  accepts that shape, still failing closed when the helper or its single caller
+  can skip, repeat or reorder a segment.
+
+### Changed
+
+- The diarization order probe now also refuses a segment reader that can
+  `continue` past a segment, or that references `_push_segment_frames` more
+  than once. Neither occurs in any pipecat release checked (1.3.0-1.17.0); both
+  would strand a speaker span.
+- The order probe now checks the reader's whole loop body and the helper's
+  whole contract rather than matching statements anywhere: it refuses a check
+  between `try` and the hand-off, a misplaced tuple unpack, a helper that
+  calls itself or rebinds its audio, and a second `run_stt` site in a
+  1.9-1.12-shaped class, and no longer refuses a reader or helper because of
+  a local function's `return` or an inner loop's `continue`.
+
+- A `pipecat-drift` workflow upgrades only `pipecat-ai` within the declared
+  range, asserts the probe accepts it, and runs the full suite. It runs Monday
+  and Thursday, on manual dispatch, and on PRs touching the probe,
+  `pyproject.toml`, the STT service or their tests.
+
 ## [1.7.0] - 2026-11-23
 
 ### Added

@@ -120,13 +120,16 @@ def segmented_stt_orders_spans() -> bool:
     VAD-stops were seen. Two shapes guarantee that: pipecat 1.3.0-1.8.x await
     ``run_stt`` inline in the stop handler, once and unconditionally
     (:func:`_inline_handler_runs_stt_once`); from 1.9.0 the handler puts the
-    segment on ``_segment_queue`` and ONE ``_segment_task_handler`` task takes
-    them off one at a time. The queue shape is only in order if the whole
+    segment on ``_segment_queue`` (1.17 puts an ``(audio, number)`` tuple and
+    its reader hands the audio to ``_push_segment_frames``) and ONE
+    ``_segment_task_handler`` task takes them off one at a time. The queue
+    shape is only in order if the whole
     class agrees (:func:`_segment_queue_is_one_fifo_consumer`): the queue is
     built once as a plain ``asyncio.Queue()`` (not LIFO / priority),
     ``start`` creates exactly one handler task, the queue's only reader, each
-    VAD-stop puts exactly one segment, and that reader is one loop that
-    awaits ``run_stt`` once per segment until the ``None`` sentinel. Anything
+    VAD-stop puts exactly one segment, that reader is one loop that hands
+    each segment to the class's only ``run_stt`` site until the ``None``
+    sentinel, and nothing in its loop can skip, repeat or swap one. Anything
     else (a concurrent, re-ordering, one-shot or skipping design) could
     strand a span or pair it with another segment - a wrong label rather
     than a missing one - so the startup preflight refuses it.
@@ -174,7 +177,7 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
     """True iff ``cls`` builds ``_segment_queue`` as ONE FIFO with ONE reader task.
 
     Parses every method defined on ``cls`` (the class that owns the queue) and
-    requires, exactly as pipecat 1.9-1.12 write it:
+    requires, exactly as pipecat 1.9-1.17 write it:
 
     - the queue is assigned once, in ``__init__``, as ``asyncio.Queue()`` with
       no arguments (a ``LifoQueue`` / ``PriorityQueue`` / factory call / a
@@ -189,10 +192,15 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
       ``_handle_user_stopped_speaking``, exactly once
       (:func:`_stop_handler_puts_one_segment`); every other put is the
       ``None`` finish sentinel (``stop``);
-    - the reader drains one-for-one (:func:`_reader_drains_one_for_one`).
+    - the reader drains one-for-one (:func:`_reader_hand_off`);
+    - ``self.run_stt`` is referenced once in the class: in the reader
+      (1.9-1.12), or in ``_push_segment_frames`` (1.17,
+      :func:`_helper_runs_stt_once`) when the reader's hand-off is the
+      helper's only reference.
 
     Fails closed on an unreadable/unparseable method or a ``"_segment_queue"``
-    string (a ``setattr`` the walk cannot follow).
+    / ``"run_stt"`` / ``"_push_segment_frames"`` string (a ``getattr`` /
+    ``setattr`` the walk cannot follow).
     """
     import ast
     import inspect
@@ -215,7 +223,11 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
     segment_puts: list[str] = []
     for name, tree in methods.items():
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and node.value == "_segment_queue":
+            if isinstance(node, ast.Constant) and node.value in (
+                "_segment_queue",
+                "run_stt",
+                _SEGMENT_PUSH_HELPER,
+            ):
                 return False
             if isinstance(node, ast.Assign):
                 targets, value = node.targets, node.value
@@ -274,7 +286,34 @@ def _segment_queue_is_one_fifo_consumer(cls: type) -> bool:
         return False
     if not _stop_handler_puts_one_segment(methods["_handle_user_stopped_speaking"]):
         return False
-    if not _reader_drains_one_for_one(methods["_segment_task_handler"]):
+    hand_off = _reader_hand_off(methods["_segment_task_handler"])
+    if hand_off is None:
+        return False
+    # One ``run_stt`` site for the whole class, whichever reader shape: in
+    # the reader itself (1.9-1.12), or in the helper the reader alone
+    # references (1.17). Any other site - a second call, a bare reference
+    # handed out as a callback, the helper calling itself - would run a
+    # segment outside the one in-order task and pop another segment's span.
+    run_sites = [
+        name
+        for name, tree in methods.items()
+        for node in ast.walk(tree)
+        if _is_self_attr(node, "run_stt")
+    ]
+    helper_sites = [
+        name
+        for name, tree in methods.items()
+        for node in ast.walk(tree)
+        if _is_self_attr(node, _SEGMENT_PUSH_HELPER)
+    ]
+    if hand_off == "run_stt":
+        if run_sites != ["_segment_task_handler"] or helper_sites:
+            return False
+    elif not (
+        run_sites == [_SEGMENT_PUSH_HELPER]
+        and helper_sites == ["_segment_task_handler"]
+        and _helper_runs_stt_once(methods[_SEGMENT_PUSH_HELPER])
+    ):
         return False
 
     def _is_the_one_task(stmt: ast.stmt) -> bool:
@@ -387,7 +426,7 @@ def _stop_handler_puts_one_segment(tree: object) -> bool:
     """True iff the VAD-stop handler puts its segment on EVERY stop it does not drop.
 
     The STT appends one span per VAD-stop and skips only when ``is_usable`` is
-    false (mirroring pipecat 1.9-1.12, which drops that segment). So the put
+    false (mirroring pipecat 1.9-1.17, which drops that segment). So the put
     must be one top-level ``await self._segment_queue.put(<segment>)``
     statement (not under a branch or loop), and every ``return`` / ``raise``
     in the handler must sit in an ``if not self.is_usable:`` block - any
@@ -418,149 +457,395 @@ def _stop_handler_puts_one_segment(tree: object) -> bool:
     return True
 
 
-def _reader_drains_one_for_one(tree: object) -> bool:
-    """True iff ``_segment_task_handler`` awaits ``run_stt`` once per queued segment.
+#: Attributes whose use outside their one sanctioned site could reorder,
+#: skip or repeat a segment's trip to ``run_stt``.
+_ORDER_ATTRS = ("run_stt", "_segment_queue", "_segment_task_handler")
 
-    Requires pipecat 1.9-1.12's exact reader shape::
+# pipecat 1.17 moved the reader's ``run_stt`` call into this method.
+_SEGMENT_PUSH_HELPER = "_push_segment_frames"
+
+
+def _frame_nodes(nodes: list, *, loops: bool = False):
+    """Every AST node that runs in the same frame as ``nodes``.
+
+    Like ``ast.walk`` but it does not enter the body of a nested ``def``,
+    ``async def`` or ``lambda`` (its decorators, defaults and annotations are
+    still visited: they run in this frame). A ``return`` in a local predicate
+    then does not count as the enclosing function's exit. With
+    ``loops=True`` it also skips the body (not the ``else``) of every loop, so
+    a ``break``/``continue`` found is one that targets an enclosing loop.
+    Classes and comprehensions are entered: fail closed on what they bind.
+    """
+    import ast
+
+    todo = list(nodes)
+    while todo:
+        node = todo.pop()
+        yield node
+        skip_body = isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+        ) or (loops and isinstance(node, (ast.For, ast.AsyncFor, ast.While)))
+        for field, value in ast.iter_fields(node):
+            if skip_body and field == "body":
+                continue
+            if isinstance(value, ast.AST):
+                todo.append(value)
+            elif isinstance(value, list):
+                todo.extend(v for v in value if isinstance(v, ast.AST))
+
+
+def _binds_any(nodes: list, names: set[str]) -> bool:
+    """True if ``nodes`` (re)bind or delete any of ``names`` in their frame.
+
+    Covers every binding form (assignment and walrus targets, ``for`` /
+    ``with`` / ``except ... as`` / ``import ... as`` / ``match`` captures,
+    ``def`` / ``class`` names), plus a ``global`` / ``nonlocal`` of one of
+    them anywhere, even inside a nested function (it rebinds this frame's
+    name from there).
+    """
+    import ast
+
+    def _bound(node: ast.AST):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            yield node.id
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            yield node.name
+        elif isinstance(node, ast.alias):
+            yield (node.asname or node.name).split(".")[0]
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            yield node.name
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            yield node.rest
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield node.name
+
+    for node in _frame_nodes(nodes):
+        if any(name in names for name in _bound(node)):
+            return True
+    return any(
+        isinstance(node, (ast.Global, ast.Nonlocal))
+        and any(name in names for name in node.names)
+        for top in nodes
+        for node in ast.walk(top)
+    )
+
+
+def _is_inert(node: object, protected: set[str]) -> bool:
+    """True if ``node`` cannot change which segment reaches ``run_stt`` next.
+
+    It never leaves the reader's loop or function (no ``return``, ``raise``,
+    ``yield``, or ``break``/``continue`` aimed at that loop), never rebinds
+    the loop's flag / item / audio names, and never touches the queue,
+    ``run_stt`` or the hand-off helper (even from a nested function: a
+    callback is another way to run them).
+    """
+    import ast
+
+    if any(
+        isinstance(n, (ast.Return, ast.Raise, ast.Yield, ast.YieldFrom))
+        for n in _frame_nodes([node])
+    ):
+        return False
+    if any(
+        isinstance(n, (ast.Break, ast.Continue))
+        for n in _frame_nodes([node], loops=True)
+    ):
+        return False
+    if _binds_any([node], protected):
+        return False
+    return not any(
+        _is_self_attr(n, attr)
+        for n in ast.walk(node)
+        for attr in (*_ORDER_ATTRS, _SEGMENT_PUSH_HELPER)
+    )
+
+
+def _without_docstring(body: list) -> list:
+    import ast
+
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+def _reader_hand_off(tree: object) -> str | None:
+    """How ``_segment_task_handler`` hands each queued segment to ``run_stt``.
+
+    Returns ``"run_stt"`` (pipecat 1.9-1.12 awaits
+    ``self.process_generator(self.run_stt(<audio>))`` itself), ``"helper"``
+    (1.17 awaits ``self._push_segment_frames(<audio>)``, which the caller must
+    prove runs ``run_stt`` once: :func:`_helper_runs_stt_once`), or ``None``
+    when the reader is not provably one-for-one. The body must be exactly::
 
         running = True
         while running:
-            audio = await self._segment_queue.get()
-            running = audio is not None
-            if audio:
+            item = await self._segment_queue.get()
+            running = item is not None
+            if item:
+                audio, self._transcribing_segment = item  # optional (1.17)
                 try:
-                    await self.process_generator(self.run_stt(audio))
-                except Exception as e: ...
+                    <hand-off of audio>               # the try's FIRST statement
+                except Exception as e:
+                    ...                               # inert
+                ...                                   # inert
+            ...                                       # inert
 
-    i.e. one top-level ``while <flag>:`` loop (no ``else``) ended ONLY by the
-    ``None`` sentinel (``<flag>`` is otherwise only ever ``True``), with no
-    ``return`` / ``break`` / ``raise`` inside it, whose body gets one item and
-    awaits the handler's ONE ``run_stt`` call on it - reached through nothing
-    but ``if <item>:`` and a ``try`` body. A one-shot reader, a ``run_stt``
-    outside the loop, a second or skippable ``run_stt`` would strand a span
-    or pair it with another segment.
+    (an optional docstring first). The sentinel is the only exit; the unpack,
+    if present, directly precedes the ``try`` (so ``audio`` is always this
+    item's); nothing runs between the ``try`` and the hand-off (a caught
+    failure there would skip a segment); ``try`` has no ``else``/``finally``;
+    and every other statement - the handlers and anything after the hand-off
+    at each level - is inert (:func:`_is_inert`). A nested function or loop
+    is judged by what runs in this frame, so a local predicate's ``return``
+    or an inner loop's ``continue`` neither passes nor fails the reader.
 
-    ``if <item>:`` skips an empty segment without calling ``run_stt``. That
-    is unreachable for ``WebSocketSTTService``: it keeps pipecat's default
-    ``wants_wav_segments`` (True), so every segment is a non-empty WAV.
+    ``if <item>:`` skips an empty segment without calling ``run_stt``. That is
+    unreachable for ``WebSocketSTTService``: it keeps pipecat's default
+    ``wants_wav_segments`` (True), so every segment is a non-empty WAV (and
+    1.17's tuple is always truthy).
     """
     import ast
 
     fn = _function_def(tree)
-    if fn is None:
-        return False
-    loops = [n for n in ast.walk(fn) if isinstance(n, ast.While)]
-    if len(loops) != 1 or loops[0] not in fn.body:
-        return False
-    loop = loops[0]
-    if loop.orelse or not isinstance(loop.test, ast.Name):
-        return False
-    flag = loop.test.id
-    if any(isinstance(n, (ast.Return, ast.Break, ast.Raise)) for n in ast.walk(loop)):
-        return False
+    if not isinstance(fn, ast.AsyncFunctionDef):
+        return None
+    body = _without_docstring(fn.body)
+    if len(body) != 2:
+        return None
+    init, loop = body
+    if not (
+        isinstance(init, ast.Assign)
+        and len(init.targets) == 1
+        and isinstance(init.targets[0], ast.Name)
+        and isinstance(init.value, ast.Constant)
+        and init.value.value is True
+    ):
+        return None
+    flag = init.targets[0].id
+    if not (
+        isinstance(loop, ast.While)
+        and isinstance(loop.test, ast.Name)
+        and loop.test.id == flag
+        and not loop.orelse
+        and len(loop.body) >= 3
+    ):
+        return None
 
-    # ``<item> = await self._segment_queue.get()``, directly in the loop body.
-    gets = [
-        stmt
-        for stmt in loop.body
-        if isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-        and isinstance(stmt.value, ast.Await)
-        and _is_queue_call(stmt.value.value, "get")
-        and not stmt.value.value.args
-        and not stmt.value.value.keywords
-    ]
-    if len(gets) != 1:
-        return False
-    item = gets[0].targets[0].id
+    get, sentinel, guard, *loop_tail = loop.body
+    # ``<item> = await self._segment_queue.get()``
+    if not (
+        isinstance(get, ast.Assign)
+        and len(get.targets) == 1
+        and isinstance(get.targets[0], ast.Name)
+        and get.targets[0].id != flag
+        and isinstance(get.value, ast.Await)
+        and _is_queue_call(get.value.value, "get")
+        and not get.value.value.args
+        and not get.value.value.keywords
+    ):
+        return None
+    item = get.targets[0].id
+    # ``<flag> = <item> is not None``
+    if not (
+        isinstance(sentinel, ast.Assign)
+        and len(sentinel.targets) == 1
+        and isinstance(sentinel.targets[0], ast.Name)
+        and sentinel.targets[0].id == flag
+        and isinstance(sentinel.value, ast.Compare)
+        and isinstance(sentinel.value.left, ast.Name)
+        and sentinel.value.left.id == item
+        and len(sentinel.value.ops) == 1
+        and isinstance(sentinel.value.ops[0], ast.IsNot)
+        and isinstance(sentinel.value.comparators[0], ast.Constant)
+        and sentinel.value.comparators[0].value is None
+    ):
+        return None
+    # ``if <item>:`` with no ``else``
+    if not (
+        isinstance(guard, ast.If)
+        and isinstance(guard.test, ast.Name)
+        and guard.test.id == item
+        and not guard.orelse
+        and guard.body
+    ):
+        return None
 
-    def _is_sentinel_test(value: ast.expr) -> bool:
+    guarded = guard.body
+    audio = item
+    first = guarded[0]
+    # pipecat 1.17: ``audio, self._transcribing_segment = <item>``
+    if (
+        isinstance(first, ast.Assign)
+        and len(first.targets) == 1
+        and isinstance(first.targets[0], ast.Tuple)
+        and len(first.targets[0].elts) == 2
+        and isinstance(first.value, ast.Name)
+        and first.value.id == item
+    ):
+        head, number = first.targets[0].elts
+        if not (
+            isinstance(head, ast.Name)
+            and head.id not in (flag, item)
+            and (
+                (
+                    isinstance(number, ast.Name)
+                    and number.id not in (flag, item, head.id)
+                )
+                or (
+                    isinstance(number, ast.Attribute)
+                    and isinstance(number.value, ast.Name)
+                    and number.value.id == "self"
+                    and number.attr not in (*_ORDER_ATTRS, _SEGMENT_PUSH_HELPER)
+                )
+            )
+        ):
+            return None
+        audio = head.id
+        guarded = guarded[1:]
+    if not guarded:
+        return None
+    attempt, *guard_tail = guarded
+    if not (
+        isinstance(attempt, ast.Try)
+        and attempt.handlers
+        and not attempt.orelse
+        and not attempt.finalbody
+    ):
+        return None
+    hand_off, *try_tail = attempt.body
+
+    def _is_audio_arg(call: object) -> bool:
         return (
-            isinstance(value, ast.Compare)
-            and isinstance(value.left, ast.Name)
-            and value.left.id == item
-            and len(value.ops) == 1
-            and isinstance(value.ops[0], ast.IsNot)
-            and isinstance(value.comparators[0], ast.Constant)
-            and value.comparators[0].value is None
+            isinstance(call, ast.Call)
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == audio
         )
 
-    # Every write of the loop flag is ``True`` outside the loop or the one
-    # ``<flag> = <item> is not None`` directly in its body.
-    sentinel_writes = 0
-    for node in ast.walk(fn):
-        targets: list[ast.expr] = []
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            targets = [node.target]
-        elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith)):
-            targets = [getattr(node, "target", None)] + [
-                item_.optional_vars for item_ in getattr(node, "items", [])
-            ]
-        for target in targets:
-            if target is None:
-                continue
-            if not any(
-                isinstance(t, ast.Name) and t.id == flag for t in ast.walk(target)
-            ):
-                continue
-            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
-                return False
-            if node in loop.body and _is_sentinel_test(node.value):
-                sentinel_writes += 1
-            elif not (
-                node in fn.body
-                and isinstance(node.value, ast.Constant)
-                and node.value.value is True
-            ):
-                return False
-    if sentinel_writes != 1:
-        return False
-
-    # The handler's one ``run_stt`` call: ``await self.process_generator(
-    # self.run_stt(<item>))``, inside the loop under only ``if <item>:``/``try``.
-    calls = [
-        n
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Call) and _is_self_attr(n.func, "run_stt")
-    ]
-    if len(calls) != 1:
-        return False
-    run_stt = calls[0]
     if not (
-        len(run_stt.args) == 1
-        and not run_stt.keywords
-        and isinstance(run_stt.args[0], ast.Name)
-        and run_stt.args[0].id == item
+        isinstance(hand_off, ast.Expr)
+        and isinstance(hand_off.value, ast.Await)
+        and isinstance(hand_off.value.value, ast.Call)
+    ):
+        return None
+    call = hand_off.value.value
+    if (
+        _is_self_attr(call.func, "process_generator")
+        and len(call.args) == 1
+        and not call.keywords
+        and isinstance(call.args[0], ast.Call)
+        and _is_self_attr(call.args[0].func, "run_stt")
+        and _is_audio_arg(call.args[0])
+    ):
+        kind = "run_stt"
+    elif _is_self_attr(call.func, _SEGMENT_PUSH_HELPER) and _is_audio_arg(call):
+        kind = "helper"
+    else:
+        return None
+
+    protected = {flag, item, audio}
+    rest = [*attempt.handlers, *try_tail, *guard_tail, *loop_tail]
+    if not all(_is_inert(node, protected) for node in rest):
+        return None
+    return kind
+
+
+def _helper_runs_stt_once(tree: object) -> bool:
+    """True iff ``_push_segment_frames(audio)`` iterates ``run_stt(audio)`` once, unconditionally.
+
+    The pipecat 1.17 shape::
+
+        async def _push_segment_frames(self, audio):
+            \"\"\"...\"\"\"
+            held: TranscriptionFrame | None = None
+            async for frame in self.run_stt(audio):
+                ...
+
+    Exactly two plain parameters; one top-level
+    ``async for <x> in self.run_stt(<audio>)`` (no ``else``, not under a
+    branch, loop or ``try``) and no other ``run_stt`` reference; ``audio``
+    never rebound anywhere in the helper (so the segment iterated is the one
+    the reader handed over); no reference to the helper itself (a retry would
+    pop another segment's span); and before the loop only a docstring,
+    constant assignments to other names, ``pass`` or a plain local ``def``
+    (no decorators, defaults or annotations, which would run here): nothing
+    that can raise or return before ``run_stt`` pops this segment's span.
+    """
+    import ast
+
+    fn = _function_def(tree)
+    if not isinstance(fn, ast.AsyncFunctionDef):
+        return False
+    args = fn.args
+    if (
+        args.posonlyargs
+        or args.vararg
+        or args.kwonlyargs
+        or args.kwarg
+        or args.defaults
+        or len(args.args) != 2
+        or args.args[0].arg != "self"
     ):
         return False
+    audio = args.args[1].arg
 
-    def _reaches(stmts: list[ast.stmt]) -> bool:
-        for stmt in stmts:
-            if (
-                isinstance(stmt, ast.Expr)
-                and isinstance(stmt.value, ast.Await)
-                and isinstance(stmt.value.value, ast.Call)
-                and _is_self_attr(stmt.value.value.func, "process_generator")
-                and stmt.value.value.args == [run_stt]
-                and not stmt.value.value.keywords
-            ):
-                return True
-            if (
-                isinstance(stmt, ast.If)
-                and isinstance(stmt.test, ast.Name)
-                and stmt.test.id == item
-                and not stmt.orelse
-                and _reaches(stmt.body)
-            ):
-                return True
-            if isinstance(stmt, ast.Try) and not stmt.orelse and _reaches(stmt.body):
-                return True
+    def _is_run_loop(stmt: ast.stmt) -> bool:
+        it = stmt.iter if isinstance(stmt, ast.AsyncFor) else None
+        return (
+            isinstance(it, ast.Call)
+            and _is_self_attr(it.func, "run_stt")
+            and len(it.args) == 1
+            and not it.keywords
+            and isinstance(it.args[0], ast.Name)
+            and it.args[0].id == audio
+            and not stmt.orelse
+        )
+
+    loops = [i for i, stmt in enumerate(fn.body) if _is_run_loop(stmt)]
+    if len(loops) != 1:
+        return False
+    if sum(_is_self_attr(n, "run_stt") for n in ast.walk(fn)) != 1:
+        return False
+    if any(_is_self_attr(n, _SEGMENT_PUSH_HELPER) for n in ast.walk(fn)):
+        return False
+    if _binds_any(fn.body, {audio}):
         return False
 
-    return _reaches(loop.body)
+    def _is_harmless(stmt: ast.stmt) -> bool:
+        if isinstance(stmt, ast.Pass):
+            return True
+        if isinstance(stmt, ast.Assign):
+            return all(isinstance(t, ast.Name) for t in stmt.targets) and isinstance(
+                stmt.value, ast.Constant
+            )
+        if isinstance(stmt, ast.AnnAssign):
+            # A local variable's annotation is never evaluated.
+            return isinstance(stmt.target, ast.Name) and (
+                stmt.value is None or isinstance(stmt.value, ast.Constant)
+            )
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = stmt.args
+            return (
+                not stmt.decorator_list
+                and stmt.returns is None
+                and not a.defaults
+                and not any(a.kw_defaults)
+                and all(
+                    p.annotation is None
+                    for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)
+                )
+                and (a.vararg is None or a.vararg.annotation is None)
+                and (a.kwarg is None or a.kwarg.annotation is None)
+            )
+        return False
+
+    return all(_is_harmless(stmt) for stmt in _without_docstring(fn.body[: loops[0]]))
 
 
 class SampleCounter:

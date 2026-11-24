@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from loguru import logger
+
 from onoats.stt import diarization_timeline as dt
 from onoats.stt.diarization_timeline import DiarizationTimeline
 
@@ -659,6 +660,12 @@ def _patch_queued_shape(
     )
     monkeypatch.setattr(SegmentedSTTService, "__init__", init)
     monkeypatch.setattr(SegmentedSTTService, "start", start or _start_one_task)
+    # A 1.9-1.12 class has no ``_push_segment_frames``; on pipecat 1.17+ the
+    # real one would be a second ``run_stt`` site (``_patch_helper_shape``
+    # puts its stand-in back).
+    monkeypatch.setattr(
+        SegmentedSTTService, "_push_segment_frames", None, raising=False
+    )
 
 
 def test_segmented_stt_orders_spans_true_for_pipecat_1_9_queue_shape(monkeypatch):
@@ -666,6 +673,293 @@ def test_segmented_stt_orders_spans_true_for_pipecat_1_9_queue_shape(monkeypatch
     queue and awaits ``run_stt`` for each in turn: still VAD-stop order."""
     _patch_queued_shape(monkeypatch)
     assert dt.segmented_stt_orders_spans() is True
+
+
+# The pipecat 1.17 shape: segments are ``(audio, number)`` tuples and the reader
+# hands the audio to ``_push_segment_frames``, the one ``run_stt`` site.
+async def _reader_via_helper(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _helper_sound(self, audio):  # pragma: no cover - never run
+    """Transcribe one segment."""
+    held = None
+    async for frame in self.run_stt(audio):
+        if not frame:
+            continue
+        held = frame
+    if held is not None:
+        await self.push_frame(held)
+
+
+async def _stop_puts_numbered_segment(self, frame):  # pragma: no cover - never run
+    segment = self._speech_buffer.stop()
+    if not self.is_usable:
+        return
+    audio = bytes(segment)
+    await self._segment_queue.put((audio, self._segment_count))
+
+
+def _patch_helper_shape(
+    monkeypatch, reader=_reader_via_helper, helper=_helper_sound, **kwargs
+):
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    kwargs.setdefault("stop_handler", _stop_puts_numbered_segment)
+    _patch_queued_shape(monkeypatch, reader, **kwargs)
+    monkeypatch.setattr(
+        SegmentedSTTService, "_push_segment_frames", helper, raising=False
+    )
+
+
+def test_segmented_stt_orders_spans_true_for_pipecat_1_17_helper_shape(monkeypatch):
+    """Regression: pipecat 1.17 moved ``run_stt`` out of the reader loop into
+    ``_push_segment_frames`` and queues ``(audio, number)`` tuples, and the probe
+    (which wanted ``run_stt`` inside the reader) refused it, so diarization
+    would not start. The order guarantee is unchanged: one task, one FIFO."""
+    _patch_helper_shape(monkeypatch)
+    assert dt.segmented_stt_orders_spans() is True
+
+
+async def _helper_conditional(self, audio):  # pragma: no cover - never run
+    if self._muted:
+        return
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _helper_returns_before_run_stt(self, audio):  # pragma: no cover - never run
+    if not audio:
+        return
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _helper_run_stt_under_if(self, audio):  # pragma: no cover - never run
+    if audio:
+        async for frame in self.run_stt(audio):
+            await self.push_frame(frame)
+
+
+async def _helper_two_run_stt_sites(self, audio):  # pragma: no cover - never run
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _helper_other_audio(self, audio):  # pragma: no cover - never run
+    async for frame in self.run_stt(b"x"):
+        await self.push_frame(frame)
+
+
+async def _helper_run_stt_not_iterated(self, audio):  # pragma: no cover - never run
+    self.run_stt(audio)
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        _helper_conditional,
+        _helper_returns_before_run_stt,
+        _helper_run_stt_under_if,
+        _helper_two_run_stt_sites,
+        _helper_other_audio,
+        _helper_run_stt_not_iterated,
+    ],
+    ids=[
+        "guarded-by-early-return",
+        "return-before-run_stt",
+        "run_stt-under-if",
+        "two-run_stt-sites",
+        "not-the-segment",
+        "run_stt-not-iterated",
+    ],
+)
+def test_segmented_stt_orders_spans_false_unless_the_helper_runs_stt_once(
+    monkeypatch, helper
+):
+    """The helper must iterate ``run_stt(<its segment>)`` once, unconditionally:
+    a helper that can skip or repeat it strands or mis-pairs the STT's span."""
+    _patch_helper_shape(monkeypatch, helper=helper)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+# Each defective reader below is the sound one (``_reader_via_helper``: unpack,
+# then ``try`` with the hand-off first and an inert handler) changed in ONE
+# place, so it is refused for the defect it is named for and not because it
+# lacks the sound ``try`` shape.
+async def _reader_skips_helper(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment and self._muted is False:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _reader_unpacks_twice(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            audio, self._other = (b"x", 0)
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _reader_hands_over_other_audio(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(b"x")
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _reader_calls_helper_and_run_stt(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _reader_returns_inside_loop(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+            return
+
+
+async def _reader_continues_before_helper(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                if self._muted:
+                    continue
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _reader_references_helper_twice(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+            self._loop.call_soon(self._push_segment_frames, b"x")
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        _reader_skips_helper,
+        _reader_unpacks_twice,
+        _reader_hands_over_other_audio,
+        _reader_calls_helper_and_run_stt,
+        _reader_returns_inside_loop,
+        _reader_continues_before_helper,
+        _reader_references_helper_twice,
+    ],
+    ids=[
+        "extra-condition",
+        "unpacked-twice",
+        "not-the-segment",
+        "helper-and-run_stt",
+        "return-in-loop",
+        "continue-before-hand-off",
+        "helper-referenced-twice",
+    ],
+)
+def test_segmented_stt_orders_spans_false_unless_the_reader_hands_each_segment_on(
+    monkeypatch, reader
+):
+    _patch_helper_shape(monkeypatch, reader=reader)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _stop_calls_helper(self, frame):  # pragma: no cover - never run
+    await self._segment_queue.put((b"a", 1))
+    await self._push_segment_frames(b"a")
+
+
+def test_segmented_stt_orders_spans_false_when_another_method_calls_the_helper(
+    monkeypatch,
+):
+    """A second caller of ``_push_segment_frames`` (here the VAD-stop handler)
+    would transcribe a segment outside the one in-order task."""
+    _patch_helper_shape(monkeypatch, stop_handler=_stop_calls_helper)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+async def _stop_also_calls_run_stt(self, frame):  # pragma: no cover - never run
+    await self._segment_queue.put((b"a", 1))
+    await self.process_generator(self.run_stt(b"a"))
+
+
+def test_segmented_stt_orders_spans_false_when_another_method_calls_run_stt(
+    monkeypatch,
+):
+    """The helper must be the class's ONLY ``run_stt`` site: a second one (here
+    the VAD-stop handler) transcribes a segment outside the one in-order task."""
+    _patch_helper_shape(monkeypatch, stop_handler=_stop_also_calls_run_stt)
+    assert dt.segmented_stt_orders_spans() is False
+
+
+def test_segmented_stt_orders_spans_false_when_the_helper_is_missing(monkeypatch):
+    """A reader that names a helper the class does not define is not provable."""
+    _patch_helper_shape(monkeypatch)
+    from pipecat.services.stt_service import SegmentedSTTService
+
+    monkeypatch.setattr(
+        SegmentedSTTService, "_push_segment_frames", None, raising=False
+    )
+    assert dt.segmented_stt_orders_spans() is False
 
 
 def _init_lifo(self, **kwargs):  # pragma: no cover - never run
@@ -817,6 +1111,28 @@ async def _handler_other_condition(self):  # pragma: no cover - never run
             await self.process_generator(self.run_stt(audio))
 
 
+async def _handler_continues_before_run_stt(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if self._muted:
+            continue
+        if audio:
+            await self.process_generator(self.run_stt(audio))
+
+
+async def _handler_continues_inside_if(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        audio = await self._segment_queue.get()
+        running = audio is not None
+        if audio:
+            if self._muted:
+                continue
+            await self.process_generator(self.run_stt(audio))
+
+
 async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
     running = True
     while running:
@@ -837,6 +1153,8 @@ async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
         _handler_stops_on_a_non_sentinel,
         _handler_other_condition,
         _handler_run_stt_not_awaited,
+        _handler_continues_before_run_stt,
+        _handler_continues_inside_if,
     ],
     ids=[
         "one-shot",
@@ -847,6 +1165,8 @@ async def _handler_run_stt_not_awaited(self):  # pragma: no cover - never run
         "loop-ends-without-sentinel",
         "extra-run_stt-condition",
         "run_stt-not-awaited",
+        "continue-before-run_stt",
+        "continue-inside-if",
     ],
 )
 def test_segmented_stt_orders_spans_false_unless_the_reader_drains_one_for_one(
@@ -1051,3 +1371,401 @@ def test_inline_shape_refused_when_run_stt_can_be_skipped(monkeypatch, handler):
     probe exists to refuse (the queue shape already enforces this)."""
     _force_inline_shape(monkeypatch, handler)
     assert dt.segmented_stt_orders_spans() is False
+
+
+# --- the whole reader x helper x class-site state space ------------------------
+#
+# Each cell is one pipecat-1.17-shaped (or 1.9-1.12-shaped) class differing from
+# the sound shape in ONE place. True cells are sound readers/helpers the probe
+# must not refuse because of a nested function or loop; False cells can skip,
+# repeat or swap a segment on its way to ``run_stt``, which pairs a later
+# transcript with another segment's span.
+
+
+async def _r_inner_loop_continue(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+                for observer in self._observers:
+                    if observer is None:
+                        continue
+                    observer()
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _r_local_def_after_hand_off(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+            def _done(result):
+                return result
+
+            self._on_done = _done
+
+
+async def _r_unpack_after_hand_off(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            try:
+                await self._push_segment_frames(audio)  # noqa: F821
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+            audio, self._transcribing_segment = segment
+
+
+async def _r_unpack_guarded_hand_off_unguarded(self):  # pragma: no cover
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+        try:
+            await self._push_segment_frames(audio)
+        except Exception as e:
+            await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _r_unpack_in_nested_def(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+
+            def _unpack():
+                audio, self._transcribing_segment = segment
+
+            try:
+                await self._push_segment_frames(audio)  # noqa: F821
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _r_check_before_hand_off(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._wait_ready()
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                await self.push_error(f"{self}: transcription failed: {e}", exception=e)
+
+
+async def _r_tail_runs_helper_again(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception:
+                await self._push_segment_frames(audio)
+
+
+async def _r_continue_in_inner_loop_else(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception as e:
+                for _ in (e,):
+                    pass
+                else:
+                    continue
+
+
+async def _r_tail_rebinds_flag(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception:
+                running = False
+
+
+async def _r_nested_def_rebinds_flag(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception:
+
+                def _stop():
+                    nonlocal running
+                    running = False
+
+                self._stop = _stop
+
+
+async def _r_handler_raises(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception:
+                raise
+
+
+async def _r_try_finally(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(audio)
+            except Exception:
+                pass
+            finally:
+                self._done()
+
+
+async def _r_hands_on_the_tuple(self):  # pragma: no cover - never run
+    running = True
+    while running:
+        segment = await self._segment_queue.get()
+        running = segment is not None
+        if segment:
+            audio, self._transcribing_segment = segment
+            try:
+                await self._push_segment_frames(segment)
+            except Exception:
+                pass
+
+
+@pytest.mark.parametrize(
+    ("reader", "expected"),
+    [
+        (_reader_via_helper, True),
+        (_r_inner_loop_continue, True),
+        (_r_local_def_after_hand_off, True),
+        (_r_unpack_after_hand_off, False),
+        (_r_unpack_guarded_hand_off_unguarded, False),
+        (_r_unpack_in_nested_def, False),
+        (_r_check_before_hand_off, False),
+        (_r_tail_runs_helper_again, False),
+        (_r_continue_in_inner_loop_else, False),
+        (_r_tail_rebinds_flag, False),
+        (_r_nested_def_rebinds_flag, False),
+        (_r_handler_raises, False),
+        (_r_try_finally, False),
+        (_r_hands_on_the_tuple, False),
+    ],
+    ids=[
+        "sound",
+        "inner-loop-continue",
+        "local-def-after-hand-off",
+        "unpack-after-hand-off",
+        "unpack-guarded-hand-off-not",
+        "unpack-in-nested-def",
+        "await-before-hand-off-in-try",
+        "handler-runs-helper-again",
+        "continue-in-inner-loop-else",
+        "handler-rebinds-flag",
+        "nested-def-nonlocal-flag",
+        "handler-raises",
+        "try-finally",
+        "hands-on-the-tuple",
+    ],
+)
+def test_reader_state_space(monkeypatch, reader, expected):
+    """Regression: the reader check matched statements found anywhere in a
+    walk, so an unpack after the hand-off, a caught check before it, or a
+    nested function's ``return`` / an inner loop's ``continue`` swung the
+    verdict. Now the loop body has one exact shape and everything else in it
+    must be inert in the reader's own frame."""
+    _patch_helper_shape(monkeypatch, reader=reader)
+    assert dt.segmented_stt_orders_spans() is expected
+
+
+async def _h_local_predicate(self, audio):  # pragma: no cover - never run
+    """Transcribe one segment."""
+
+    def _keep(frame):
+        return frame is not None
+
+    held: object | None = None
+    async for frame in self.run_stt(audio):
+        if _keep(frame):
+            held = frame
+    if held is not None:
+        await self.push_frame(held)
+
+
+async def _h_retries_itself(self, audio):  # pragma: no cover - never run
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+    if self._retry:
+        await self._push_segment_frames(audio)
+
+
+async def _h_swaps_audio(self, audio):  # pragma: no cover - never run
+    previous = self._previous
+    self._previous = audio
+    audio = previous
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _h_rebinds_audio_in_loop(self, audio):  # pragma: no cover - never run
+    async for frame in self.run_stt(audio):
+        for audio in (frame,):  # noqa: B020
+            await self.push_frame(audio)
+
+
+async def _h_awaits_before_run_stt(self, audio):  # pragma: no cover - never run
+    await self._wait_ready()
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+async def _h_call_before_run_stt(self, audio):  # pragma: no cover - never run
+    held = self._initial()
+    async for frame in self.run_stt(audio):
+        held = frame
+    await self.push_frame(held)
+
+
+async def _h_decorated_local_def(self, audio):  # pragma: no cover - never run
+    @self._register
+    def _keep(frame):
+        return frame
+
+    async for frame in self.run_stt(audio):
+        await self.push_frame(_keep(frame))
+
+
+async def _h_run_stt_handed_out(self, audio):  # pragma: no cover - never run
+    self._later = self.run_stt
+    async for frame in self.run_stt(audio):
+        await self.push_frame(frame)
+
+
+@pytest.mark.parametrize(
+    ("helper", "expected"),
+    [
+        (_helper_sound, True),
+        (_h_local_predicate, True),
+        (_h_retries_itself, False),
+        (_h_swaps_audio, False),
+        (_h_rebinds_audio_in_loop, False),
+        (_h_awaits_before_run_stt, False),
+        (_h_call_before_run_stt, False),
+        (_h_decorated_local_def, False),
+        (_h_run_stt_handed_out, False),
+    ],
+    ids=[
+        "sound",
+        "local-predicate-return",
+        "calls-itself",
+        "swaps-audio",
+        "rebinds-audio-in-loop",
+        "await-before-run_stt",
+        "call-before-run_stt",
+        "decorated-local-def",
+        "run_stt-handed-out",
+    ],
+)
+def test_helper_state_space(monkeypatch, helper, expected):
+    """Regression: the helper check excluded the helper from its own caller
+    scan, ignored writes to its audio parameter and counted a local
+    predicate's ``return`` as its own, so a retry or a swapped segment passed
+    and a sound helper was refused."""
+    _patch_helper_shape(monkeypatch, helper=helper)
+    assert dt.segmented_stt_orders_spans() is expected
+
+
+async def _stop_refers_to_run_stt(self, frame):  # pragma: no cover - never run
+    self._later = self.run_stt
+    await self._segment_queue.put(b"a")
+
+
+async def _stop_refers_to_the_helper(self, frame):  # pragma: no cover - never run
+    self._later = self._push_segment_frames
+    await self._segment_queue.put(b"a")
+
+
+async def _stop_getattr_run_stt(self, frame):  # pragma: no cover - never run
+    self._later = getattr(self, "run_stt")  # noqa: B009
+    await self._segment_queue.put(b"a")
+
+
+@pytest.mark.parametrize(
+    ("shape", "stop_handler", "expected"),
+    [
+        ("1.9", _stop_puts_one_segment, True),
+        ("1.9", _stop_also_calls_run_stt, False),
+        ("1.9", _stop_refers_to_run_stt, False),
+        ("1.9", _stop_refers_to_the_helper, False),
+        ("1.9", _stop_getattr_run_stt, False),
+        ("1.17", _stop_puts_numbered_segment, True),
+        ("1.17", _stop_also_calls_run_stt, False),
+        ("1.17", _stop_refers_to_run_stt, False),
+        ("1.17", _stop_calls_helper, False),
+        ("1.17", _stop_getattr_run_stt, False),
+    ],
+    ids=[
+        "1.9-sound",
+        "1.9-second-run_stt-call",
+        "1.9-run_stt-handed-out",
+        "1.9-helper-referenced",
+        "1.9-run_stt-by-name",
+        "1.17-sound",
+        "1.17-second-run_stt-call",
+        "1.17-run_stt-handed-out",
+        "1.17-second-helper-caller",
+        "1.17-run_stt-by-name",
+    ],
+)
+def test_one_run_stt_site_for_both_reader_shapes(
+    monkeypatch, shape, stop_handler, expected
+):
+    """Regression: only the 1.17 helper branch required the class's one
+    ``run_stt`` site, so a 1.9-1.12 class whose stop handler also ran
+    ``run_stt`` passed. The class-wide site scan now covers both shapes."""
+    if shape == "1.9":
+        _patch_queued_shape(monkeypatch, stop_handler=stop_handler)
+    else:
+        _patch_helper_shape(monkeypatch, stop_handler=stop_handler)
+    assert dt.segmented_stt_orders_spans() is expected

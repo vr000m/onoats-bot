@@ -19,8 +19,10 @@ pipecat's ``run_test`` harness, with a stubbed deferred decode: a fake
 from __future__ import annotations
 
 import asyncio
+import collections
 import functools
 import inspect
+import struct
 
 import pytest
 from loguru import logger
@@ -64,14 +66,20 @@ def _clean_registry():
 
 class _ScriptedClient:
     """Fake ``TranscriptionClient``: ``commit()`` is the deferred decode - it
-    queues the next scripted transcript (``None`` entry -> empty text)."""
+    queues the next scripted transcript (``None`` entry -> empty text), or,
+    when ``label_audio`` is set, ``label_audio(<audio sent since the last
+    commit>)`` (so a test can tell which segment was decoded). ``commit_delay``
+    makes the decode slow, so later VAD stops arrive while it is outstanding."""
 
     instances: list[_ScriptedClient] = []
     script: list[str] = []
+    label_audio = None
+    commit_delay = 0.0
 
     def __init__(self, **kwargs):
         self._events: asyncio.Queue = asyncio.Queue()
         self.committed = 0
+        self._sent = bytearray()
         _ScriptedClient.instances.append(self)
 
     async def connect(self):
@@ -88,11 +96,19 @@ class _ScriptedClient:
             yield ev
 
     async def send_audio(self, data):
-        pass
+        self._sent += data
 
     async def commit(self):
         self.committed += 1
-        text = _ScriptedClient.script.pop(0) if _ScriptedClient.script else "hello"
+        sent, self._sent = bytes(self._sent), bytearray()
+        if _ScriptedClient.commit_delay:
+            await asyncio.sleep(_ScriptedClient.commit_delay)
+        if _ScriptedClient.label_audio is not None:
+            text = _ScriptedClient.label_audio(sent)
+        elif _ScriptedClient.script:
+            text = _ScriptedClient.script.pop(0)
+        else:
+            text = "hello"
         await self._events.put({"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": text})
 
     async def cancel(self):
@@ -109,6 +125,8 @@ class _ScriptedClient:
 def _fake_client(monkeypatch):
     _ScriptedClient.instances = []
     _ScriptedClient.script = []
+    _ScriptedClient.label_audio = None
+    _ScriptedClient.commit_delay = 0.0
     monkeypatch.setattr(wss_module, "TranscriptionClient", _ScriptedClient)
     monkeypatch.setattr(
         wss_module, "_RECONNECT_BACKOFF_SECONDS", (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -116,6 +134,8 @@ def _fake_client(monkeypatch):
     yield
     _ScriptedClient.instances = []
     _ScriptedClient.script = []
+    _ScriptedClient.label_audio = None
+    _ScriptedClient.commit_delay = 0.0
 
 
 def _svc(stamp: bool = True, **kw) -> WebSocketSTTService:
@@ -126,9 +146,9 @@ def _svc(stamp: bool = True, **kw) -> WebSocketSTTService:
     )
 
 
-def _audio(n: int = CHUNK) -> InputAudioRawFrame:
+def _audio(n: int = CHUNK, value: int = 1) -> InputAudioRawFrame:
     return InputAudioRawFrame(
-        audio=b"\x01\x00" * n, sample_rate=PIPELINE_SAMPLE_RATE, num_channels=1
+        audio=bytes([value, 0]) * n, sample_rate=PIPELINE_SAMPLE_RATE, num_channels=1
     )
 
 
@@ -140,12 +160,13 @@ def _vad_stop() -> VADUserStoppedSpeakingFrame:
     return VADUserStoppedSpeakingFrame(stop_secs=0.0, timestamp=0.0)
 
 
-def _segment(pre: int, speech: int) -> list:
-    """``pre`` chunks of silence/pre-roll, VAD start, ``speech`` chunks, VAD stop."""
+def _segment(pre: int, speech: int, value: int = 1) -> list:
+    """``pre`` chunks of silence/pre-roll, VAD start, ``speech`` chunks, VAD stop.
+    Every chunk is the 16-bit sample ``value``, so a segment's audio names it."""
     return (
-        [_audio() for _ in range(pre)]
+        [_audio(value=value) for _ in range(pre)]
         + [_vad_start()]
-        + [_audio() for _ in range(speech)]
+        + [_audio(value=value) for _ in range(speech)]
         + [_vad_stop()]
     )
 
@@ -265,37 +286,40 @@ def test_default_kwarg_is_false():
 # ----------------------------------------------- fail-loud slot discipline
 
 
-def test_spans_stay_aligned_when_run_stt_is_deferred(monkeypatch):
+def test_spans_stay_aligned_when_run_stt_is_deferred():
     """pipecat 1.9+ queues each segment and a task runs ``run_stt`` later, so
-    several spans are outstanding before the first ``run_stt`` starts. The stop
-    handler is replaced by that queued shape (all three VAD-stops are seen,
-    then the segments are decoded in order): each transcript must still carry
-    its own segment's span."""
+    several spans are outstanding before the first ``run_stt`` starts (a slow
+    decode makes that so; on pipecat <= 1.8 ``run_stt`` runs inline and the
+    same assertions hold). This drives pipecat's OWN stop handler and queue, not
+    a stand-in: each segment carries distinct audio (its samples are its
+    number) and the client names the transcript after the audio it was sent,
+    so a producer that queues the wrong audio, or a reader that reorders or
+    repeats a segment, is caught along with a mis-popped span. Pipecat's
+    private buffers (``_audio_buffer`` before 1.17, ``_speech_buffer`` after)
+    are never read."""
     svc = _svc()
-    _ScriptedClient.script = ["one", "two", "three"]
-    deferred: list[bytes] = []
+    # pipecat sends a WAV whose PCM framing (pre-roll, trailing padding) varies
+    # by version, so name a segment by its most common non-zero sample.
+    names = {1: "one", 2: "two", 3: "three"}
 
-    async def _queued(frame):
-        svc._user_speaking = False
-        deferred.append(bytes(svc._audio_buffer))
-        svc._audio_buffer.clear()
-        if len(deferred) == 3:
-            for audio in deferred:
-                await svc.process_generator(svc.run_stt(audio))
+    def _label(sent: bytes) -> str:
+        samples = struct.unpack_from(f"<{(len(sent) - 44) // 2}h", sent, 44)
+        return names[collections.Counter(x for x in samples if x).most_common(1)[0][0]]
 
-    monkeypatch.setattr(svc, "_handle_user_stopped_speaking", _queued)
+    _ScriptedClient.label_audio = _label
+    _ScriptedClient.commit_delay = 0.03
     out = _run(
         svc,
-        _segment(pre=1, speech=1)
-        + _segment(pre=2, speech=2)
-        + _segment(pre=0, speech=3),
+        _segment(pre=1, speech=1, value=1)
+        + _segment(pre=2, speech=2, value=2)
+        + _segment(pre=0, speech=3, value=3),
     )
-    assert [f.text for f in out] == ["one", "two", "three"]
     # seg1 [1,2); seg2 [2+2, 4+2)=[4,6)... counted in chunks from the clock.
-    assert [(getattr(f, START_ATTR), getattr(f, END_ATTR)) for f in out] == [
-        (1 * CHUNK, 2 * CHUNK),
-        (4 * CHUNK, 6 * CHUNK),
-        (6 * CHUNK, 9 * CHUNK),
+    # Each transcript (named after the audio decoded) with its own span.
+    assert [(f.text, getattr(f, START_ATTR), getattr(f, END_ATTR)) for f in out] == [
+        ("one", 1 * CHUNK, 2 * CHUNK),
+        ("two", 4 * CHUNK, 6 * CHUNK),
+        ("three", 6 * CHUNK, 9 * CHUNK),
     ]
 
 
