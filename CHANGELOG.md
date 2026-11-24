@@ -15,6 +15,8 @@ Annotated tags exist from `v0.9.0` forward.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-23
+
 ### Added
 
 - **Re-mint window in the queue contract.** `session_meta` now carries
