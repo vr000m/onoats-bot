@@ -581,7 +581,11 @@ AGENT_PROMPT = "build_workflow.txt"
 # those checks.
 EXTRA_PROMPTS: dict[str, tuple[object, ...]] = {"name_speakers.txt": ()}
 # Their placeholders are classified here, apart from the pipeline's sets above,
-# which the coding-agent task's ask list is checked against.
+# which the coding-agent task's ask list is checked against. ``labels`` is the
+# one exception to "the caller computes it from a date or a count": it is a list
+# of diarizer labels taken from the session's ``speakers`` values, and the prompt
+# asks for one JSON key per label. It sits outside a fence, so the caller must
+# build it from labels that match ``S`` plus digits, never from raw file text.
 EXTRA_TRUSTED_FIELDS = frozenset({"labels"})
 EXTRA_UNTRUSTED_FIELDS = frozenset({"participants"})
 PROMPT_URL = "https://onoats.dev/prompts/"

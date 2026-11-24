@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from onoats.categories import (
     DEFAULT_CATEGORY,
     INVALID_CATEGORY_ERROR_TAG,
@@ -108,8 +107,10 @@ def test_session_meta_line_carries_idle_remint_sec_only_when_given():
     )
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0, 1e12, True])
 def test_session_meta_line_drops_an_unusable_idle_remint_window(bad):
+    # ``1e12`` is finite but beyond what the config reader accepts, and ``True``
+    # would serialise as ``true``: the header applies the reader's own predicate.
     prov = {"model": "m/x", "version": "r"}
     line = session_meta_line(
         run_id="abc", diarization=prov, diarization_idle_remint_sec=bad

@@ -5,7 +5,6 @@ from __future__ import annotations
 import textwrap
 
 import pytest
-
 from onoats.config import OnoatsConfig, load_config, normalize_launchd_label
 
 _CONFIG = textwrap.dedent(
@@ -154,9 +153,8 @@ def test_diarization_flag_resolution(monkeypatch):
 
 
 def test_diarization_flag_garbage_is_false_with_warning(monkeypatch):
-    from loguru import logger
-
     import onoats.config as cfgmod
+    from loguru import logger
 
     monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
     monkeypatch.setattr(cfgmod, "_warned_diarization_values", set())
@@ -172,9 +170,8 @@ def test_diarization_flag_garbage_is_false_with_warning(monkeypatch):
 def test_diarization_flag_garbage_warns_once_across_reads_and_configs(monkeypatch):
     """The flag is read at several startup sites (each often on its own config
     object): one WARNING per process per bad value, not one per read."""
-    from loguru import logger
-
     import onoats.config as cfgmod
+    from loguru import logger
 
     monkeypatch.delenv("ONOATS_DIARIZATION", raising=False)
     monkeypatch.setattr(cfgmod, "_warned_diarization_values", set())
@@ -274,6 +271,15 @@ def test_diarization_idle_remint_sec_default_env_only_fills_a_gap(monkeypatch):
         assert OnoatsConfig(raw=toml).diarization_idle_remint_sec == 3600.0
     toml = {"stt": {"diarization_idle_remint_sec": "soon"}}
     assert OnoatsConfig(raw=toml).diarization_idle_remint_sec is None
+
+
+def test_diarization_idle_remint_sec_upper_bound_is_inclusive(monkeypatch):
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", raising=False)
+    at = {"stt": {"diarization_idle_remint_sec": "1e9"}}
+    assert OnoatsConfig(raw=at).diarization_idle_remint_sec == 1e9
+    over = {"stt": {"diarization_idle_remint_sec": "1000000001"}}
+    assert OnoatsConfig(raw=over).diarization_idle_remint_sec is None
 
 
 @pytest.mark.parametrize("bad", ["soon", "0", "-5", "inf", "nan", "1e305", True])

@@ -513,15 +513,12 @@ async def run_onoats_dual(
     effective_remint_sec: float | None = None
     if cfg.diarization:
         # Lazy: pulls numpy, which only diarized runs need here.
-        from onoats.stt.diarization_timeline import SLOT_IDLE_REMINT_SEC
+        from onoats.stt.diarization_timeline import effective_idle_remint_sec
 
-        # Same predicate as ``DiarizationTimeline.__init__`` (``is None``, not
-        # truthiness), so the header can never name a window the timeline
-        # was not built with.
-        effective_remint_sec = (
-            SLOT_IDLE_REMINT_SEC
-            if cfg.diarization_idle_remint_sec is None
-            else cfg.diarization_idle_remint_sec
+        # The timeline's own rule, so the header can never name a window the
+        # timeline was not built with.
+        effective_remint_sec = effective_idle_remint_sec(
+            cfg.diarization_idle_remint_sec
         )
 
     transcript_buffer = TranscriptBuffer(

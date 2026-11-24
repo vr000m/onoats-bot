@@ -20,9 +20,8 @@ so a downstream consumer (a queue worker, or the converter) can honor it.
 from __future__ import annotations
 
 import json
-import math
 
-from onoats.config import OnoatsConfig, load_config
+from onoats.config import OnoatsConfig, load_config, parse_idle_remint_sec
 
 DEFAULT_CATEGORY = "uncategorized"
 INVALID_CATEGORY_ERROR_TAG = "ONOATS-ERROR invalid-category"
@@ -92,12 +91,15 @@ def session_meta_line(
         meta["run_id"] = run_id
     if diarization:
         meta["diarization"] = dict(diarization)
-    # The window only means something beside diarization provenance, and
-    # ``json.dumps`` would emit the non-JSON ``NaN``/``Infinity`` for a bad float.
-    if (
-        diarization
-        and diarization_idle_remint_sec is not None
-        and 0 < diarization_idle_remint_sec < math.inf
-    ):
-        meta["diarization_idle_remint_sec"] = diarization_idle_remint_sec
+    # The window only means something beside diarization provenance. It must
+    # pass the same predicate the config reader applies (so the header never
+    # names a window the reader would reject, and ``json.dumps`` can never emit
+    # the non-JSON ``NaN``/``Infinity`` or a bool as ``true``).
+    if diarization and diarization_idle_remint_sec is not None:
+        try:
+            window = parse_idle_remint_sec(diarization_idle_remint_sec)
+        except ValueError:
+            window = None
+        if window is not None:
+            meta["diarization_idle_remint_sec"] = window
     return json.dumps(meta, ensure_ascii=False)

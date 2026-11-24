@@ -74,6 +74,18 @@ HOLD_SEC = 1.5
 #: 4-person call (2026-10-12) split every returning speaker at the earlier 300 s,
 #: after silences of 336-946 s; ``[stt].diarization_idle_remint_sec`` overrides it.
 SLOT_IDLE_REMINT_SEC = 1200.0
+
+
+def effective_idle_remint_sec(idle_remint_sec: float | None) -> float:
+    """The re-mint window a timeline built with *idle_remint_sec* will use.
+
+    The one owner of the ``None`` -> default rule (``is None``, not truthiness):
+    ``DiarizationTimeline`` builds from it and ``dual`` writes it into the
+    ``session_meta`` header, so the header can never name another window.
+    """
+    return SLOT_IDLE_REMINT_SEC if idle_remint_sec is None else float(idle_remint_sec)
+
+
 #: Queue / segment-serialisation slack added to the ring capacity.
 RING_HEADROOM_SEC = 10.0
 #: How long after the labeler starts the worker may still be loading the model
@@ -606,8 +618,8 @@ class DiarizationTimeline:
         idle_remint_sec: float | None = None,
     ) -> None:
         cap = RING_CAPACITY_SEC if capacity_sec is None else float(capacity_sec)
-        idle = SLOT_IDLE_REMINT_SEC if idle_remint_sec is None else idle_remint_sec
-        self._idle_remint_samples = int(float(idle) * SAMPLE_RATE_HZ)
+        idle = effective_idle_remint_sec(idle_remint_sec)
+        self._idle_remint_samples = int(idle * SAMPLE_RATE_HZ)
         self._capacity_samples = int(cap * SAMPLE_RATE_HZ)
         self._lock = threading.RLock()
         self._segments: list[_Segment] = []  # sorted by start
