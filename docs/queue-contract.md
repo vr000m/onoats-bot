@@ -72,12 +72,16 @@ window in seconds (a positive number, e.g. `1200.0`):
 ~~~
 
 A speaker slot that stays silent for longer than this gets a fresh label on its
-next utterance (`S2` can come back as `S6`), so a consumer matching speakers
-across labels should use this value as the longest gap that can still be the
-same slot. It is the value the run's diarizer was built with (env, then
-`config.toml`, then the built-in default), written to every file of the run.
-Absent when diarization is off or in files from older versions; treat absence
-as unknown. Which label was re-minted from which is not recorded.
+next utterance (`S2` can come back as `S6`). A return within the window keeps
+its label; only a longer silence can split one speaker across two labels, so a
+consumer matching speakers across labels should treat this value as the
+shortest silence at which a same-speaker relabel can happen. It is the value
+the run's diarizer was built with (`ONOATS_DIARIZATION_IDLE_REMINT_SEC`, then
+`[stt].diarization_idle_remint_sec`, then
+`ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT`, then the built-in default),
+written to every file of the run. Absent when diarization is off or in files
+from older versions; treat absence as unknown. Which label was re-minted from
+which is not recorded.
 
 A wrapper can supply a default without reading `config.toml` by setting
 `ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT`; it applies only when neither

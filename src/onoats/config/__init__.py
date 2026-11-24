@@ -465,16 +465,23 @@ class OnoatsConfig:
         ``[stt].diarization_idle_remint_sec`` > env
         ``ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT`` (a wrapper's
         "only if unset" default, so it need not parse config.toml) > ``None``
-        (the timeline's own default). A non-positive, non-finite or non-numeric value logs one
-        WARNING and falls back to the default, so a typo can never disable
-        re-minting or make every utterance a new speaker.
+        (the timeline's own default). A non-positive, non-finite or
+        non-numeric value logs one WARNING and falls back to the timeline's
+        default (an invalid explicit value does not fall through to the
+        ``_DEFAULT`` env), so a typo can never disable re-minting or make
+        every utterance a new speaker.
         """
         val = _env_or(
             "ONOATS_DIARIZATION_IDLE_REMINT_SEC",
             self.raw.get("stt", {}).get("diarization_idle_remint_sec"),
         )
-        if val in (None, ""):
+        origin = ""
+        # "Unset" is whatever ``parse_idle_remint_sec`` calls absent (None or a
+        # blank string), so a whitespace-only config value still lets the
+        # wrapper default apply.
+        if val is None or (isinstance(val, str) and not val.strip()):
             val = _env_or("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", None)
+            origin = " from ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT"
         try:
             return parse_idle_remint_sec(val)
         except ValueError:
@@ -483,7 +490,7 @@ class OnoatsConfig:
         if text not in _warned_diarization_values:
             _warned_diarization_values.add(text)
             logger.warning(
-                f"STT: ignoring invalid diarization_idle_remint_sec {val!r} "
+                f"STT: ignoring invalid diarization_idle_remint_sec {val!r}{origin} "
                 "(expected a positive number of seconds); using the default"
             )
         return None

@@ -884,6 +884,46 @@ def test_dual_diarization_lock_then_preflight_precede_capture(
     assert calls[:3] == ["lock", "preflight", builder], calls
 
 
+@pytest.mark.parametrize(
+    ("diarization", "env_sec", "expected"),
+    [
+        ("1", None, 1200.0),  # unset: the timeline's built-in default
+        ("1", "3600", 3600.0),  # explicit window wins and is what the header says
+        ("0", "3600", None),  # diarization off: no window is recorded
+    ],
+)
+def test_dual_hands_the_buffer_the_effective_idle_remint_window(
+    diarization, env_sec, expected, tmp_path, monkeypatch
+):
+    """The header's window is the one the run's timeline is built with."""
+    import onoats.processors.transcript_buffer as buffer_mod
+
+    monkeypatch.setenv("AUDIO_SOURCE", "socket")
+    monkeypatch.setenv("ONOATS_DIARIZATION", diarization)
+    monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC_DEFAULT", raising=False)
+    if env_sec is None:
+        monkeypatch.delenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", raising=False)
+    else:
+        monkeypatch.setenv("ONOATS_DIARIZATION_IDLE_REMINT_SEC", env_sec)
+    dual_mod, _calls = _dual_spies(monkeypatch, tmp_path, preflight_raises=False)
+    captured: list[dict] = []
+
+    class FakeBuffer:
+        run_id = "0123456789abcdef0123456789abcdef"
+
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr(buffer_mod, "TranscriptBuffer", FakeBuffer)
+
+    with pytest.raises(_Stop):
+        asyncio.run(dual_mod.run_onoats_dual(data_dir=tmp_path / "data"))
+
+    (kwargs,) = captured
+    assert kwargs["diarization_idle_remint_sec"] == expected
+    assert (kwargs["diarization_meta"] is not None) == (diarization == "1")
+
+
 @pytest.mark.parametrize("source", ["portaudio", "socket"])
 @pytest.mark.parametrize("supplied", [False, True], ids=["captured", "supplied"])
 def test_session_snapshot_lock_order_whole_backend_state_space(

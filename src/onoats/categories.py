@@ -81,8 +81,8 @@ def session_meta_line(
     (``{"model", "version"}``) recording that diarization was configured on,
     not that a line was labelled. ``diarization_idle_remint_sec`` is the
     effective idle window (seconds) after which a silent speaker slot is given
-    a fresh label; omitted when diarization is off. The returned string has NO trailing newline
-    — the writer appends it.
+    a fresh label; omitted when diarization is off. The returned string has NO
+    trailing newline — the writer appends it.
     """
     meta: dict[str, object] = {"type": "session_meta"}
     if category:
